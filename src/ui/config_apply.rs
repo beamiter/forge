@@ -1092,6 +1092,8 @@ impl UiState {
         self.ai_panel.refresh_config_display();
         self.ai_panel.refresh_persisted_privacy();
         self.sync_agent_toggle();
+        // `agent_tasks_enabled` decides whether the Tasks button is offered.
+        self.sync_task_badge();
 
         // Update keybindings
         *self.keybinding_map.borrow_mut() = new_keybindings;

@@ -26,9 +26,7 @@ use crate::agent_task::{
     AgentProvider, ApprovalDecision, CodexAppServerPhase, NativePromptPolicy, NewTask, TaskId,
     TaskManager, TaskRuntimeKind, TaskStatus, TaskTerminalRole, TaskValidationStatus,
 };
-use crate::agent_task_ui::{
-    self, order_task_rows, row_status_line, TaskPanelAction, TaskRowSnapshot,
-};
+use crate::agent_task_ui::{self, row_status_line, TaskPanelAction, TaskRowSnapshot};
 use crate::ui::tasks_panel::{DiffSync, TaskDetailSync, TasksPanelSync};
 use crate::ui::{PaneLeaf, UiState};
 
@@ -142,15 +140,32 @@ fn task_action_allowed(enabled: bool, action: &TaskPanelAction) -> bool {
                 | TaskPanelAction::FocusValidation(_)
                 | TaskPanelAction::ReviewDiff(_)
                 | TaskPanelAction::Archive(_)
+                | TaskPanelAction::Restore(_)
                 | TaskPanelAction::Complete(_)
                 | TaskPanelAction::AcceptReviewed(_)
         )
 }
 
+/// Why Hide is unavailable. The manager's own error names a raw task ID.
+const ARCHIVE_BLOCKED: &str =
+    "Stop the Agent and wait for any running validation before hiding this task.";
+
 impl UiState {
     fn task_toast(&self, message: impl AsRef<str>) {
-        self.toast_overlay
-            .add_toast(adw::Toast::new(message.as_ref()));
+        // Task messages carry paths, Git output and provider errors; never
+        // interpret them as Pango markup.
+        let toast = adw::Toast::new("");
+        toast.set_use_markup(false);
+        toast.set_title(message.as_ref());
+        self.toast_overlay.add_toast(toast);
+    }
+
+    fn task_provider_name(&self, task_id: TaskId) -> &'static str {
+        self.agent_tasks
+            .borrow()
+            .task_manager
+            .get(task_id)
+            .map_or("the Agent", |task| task.provider.display_name())
     }
 
     fn task_prompt_policy(&self) -> NativePromptPolicy {
@@ -176,6 +191,32 @@ impl UiState {
         domain.next_task_terminal_serial
     }
 
+    /// Keep the top-bar Tasks button in step with the domain. It is shown
+    /// only where tasks can be used and counts attention by the shared rule.
+    pub(crate) fn sync_task_badge(&self) {
+        let (has_tasks, counts) = {
+            let domain = self.agent_tasks.borrow();
+            (
+                !domain.task_manager.tasks().is_empty(),
+                domain.task_manager.attention_counts(),
+            )
+        };
+        let visible = self.config.borrow().agent_tasks_enabled || has_tasks;
+        let state = (visible, counts.total(), counts.summary());
+        if self.task_badge_state.borrow().as_ref() == Some(&state) {
+            return;
+        }
+        *self.task_badge_state.borrow_mut() = Some(state.clone());
+        let (visible, count, summary) = state;
+        self.tasks_button.set_visible(visible);
+        self.tasks_badge.set_visible(visible && count > 0);
+        self.tasks_badge.set_label(&count.to_string());
+        let (tooltip, label) = super::tasks_button_presentation(count, summary.as_deref());
+        self.tasks_button.set_tooltip_text(Some(&tooltip));
+        self.tasks_button
+            .update_property(&[gtk4::accessible::Property::Label(&label)]);
+    }
+
     pub(crate) fn toggle_tasks_panel(&self) {
         // Safe mode needs no separate guard: it loads safe defaults, which
         // keep `agent_tasks_enabled` false and land on the same opt-in toast.
@@ -191,6 +232,9 @@ impl UiState {
         self.agent_tasks.borrow_mut().panel_visible = visible;
         self.sync_side_panel();
         if visible {
+            // Opening the panel (for example from the attention badge) shows
+            // the ordinary views, never a hidden-tasks list left from before.
+            self.tasks_panel.leave_hidden();
             self.sync_tasks_panel();
         }
         self.ensure_agent_tasks_timer();
@@ -238,17 +282,18 @@ impl UiState {
             };
             if let Some(issue) = report.issues.last() {
                 self.task_toast(format!("Native Agent issue: {}", issue.detail));
-            } else {
-                let message = agent_task_ui::task_completion_feedback(
-                    &self.agent_tasks.borrow().task_manager,
-                    report
-                        .completions
-                        .iter()
-                        .map(|completion| (completion.task_id, completion.outcome)),
-                );
-                if let Some(message) = message {
-                    agent_task_ui::show_task_feedback(&self.toast_overlay, &message);
-                }
+            }
+            // Completion feedback is reported even when the same poll also
+            // surfaced a runtime issue for another (or the same) task.
+            let message = agent_task_ui::task_completion_feedback(
+                &self.agent_tasks.borrow().task_manager,
+                report
+                    .completions
+                    .iter()
+                    .map(|completion| (completion.task_id, completion.outcome)),
+            );
+            if let Some(message) = message {
+                agent_task_ui::show_task_feedback(&self.toast_overlay, &message);
             }
             keep_fast |=
                 report.made_progress() || self.agent_tasks.borrow().agent_runtime.needs_fast_poll();
@@ -296,6 +341,7 @@ impl UiState {
                 self.sync_tasks_panel();
             }
         }
+        self.sync_task_badge();
 
         let (has_tasks, panel_visible) = {
             let domain = self.agent_tasks.borrow();
@@ -443,12 +489,15 @@ impl UiState {
                 };
                 match result {
                     Ok(()) => {
+                        let provider = self.task_provider_name(task_id);
                         if self.agent_tasks.borrow().agent_runtime.has_running(task_id) {
-                            self.task_toast("Stopping Codex and waiting for process cleanup…");
+                            self.task_toast(format!(
+                                "Stopping {provider} and waiting for process cleanup…"
+                            ));
                         } else {
-                            self.task_toast(
-                                "Native Codex preparation cancelled; finishing background cleanup…",
-                            );
+                            self.task_toast(format!(
+                                "Native {provider} preparation cancelled; finishing background cleanup…"
+                            ));
                         }
                     }
                     Err(error) => self.task_toast(error.to_string()),
@@ -468,7 +517,10 @@ impl UiState {
                         .map_err(|error| error.to_string())
                 };
                 match &result {
-                    Ok(()) => self.task_toast("Follow-up queued on the existing Codex thread…"),
+                    Ok(()) => self.task_toast(format!(
+                        "Follow-up queued on the existing {} session…",
+                        self.task_provider_name(request.task_id)
+                    )),
                     Err(error) => self.task_toast(error.clone()),
                 }
                 self.tasks_panel.resolve_follow_up(request, result);
@@ -484,9 +536,10 @@ impl UiState {
                     agent_runtime.finish_codex(task_manager, task_id)
                 };
                 match result {
-                    Ok(()) => self.task_toast(
-                        "Finishing Codex and waiting for containment cleanup before validation…",
-                    ),
+                    Ok(()) => self.task_toast(format!(
+                        "Finishing {} and waiting for containment cleanup before validation…",
+                        self.task_provider_name(task_id)
+                    )),
                     Err(error) => self.task_toast(error.to_string()),
                 }
             }
@@ -546,7 +599,8 @@ impl UiState {
                     let mut domain = self.agent_tasks.borrow_mut();
                     let archived = domain.task_manager.archive(task_id);
                     if archived.is_ok() {
-                        domain.agent_runtime.clear_retained(task_id);
+                        // Keep any retained native view: Restore brings the
+                        // task back with its transcript and recovery evidence.
                         if domain.selected_task == Some(task_id) {
                             domain.selected_task = None;
                         }
@@ -554,11 +608,34 @@ impl UiState {
                     archived
                 };
                 match result {
-                    Ok(()) => self.task_toast("Task hidden; worktree left in place"),
+                    Ok(()) => self.task_toast(
+                        "Task hidden; its worktree is unchanged. Restore it from Hidden tasks.",
+                    ),
+                    Err(_) => self.task_toast(ARCHIVE_BLOCKED),
+                }
+            }
+            TaskPanelAction::Restore(task_id) => {
+                let result = {
+                    let mut domain = self.agent_tasks.borrow_mut();
+                    let restored = domain.task_manager.restore(task_id);
+                    if restored.is_ok() {
+                        // Keep it selected so the restored task is easy to find.
+                        domain.selected_task = Some(task_id);
+                    }
+                    restored.map(|()| {
+                        domain
+                            .task_manager
+                            .get(task_id)
+                            .map_or("restored", |task| task.status.label())
+                    })
+                };
+                match result {
+                    Ok(state) => self.task_toast(format!("Task restored · {state}")),
                     Err(error) => self.task_toast(error.to_string()),
                 }
             }
         }
+        self.sync_task_badge();
         self.ensure_agent_tasks_timer();
         if self.agent_tasks.borrow().panel_visible {
             self.sync_tasks_panel();
@@ -792,7 +869,10 @@ impl UiState {
             let domain = self.agent_tasks.borrow();
             if domain.agent_runtime.has_preparing(task_id) {
                 drop(domain);
-                self.task_toast("Cancel native Codex preparation before starting a terminal");
+                self.task_toast(format!(
+                    "Cancel native {} preparation before starting a terminal",
+                    self.task_provider_name(task_id)
+                ));
                 return;
             }
             let failed_terminal_retry = domain
@@ -1169,7 +1249,7 @@ impl UiState {
         }
 
         let domain = self.agent_tasks.borrow();
-        let mut rows: Vec<TaskRowSnapshot> = domain
+        let rows: Vec<TaskRowSnapshot> = domain
             .task_manager
             .tasks()
             .iter()
@@ -1202,13 +1282,6 @@ impl UiState {
                     .map(|detail| jterm_core::review_input::safe_inline_display(detail, 1024)),
             })
             .collect();
-        let updated: HashMap<TaskId, u64> = domain
-            .task_manager
-            .tasks()
-            .iter()
-            .map(|task| (task.id, task.updated_at_ms))
-            .collect();
-        order_task_rows(&mut rows, |id| updated.get(&id).copied().unwrap_or(0));
 
         let selected = domain
             .selected_task
@@ -1230,17 +1303,16 @@ impl UiState {
         let create_hint = if domain.pending_task_creation.is_some() {
             "Creating the isolated task worktree…".to_string()
         } else if !native_ai_enabled {
-            "Start Codex needs AI enabled plus command-context sharing consent (config: ai_enabled, ai_share_command_context)"
+            "Native Agents need AI enabled plus command-context sharing consent (config: ai_enabled, ai_share_command_context)"
                 .to_string()
         } else {
             String::new()
         };
-        let dashboard = crate::agent_task::DashboardSnapshot::project(
-            domain
-                .task_manager
-                .tasks()
-                .iter()
-                .filter(|task| task.status != crate::agent_task::TaskStatus::Archived),
+        // Hidden tasks stay in the projection so the panel can offer them for
+        // restore; its scope excludes them from every ordinary view. The
+        // panel chooses the final order, so no intermediate sort happens here.
+        let dashboard = crate::agent_task::DashboardSnapshot::project_unsorted(
+            domain.task_manager.tasks(),
             |id| crate::agent_task::DashboardActivity {
                 has_active_agent_stream: domain.task_manager.has_active_agent_event_stream(id),
                 native_preparing: domain.agent_runtime.has_preparing(id),
@@ -1252,7 +1324,6 @@ impl UiState {
             .task_manager
             .tasks()
             .iter()
-            .filter(|task| task.status != crate::agent_task::TaskStatus::Archived)
             .map(|task| (task.id, task.repo_root.clone()))
             .collect();
         let sync = TasksPanelSync {
@@ -1280,7 +1351,8 @@ fn task_detail_sync(
     can_focus_validation: bool,
 ) -> Option<TaskDetailSync> {
     let task = domain.task_manager.get(task_id)?;
-    let view = domain.agent_runtime.snapshot(task_id);
+    // One shared view per provider change; idle ticks reuse it.
+    let view = domain.agent_runtime.shared_snapshot(task_id);
     let has_stream = domain.task_manager.has_active_agent_event_stream(task_id);
     let native_idle = task.status == TaskStatus::ReadyForReview
         && has_stream
@@ -1345,8 +1417,10 @@ fn task_detail_sync(
     let follow_up_hint = if native_idle && !native_ai_enabled {
         "Enable AI features and command-context sharing before sending another turn".to_string()
     } else if native_idle {
-        "Send another turn on this loaded Codex thread, or finish the session to unlock validation"
-            .to_string()
+        format!(
+            "Send another turn on this loaded {} session, or finish the session to unlock validation",
+            task.provider.display_name()
+        )
     } else {
         String::new()
     };
@@ -1375,8 +1449,15 @@ fn task_detail_sync(
             text: domain.agent_diff.state().text.clone(),
         });
 
+    let archived = task.status == TaskStatus::Archived;
+    let archive_check = domain.task_manager.can_archive(task_id);
     Some(TaskDetailSync {
         id: task.id,
+        provider: task.provider,
+        archived,
+        can_archive: !archived && archive_check.is_ok(),
+        archive_note: (!archived && archive_check.is_err()).then(|| ARCHIVE_BLOCKED.to_string()),
+        can_restore: archived && task.archived_from.is_some(),
         title: task.title.clone(),
         status_line,
         branch: task.branch.clone(),
@@ -1397,16 +1478,12 @@ fn task_detail_sync(
             && task.status == TaskStatus::ReadyForReview
             && task.validation.status == TaskValidationStatus::NotRun
             && !has_stream,
-        stream: view.map(Box::new),
-        approvals: domain
-            .agent_runtime
-            .snapshot(task_id)
+        approvals: view
+            .as_ref()
             .map(|snapshot| snapshot.pending_approvals.clone())
             .unwrap_or_default(),
-        completed_turns: domain
-            .agent_runtime
-            .snapshot(task_id)
-            .map_or(0, |snapshot| snapshot.completed_turns),
+        completed_turns: view.as_ref().map_or(0, |snapshot| snapshot.completed_turns),
+        stream: view,
         can_start_native: task.provider.supports_native_driver()
             && (task.brief.is_some() || task.source_context.is_some())
             && task.status == TaskStatus::Created

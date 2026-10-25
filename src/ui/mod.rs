@@ -1,6 +1,8 @@
 use gtk4::glib::prelude::ObjectExt;
 use gtk4::Notebook;
-use gtk4::{CssProvider, ScrolledWindow, SearchBar, SearchEntry, Stack, ToggleButton};
+use gtk4::{
+    Button, CssProvider, Label, ScrolledWindow, SearchBar, SearchEntry, Stack, ToggleButton,
+};
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -265,6 +267,25 @@ pub(crate) fn tab_display_title(
     }
 }
 
+/// Accessible name and default tooltip of the top-bar Tasks button.
+pub(crate) const TASKS_BUTTON_LABEL: &str = "Toggle agent Tasks panel";
+pub(crate) const TASKS_BUTTON_TOOLTIP: &str = "Agent tasks · Toggle Tasks (Ctrl+Alt+Shift+T)";
+
+/// Tooltip and accessible name for the Tasks button. Attention is counted by
+/// the shared dashboard rule; hidden tasks never count.
+pub(crate) fn tasks_button_presentation(count: usize, summary: Option<&str>) -> (String, String) {
+    let tooltip = match summary {
+        Some(summary) if count > 0 => format!("{summary} · Toggle Tasks (Ctrl+Alt+Shift+T)"),
+        _ => TASKS_BUTTON_TOOLTIP.to_string(),
+    };
+    let label = if count > 0 {
+        format!("{TASKS_BUTTON_LABEL}, {count} need you")
+    } else {
+        TASKS_BUTTON_LABEL.to_string()
+    };
+    (tooltip, label)
+}
+
 #[derive(Clone)]
 pub(crate) struct UiState {
     /// Navigation widgets upgrade the window controller only for a click;
@@ -430,6 +451,11 @@ pub(crate) struct UiState {
     /// Visible top-bar control reflecting whether a Shell Agent session is
     /// currently active.
     pub(crate) agent_toggle: ToggleButton,
+    /// Top-bar Tasks button and its attention count.
+    pub(crate) tasks_button: Button,
+    pub(crate) tasks_badge: Label,
+    /// Last Tasks button state, to skip redundant widget updates.
+    pub(crate) task_badge_state: RefCell<Option<(bool, usize, Option<String>)>>,
     /// Suppresses a storm of identical persistence alerts while a continuous
     /// setting (opacity/font size) emits multiple change notifications.
     pub(crate) config_save_error_visible: Rc<Cell<bool>>,

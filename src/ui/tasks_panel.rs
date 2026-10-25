@@ -70,6 +70,14 @@ pub(crate) struct TasksPanelSync {
 #[derive(Clone, Debug)]
 pub(crate) struct TaskDetailSync {
     pub(crate) id: TaskId,
+    pub(crate) provider: crate::agent_task::AgentProvider,
+    /// Hidden tasks offer only Restore and read-only inspection.
+    pub(crate) archived: bool,
+    /// Hide is offered only when the task manager would accept it now.
+    pub(crate) can_archive: bool,
+    /// Why Hide is unavailable for a visible task.
+    pub(crate) archive_note: Option<String>,
+    pub(crate) can_restore: bool,
     pub(crate) title: String,
     pub(crate) status_line: String,
     pub(crate) branch: String,
@@ -79,7 +87,9 @@ pub(crate) struct TaskDetailSync {
     pub(crate) native_label: String,
     pub(crate) manual_review: bool,
     pub(crate) can_accept_review: bool,
-    pub(crate) stream: Option<Box<crate::agent_task::CodexAppServerViewSnapshot>>,
+    /// Shared with the runtime until the provider view changes, so an idle
+    /// task is neither copied each tick nor re-rendered as a changed stream.
+    pub(crate) stream: Option<std::sync::Arc<crate::agent_task::CodexAppServerViewSnapshot>>,
     pub(crate) approvals: Vec<crate::agent_task::CodexAppServerApproval>,
     pub(crate) completed_turns: usize,
     pub(crate) can_start_native: bool,
@@ -120,12 +130,46 @@ pub(crate) enum ActionKind {
     AcceptReviewed,
     ReviewDiff,
     Archive,
+    Restore,
+}
+
+/// Hidden (archived) tasks the domain still holds and can restore.
+fn archived_count(sync: &TasksPanelSync) -> usize {
+    sync.dashboard
+        .rows
+        .iter()
+        .filter(|row| row.status == crate::agent_task::TaskStatus::Archived)
+        .count()
+}
+
+/// The selected task and its status in a snapshot.
+fn selected_status(
+    sync: &TasksPanelSync,
+) -> (Option<TaskId>, Option<crate::agent_task::TaskStatus>) {
+    let status = sync.selected.and_then(|id| {
+        sync.dashboard
+            .rows
+            .iter()
+            .find(|row| row.id == id)
+            .map(|row| row.status)
+    });
+    (sync.selected, status)
+}
+
+/// Rows eligible for the current view: hidden tasks only while the hidden
+/// view is open, every other task otherwise.
+fn in_archive_scope(row: &crate::agent_task::DashboardRow, hidden: bool) -> bool {
+    (row.status == crate::agent_task::TaskStatus::Archived) == hidden
 }
 
 /// Choose a visible next operation only from the adapter's runtime gates.
 /// Guidance text never grants permission or approves a pending request.
 fn primary_task_action(detail: &TaskDetailSync) -> Option<(ActionKind, String)> {
-    let (kind, label) = if !detail.approvals.is_empty() {
+    let (kind, label) = if detail.archived {
+        return detail
+            .can_restore
+            .then(|| (ActionKind::Restore, "Restore task".into()));
+    } else if !detail.approvals.is_empty() {
         return None;
     } else if detail.can_finish {
         (ActionKind::FinishCodex, "Finish session")
@@ -158,7 +202,7 @@ fn primary_task_action(detail: &TaskDetailSync) -> Option<(ActionKind, String)> 
     Some((kind, label.to_string()))
 }
 
-const ACTION_KINDS: [(ActionKind, &str); 11] = [
+const ACTION_KINDS: [(ActionKind, &str); 12] = [
     (ActionKind::StartNative, "Start provider"),
     (ActionKind::StartTerminal, "Start terminal"),
     (ActionKind::FocusTerminal, "Agent terminal"),
@@ -169,7 +213,8 @@ const ACTION_KINDS: [(ActionKind, &str); 11] = [
     (ActionKind::Complete, "Complete"),
     (ActionKind::AcceptReviewed, "Accept reviewed work"),
     (ActionKind::ReviewDiff, "Diff"),
-    (ActionKind::Archive, "Archive"),
+    (ActionKind::Archive, "Hide"),
+    (ActionKind::Restore, "Restore"),
 ];
 
 type ActionCallback = Rc<RefCell<Box<dyn Fn(TaskPanelAction)>>>;
@@ -273,6 +318,8 @@ pub(crate) struct TasksPanel {
     dashboard_summary: Label,
     dashboard_clear: Button,
     dashboard_reveal: Button,
+    /// Switch between ordinary views and hidden (archived) tasks.
+    hidden_toggle: gtk4::ToggleButton,
     dashboard_buttons: Vec<(crate::agent_task::DashboardView, Button)>,
     /// Per-task follow-up drafts; the app never sees keystrokes, only the
     /// final text carried by `TaskPanelAction::FollowUp`.
@@ -509,6 +556,12 @@ impl TasksPanel {
         dashboard_reveal.set_child(Some(&reveal_label));
         dashboard_reveal.set_visible(false);
         root.append(&dashboard_reveal);
+        let hidden_toggle = gtk4::ToggleButton::new();
+        hidden_toggle.set_visible(false);
+        hidden_toggle.set_tooltip_text(Some(
+            "Hidden tasks keep their worktrees; restore one to bring it back",
+        ));
+        root.append(&hidden_toggle);
 
         let paned = gtk4::Paned::new(gtk4::Orientation::Vertical);
         paned.set_vexpand(true);
@@ -691,7 +744,7 @@ impl TasksPanel {
         follow_up_row.set_visible(false);
         let follow_up_entry = Entry::new();
         follow_up_entry.set_hexpand(true);
-        follow_up_entry.set_placeholder_text(Some("Follow-up turn for Codex…"));
+        follow_up_entry.set_placeholder_text(Some("Follow-up turn for the Agent…"));
         follow_up_row.append(&follow_up_entry);
         let follow_up_send = Button::from_icon_name("go-next-symbolic");
         follow_up_send.add_css_class("flat");
@@ -723,6 +776,7 @@ impl TasksPanel {
             dashboard_summary,
             dashboard_clear,
             dashboard_reveal,
+            hidden_toggle,
             dashboard_buttons,
             follow_up_drafts: Rc::new(RefCell::new(HashMap::new())),
             follow_up_receipts: Rc::new(RefCell::new(FollowUpReceipts::default())),
@@ -834,6 +888,9 @@ impl TasksPanel {
                 if is_status {
                     panel.attention_kind.set(None);
                 }
+                // Dropdown edits keep the current hidden/ordinary view. Read
+                // it before the mutable borrow below begins.
+                let hidden = panel.filters.borrow().hidden;
                 *panel.filters.borrow_mut() =
                     TaskFilters {
                         provider: panel.provider_filter.selected().checked_sub(1).and_then(
@@ -857,6 +914,7 @@ impl TasksPanel {
                             .selected()
                             .checked_sub(1)
                             .and_then(|index| STATES.get(index as usize).copied()),
+                        hidden,
                     };
                 panel.apply_dashboard_filters();
             });
@@ -936,6 +994,21 @@ impl TasksPanel {
                 panel.apply_dashboard_filters();
             });
         }
+        let panel = self.clone();
+        self.hidden_toggle.connect_toggled(move |button| {
+            if panel.filter_guard.get() {
+                return;
+            }
+            panel.filters.borrow_mut().hidden = button.is_active();
+            panel.attention_kind.set(None);
+            panel.filter_guard.set(true);
+            panel.attention_filter.set_selected(0);
+            panel.filter_guard.set(false);
+            panel
+                .dashboard_view
+                .set(crate::agent_task::DashboardView::All);
+            panel.apply_dashboard_filters();
+        });
         for button in [&self.dashboard_clear, &self.dashboard_reveal] {
             let panel = self.clone();
             button.connect_clicked(move |_| {
@@ -1085,6 +1158,7 @@ impl TasksPanel {
             ActionKind::AcceptReviewed => TaskPanelAction::AcceptReviewed(id),
             ActionKind::ReviewDiff => TaskPanelAction::ReviewDiff(id),
             ActionKind::Archive => TaskPanelAction::Archive(id),
+            ActionKind::Restore => TaskPanelAction::Restore(id),
         };
         self.emit(action);
     }
@@ -1131,6 +1205,14 @@ impl TasksPanel {
     /// against what it currently renders and touches widgets only on real
     /// change, so an unchanged push is allocation-quiet; the domain remains
     /// the only owner of task state.
+    /// Return to the ordinary views, for example when the panel is opened.
+    pub(crate) fn leave_hidden(&self) {
+        if self.filters.borrow().hidden {
+            self.filters.borrow_mut().hidden = false;
+            self.apply_dashboard_filters();
+        }
+    }
+
     pub(crate) fn sync(&self, sync: TasksPanelSync) {
         let choices = self.filters.borrow().workspace_choices(&sync.workspaces);
         if *self.workspace_choices.borrow() != choices {
@@ -1158,10 +1240,26 @@ impl TasksPanel {
             self.workspace_filter.set_selected(selected);
             self.filter_guard.set(false);
         }
+        // A task that newly becomes selected outside the hidden list, such
+        // as one just created or just restored, must never be invisible: the
+        // hidden view gives way to it. It also closes once nothing hidden
+        // remains.
+        let before = selected_status(&self.unfiltered_state.borrow());
+        let surfaced = match selected_status(&sync) {
+            (Some(id), Some(status)) if status != crate::agent_task::TaskStatus::Archived => {
+                before.0 != Some(id) || before.1 == Some(crate::agent_task::TaskStatus::Archived)
+            }
+            _ => false,
+        };
+        if self.filters.borrow().hidden && (surfaced || archived_count(&sync) == 0) {
+            self.filters.borrow_mut().hidden = false;
+        }
+        let hidden = self.filters.borrow().hidden;
         let live = sync
             .dashboard
             .rows
             .iter()
+            .filter(|row| in_archive_scope(row, hidden))
             .map(|row| row.id)
             .collect::<std::collections::HashSet<_>>();
         self.row_widgets
@@ -1269,13 +1367,22 @@ impl TasksPanel {
         };
         self.scope_filters.set_label(Some(&scope_label));
         drop(filters);
-        self.dashboard_summary.set_label(&format!(
-            "{} shown · {} provider/workspace/search matches · {} need you · {} awaiting approval (counts before state/view)",
-            dashboard.rows.len(),
-            dashboard.counts.total,
-            dashboard.counts.attention,
-            dashboard.counts.pending_approval,
-        ));
+        let hidden_view = self.filters.borrow().hidden;
+        self.dashboard_summary.set_label(&if hidden_view {
+            format!(
+                "{} hidden shown · {} search matches · restore a task to return it to its previous state",
+                dashboard.rows.len(),
+                dashboard.counts.total,
+            )
+        } else {
+            format!(
+                "{} shown · {} provider/workspace/search matches · {} need you · {} awaiting approval (counts before state/view)",
+                dashboard.rows.len(),
+                dashboard.counts.total,
+                dashboard.counts.attention,
+                dashboard.counts.pending_approval,
+            )
+        });
         self.dashboard_clear.set_visible(
             *self.filters.borrow() != TaskFilters::default()
                 || self.attention_kind.get().is_some()
@@ -1289,10 +1396,19 @@ impl TasksPanel {
                 .dashboard
                 .rows
                 .iter()
-                .any(|row| row.id == id)
+                .any(|row| row.id == id && in_archive_scope(row, hidden_view))
                 && dashboard.selected_index(Some(id)).is_none()
         });
         self.dashboard_reveal.set_visible(selected_hidden);
+        let archived = archived_count(&self.unfiltered_state.borrow());
+        let guard = self.filter_guard.replace(true);
+        self.hidden_toggle.set_visible(archived > 0 || hidden_view);
+        self.hidden_toggle
+            .set_label(&format!("Hidden tasks ({archived})"));
+        if self.hidden_toggle.is_active() != hidden_view {
+            self.hidden_toggle.set_active(hidden_view);
+        }
+        self.filter_guard.set(guard);
         for (view, button) in &self.dashboard_buttons {
             let label = dashboard_filter_label(*view, &dashboard.counts);
             if button.label().as_deref() != Some(label.as_str()) {
@@ -1364,14 +1480,28 @@ impl TasksPanel {
                 ActionKind::Complete => detail.can_complete,
                 ActionKind::AcceptReviewed => detail.can_accept_review,
                 ActionKind::ReviewDiff => true,
-                // Archiving is always safe to offer for a selected task.
-                ActionKind::Archive => true,
+                // Offered only when the manager would accept it now.
+                ActionKind::Archive => detail.can_archive,
+                ActionKind::Restore => detail.can_restore,
             });
             button.set_sensitive(sensitive);
+            if *kind == ActionKind::Archive {
+                button.set_tooltip_text(Some(
+                    detail
+                        .and_then(|detail| detail.archive_note.as_deref())
+                        .unwrap_or("Hide this task; its worktree is unchanged and it can be restored from Hidden tasks"),
+                ));
+            }
             let visible = detail.is_some_and(|detail| match kind {
-                ActionKind::Complete => !detail.manual_review,
-                ActionKind::AcceptReviewed => detail.manual_review,
-                _ => true,
+                ActionKind::Complete => !detail.manual_review && !detail.archived,
+                ActionKind::AcceptReviewed => detail.manual_review && !detail.archived,
+                ActionKind::Archive => !detail.archived,
+                ActionKind::Restore => detail.archived,
+                // A hidden task keeps only read-only inspection.
+                ActionKind::ReviewDiff
+                | ActionKind::FocusTerminal
+                | ActionKind::FocusValidation => true,
+                _ => !detail.archived,
             });
             button.set_visible(visible);
             if let Some(holder) = button.parent().and_downcast::<gtk4::FlowBoxChild>() {
@@ -1434,6 +1564,11 @@ impl TasksPanel {
             }
 
             self.follow_up_row.set_visible(detail.can_follow_up);
+            let placeholder = format!("Follow-up turn for {}…", detail.provider.display_name());
+            if self.follow_up_entry.placeholder_text().as_deref() != Some(placeholder.as_str()) {
+                self.follow_up_entry
+                    .set_placeholder_text(Some(&placeholder));
+            }
             let receipts = self.follow_up_receipts.borrow();
             let error = receipts.error(detail.id);
             let hint = error.unwrap_or(&detail.follow_up_hint);
@@ -1563,13 +1698,16 @@ impl TasksPanel {
             let focused = cache
                 .iter()
                 .find_map(|(id, widgets)| widgets.row.has_focus().then_some(*id));
-            // Cache is bounded by the current unfiltered snapshot, not task history.
+            // Cache is bounded by the current unfiltered snapshot, not task
+            // history; hidden tasks are cached only while the hidden view is open.
+            let hidden = self.filters.borrow().hidden;
             let live = self
                 .unfiltered_state
                 .borrow()
                 .dashboard
                 .rows
                 .iter()
+                .filter(|row| in_archive_scope(row, hidden))
                 .map(|row| row.id)
                 .collect::<std::collections::HashSet<_>>();
             cache.retain(|id, _| live.contains(id));
@@ -2049,6 +2187,11 @@ mod tests {
             .collect();
         let detail = TaskDetailSync {
             id: selected,
+            provider: crate::agent_task::AgentProvider::Codex,
+            archived: false,
+            can_archive: true,
+            archive_note: None,
+            can_restore: false,
             title: "First task".into(),
             status_line: "Created".into(),
             branch: "test/dashboard".into(),
@@ -2094,6 +2237,180 @@ mod tests {
             index += 1;
         }
         result
+    }
+
+    #[test]
+    #[ignore = "requires a native GTK display"]
+    fn hidden_tasks_offer_only_restore_and_hide_follows_manager_gates() {
+        gtk4::init().expect("GTK display");
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let sink = actions.clone();
+        let panel = TasksPanel::build();
+        panel.connect_action(move |action| sink.borrow_mut().push(action));
+        let window = gtk4::Window::builder()
+            .default_width(520)
+            .default_height(920)
+            .build();
+        window.set_child(Some(&panel.root));
+        window.present();
+        let drain = || {
+            while gtk4::glib::MainContext::default().pending() {
+                gtk4::glib::MainContext::default().iteration(false);
+            }
+        };
+        let action_button = |kind| {
+            panel
+                .action_buttons
+                .borrow()
+                .iter()
+                .find(|(candidate, _)| *candidate == kind)
+                .unwrap()
+                .1
+                .clone()
+        };
+        let mut sync = dashboard_test_sync();
+        let visible = sync.selected.unwrap();
+        let hidden_id = sync.rows[1].id;
+        sync.rows[1].status = crate::agent_task::TaskStatus::Archived;
+        sync.dashboard
+            .rows
+            .iter_mut()
+            .find(|row| row.id == hidden_id)
+            .unwrap()
+            .status = crate::agent_task::TaskStatus::Archived;
+        {
+            let detail = sync.detail.as_mut().unwrap();
+            detail.can_archive = false;
+            detail.archive_note = Some("Stop the Agent first".into());
+        }
+        panel.sync(sync.clone());
+        panel.actions_expander.set_expanded(true);
+        drain();
+        assert_eq!(
+            panel
+                .state
+                .borrow()
+                .rows
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            [visible],
+            "ordinary views exclude hidden tasks"
+        );
+        assert!(panel.hidden_toggle.is_visible());
+        assert_eq!(
+            panel.hidden_toggle.label().as_deref(),
+            Some("Hidden tasks (1)")
+        );
+        let hide = action_button(ActionKind::Archive);
+        assert!(hide.is_visible() && !hide.is_sensitive());
+        assert_eq!(hide.tooltip_text().as_deref(), Some("Stop the Agent first"));
+        assert!(!action_button(ActionKind::Restore).is_visible());
+
+        panel.hidden_toggle.set_active(true);
+        drain();
+        assert!(panel.filters.borrow().hidden);
+        assert_eq!(
+            panel
+                .state
+                .borrow()
+                .rows
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            [hidden_id]
+        );
+        // Dropdown edits keep the hidden view.
+        panel.provider_filter.set_selected(1);
+        drain();
+        assert!(panel.filters.borrow().hidden);
+        panel.provider_filter.set_selected(0);
+        drain();
+        let mut hidden_sync = sync.clone();
+        hidden_sync.selected = Some(hidden_id);
+        {
+            let detail = hidden_sync.detail.as_mut().unwrap();
+            detail.id = hidden_id;
+            detail.archived = true;
+            detail.can_archive = false;
+            detail.archive_note = None;
+            detail.can_restore = true;
+            detail.can_start_terminal = true;
+            detail.can_run_validation = true;
+        }
+        panel.sync(hidden_sync.clone());
+        drain();
+        let restore = action_button(ActionKind::Restore);
+        assert!(restore.is_visible() && restore.is_sensitive());
+        assert!(!action_button(ActionKind::Archive).is_visible());
+        for kind in [ActionKind::StartTerminal, ActionKind::RunValidation] {
+            assert!(
+                !action_button(kind).is_visible(),
+                "a hidden task offers no lifecycle action: {kind:?}"
+            );
+        }
+        assert!(action_button(ActionKind::ReviewDiff).is_visible());
+        assert_eq!(
+            primary_task_action(hidden_sync.detail.as_ref().unwrap()),
+            Some((ActionKind::Restore, "Restore task".into()))
+        );
+        restore.emit_clicked();
+        drain();
+        assert!(matches!(
+            actions.borrow().last(),
+            Some(TaskPanelAction::Restore(id)) if *id == hidden_id
+        ));
+
+        // A task newly selected outside the hidden list (one just created,
+        // say) is never left invisible: the hidden view gives way to it.
+        let mut created = sync.clone();
+        created.selected = Some(visible);
+        panel.sync(created);
+        drain();
+        assert!(!panel.filters.borrow().hidden);
+        assert!(!panel.hidden_toggle.is_active());
+        assert!(panel
+            .state
+            .borrow()
+            .rows
+            .iter()
+            .any(|row| row.id == visible));
+        // Opening the panel returns to the ordinary views as well.
+        panel.hidden_toggle.set_active(true);
+        drain();
+        assert!(panel.filters.borrow().hidden);
+        panel.leave_hidden();
+        drain();
+        assert!(!panel.filters.borrow().hidden);
+        assert!(!panel.hidden_toggle.is_active());
+        panel.hidden_toggle.set_active(true);
+        panel.sync(hidden_sync.clone());
+        drain();
+        assert!(panel.filters.borrow().hidden, "browsing hidden tasks");
+
+        // Restoring the selected task (here the last hidden one) shows it
+        // in the ordinary views.
+        let mut restored = sync.clone();
+        restored.rows[1].status = crate::agent_task::TaskStatus::Failed;
+        restored
+            .dashboard
+            .rows
+            .iter_mut()
+            .find(|row| row.id == hidden_id)
+            .unwrap()
+            .status = crate::agent_task::TaskStatus::Failed;
+        restored.selected = Some(hidden_id);
+        panel.sync(restored);
+        drain();
+        assert!(!panel.filters.borrow().hidden);
+        assert!(!panel.hidden_toggle.is_visible());
+        assert!(panel
+            .state
+            .borrow()
+            .rows
+            .iter()
+            .any(|row| row.id == hidden_id));
+        window.close();
     }
 
     #[test]

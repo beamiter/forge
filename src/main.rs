@@ -889,8 +889,28 @@ pub fn run() -> glib::ExitCode {
 
         let sessions_button = gtk4::Button::from_icon_name("view-grid-symbolic");
         sessions_button.set_tooltip_text(Some("Agent Sessions: resume Codex / Claude (Ctrl+Alt+Shift+G)"));
+        sessions_button.update_property(&[gtk4::accessible::Property::Label("Agent Sessions")]);
         sessions_button.add_css_class("flat");
+        // Tasks with an attention count, shown only where tasks can be used.
+        let tasks_button = gtk4::Button::new();
+        tasks_button.set_visible(false);
+        tasks_button.set_focus_on_click(false);
+        tasks_button.add_css_class("flat");
+        tasks_button.set_tooltip_text(Some(ui::TASKS_BUTTON_TOOLTIP));
+        tasks_button.update_property(&[
+            gtk4::accessible::Property::Label(ui::TASKS_BUTTON_LABEL),
+            gtk4::accessible::Property::KeyShortcuts("Control+Alt+Shift+T"),
+        ]);
+        let tasks_content = gtk4::Box::new(Orientation::Horizontal, 4);
+        tasks_content.append(&gtk4::Image::from_icon_name("view-list-bullet-symbolic"));
+        let tasks_badge = gtk4::Label::new(None);
+        tasks_badge.set_visible(false);
+        tasks_badge.add_css_class("caption-heading");
+        tasks_badge.add_css_class("accent");
+        tasks_content.append(&tasks_badge);
+        tasks_button.set_child(Some(&tasks_content));
         trailing_actions.append(&sessions_button);
+        trailing_actions.append(&tasks_button);
         trailing_actions.append(&agent_toggle);
         trailing_actions.append(&add_tab_button);
         trailing_actions.append(&minimize_window_button);
@@ -1336,6 +1356,9 @@ pub fn run() -> glib::ExitCode {
             organism_agent: ui::OrganismAgentSignal::new(organism_life.clone(), config.clone()),
             organism_life,
             agent_toggle: agent_toggle.clone(),
+            tasks_button: tasks_button.clone(),
+            tasks_badge: tasks_badge.clone(),
+            task_badge_state: RefCell::new(None),
             config_save_error_visible: Rc::new(Cell::new(false)),
             safe_mode_config_notice_visible: Rc::new(Cell::new(false)),
             config_reload_conflict_visible: Rc::new(Cell::new(false)),
@@ -1434,6 +1457,7 @@ pub fn run() -> glib::ExitCode {
         );
         ui.apply_dynamic_css();
         ui.sync_agent_toggle();
+        ui.sync_task_badge();
         ui.sync_bottom_bar_visibility();
 
         // jterm prefers jsh as its shell, so it is worth noticing when the
@@ -1508,6 +1532,10 @@ pub fn run() -> glib::ExitCode {
         let ui_for_sessions = ui.clone();
         sessions_button.connect_clicked(move |_| {
             ui_for_sessions.execute_action(crate::keybindings::Action::OpenAgentSessions);
+        });
+        let ui_for_tasks = ui.clone();
+        tasks_button.connect_clicked(move |_| {
+            ui_for_tasks.execute_action(crate::keybindings::Action::ToggleTasksPanel);
         });
 
         // Wire the visible Shell Agent state toggle.

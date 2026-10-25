@@ -81,6 +81,10 @@ tests=(
     vim9_ide_buffer::tests::retained_overlays_reuse_blink_frames_then_refresh_theme_contents_and_pango
     ui::tasks_panel::tests::task_terminal_buttons_only_emit_focus_for_existing_bindings
     ui::tasks_panel::tests::task_reason_updates_and_disappears_without_retargeting
+    ui::tasks_panel::tests::hidden_tasks_offer_only_restore_and_hide_follows_manager_gates
+    ui::agent_sessions::native_tests::session_manager_filters_preserves_selection_and_resumes_exact_argv
+    ui::agent_sessions::native_tests::agent_management_v4_refresh_never_retargets_and_guards_live_resume
+    ui::agent_sessions::session_bulk::native_tests::agent_management_v3_batch_controls_keep_exact_targets_and_drafts
     ui::tasks_panel::control_tests::task_control_center_preserves_search_action_identity_and_rejected_drafts
     ui::task_ops::focus_tests::task_terminal_focus_tracks_reordered_split_and_closed_leaf
     terminal::tests::explicit_focus_return_respects_reopened_search
