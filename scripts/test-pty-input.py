@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Test extracted production PTY admission and the pinned core filter on Linux.
 
-Requires rustc and fetched pinned jterm_core/jagent checkouts (cargo fetch,
-or set JTERM_CORE_SOURCE and JAGENT_SOURCE). No GTK build or replacement input filter is used.
+Requires rustc, the path-dependency jterm_core checkout (the sibling tree or
+the materialized bundle) and the fetched pinned jagent checkout (cargo fetch),
+or set JTERM_CORE_SOURCE and JAGENT_SOURCE. No GTK build or replacement input filter is used.
 FORGE_INPUT_SOURCE can point at another Forge tree for baseline comparisons.
 """
 from pathlib import Path
@@ -29,8 +30,15 @@ def item(source, signature):
 
 def checkout(name, variable, cache=None):
     manifest = (ROOT / "Cargo.toml").read_text()
-    revision = re.search(rf'{name} = .*rev = "([a-f0-9]+)"', manifest).group(1)
     explicit = os.environ.get(variable)
+    # A path dependency (the bundled or sibling shared core) is the source.
+    path = re.search(rf'^{name} = \{{[^\n]*\bpath = "([^"]+)"', manifest, re.M)
+    if path:
+        source = Path(explicit) if explicit else (ROOT / path.group(1)).resolve()
+        if (source / "src").is_dir():
+            return source
+        sys.exit(f"Materialize {name} at {source} or set {variable} to its checkout")
+    revision = re.search(rf'{name} = .*rev = "([a-f0-9]+)"', manifest).group(1)
     home = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo"))
     candidates = [Path(explicit)] if explicit else list(
         (cache or home / "git/checkouts").glob(f"{name}-*/*")
@@ -46,7 +54,7 @@ def checkout(name, variable, cache=None):
 if sys.platform != "linux":
     sys.exit("This native PTY harness requires Linux")
 core = checkout("jterm_core", "JTERM_CORE_SOURCE")
-jagent = checkout("jagent", "JAGENT_SOURCE", core.parent.parent)
+jagent = checkout("jagent", "JAGENT_SOURCE")
 pty = (ROOT / "src/pty.rs").read_text()
 source = Path(__file__).with_name("pty_input_harness.rs").read_text()
 for name in ("PTY_INPUT_QUEUE_CAPACITY", "MAX_PTY_INPUT_MESSAGE_BYTES"):
