@@ -259,6 +259,8 @@ pub(crate) struct TasksPanel {
     dashboard_query_error: Label,
     dashboard_sort: gtk4::DropDown,
     next_attention: Button,
+    previous_attention: Button,
+    dashboard_focus_project: Button,
     dashboard_query: Entry,
     filters: Rc<RefCell<TaskFilters>>,
     scope_filters: gtk4::Expander,
@@ -475,18 +477,29 @@ impl TasksPanel {
         dashboard_summary.set_wrap(true);
         dashboard_summary.add_css_class("caption");
         root.append(&dashboard_summary);
-        let dashboard_controls = GBox::new(gtk4::Orientation::Horizontal, 6);
+        let dashboard_controls = GBox::new(gtk4::Orientation::Vertical, 6);
         let dashboard_sort = gtk4::DropDown::from_strings(
             &crate::agent_task::DashboardSort::ALL.map(|sort| sort.label()),
         );
         dashboard_sort.set_hexpand(true);
         dashboard_sort.set_tooltip_text(Some("Order visible tasks"));
         dashboard_sort.update_property(&[gtk4::accessible::Property::Label("Task sort order")]);
+        let previous_attention = Button::with_label("Previous needs you");
+        previous_attention
+            .set_tooltip_text(Some("Select the previous visible task needing attention"));
         let next_attention = Button::with_label("Next needs you");
         next_attention.set_tooltip_text(Some("Select the next visible task needing attention"));
         dashboard_controls.append(&dashboard_sort);
-        dashboard_controls.append(&next_attention);
+        let attention_navigation = GBox::new(gtk4::Orientation::Horizontal, 6);
+        attention_navigation.append(&previous_attention);
+        attention_navigation.append(&next_attention);
+        dashboard_controls.append(&attention_navigation);
         root.append(&dashboard_controls);
+        let dashboard_focus_project = Button::with_label("Selected project");
+        dashboard_focus_project.set_tooltip_text(Some(
+            "Narrow to the selected task's exact project; keep the current search and provider",
+        ));
+        root.append(&dashboard_focus_project);
         let dashboard_clear = Button::with_label("Clear filters");
         dashboard_clear.set_visible(false);
         root.append(&dashboard_clear);
@@ -696,6 +709,8 @@ impl TasksPanel {
             dashboard_query_error,
             dashboard_sort,
             next_attention,
+            previous_attention,
+            dashboard_focus_project,
             dashboard_query,
             filters: Rc::new(RefCell::new(TaskFilters::default())),
             scope_filters,
@@ -853,6 +868,38 @@ impl TasksPanel {
         self.dashboard_sort.connect_selected_notify(move |_| {
             if !panel.filter_guard.get() {
                 panel.apply_dashboard_filters();
+            }
+        });
+        let panel = self.clone();
+        self.dashboard_focus_project.connect_clicked(move |_| {
+            panel.apply_dashboard_filters();
+            let project = {
+                let state = panel.state.borrow();
+                TaskFilters::selected_project(&state.dashboard, state.selected, &state.workspaces)
+            };
+            if let Some(project) = project {
+                let index = panel
+                    .workspace_choices
+                    .borrow()
+                    .iter()
+                    .position(|path| *path == project);
+                if let Some(index) = index {
+                    panel.workspace_filter.set_selected(index as u32 + 1);
+                }
+            }
+        });
+        let panel = self.clone();
+        self.previous_attention.connect_clicked(move |_| {
+            panel.apply_dashboard_filters();
+            let (target, selected) = {
+                let state = panel.state.borrow();
+                (
+                    state.dashboard.previous_attention(state.selected),
+                    state.selected,
+                )
+            };
+            if let Some(id) = target.filter(|id| Some(*id) != selected) {
+                panel.emit(TaskPanelAction::Select(id));
             }
         });
         let panel = self.clone();
@@ -1126,26 +1173,18 @@ impl TasksPanel {
 
     fn apply_dashboard_filters(&self) {
         let mut sync = self.unfiltered_state.borrow().clone();
-        let attention_scope = TaskFilters {
-            status: None,
-            ..self.filters.borrow().clone()
-        }
-        .project(
+        let mut dashboard = self.filters.borrow().scope(
             &sync.dashboard,
             &sync.workspaces,
             self.dashboard_query.text().as_str(),
-            crate::agent_task::DashboardView::All,
         );
+        let attention_counts = dashboard.attention_counts();
         let attention_labels = std::iter::once("All attention reasons".to_string())
             .chain(
                 crate::agent_task::DashboardAttentionKind::ALL
                     .iter()
                     .map(|kind| {
-                        let count = attention_scope
-                            .rows
-                            .iter()
-                            .filter(|row| row.attention_kind() == Some(*kind))
-                            .count();
+                        let count = attention_counts.get(*kind);
                         format!("{} · {count}", kind.label())
                     }),
             )
@@ -1191,18 +1230,13 @@ impl TasksPanel {
         } else {
             self.dashboard_query.remove_css_class("error");
         }
-        let mut dashboard = self.filters.borrow().project(
-            &sync.dashboard,
-            &sync.workspaces,
-            self.dashboard_query.text().as_str(),
+        let status = self.filters.borrow().status;
+        dashboard
+            .rows
+            .retain(|row| status.is_none_or(|status| row.status == status));
+        dashboard.apply_view(
             self.dashboard_view.get(),
-        );
-        if let Some(kind) = self.attention_kind.get() {
-            dashboard
-                .rows
-                .retain(|row| row.attention_kind() == Some(kind));
-        }
-        dashboard.sort_rows(
+            self.attention_kind.get(),
             crate::agent_task::DashboardSort::ALL
                 .get(self.dashboard_sort.selected() as usize)
                 .copied()
@@ -1270,6 +1304,11 @@ impl TasksPanel {
                 button.remove_css_class("suggested-action");
             }
         }
+        self.dashboard_focus_project.set_sensitive(
+            TaskFilters::selected_project(&dashboard, sync.selected, &sync.workspaces).is_some(),
+        );
+        self.previous_attention
+            .set_sensitive(dashboard.previous_attention(sync.selected).is_some());
         self.next_attention
             .set_sensitive(dashboard.next_attention(sync.selected).is_some());
         sync.dashboard = dashboard;
@@ -2487,6 +2526,62 @@ mod tests {
 
     #[test]
     #[ignore = "requires a native GTK display"]
+    fn selected_project_focus_keeps_query_identity_and_rejects_hidden_selection() {
+        gtk4::init().expect("GTK display");
+        let panel = TasksPanel::build();
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let sink = actions.clone();
+        panel.connect_action(move |action| sink.borrow_mut().push(action));
+        let mut sync = dashboard_test_sync();
+        let selected = sync.selected.unwrap();
+        sync.workspaces = sync
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    row.id,
+                    std::path::PathBuf::from(if row.id == selected {
+                        "/repo/selected"
+                    } else {
+                        "/repo/other"
+                    }),
+                )
+            })
+            .collect();
+        panel.sync(sync);
+        panel.dashboard_query.set_text("provider:codex");
+        panel.provider_filter.set_selected(1);
+        assert!(panel.dashboard_focus_project.is_sensitive());
+        panel.dashboard_focus_project.emit_clicked();
+        assert_eq!(
+            panel.filters.borrow().workspace.as_deref(),
+            Some(std::path::Path::new("/repo/selected"))
+        );
+        assert_eq!(panel.dashboard_query.text().as_str(), "provider:codex");
+        assert_eq!(
+            panel.filters.borrow().provider,
+            Some(crate::agent_task::AgentProvider::Codex)
+        );
+        assert_eq!(panel.state.borrow().selected, Some(selected));
+        assert_eq!(panel.state.borrow().rows.len(), 1);
+        assert!(
+            actions.borrow().is_empty(),
+            "view focus cannot operate a task"
+        );
+        panel.dashboard_clear.emit_clicked();
+        panel
+            .dashboard_view
+            .set(crate::agent_task::DashboardView::Finished);
+        panel.apply_dashboard_filters();
+        assert!(!panel.dashboard_focus_project.is_sensitive());
+        panel.dashboard_focus_project.emit_clicked();
+        assert!(panel.filters.borrow().workspace.is_none());
+        assert_eq!(panel.state.borrow().selected, Some(selected));
+        assert!(actions.borrow().is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires a native GTK display"]
     fn dashboard_filter_counts_follow_search_not_selected_view() {
         gtk4::init().expect("GTK display");
         let panel = TasksPanel::build();
@@ -2556,8 +2651,16 @@ mod tests {
             &[TaskPanelAction::Select(attention)]
         );
         actions.borrow_mut().clear();
+        panel.previous_attention.emit_clicked();
+        assert_eq!(
+            actions.borrow().as_slice(),
+            &[TaskPanelAction::Select(attention)]
+        );
+        actions.borrow_mut().clear();
         panel.dashboard_query.set_text("First");
+        assert!(!panel.previous_attention.is_sensitive());
         assert!(!panel.next_attention.is_sensitive());
+        panel.previous_attention.emit_clicked();
         panel.next_attention.emit_clicked();
         assert!(
             actions.borrow().is_empty(),
