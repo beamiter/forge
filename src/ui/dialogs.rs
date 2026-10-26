@@ -1818,6 +1818,29 @@ const WORKFLOW_PALETTE_POLICY: crate::workflows::PickerPolicy =
 const WORKFLOW_PALETTE_LABEL_BYTES: usize = 256;
 const WORKFLOW_PALETTE_PREVIEW_BYTES: usize = 4 * 1024;
 
+fn replace_workflow_picker_library(
+    picker: &mut crate::workflows::WorkflowPicker,
+    workflows: &[crate::workflows::Workflow],
+    query: &str,
+    selected: Option<usize>,
+) -> usize {
+    let path = selected
+        .and_then(|index| picker.workflow_at_filtered(index))
+        .and_then(|workflow| workflow.source_path.clone());
+    let mut next =
+        crate::workflows::WorkflowPicker::new(workflows.to_vec(), WORKFLOW_PALETTE_POLICY);
+    next.set_query(query);
+    let selected = path
+        .and_then(|path| {
+            next.filtered()
+                .iter()
+                .position(|workflow| workflow.source_path.as_ref() == Some(&path))
+        })
+        .unwrap_or(0);
+    *picker = next;
+    selected
+}
+
 fn render_workflow_palette_rows(list: &ListBox, workflows: &[crate::workflows::Workflow]) {
     while let Some(row) = list.row_at_index(0) {
         list.remove(&row);
@@ -2350,6 +2373,10 @@ fn refresh_workflow_picker_query(
 
 /// Retire the argument form only after the original target accepts the text.
 /// Acceptance may only enqueue PTY input; it does not acknowledge later I/O.
+fn workflow_dialog_if_open(dialog: &glib::WeakRef<adw::Dialog>) -> Option<adw::Dialog> {
+    dialog.upgrade().filter(|dialog| dialog.parent().is_some())
+}
+
 fn finish_workflow_insertion(insert: impl FnOnce() -> bool, finish: impl FnOnce()) {
     if insert() {
         finish();
@@ -6056,30 +6083,8 @@ impl UiState {
             return;
         };
 
-        let workflows = crate::workflows::load_all();
-        if workflows.is_empty() {
-            // `None` when no absolute user config directory resolves, which is
-            // also when the loader skips that tier: the hint must never name a
-            // directory the loader would not read.
-            let user_dir = crate::workflows::user_workflow_dir();
-            let target = user_dir
-                .as_ref()
-                .map(|dir| dir.display().to_string())
-                .unwrap_or_else(|| "your user configuration directory".to_string());
-            log::debug!("[workflows] no workflows in {target}");
-            // Toast-like hint via a one-shot message dialog. Otherwise the
-            // user gets no feedback at all and concludes the chord is dead.
-            let dialog = adw::MessageDialog::builder()
-                .heading("No workflows yet")
-                .body(format!(
-                    "Add `*.toml`, `*.yaml`, or `*.yml` workflow files to:\n\n{target}"
-                ))
-                .build();
-            dialog.add_response("ok", "OK");
-            dialog.set_transient_for(Some(&self.window));
-            dialog.present();
-            return;
-        }
+        let library = self.workflow_library.snapshot().value;
+        self.refresh_workflow_library();
 
         let dialog = adw::Dialog::builder()
             .title("Workflows")
@@ -6100,7 +6105,7 @@ impl UiState {
         list_box.set_margin_bottom(12);
 
         let picker = Rc::new(RefCell::new(crate::workflows::WorkflowPicker::new(
-            workflows,
+            library.as_ref().clone(),
             WORKFLOW_PALETTE_POLICY,
         )));
         let visible: Vec<_> = picker.borrow().filtered().into_iter().cloned().collect();
@@ -6118,6 +6123,10 @@ impl UiState {
         filter_entry.set_margin_top(8);
         filter_entry.set_margin_bottom(8);
         search_box.append(&filter_entry);
+        let load_status = Label::new(Some("Refreshing workflows…"));
+        load_status.set_wrap(true);
+        load_status.add_css_class("dim-label");
+        search_box.append(&load_status);
         search_box.append(&scrolled);
 
         let toolbar_view = adw::ToolbarView::new();
@@ -6178,10 +6187,15 @@ impl UiState {
 
         let pick_for_activate = pick.clone();
         let dialog_for_activate = dialog.clone();
-        list_box.connect_row_activated(move |_, row| {
-            let idx = row.index() as usize;
+        list_box.connect_row_activated(move |list, row| {
+            let index = row.index();
+            // A queued activation from a removed row belongs to the previous
+            // library/query, never to the workflow now occupying that index.
+            if index < 0 || list.row_at_index(index).as_ref() != Some(row) {
+                return;
+            }
             dialog_for_activate.force_close();
-            pick_for_activate(idx);
+            pick_for_activate(index as usize);
         });
 
         let key_controller = EventControllerKey::new();
@@ -6242,6 +6256,29 @@ impl UiState {
             *dialog_ref.borrow_mut() = None;
         });
 
+        {
+            let picker = picker.clone();
+            let list = list_box.downgrade();
+            let filter = filter_entry.downgrade();
+            self.watch_workflow_library(&dialog, &load_status, library, move |workflows| {
+                let (Some(list), Some(filter)) = (list.upgrade(), filter.upgrade()) else {
+                    return;
+                };
+                let selected = list.selected_row().map(|row| row.index() as usize);
+                let mut picker = picker.borrow_mut();
+                let selected = replace_workflow_picker_library(
+                    &mut picker,
+                    workflows,
+                    filter.text().as_str(),
+                    selected,
+                );
+                let visible: Vec<_> = picker.filtered().into_iter().cloned().collect();
+                render_workflow_palette_rows(&list, &visible);
+                if let Some(row) = list.row_at_index(selected as i32) {
+                    list.select_row(Some(&row));
+                }
+            });
+        }
         *self.workflows_palette_dialog.borrow_mut() = Some(dialog.clone());
         dialog.present(Some(&self.window));
         filter_entry.grab_focus();
@@ -6360,10 +6397,17 @@ impl UiState {
                 "Clear this value and mark it as required"
             }));
             let form_for_reset = form.clone();
-            let row_for_reset = row.clone();
+            let row_for_reset = row.downgrade();
+            let dialog_for_reset = dialog.downgrade();
             let refresh_for_reset = refresh_outstanding.clone();
             let sync_for_reset = programmatic_sync.clone();
             reset.connect_clicked(move |_| {
+                if workflow_dialog_if_open(&dialog_for_reset).is_none() {
+                    return;
+                }
+                let Some(row_for_reset) = row_for_reset.upgrade() else {
+                    return;
+                };
                 // Drop the mutable borrow before `set_text`: changing the row
                 // emits `changed`, whose callback borrows the same form.
                 let value = {
@@ -6390,10 +6434,19 @@ impl UiState {
         dialog.set_child(Some(&toolbar_view));
 
         let form_for_run = form.clone();
-        let pane_for_run = pane.clone();
+        let pane_for_run = Some(pane.root_widget().downgrade());
         let ui_for_run = self.clone();
-        let dialog_for_run = dialog.clone();
+        let dialog_for_run = dialog.downgrade();
         run_btn.connect_clicked(move |_| {
+            let Some(dialog_for_run) = workflow_dialog_if_open(&dialog_for_run) else {
+                return;
+            };
+            let Some(pane_for_run) = ui_for_run.palette_input_target(&pane_for_run) else {
+                ui_for_run.toast_overlay.add_toast(adw::Toast::new(
+                    "Nothing was inserted: the workflow's original pane is no longer active.",
+                ));
+                return;
+            };
             // `ArgsForm::render` re-validates the workflow, bounds and checks
             // every value, and puts the finished text back across
             // `review_input::validate`. The old path called `substitute`,
@@ -6429,9 +6482,12 @@ impl UiState {
         // keyboard-only operation. It deliberately never sends Enter to PTY.
         let key_controller = EventControllerKey::new();
         key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
-        let dialog_for_key = dialog.clone();
-        let run_btn_for_key = run_btn.clone();
+        let dialog_for_key = dialog.downgrade();
+        let run_btn_for_key = run_btn.downgrade();
         key_controller.connect_key_pressed(move |_, keyval, _, state| {
+            let Some(dialog_for_key) = workflow_dialog_if_open(&dialog_for_key) else {
+                return false.into();
+            };
             if keyval == Key::Escape {
                 dialog_for_key.force_close();
                 return true.into();
@@ -6439,7 +6495,9 @@ impl UiState {
             if matches!(keyval, Key::Return | Key::KP_Enter)
                 && state.contains(ModifierType::CONTROL_MASK)
             {
-                run_btn_for_key.emit_clicked();
+                if let Some(run_btn_for_key) = run_btn_for_key.upgrade() {
+                    run_btn_for_key.emit_clicked();
+                }
                 return true.into();
             }
             false.into()
@@ -6823,6 +6881,103 @@ mod tests {
     }
 
     #[test]
+    fn workflow_form_callbacks_do_not_keep_dialog_rows_or_pane_alive() {
+        let source = include_str!("dialogs.rs");
+        let form = source
+            .split("    pub(crate) fn show_workflow_args_dialog(")
+            .nth(1)
+            .unwrap()
+            .split("    /// Read-only view of a completed record")
+            .next()
+            .unwrap();
+        for weak in [
+            "let row_for_reset = row.downgrade()",
+            "let dialog_for_run = dialog.downgrade()",
+            "let dialog_for_key = dialog.downgrade()",
+            "let pane_for_run = Some(pane.root_widget().downgrade())",
+        ] {
+            assert!(form.contains(weak), "missing weak callback owner: {weak}");
+        }
+        assert!(!form.contains("let pane_for_run = pane.clone()"));
+        assert!(form.contains("ui_for_run.palette_input_target(&pane_for_run)"));
+        let submit = form
+            .split("run_btn.connect_clicked(move |_|")
+            .nth(1)
+            .unwrap();
+        assert!(
+            submit.find("workflow_dialog_if_open").unwrap() < submit.find(".render()").unwrap()
+        );
+        assert!(submit.find("palette_input_target").unwrap() < submit.find(".render()").unwrap());
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK process and display"]
+    fn workflow_form_weak_callbacks_release_closed_widgets() {
+        use adw::prelude::*;
+        use gtk4::glib;
+        use libadwaita as adw;
+        use std::cell::Cell;
+        use std::rc::Rc;
+        adw::init().expect("GTK/Adwaita display");
+        let pump = || {
+            while glib::MainContext::default().iteration(false) {}
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        let window = adw::Window::new();
+        let dialog = adw::Dialog::new();
+        let body = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let row = adw::EntryRow::new();
+        let reset = gtk4::Button::with_label("Reset");
+        row.add_suffix(&reset);
+        body.append(&row);
+        let insert = gtk4::Button::with_label("Insert");
+        body.append(&insert);
+        dialog.set_child(Some(&body));
+        let weak_dialog = dialog.downgrade();
+        let weak_row = row.downgrade();
+        let calls = Rc::new(Cell::new(0));
+        {
+            let dialog = weak_dialog.clone();
+            let calls = calls.clone();
+            insert.connect_clicked(move |_| {
+                if super::workflow_dialog_if_open(&dialog).is_some() {
+                    calls.set(calls.get() + 1);
+                }
+            });
+        }
+        {
+            let dialog = weak_dialog.clone();
+            let row = weak_row.clone();
+            reset.connect_clicked(move |_| {
+                if super::workflow_dialog_if_open(&dialog).is_some() {
+                    if let Some(row) = row.upgrade() {
+                        row.set_text("reset");
+                    }
+                }
+            });
+        }
+        window.present();
+        dialog.present(Some(&window));
+        pump();
+        insert.emit_clicked();
+        assert_eq!(calls.get(), 1);
+        dialog.force_close();
+        pump();
+        insert.emit_clicked();
+        assert_eq!(calls.get(), 1, "late submit after close must be inert");
+        drop((insert, reset, row, body, dialog));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while weak_dialog.upgrade().is_some() || weak_row.upgrade().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "closed form leaked its widgets"
+            );
+            pump();
+        }
+        window.close();
+    }
+
+    #[test]
     fn workflow_form_completion_uses_the_captured_target_after_acceptance() {
         let source = include_str!("dialogs.rs");
         let form = source
@@ -6953,6 +7108,43 @@ mod tests {
             .next()
             .unwrap();
         assert!(!mouse.contains("refresh_query"));
+    }
+
+    #[test]
+    fn workflow_background_refresh_preserves_query_and_selected_source_path() {
+        let make = |name: &str| Workflow {
+            name: name.into(),
+            description: String::new(),
+            command: "echo done".into(),
+            tags: Vec::new(),
+            shell: None,
+            args: Vec::new(),
+            source_path: Some(std::path::PathBuf::from(format!("/w/{name}.toml"))),
+        };
+        let mut picker = crate::workflows::WorkflowPicker::new(
+            vec![make("alpha"), make("beta")],
+            WORKFLOW_PALETTE_POLICY,
+        );
+        let selected = super::replace_workflow_picker_library(
+            &mut picker,
+            &[make("new"), make("alpha"), make("beta")],
+            "",
+            Some(1),
+        );
+        assert_eq!(selected, 2);
+        assert_eq!(picker.workflow_at_filtered(selected).unwrap().name, "beta");
+        let selected = super::replace_workflow_picker_library(
+            &mut picker,
+            &[make("alpha"), make("beta")],
+            "beta",
+            Some(selected),
+        );
+        assert_eq!(picker.query(), "beta");
+        assert_eq!(selected, 0);
+        assert_eq!(picker.workflow_at_filtered(selected).unwrap().name, "beta");
+        let selected = super::replace_workflow_picker_library(&mut picker, &[], "beta", Some(0));
+        assert_eq!(selected, 0);
+        assert!(picker.filtered().is_empty());
     }
 
     #[test]

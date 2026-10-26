@@ -64,6 +64,7 @@ tests=(
     terminal::launch_recovery::tests::close_and_exit_retire_pending_commands_and_background_retry_keeps_focus
     block_view::search_navigation_tests::native_search_identity_characterization
     ui::dialogs::native_palette_activation_tests::palette_activation_preserves_snapshot_unfold_failure_focus_and_stale_ownership
+    ui::dialogs::tests::workflow_form_weak_callbacks_release_closed_widgets
     ui::tasks_panel::tests::approval_details_are_paged_read_only_and_stale_controls_cannot_decide
     block_view::incremental_find_tests::block_native_find_controls_keep_query_caret_and_tab_focus
     block_view::incremental_find_tests::chat_native_find_controls_keep_query_caret_and_tab_focus

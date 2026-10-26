@@ -1342,6 +1342,7 @@ pub fn run() -> glib::ExitCode {
             cross_block_search_dialog: Rc::new(RefCell::new(None)),
             cross_block_search_toggle_latch: Rc::new(RefCell::new(Default::default())),
             cross_block_search_memory: Rc::new(RefCell::new(Default::default())),
+            workflow_library: jterm_core::workflows::BackgroundRefresh::new(Vec::new()),
             workflows_palette_dialog: Rc::new(RefCell::new(None)),
             settings_dialog: Rc::new(RefCell::new(None)),
             organism_settings_controls: Rc::new(RefCell::new(None)),
