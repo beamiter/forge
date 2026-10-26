@@ -1,7 +1,7 @@
 //! Small real-shell stage; no direct draft assignments or synthetic OSC feed.
 use super::*;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use vte4::TerminalExt;
 
@@ -27,21 +27,50 @@ fn wait(mut ready: impl FnMut() -> bool, why: &str) {
     }
     settle();
 }
-fn keys(args: &[&str]) {
-    let mut child = Command::new("wtype").args(args).spawn().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success(), "native Wayland keyboard injection");
-            break;
-        }
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("native keyboard injection deadline");
-        }
+// Keep each injector's keymap alive until GTK has consumed every release.
+// wtype exiting only proves it sent requests: destroying its virtual keyboard
+// can replace the seat keymap while GTK still has queued key events.
+struct Keyboard(Child);
+impl Drop for Keyboard {
+    fn drop(&mut self) {
+        // Never close stdin first: EOF would execute the final blocked command.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+fn keys(window: &gtk4::Window, args: &[&str], releases: usize) {
+    let consumed = Rc::new(Cell::new(0usize));
+    let events = gtk4::EventControllerKey::new();
+    events.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    let consumed_cb = consumed.clone();
+    events.connect_key_released(move |_, _, _, _| consumed_cb.set(consumed_cb.get() + 1));
+    window.add_controller(events.clone());
+    // Like the seat-only keyboard, '-' waits on an unwritten stdin pipe after
+    // the requested keys. No extra key or timing-dependent grace period.
+    let mut keyboard = Keyboard(
+        Command::new("wtype")
+            .args(args)
+            .arg("-")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while consumed.get() < releases {
+        assert!(
+            keyboard.0.try_wait().unwrap().is_none(),
+            "native keyboard exited before GTK consumed input"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "native keyboard consumption deadline: {} of {releases} releases",
+            consumed.get()
+        );
         pump();
     }
+    window.remove_controller(&events);
+    assert_eq!(consumed.get(), releases, "unexpected native key releases");
+    drop(keyboard);
     settle();
 }
 
@@ -238,9 +267,7 @@ fn chat_real_bash_keyboard_and_clipboard() {
 #[allow(deprecated)]
 fn run_real_bash_keyboard_and_clipboard(metadata: bool) {
     let _observations = MetadataObservation;
-    if metadata {
-        METADATA_EVENTS.with(|events| *events.borrow_mut() = Some(Vec::new()));
-    }
+    METADATA_EVENTS.with(|events| *events.borrow_mut() = Some(Vec::new()));
     jterm_core::child_env::capture_inherited_environment()
         .expect("capture child environment before GTK");
     gtk4::init().unwrap();
@@ -256,8 +283,8 @@ fn run_real_bash_keyboard_and_clipboard(metadata: bool) {
     .unwrap();
     std::fs::write(home.join("rc"),"set +o history\nset -o emacs\nbind 'set enable-bracketed-paste on'\nPS1='$ '\nsource \"$HOME/integration.bash\"\n").unwrap();
     if metadata {
-        // Only the owned history-enabled lane opts in. The legacy rc above
-        // and its history-disabled strict identity oracle remain unchanged.
+        // Only this owned lane opts into history and exact command metadata.
+        // The other lane keeps history disabled and correlates execution ids.
         std::fs::write(home.join("rc"), "set -o history\nshopt -s cmdhist\nHISTCONTROL=ignoreboth\nunset HISTIGNORE HISTTIMEFORMAT\nset -o emacs\nbind 'set enable-bracketed-paste on'\nPS1='$ '\nsource \"$HOME/integration.bash\"\n").unwrap();
     }
     let mut config = crate::config::Config::safe_defaults();
@@ -406,7 +433,7 @@ fn run_real_bash_keyboard_and_clipboard(metadata: bool) {
         let token = glib::uuid_string_random().to_string();
         let literal = "中文 e\u{301} ＡＢＣ ".repeat(8);
         let mut command = format!(
-            "printf '%s\\0' '{token}' '{literal}' \"$BASHPID\" \"$(tty)\" > \"$HOME/{path}\""
+            "printf '%s\\0' '{token}' '{literal}' \"$BASHPID\" \"$(tty)\" \"$__forge_command_id\" > \"$HOME/{path}\""
         );
         if metadata {
             // BASH_COMMAND is Bash's currently executing simple command. It is
@@ -418,18 +445,22 @@ fn run_real_bash_keyboard_and_clipboard(metadata: bool) {
         let target = home.join(path);
         assert_eq!(view.pty.pid_i32(), shell_pid);
         if path == "key" {
-            keys(&[&command]);
-            keys(&["界X"]);
-            keys(&[
-                "-P",
-                "BackSpace",
-                "-p",
-                "BackSpace",
-                "-P",
-                "BackSpace",
-                "-p",
-                "BackSpace",
-            ]);
+            let editing = format!("{command}界X");
+            keys(
+                &window,
+                &[
+                    &editing,
+                    "-P",
+                    "BackSpace",
+                    "-p",
+                    "BackSpace",
+                    "-P",
+                    "BackSpace",
+                    "-p",
+                    "BackSpace",
+                ],
+                command.chars().count() + 4,
+            );
         } else {
             assert!(
                 view.bracketed_paste.get(),
@@ -457,38 +488,58 @@ fn run_real_bash_keyboard_and_clipboard(metadata: bool) {
         view.grab_focus();
         settle();
         assert!(view.active_vte.has_focus());
-        keys(&["-P", "Return", "-p", "Return"]);
+        keys(&window, &["-P", "Return", "-p", "Return"], 1);
         wait(
             || target.exists(),
             "fresh native Enter must execute owned command",
         );
         let bytes = std::fs::read(&target).unwrap();
         let parts = bytes.split(|b| *b == 0).collect::<Vec<_>>();
-        assert_eq!(parts.len(), if metadata { 7 } else { 5 });
+        assert_eq!(parts.len(), if metadata { 7 } else { 6 });
         assert_eq!(parts[0], token.as_bytes());
         assert_eq!(parts[1], literal.as_bytes());
         assert_eq!(parts[2], shell_pid.to_string().as_bytes());
         let actual_tty = String::from_utf8(parts[3].to_vec()).unwrap();
         assert!(actual_tty.starts_with("/dev/pts/"));
         assert_eq!(tty.get_or_insert(actual_tty.clone()), &actual_tty);
+        let execution_id = std::str::from_utf8(parts[4]).unwrap();
+        assert!(execution_id.starts_with(&format!("forge-bash-{shell_pid}-")));
         wait(
             || {
-                view.finished_blocks
-                    .borrow()
-                    .iter()
-                    .any(|b| !b.is_background && b.cmd_text.contains(&token))
+                METADATA_EVENTS.with(|events| {
+                    events.borrow().as_ref().unwrap().iter().any(|event| {
+                        event["phase"] == "record" && event["execution_id"] == execution_id
+                    })
+                })
             },
-            "real completed command capsule",
+            "real completed command capsule with Bash's accepted execution id",
         );
-        let mut identity = serde_json::Value::Null;
+        let events = METADATA_EVENTS.with(|events| events.borrow().as_ref().unwrap().clone());
+        let matching = events
+            .iter()
+            .filter(|event| event["execution_id"] == execution_id)
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 3, "one accepted C, D and completed record");
+        assert_eq!(matching[0]["phase"], "start");
+        assert_eq!(matching[1]["phase"], "end");
+        assert_eq!(matching[1]["correlation"], "MatchedUntrusted");
+        assert_eq!(matching[1]["exit_code"], 0);
+        assert_eq!(matching[2]["phase"], "record");
+        assert_eq!(matching[2]["completion_provenance"], "ShellReported");
+        let block_id = matching[2]["block_id"].as_u64().unwrap();
+        assert_eq!(matching[0]["block_id"], block_id);
+        let mut identity =
+            serde_json::json!({"execution_id":execution_id,"block_id":block_id,"events":matching});
         let capsule = {
             let blocks = view.finished_blocks.borrow();
             let block = blocks
                 .iter()
-                .find(|b| !b.is_background && b.cmd_text.contains(&token))
+                .find(|b| !b.is_background && b.id == block_id)
                 .unwrap();
-            // Persist independent truth before the unchanged identity oracle
-            // can fail, so screen padding ambiguity is inspectable.
+            // History-disabled shells cannot report an exact edited command.
+            // Correlate the capsule through the execution id independently
+            // written by the very Bash command whose accepted bytes we check.
+            // Retain accepted bytes and the screen-derived label for diagnosis.
             std::fs::write(
                 out.join(format!("{path}-capsule-identity.json")),
                 serde_json::to_vec_pretty(&serde_json::json!({
@@ -540,7 +591,13 @@ fn run_real_bash_keyboard_and_clipboard(metadata: bool) {
                 )
                 .unwrap();
             }
-            assert_eq!(block.cmd_text, command);
+            if metadata {
+                assert_eq!(block.cmd_text, command);
+            } else {
+                assert!(parts[5].is_empty());
+                assert_eq!(matching[0]["command_source"], "Screen");
+                assert_eq!(matching[2]["command_source"], "Screen");
+            }
             assert!(block.widget.has_css_class("chat-pair"));
             let terminal = &block.command_vte;
             let style = terminal.style_context();
@@ -560,7 +617,7 @@ fn run_real_bash_keyboard_and_clipboard(metadata: bool) {
         capture(&view, &window, &out, stage, "finished");
         stage += 1;
     }
-    if metadata {
+    {
         let events = METADATA_EVENTS.with(|events| events.borrow().as_ref().unwrap().clone());
         assert_eq!(
             events.len(),

@@ -160,7 +160,7 @@ fn production_dialog_is_frozen_stale_safe_and_primary_neutral() {
     check_primary();
     // Deterministic old-query completion at the real worker publication point.
     let rejected_before = controls.rejected_replies.get();
-    let (arrived, release, published, finish) = controls.worker.pause_next_publication();
+    let (arrived, release, published, finish) = controls.worker.pause_publication_for("need");
     input.set_text("need");
     until(|| arrived.try_recv().is_ok());
     input.set_text("absent");
@@ -230,7 +230,7 @@ fn production_dialog_is_frozen_stale_safe_and_primary_neutral() {
     until(|| status(&controls) == "No matches in this snapshot.");
     let old_id = controls.snapshot.id;
     // Close while a real worker result is blocked. Retire before its release.
-    let (arrived, release, published, finish) = controls.worker.pause_next_publication();
+    let (arrived, release, published, finish) = controls.worker.pause_publication_for("needle");
     input.set_text("needle");
     until(|| arrived.try_recv().is_ok());
     assert!(dialog.close());
@@ -250,7 +250,7 @@ fn production_dialog_is_frozen_stale_safe_and_primary_neutral() {
     let (reopened, refreshed) = present_exact_preview(&window, a.clone(), "fresh").unwrap();
     assert_ne!(refreshed.snapshot.id, old_id);
     until(|| status(&refreshed) == "Preview: 1 of 3");
-    let (arrived, release, published, finish) = refreshed.worker.pause_next_publication();
+    let (arrived, release, published, finish) = refreshed.worker.pause_publication_for("needle");
     entry(&reopened).set_text("needle");
     until(|| arrived.try_recv().is_ok());
     stack.remove(&a.widget());
@@ -275,7 +275,8 @@ fn production_dialog_is_frozen_stale_safe_and_primary_neutral() {
     settle();
     let (last, last_controls) = present_exact_preview(&window, b.clone(), "different").unwrap();
     until(|| status(&last_controls) == "Preview: 1 of 3");
-    let (arrived, release, published, finish) = last_controls.worker.pause_next_publication();
+    let (arrived, release, published, finish) =
+        last_controls.worker.pause_publication_for("differ");
     entry(&last).set_text("differ");
     until(|| arrived.try_recv().is_ok());
     window.destroy();

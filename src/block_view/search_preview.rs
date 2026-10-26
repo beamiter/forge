@@ -306,6 +306,7 @@ pub(crate) struct Worker {
 }
 #[cfg(test)]
 struct PublicationGate {
+    query: String,
     reached: mpsc::SyncSender<()>,
     release: mpsc::Receiver<()>,
     published: mpsc::SyncSender<()>,
@@ -360,7 +361,20 @@ impl Worker {
                         // Test the real check-to-store race: newer UI state may
                         // arrive after validation but before this publication.
                         #[cfg(test)]
-                        let gate = publication_gate_thread.lock().unwrap().take();
+                        let gate = {
+                            let mut pending = publication_gate_thread.lock().unwrap();
+                            // GtkEditable::set_text may emit changed for its
+                            // intermediate empty value. Only the query this
+                            // handshake names may consume its publication gate.
+                            if pending
+                                .as_ref()
+                                .is_some_and(|gate| gate.query == request.query)
+                            {
+                                pending.take()
+                            } else {
+                                None
+                            }
+                        };
                         #[cfg(test)]
                         if let Some(gate) = &gate {
                             let _ = gate.reached.send(());
@@ -420,12 +434,13 @@ impl Worker {
         self.exited.load(Ordering::Acquire)
     }
     #[cfg(test)]
-    pub(crate) fn pause_next_publication(&self) -> PublicationHandshake {
+    pub(crate) fn pause_publication_for(&self, query: &str) -> PublicationHandshake {
         let (reached, arrived) = mpsc::sync_channel(1);
         let (release, wait) = mpsc::sync_channel(1);
         let (published, stored) = mpsc::sync_channel(1);
         let (finish, resume) = mpsc::sync_channel(1);
         *self.publication_gate.lock().unwrap() = Some(PublicationGate {
+            query: query.to_owned(),
             reached,
             release: wait,
             published,

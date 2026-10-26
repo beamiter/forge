@@ -123,13 +123,26 @@ def shell_acceptance(records, metadata=False):
                     or complete['block_id'] != identity['block_id']
                     or end['correlation'] != 'MatchedUntrusted' or end['exit_code'] != 0):
                 raise RuntimeError('Wrong parsed command, exactness or capsule correlation')
+        else:
+            identity = record['metadata_identity']
+            execution_id = identity['execution_id']
+            expected[-1:] = [execution_id.encode(), b'']
+            events = identity['events']
+            if (not re.fullmatch(r'forge-bash-' + str(record['pid']) + r'-[1-9][0-9]*', execution_id)
+                    or len(events) != 3 or [event['phase'] for event in events] != ['start', 'end', 'record']
+                    or any(event['execution_id'] != execution_id for event in events)
+                    or events[0]['block_id'] != identity['block_id']
+                    or events[2]['block_id'] != identity['block_id']
+                    or events[1]['correlation'] != 'MatchedUntrusted' or events[1]['exit_code'] != 0
+                    or events[2]['completion_provenance'] != 'ShellReported'
+                    or events[0]['command_source'] != 'Screen' or events[2]['command_source'] != 'Screen'):
+                raise RuntimeError('Wrong history-disabled execution/capsule correlation')
         if parts != expected:
             raise RuntimeError('Actual shell accepted bytes differ from expected input')
-    if metadata:
-        if first['metadata_identity']['execution_id'] == second['metadata_identity']['execution_id']:
-            raise RuntimeError('Reused execution id')
-        if first['metadata_identity']['block_id'] == second['metadata_identity']['block_id']:
-            raise RuntimeError('Reused capsule id')
+    if first['metadata_identity']['execution_id'] == second['metadata_identity']['execution_id']:
+        raise RuntimeError('Reused execution id')
+    if first['metadata_identity']['block_id'] == second['metadata_identity']['block_id']:
+        raise RuntimeError('Reused capsule id')
 
 
 def metadata_events_acceptance(records, events):
@@ -251,11 +264,10 @@ for_window [title="^Forge F13 native render$"] floating enable, border none
                 raise RuntimeError('Native fixture failed; see fixture.log')
             accepted = json.loads((out / 'shell-acceptance.json').read_text())
             shell_acceptance(accepted, metadata)
-            if metadata:
-                metadata_events_acceptance(accepted, json.loads((out / 'metadata-events.json').read_text()))
+            metadata_events_acceptance(accepted, json.loads((out / 'metadata-events.json').read_text()))
             result = dict(stages=reports, history_metadata=metadata,
                 scope=('owned simple printf accepted BASH_COMMAND bytes, parsed C/D id, ShellReported record and capsule identity; global paste shortcut unverified' if metadata else
-                       'real Bash acceptance bytes; global paste shortcut and complete draft snapshot unverified'))
+                       'real Bash acceptance bytes and same-execution C/D/capsule identity; history-disabled screen command text, global paste shortcut and complete draft snapshot unverified'))
         except BaseException as error:
             original_error = error
             raise

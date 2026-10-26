@@ -86,8 +86,14 @@ class MetadataOracles(unittest.TestCase):
         sample = records()
         for record in sample:
             parts = bytes.fromhex(record['accepted_hex']).split(b'\0')
-            record['accepted_hex'] = b'\0'.join(parts[:4] + [b'']).hex()
-            del record['metadata_identity']
+            record['accepted_hex'] = b'\0'.join(parts[:5] + [b'']).hex()
+            identity = record['metadata_identity']
+            # Execution ids still exist with history disabled. Exact logical
+            # command metadata is absent and must never be required here.
+            for field in ['expected_command', 'capsule_command', 'stored_command_exact']:
+                del identity[field]
+            for index in [0, 2]:
+                identity['events'][index]['command_source'] = 'Screen'
         m.shell_acceptance(sample)
         with self.assertRaises(KeyError):
             m.shell_acceptance(sample, metadata=True)
