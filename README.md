@@ -439,6 +439,17 @@ Tasks 面板显示当前可见数与搜索匹配数，各状态按钮也显示�
 本地 ASCII 生命体默认开启，会响应命令与 Agent 状态；设为 `ascii_organism_enabled = false` 可关闭。
 关闭期间的 Agent 活动不会改变它的生命状态，也不会在重新开启时补发反应。
 
+每个 GUI 只有一个生命体。切换 block、分屏或标签页时，原来的身体先隐藏，再由当前本地窗格接管；
+常驻的 organism 卡片已移除，滚动阅读时的小头像与活跃区域身体互斥，非焦点 VTE 分屏整行隐去，保留原有尺寸以避免终端重排。
+生命状态、环境习惯、问候冷却和聊天语气在窗口内共享；Static 仍保留同一个静态身体。
+**Inspect ASCII companion** 以文字显示状态，并提供 **Say hello / Keep me company / Tell a story / Take a break**。
+回复来自本地编写的短对话和轮换故事，使用面板打开时的活动快照，不执行命令、不调用 Agent。
+
+可在该面板开启 **Gentle break reminders**；持久配置 `ascii_organism_care_enabled` 默认 `false`。
+累计前台近期有人类输入的工作时间后，伴侣只在空闲安全时通过普通 toast 轻声提醒喝水、活动或远眺；
+**Later** 延后 20 分钟，**Take a break** 重置本次工作计时。后台窗格、输入中、运行命令、全屏程序或模态对话框期间不提醒。
+Static 模式只限制动画，仍支持用户明确开启的文字提醒。
+
 命令面板中的应用动作及其当前绑定可在 `Ctrl+Shift+P` 中搜索；这些动作可在
 `[keybindings]` 中覆盖，设为 `false` 可解除绑定。Block 视图内的上下文键
 `Alt+Shift+F`（过滤）、`Ctrl+Shift+B`（书签）和 `Ctrl+,` / `Ctrl+.`（前后书签）

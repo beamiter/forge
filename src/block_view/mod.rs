@@ -17096,6 +17096,16 @@ impl TermView {
         }
     }
 
+    /// Reading a running block's scrollback gives the one companion a compact
+    /// home in the sticky header, never a second body beside the live surface.
+    pub(crate) fn organism_uses_running_header(&self) -> bool {
+        self.user_scrolled_up.get()
+            && self
+                .sticky_organism_slot
+                .parent()
+                .is_some_and(|header| header.is_mapped())
+    }
+
     /// Attach a separate compact avatar to the sticky running-command header.
     /// Its slot is shown only when that header represents a running command,
     /// never for a pinned finished block.
