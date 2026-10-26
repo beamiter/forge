@@ -1,44 +1,31 @@
-//! Block-view scrolling, follow-bottom settling, and widget virtualization.
+//! Frame-clock motion for the retained Block/Chat transcript canvas.
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::ScrolledWindow;
 use gtk4 as gtk;
+use jterm_core::transcript_canvas::CanvasMotion;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-/// Ignore sub-pixel adjustment churn. GTK can report tiny floating-point
-/// differences after layout even though the viewport is visually stationary;
-/// writing those values back wakes every value-changed observer for no benefit.
 const SCROLL_EPSILON_PX: f64 = 0.5;
-/// Once the computed bottom target is unchanged for this many layout frames,
-/// virtualized blocks have had enough time to realize and the pin can release.
 const BOTTOM_STABLE_FRAMES: u8 = 4;
-/// Safety bound for unusually slow virtual-layout settling.
-const MAX_BOTTOM_PIN_TRIES: u8 = 12;
+/// Wheel distance is independent of window height. Surface deltas are already
+/// logical pixels and must never be converted into page-sized wheel notches.
+const WHEEL_DISTANCE_PX: f64 = 54.0;
+const COAST_FRICTION: f64 = 8.0;
 
 fn scroll_value_changed(current: f64, target: f64) -> bool {
     (current - target).abs() > SCROLL_EPSILON_PX
 }
 
-/// The scroll lock a user's own move of the history leaves behind, recorded
-/// the moment the adjustment moves.
-///
-/// Anything off the bottom is a request to stop following. The deferred
-/// geometric probe alone can't say so: it only reports "away" once the live
-/// card has left the viewport, and while an agent streams that card is a full
-/// page, so a scrollbar drag, a find match or a bookmark jump into the last
-/// few blocks never got that far and the next repaint snapped it back.
+fn bottom_value(adjustment: &gtk::Adjustment) -> f64 {
+    (adjustment.upper() - adjustment.page_size()).max(adjustment.lower())
+}
+
 pub(crate) fn user_scroll_intent(value: f64, bottom: f64) -> bool {
     scroll_value_changed(value, bottom)
 }
 
-/// The scroll lock after the deferred geometric probe has looked.
-///
-/// A live card that has left the viewport always locks, as it always has. With
-/// the card still on screen the probe no longer clears an intent the user
-/// already recorded while the adjustment is still off the bottom, but it never
-/// creates one either: between the event and this idle `upper` may have grown
-/// under a view that was following, which is drift, not a request.
 pub(crate) fn next_scroll_lock(prev: bool, holder_visible: bool, value: f64, bottom: f64) -> bool {
     !holder_visible || (prev && scroll_value_changed(value, bottom))
 }
@@ -50,12 +37,6 @@ fn next_stable_frame_count(last_target: Option<f64>, target: f64, current: u8) -
     }
 }
 
-/// Claim or refresh the single follow-bottom settling source.
-///
-/// A coalesced request still increments `generation`. The active timer observes
-/// that change on its next frame and resets its retry/stability counters, giving
-/// newly-added virtualized content a full settling window without starting a
-/// second timer.
 fn request_bottom_pin(user_scrolled: bool, active: &Cell<bool>, generation: &Cell<u64>) -> bool {
     if user_scrolled {
         return false;
@@ -64,20 +45,31 @@ fn request_bottom_pin(user_scrolled: bool, active: &Cell<bool>, generation: &Cel
     !active.replace(true)
 }
 
-/// Scrolls the block list to follow the live prompt.
-///
-/// The synchronous update in `mark_dirty` intentionally runs before GTK lays out
-/// a freshly appended block. The short frame-spaced settling pass then handles
-/// virtualized blocks whose heights become known only after subsequent layouts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CanvasDrive {
+    #[default]
+    Idle,
+    Follow,
+    Wheel,
+    Coast,
+}
+
+/// One controller belongs to one pane's persistent scroller. PTY output only
+/// retargets this controller; it never writes an abrupt adjustment value.
+/// Native pointer/scrollbar moves interrupt it, precision input is direct, and
+/// frame time (rather than a 16 ms timer) drives wheel/follow presentation.
 #[derive(Clone)]
 pub(crate) struct ScrollDebouncer {
     pub(crate) user_scrolled_up: Rc<Cell<bool>>,
     pub(crate) programmatic_scroll: Rc<Cell<bool>>,
-    /// At most one frame-spaced follow-bottom source may run at a time. Repeated
-    /// output/layout notifications refresh its generation instead of creating
-    /// overlapping timers.
     bottom_pin_active: Rc<Cell<bool>>,
     bottom_pin_generation: Rc<Cell<u64>>,
+    motion: Rc<RefCell<CanvasMotion>>,
+    drive: Rc<Cell<CanvasDrive>>,
+    tick: Rc<RefCell<Option<gtk::TickCallbackId>>>,
+    coast_velocity: Rc<Cell<f64>>,
+    precision_forwarded: Rc<Cell<bool>>,
+    immediate_follow: Rc<Cell<bool>>,
 }
 
 impl ScrollDebouncer {
@@ -90,123 +82,516 @@ impl ScrollDebouncer {
             programmatic_scroll,
             bottom_pin_active: Rc::new(Cell::new(false)),
             bottom_pin_generation: Rc::new(Cell::new(0)),
+            motion: Rc::new(RefCell::new(CanvasMotion::default())),
+            drive: Rc::new(Cell::new(CanvasDrive::Idle)),
+            tick: Rc::new(RefCell::new(None)),
+            coast_velocity: Rc::new(Cell::new(0.0)),
+            precision_forwarded: Rc::new(Cell::new(false)),
+            immediate_follow: Rc::new(Cell::new(false)),
         }
+    }
+
+    pub(crate) fn install(&self, scroll: &ScrolledWindow, content: &gtk::Box) {
+        scroll.set_kinetic_scrolling(true);
+        scroll.set_overlay_scrolling(true);
+        // A hidden tab must not retain a clock callback, a strong widget, or a
+        // fling that resumes unexpectedly when the tab becomes visible again.
+        let this = self.clone();
+        scroll.connect_unmap(move |_| this.stop_motion());
+        let this = self.clone();
+        scroll.connect_map(move |scroll| {
+            if !this.user_scrolled_up.get() {
+                // A tab returning after background output starts at its current
+                // live edge; do not animate through unseen restored history.
+                this.immediate_follow.set(true);
+                this.pin_to_bottom_deferred(scroll);
+            }
+        });
+        // Descendant VTE controllers claim their own scrollback first. At the
+        // content's bubble phase the remaining header/gap events share the same
+        // outer canvas as events forwarded at a terminal's boundary.
+        let controller = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+        self.watch_gesture(&controller, scroll);
+        let outer = scroll.downgrade();
+        let this = self.clone();
+        controller.connect_scroll(move |controller, _, dy| {
+            let Some(outer) = outer.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            this.scroll_wheel(
+                &outer,
+                dy,
+                controller.unit() == gtk::gdk::ScrollUnit::Surface,
+            );
+            glib::Propagation::Stop
+        });
+        content.add_controller(controller);
+    }
+
+    /// Register before the consumer's scroll callback. Only the last event
+    /// actually handed to the outer canvas may coast; an inner VTE consuming
+    /// the final event clears that ownership, avoiding a second scroll surface.
+    pub(crate) fn watch_gesture(
+        &self,
+        controller: &gtk::EventControllerScroll,
+        scroll: &ScrolledWindow,
+    ) {
+        controller.set_flags(controller.flags() | gtk::EventControllerScrollFlags::KINETIC);
+        let this = self.clone();
+        controller.connect_scroll_begin(move |_| this.stop_motion());
+        let forwarded = self.precision_forwarded.clone();
+        controller.connect_scroll(move |_, _, _| {
+            forwarded.set(false);
+            glib::Propagation::Proceed
+        });
+        let this = self.clone();
+        let outer = scroll.downgrade();
+        controller.connect_decelerate(move |_, _, velocity| {
+            if !this.precision_forwarded.replace(false)
+                || !velocity.is_finite()
+                || velocity.abs() < 0.02
+            {
+                return;
+            }
+            let Some(outer) = outer.upgrade().filter(|outer| outer.is_mapped()) else {
+                return;
+            };
+            if !animations_enabled(&outer) {
+                return;
+            }
+            this.drive.set(CanvasDrive::Coast);
+            // GTK's decelerate velocity is in pixels/ms. Integrate its bounded
+            // exponential tail on the display clock; never add another spring
+            // to precision deltas while the user's fingers are moving.
+            this.coast_velocity
+                .set((velocity * 1000.0).clamp(-12_000.0, 12_000.0));
+            this.start_clock(&outer);
+        });
     }
 
     pub(crate) fn mark_dirty(&self, scroll: &ScrolledWindow) {
-        if self.user_scrolled_up.get() {
-            return;
-        }
-        let adj = scroll.vadjustment();
-        let target = (adj.upper() - adj.page_size()).max(adj.lower());
-        if !scroll_value_changed(adj.value(), target) {
-            return;
-        }
-        // Guard the scroll with the programmatic flag so the scroll-lock detector
-        // does not mistake it for the user dragging the scrollbar.
-        self.programmatic_scroll.set(true);
-        adj.set_value(target);
-        self.programmatic_scroll.set(false);
+        self.pin_to_bottom_deferred(scroll);
     }
 
-    /// Follow the live prompt across a few settled layout passes.
-    ///
-    /// With virtual scrolling, hidden blocks have zero GTK height until the
-    /// scroll position brings them near the viewport. A single bottom jump can
-    /// therefore land short: the jump reveals more blocks, those blocks expand,
-    /// and the adjustment upper bound grows on the next frame.
     pub(crate) fn pin_to_bottom_deferred(&self, scroll: &ScrolledWindow) {
-        if !request_bottom_pin(
-            self.user_scrolled_up.get(),
-            &self.bottom_pin_active,
-            &self.bottom_pin_generation,
-        ) {
+        if self.user_scrolled_up.get() || !scroll.is_mapped() {
             return;
         }
-
-        let scroll = scroll.clone();
-        let user_scrolled = self.user_scrolled_up.clone();
-        let programmatic = self.programmatic_scroll.clone();
-        let bottom_pin_active = self.bottom_pin_active.clone();
-        let bottom_pin_generation = self.bottom_pin_generation.clone();
-        let observed_generation = Rc::new(Cell::new(bottom_pin_generation.get()));
-        let tries = Rc::new(Cell::new(0u8));
-        let last_target = Rc::new(Cell::new(None::<f64>));
-        let stable_frames = Rc::new(Cell::new(0u8));
-
-        // An idle source that returns Continue can consume all retries before GTK
-        // reaches another layout frame. Space retries by roughly one frame so
-        // every observation can see newly realized block geometry.
-        glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
-            if user_scrolled.get() {
-                bottom_pin_active.set(false);
-                return glib::ControlFlow::Break;
+        let starting =
+            request_bottom_pin(false, &self.bottom_pin_active, &self.bottom_pin_generation);
+        let adjustment = scroll.vadjustment();
+        {
+            let mut motion = self.motion.borrow_mut();
+            motion.set_bounds(adjustment.lower(), bottom_value(&adjustment));
+            if starting || self.drive.get() != CanvasDrive::Follow {
+                motion.jump_to(adjustment.value());
             }
+            motion.set_reduced_motion(!animations_enabled(scroll));
+            motion.set_target(bottom_value(&adjustment));
+        }
+        self.drive.set(CanvasDrive::Follow);
+        if !animations_enabled(scroll) {
+            let position = self.motion.borrow().position();
+            self.programmatic_scroll.set(true);
+            adjustment.set_value(position);
+            self.programmatic_scroll.set(false);
+        }
+        self.start_clock(scroll);
+    }
 
-            // Output or layout changed while the timer was active. Refresh the
-            // settling budget rather than creating another timer.
-            let generation = bottom_pin_generation.get();
-            if observed_generation.get() != generation {
-                observed_generation.set(generation);
-                tries.set(0);
-                last_target.set(None);
+    pub(crate) fn scroll_wheel(&self, scroll: &ScrolledWindow, delta: f64, surface: bool) {
+        if !delta.is_finite() || delta == 0.0 {
+            return;
+        }
+        let adjustment = scroll.vadjustment();
+        let (position, target) = {
+            let mut motion = self.motion.borrow_mut();
+            motion.set_bounds(adjustment.lower(), bottom_value(&adjustment));
+            motion.set_reduced_motion(!animations_enabled(scroll));
+            if self.drive.get() != CanvasDrive::Wheel
+                || scroll_value_changed(motion.position(), adjustment.value())
+            {
+                motion.jump_to(adjustment.value());
+            }
+            if surface {
+                motion.jump_to(adjustment.value() + delta);
+            } else {
+                motion.scroll_by(delta * WHEEL_DISTANCE_PX);
+            }
+            (motion.position(), motion.target())
+        };
+        self.drive.set(CanvasDrive::Wheel);
+        self.coast_velocity.set(0.0);
+        self.precision_forwarded.set(surface);
+        // Claim reading intent before an output batch can ask to follow again.
+        self.user_scrolled_up
+            .set(scroll_value_changed(target, bottom_value(&adjustment)));
+        if surface || !animations_enabled(scroll) {
+            adjustment.set_value(position);
+            self.record_wheel_intent(scroll);
+        } else {
+            self.start_clock(scroll);
+        }
+    }
+
+    fn start_clock(&self, scroll: &ScrolledWindow) {
+        if self.tick.borrow().is_some() || !scroll.is_mapped() {
+            return;
+        }
+        self.bottom_pin_active.set(true);
+        let this = self.clone();
+        let last_time = Cell::new(None::<i64>);
+        let last_target = Cell::new(None::<f64>);
+        let stable_frames = Cell::new(0u8);
+        let observed_generation = Cell::new(this.bottom_pin_generation.get());
+        let settling_elapsed = Cell::new(0.0f64);
+        let id = scroll.add_tick_callback(move |scroll, clock| {
+            let finish = || {
+                this.tick.borrow_mut().take();
+                this.bottom_pin_active.set(false);
+                this.drive.set(CanvasDrive::Idle);
+                this.immediate_follow.set(false);
+                this.motion.borrow_mut().cancel();
+                glib::ControlFlow::Break
+            };
+            let drive = this.drive.get();
+            if !scroll.is_mapped()
+                || drive == CanvasDrive::Idle
+                || (drive == CanvasDrive::Follow && this.user_scrolled_up.get())
+            {
+                return finish();
+            }
+            let adjustment = scroll.vadjustment();
+            let now = clock.frame_time();
+            let dt = last_time
+                .replace(Some(now))
+                .map(|last| ((now - last) as f64 / 1_000_000.0).clamp(0.0, 0.05))
+                .unwrap_or(0.0);
+            if observed_generation.replace(this.bottom_pin_generation.get())
+                != this.bottom_pin_generation.get()
+            {
+                settling_elapsed.set(0.0);
                 stable_frames.set(0);
             }
-
-            if tries.get() >= MAX_BOTTOM_PIN_TRIES {
-                bottom_pin_active.set(false);
-                return glib::ControlFlow::Break;
-            }
-            tries.set(tries.get() + 1);
-
-            let adj = scroll.vadjustment();
-            let target = (adj.upper() - adj.page_size()).max(adj.lower());
-            let next_stable =
-                next_stable_frame_count(last_target.get(), target, stable_frames.get());
+            settling_elapsed.set(settling_elapsed.get() + dt);
+            let (position, animating, target) = {
+                let mut motion = this.motion.borrow_mut();
+                motion.set_bounds(adjustment.lower(), bottom_value(&adjustment));
+                // Scrollbar drag, keyboard navigation, selection autoscroll and
+                // native searches own their actual adjustment immediately.
+                if scroll_value_changed(motion.position(), adjustment.value()) {
+                    drop(motion);
+                    return finish();
+                }
+                motion.set_reduced_motion(!animations_enabled(scroll));
+                if drive == CanvasDrive::Follow {
+                    motion.set_target(bottom_value(&adjustment));
+                    if adjustment.page_size() > 0.0 && this.immediate_follow.replace(false) {
+                        motion.jump_to(bottom_value(&adjustment));
+                    }
+                }
+                let position = if drive == CanvasDrive::Coast {
+                    let velocity = this.coast_velocity.get();
+                    let decay = (-COAST_FRICTION * dt).exp();
+                    this.coast_velocity.set(velocity * decay);
+                    let distance = velocity * (1.0 - decay) / COAST_FRICTION;
+                    let old = motion.position();
+                    motion.jump_to(old + distance);
+                    motion.position()
+                } else {
+                    motion.advance(dt)
+                };
+                (position, motion.is_animating(), motion.target())
+            };
+            this.programmatic_scroll.set(drive == CanvasDrive::Follow);
+            adjustment.set_value(position);
+            this.programmatic_scroll.set(false);
+            let stable = next_stable_frame_count(last_target.get(), target, stable_frames.get());
             last_target.set(Some(target));
-            stable_frames.set(next_stable);
-
-            if scroll_value_changed(adj.value(), target) {
-                programmatic.set(true);
-                adj.set_value(target);
-                programmatic.set(false);
-            }
-
-            if next_stable >= BOTTOM_STABLE_FRAMES {
-                bottom_pin_active.set(false);
-                glib::ControlFlow::Break
+            stable_frames.set(stable);
+            let done = match drive {
+                CanvasDrive::Follow => {
+                    (!animating && stable >= BOTTOM_STABLE_FRAMES) || settling_elapsed.get() > 1.5
+                }
+                CanvasDrive::Coast => {
+                    this.coast_velocity.get().abs() < 8.0
+                        || (position <= adjustment.lower() && this.coast_velocity.get() < 0.0)
+                        || (position >= bottom_value(&adjustment)
+                            && this.coast_velocity.get() > 0.0)
+                        || !animations_enabled(scroll)
+                }
+                CanvasDrive::Wheel => !animating,
+                CanvasDrive::Idle => true,
+            };
+            if done {
+                finish()
             } else {
                 glib::ControlFlow::Continue
             }
         });
+        *self.tick.borrow_mut() = Some(id);
     }
 
-    /// Record whether a wheel notch left the history away from its bottom.
-    ///
-    /// Call this straight after writing the outer adjustment. The other writer
-    /// of `user_scrolled_up` is a deferred probe that compares the live card's
-    /// top edge against the viewport, so it only flips once the view has moved
-    /// by a whole card height — and while a command streams, the card is a full
-    /// viewport. One notch moves a tenth of a page and the follow-bottom pin
-    /// puts it back on the next frame, so the displacement could never
-    /// accumulate to what that probe needs: wheeling up into the finished
-    /// blocks kicked once per notch and went nowhere until the command ended.
-    /// Reading the adjustment we just wrote settles it in one step, and a notch
-    /// that lands back at the bottom clears the flag again.
-    ///
-    /// The outer adjustment's value-changed handler now records the same
-    /// [`user_scroll_intent`] for every non-programmatic move and the probe
-    /// keeps it ([`next_scroll_lock`]), so this is belt and braces for the
-    /// wheel paths that write the adjustment themselves.
+    fn stop_motion(&self) {
+        // Take outside the RefCell borrow: removing a GTK callback can release
+        // closures synchronously, including another clone of this controller.
+        let tick = self.tick.borrow_mut().take();
+        if let Some(tick) = tick {
+            tick.remove();
+        }
+        self.bottom_pin_active.set(false);
+        self.drive.set(CanvasDrive::Idle);
+        self.immediate_follow.set(false);
+        self.coast_velocity.set(0.0);
+        self.precision_forwarded.set(false);
+        self.motion.borrow_mut().cancel();
+    }
+
     pub(crate) fn record_wheel_intent(&self, scroll: &ScrolledWindow) {
         let adjustment = scroll.vadjustment();
-        let bottom = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
-        self.user_scrolled_up
-            .set(scroll_value_changed(adjustment.value(), bottom));
+        self.user_scrolled_up.set(scroll_value_changed(
+            adjustment.value(),
+            bottom_value(&adjustment),
+        ));
     }
 
     pub(crate) fn reset_scroll_lock(&self) {
         self.user_scrolled_up.set(false);
+    }
+}
+
+/// Preserve the document coordinate of surviving content when bounded history
+/// retires an old prefix. Measure actual GTK origins before detaching anything;
+/// widget estimates may differ after wrapping, font changes or virtualization.
+pub(crate) struct PrefixRebase {
+    adjustment: gtk::Adjustment,
+    removed_height: f64,
+    controller: ScrollDebouncer,
+}
+
+impl PrefixRebase {
+    pub(crate) fn capture(
+        first: &gtk::Widget,
+        last: &gtk::Widget,
+        controller: &ScrollDebouncer,
+    ) -> Option<Self> {
+        let scroll = first
+            .ancestor(ScrolledWindow::static_type())?
+            .downcast::<ScrolledWindow>()
+            .ok()?;
+        if !scroll.is_mapped() {
+            return None;
+        }
+        let mut next = last.next_sibling();
+        while next.as_ref().is_some_and(|widget| !widget.is_visible()) {
+            next = next?.next_sibling();
+        }
+        let after = next?;
+        let removed_height =
+            f64::from(after.compute_bounds(&scroll)?.y() - first.compute_bounds(&scroll)?.y());
+        if !removed_height.is_finite() || removed_height <= 0.0 {
+            return None;
+        }
+        Some(Self {
+            adjustment: scroll.vadjustment(),
+            removed_height,
+            controller: controller.clone(),
+        })
+    }
+
+    pub(crate) fn apply(self) {
+        let current = self.adjustment.value();
+        {
+            let mut motion = self.controller.motion.borrow_mut();
+            motion.set_bounds(self.adjustment.lower(), bottom_value(&self.adjustment));
+            if scroll_value_changed(motion.position(), current) {
+                motion.jump_to(current);
+            }
+            motion.shift(-self.removed_height);
+        }
+        self.controller.programmatic_scroll.set(true);
+        self.adjustment.set_value(current - self.removed_height);
+        self.controller.programmatic_scroll.set(false);
+    }
+}
+
+fn animations_enabled(scroll: &ScrolledWindow) -> bool {
+    scroll.settings().is_gtk_enable_animations()
+}
+
+#[cfg(test)]
+mod canvas_native_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn spin_for(milliseconds: u64) {
+        let deadline = Instant::now() + Duration::from_millis(milliseconds);
+        let context = glib::MainContext::default();
+        while Instant::now() < deadline {
+            while context.pending() {
+                context.iteration(false);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display and frame clock; run with test-gtk-display.sh"]
+    fn retained_canvas_scrolls_through_frames_and_yields_to_reading() {
+        gtk::init().expect("GTK display");
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let retained = gtk::Label::new(Some("Retained command and output"));
+        retained.set_height_request(1200);
+        let stream = gtk::Label::new(Some("stream grows in place"));
+        stream.set_height_request(160);
+        let retired_prefix = gtk::Label::new(Some("Old bounded history"));
+        retired_prefix.set_height_request(500);
+        content.append(&retired_prefix);
+        content.append(&retained);
+        content.append(&stream);
+        let scroll = gtk::ScrolledWindow::builder().child(&content).build();
+        let window = gtk::Window::builder()
+            .default_width(640)
+            .default_height(400)
+            .child(&scroll)
+            .build();
+        let controller =
+            ScrollDebouncer::with_scroll_lock(Rc::new(Cell::new(false)), Rc::new(Cell::new(false)));
+        controller.install(&scroll, &content);
+        let settings = scroll.settings();
+        let animations = settings.is_gtk_enable_animations();
+        settings.set_gtk_enable_animations(true);
+        let samples = Rc::new(RefCell::new(Vec::<f64>::new()));
+        let values = samples.clone();
+        let user = controller.user_scrolled_up.clone();
+        let programmatic = controller.programmatic_scroll.clone();
+        scroll
+            .vadjustment()
+            .connect_value_changed(move |adjustment| {
+                values.borrow_mut().push(adjustment.value());
+                if !programmatic.get() {
+                    user.set(scroll_value_changed(
+                        adjustment.value(),
+                        bottom_value(adjustment),
+                    ));
+                }
+            });
+        window.present();
+        spin_for(650);
+        let adjustment = scroll.vadjustment();
+        assert!((adjustment.value() - bottom_value(&adjustment)).abs() < 0.5);
+        assert!(
+            controller.tick.borrow().is_none(),
+            "settled canvas must stop waking frames"
+        );
+        let before = adjustment.value();
+        samples.borrow_mut().clear();
+        stream.set_height_request(460);
+        controller.mark_dirty(&scroll);
+        assert_eq!(
+            adjustment.value(),
+            before,
+            "output must not synchronously jump"
+        );
+        spin_for(650);
+        let target = bottom_value(&adjustment);
+        assert!(target > before + 250.0);
+        let values = samples.borrow();
+        assert!(
+            values
+                .iter()
+                .filter(|&&value| value > before + 0.5 && value < target - 0.5)
+                .count()
+                >= 4,
+            "growth must be presented over real intermediate frames: {values:?}"
+        );
+        assert!(
+            values.windows(2).all(|pair| pair[1] + 0.5 >= pair[0]),
+            "follow must be monotonic"
+        );
+        drop(values);
+        assert!((adjustment.value() - target).abs() < 0.5);
+        assert_eq!(
+            retired_prefix.next_sibling().as_ref(),
+            Some(retained.upcast_ref()),
+            "updates retain the same history widget"
+        );
+
+        // A tiny touchpad movement is exact, independent of page height, and
+        // immediately revokes follow even while output continues below it.
+        controller.scroll_wheel(&scroll, -0.375, true);
+        assert!((adjustment.value() - (target - 0.375)).abs() < 0.0001);
+        // Leave the visual-edge epsilon so the reader owns the viewport.
+        controller.scroll_wheel(&scroll, -12.5, true);
+        let reading = adjustment.value();
+        stream.set_height_request(700);
+        controller.mark_dirty(&scroll);
+        spin_for(250);
+        assert!(
+            (adjustment.value() - reading).abs() < 0.0001,
+            "stream must not pull a reader down"
+        );
+        assert!(controller.user_scrolled_up.get());
+
+        // Discrete input moves over multiple frames and an external scrollbar
+        // move interrupts that motion instead of being overwritten next frame.
+        controller.scroll_wheel(&scroll, -2.0, false);
+        assert_eq!(adjustment.value(), reading);
+        spin_for(35);
+        assert!(adjustment.value() < reading);
+        let manual = adjustment.value() - 30.0;
+        adjustment.set_value(manual);
+        spin_for(150);
+        assert!((adjustment.value() - manual).abs() < 0.0001);
+        assert!(controller.tick.borrow().is_none());
+
+        let retained_y = retained
+            .compute_bounds(&scroll)
+            .expect("retained card bounds")
+            .y();
+        let rebase = PrefixRebase::capture(
+            retired_prefix.upcast_ref(),
+            retired_prefix.upcast_ref(),
+            &controller,
+        )
+        .expect("measured prefix");
+        content.remove(&retired_prefix);
+        rebase.apply();
+        spin_for(80);
+        assert!(
+            (retained.compute_bounds(&scroll).unwrap().y() - retained_y).abs() < 0.5,
+            "retiring old history keeps surviving content under the same screen pixel"
+        );
+        assert!(controller.user_scrolled_up.get());
+
+        controller.scroll_wheel(&scroll, -2.0, false);
+        assert!(controller.tick.borrow().is_some());
+        window.set_visible(false);
+        assert!(
+            controller.tick.borrow().is_none(),
+            "unmapping retires the display callback synchronously"
+        );
+        let hidden = adjustment.value();
+        spin_for(80);
+        window.present();
+        spin_for(100);
+        assert!(
+            (adjustment.value() - hidden).abs() < 0.0001,
+            "remap preserves the reader's position"
+        );
+
+        settings.set_gtk_enable_animations(false);
+        controller.reset_scroll_lock();
+        controller.pin_to_bottom_deferred(&scroll);
+        spin_for(100);
+        assert!(
+            (adjustment.value() - bottom_value(&adjustment)).abs() < 0.5,
+            "reduced motion still reaches live output"
+        );
+        assert!(controller.tick.borrow().is_none());
+        settings.set_gtk_enable_animations(animations);
+        window.close();
+        spin_for(20);
     }
 }
 
