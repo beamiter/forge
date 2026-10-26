@@ -1754,7 +1754,8 @@ mod tests {
             );
         }
 
-        // A hovered selection keeps both the ring and the lift.
+        // Legacy unscoped cards keep the ring and lift. Transcript-scoped
+        // overrides below must retain only the inset selection ring.
         for selector in [
             ".block-selected.block-hovered",
             ".block-selected.block-selection-active.block-hovered",
@@ -1764,6 +1765,55 @@ mod tests {
                 body.contains("inset") && body.contains("14px"),
                 "`{selector}` must carry the ring AND the hover elevation: {body}"
             );
+        }
+
+        // Continuous transcript overrides win over those legacy combinations,
+        // without claiming outcome borders or introducing another outer shadow.
+        let accent = config.semantic_colors().accent;
+        let selected_shadow = format!(
+            "box-shadow: inset 0 0 0 2px rgba({},{},{},0.65);",
+            (accent.red() * 255.0) as u8,
+            (accent.green() * 255.0) as u8,
+            (accent.blue() * 255.0) as u8,
+        );
+        let active_shadow = format!("box-shadow: inset 0 0 0 3px {};", rgba_to_hex(&accent));
+        for (selector, expected) in [
+            (
+                ".block-list .block-finished.block-selected",
+                selected_shadow,
+            ),
+            (
+                ".block-list .block-finished.block-selected.block-selection-active",
+                active_shadow,
+            ),
+        ] {
+            let body = rule_body(&css, selector);
+            assert_eq!(
+                body.trim(),
+                expected,
+                "{selector} must only own its inset ring"
+            );
+            assert!(
+                css.find(&format!("{selector} {{")).unwrap()
+                    > css
+                        .find(".block-selected.block-selection-active.block-hovered {")
+                        .unwrap(),
+                "transcript overrides must follow the legacy hover rules"
+            );
+        }
+        assert_eq!(
+            rule_body(&css, ".block-list .block-finished:not(.block-selected)").trim(),
+            "box-shadow: none;",
+            "unselected transcript cards must not acquire elevation or erase outcome cues"
+        );
+
+        for selector in [
+            ".block-list .block-finished",
+            ".block-list .block-finished:not(.block-failed):not(.block-background):not(.block-selected):not(.block-hovered)",
+        ] {
+            let body = rule_body(&css, selector);
+            assert!(!body.contains("box-shadow"), "neutral history cannot add a shadow");
+            assert!(!body.contains("transform"), "neutral history cannot lift or move");
         }
 
         // Nothing else may quietly join the box-shadow contest. Scoped to the
@@ -1778,6 +1828,9 @@ mod tests {
             owners,
             vec![
                 ".block-hovered",
+                ".block-list .block-finished.block-selected",
+                ".block-list .block-finished.block-selected.block-selection-active",
+                ".block-list .block-finished:not(.block-selected)",
                 ".block-selected",
                 ".block-selected.block-hovered",
                 ".block-selected.block-selection-active",
