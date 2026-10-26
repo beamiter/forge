@@ -1776,7 +1776,10 @@ mod tests {
             (accent.green() * 255.0) as u8,
             (accent.blue() * 255.0) as u8,
         );
-        let active_shadow = format!("box-shadow: inset 0 0 0 3px {};", rgba_to_hex(&accent));
+        let active_shadow = format!(
+            "box-shadow: inset 0 0 0 3px {};",
+            super::rgba_to_hex(&accent)
+        );
         for (selector, expected) in [
             (
                 ".block-list .block-finished.block-selected",
