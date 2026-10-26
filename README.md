@@ -134,7 +134,7 @@ ShellCheck，不会在检查过程中解析出另一份依赖图。
 `make package` 刻意使用宿主 Cargo 与系统 GTK/VTE 开发库：发行归档按兼容系统的动态库
 ABI 分发，不能把 Nix store 解释器/RPATH 烘进裸二进制。日常构建和验收仍使用上面的 Nix 门禁。
 
-安装脚本默认优先使用 Nix；没有 Nix 时自动退回 Cargo，并在备份已有配置后替换为随版本提供的默认配置（保留自定义配置请加 `--no-config`）：
+安装脚本默认优先使用 Nix；没有 Nix 时自动退回 Cargo。已有配置仅在字段结构变化时备份并替换；仅默认值、注释或顺序变化时保留原配置。使用 `--no-config` 可始终保留自定义配置：
 
 ```bash
 ./scripts/install.sh
@@ -674,11 +674,20 @@ terminal. Existing defaults and existing panes are unchanged. See
 directory. Existing binaries are replaced atomically.
 
 The configuration is installed to `${XDG_CONFIG_HOME:-$HOME/.config}/forge/config.toml`.
-An existing regular config is backed up as `config.toml.backup.<unique suffix>`
-before replacing it with the bundled defaults. Identical configs do not create
-extra backups. Use `--no-config` to retain all custom settings, or copy selected
-settings back from the private backup after installation. Symlinked configs are
-left unchanged. `--dry-run` does not write binaries, configs, or backups.
+On first installation, the bundled defaults are installed. For an existing
+regular config, the installer compares its TOML field structure with the bundled
+config, including nested tables. Changes only to values, comments, or ordering
+keep the existing file and do not create a backup. Added, removed, or renamed
+fields trigger a private `config.toml.backup.<unique suffix>` copy followed by
+atomic replacement with the bundled defaults. Array lengths and element values
+are ignored; fields within table elements are compared when both arrays contain
+tables. Copy selected custom settings back from the backup after a field change,
+or use `--no-config` to always retain your current settings.
+
+Comparison uses Python 3.11+ `tomllib`, or `tomli` on older Python 3 versions.
+If the parser is unavailable or either file cannot be parsed, the installer
+reports the reason and keeps the existing config. Symlinked configs are left
+unchanged. `--dry-run` does not write binaries, configs, or backups.
 
 An already-running terminal keeps its current process; restart it to use the new
 binary and configuration. If an older copy comes first in PATH, the installer
