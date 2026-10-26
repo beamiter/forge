@@ -6,6 +6,11 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- Soft-wrapped lines are painted natively in the Vim9 editor instead of
+  switching the buffer to the compatibility view: continuation rows,
+  `showbreak`, `breakindent` and `smoothscroll` partial lines keep Vim's exact
+  layout, and touchpad or wheel scrolling moves one wrapped row at a time
+  (shared core render protocol 9).
 - Closed Vim folds are painted natively in the Vim9 editor instead of
   switching the buffer to the compatibility view: fold text and its filler use
   Vim's `Folded` colors, rows below keep Vim's positions, and touchpad or wheel
