@@ -41,6 +41,21 @@ fn presentation_surface(previous: ChatSurface, state: BlockState, integrated: bo
     }
 }
 
+/// Extend prompt-redraw continuity across a completed command as well.
+fn completion_surface(previous: ChatSurface, state: BlockState, integrated: bool) -> ChatSurface {
+    // Prompt is sufficient even when a fast C/D pair never paints Running.
+    // Fullscreen, fallback, Idle and lost integration retire the hold through
+    // the existing real-state/prompt-redraw resolver below.
+    if integrated && matches!(previous, ChatSurface::Prompt | ChatSurface::Running) {
+        match state {
+            BlockState::PostCommand => return ChatSurface::Running,
+            BlockState::CollectingPrompt => return ChatSurface::Prompt,
+            _ => {}
+        }
+    }
+    presentation_surface(previous, state, integrated)
+}
+
 /// The command and real foreground represented at an action's origin.
 #[derive(Clone, Copy)]
 pub(super) struct StopTarget {
@@ -481,7 +496,25 @@ impl ChatPresentation {
     }
 
     pub(super) fn presentation_surface(&self, state: BlockState, integrated: bool) -> ChatSurface {
-        presentation_surface(self.current.get(), state, integrated)
+        // Controls retain their existing real-state/generation guards. Retire
+        // a displayed Stop immediately even while its Running layout continues.
+        if state != BlockState::CollectingOutput {
+            self.displayed_stop_target.set(None);
+            if let Some(stop) = self.stop.upgrade() {
+                stop.set_sensitive(false);
+            }
+        }
+        if !surface(state, integrated).allows_submit_affordance() {
+            if let Some(submit) = self.submit.upgrade() {
+                submit.set_sensitive(false);
+            }
+        }
+        completion_surface(self.current.get(), state, integrated)
+    }
+
+    pub(super) fn reset_presentation(&self) {
+        self.current.set(ChatSurface::Passthrough);
+        self.displayed_stop_target.set(None);
     }
 
     /// Move the one live VTE without moving the stable history insertion anchor.
@@ -644,6 +677,92 @@ pub(super) fn viewport_height_for(vte: &Terminal) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_presentation_survives_normal_and_coalesced_commands() {
+        use BlockState::*;
+        use ChatSurface::*;
+        for states in [
+            vec![
+                AwaitingCommand,
+                CollectingOutput,
+                PostCommand,
+                CollectingPrompt,
+                AwaitingCommand,
+            ],
+            // A fast command can start and end between two layout callbacks.
+            vec![
+                AwaitingCommand,
+                PostCommand,
+                CollectingPrompt,
+                AwaitingCommand,
+            ],
+            vec![AwaitingCommand, CollectingPrompt, AwaitingCommand],
+        ] {
+            let mut previous = Passthrough;
+            for state in states {
+                previous = completion_surface(previous, state, true);
+                assert_eq!(
+                    previous,
+                    match state {
+                        CollectingOutput | PostCommand => Running,
+                        _ => Prompt,
+                    },
+                    "{state:?} must not hand the viewport to native VTE"
+                );
+                if matches!(state, PostCommand | CollectingPrompt) {
+                    assert!(!surface(state, true).allows_submit_affordance());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn completion_presentation_starts_native_and_retires_on_takeover() {
+        use BlockState::*;
+        use ChatSurface::*;
+        let mut previous = Passthrough;
+        for state in [Idle, CollectingPrompt, CollectingPrompt, PostCommand] {
+            previous = completion_surface(previous, state, true);
+            assert_eq!(
+                previous, Passthrough,
+                "no confirmed Chat interaction: {state:?}"
+            );
+        }
+        for held in [Prompt, Running] {
+            for state in [Idle, RawFallback, AltScreen] {
+                previous = held;
+                previous = completion_surface(previous, state, true);
+                assert_eq!(
+                    previous,
+                    if state == AltScreen {
+                        Fullscreen
+                    } else {
+                        Passthrough
+                    }
+                );
+                let state = CollectingPrompt;
+                assert_eq!(
+                    completion_surface(previous, state, true),
+                    Passthrough,
+                    "native takeover retires the presentation hold"
+                );
+            }
+        }
+    }
+    #[test]
+    fn completion_presentation_lost_integration_clears_hold() {
+        for previous in [ChatSurface::Prompt, ChatSurface::Running] {
+            for state in [BlockState::PostCommand, BlockState::CollectingPrompt] {
+                assert_eq!(
+                    completion_surface(previous, state, false),
+                    ChatSurface::Passthrough
+                );
+                assert!(!surface(state, true).allows_submit_affordance());
+            }
+        }
+    }
+
     #[test]
     fn chat_stop_captures_every_native_button_activation_key() {
         for key in [

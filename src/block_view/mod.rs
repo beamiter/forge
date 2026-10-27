@@ -7549,6 +7549,7 @@ fn command_reuse_menu_label(selected_count: usize) -> &'static str {
 /// `ReaderCtx` holds — finished-block actions and the context menu rebind
 /// them when the user re-runs a command from history.
 struct BlockBackend {
+    chat_presentation: Option<Rc<chat::ChatPresentation>>,
     menu_keybindings: shortcut_hints::MenuKeybindings,
     active_rc: Rc<RefCell<ActiveBlock>>,
     /// The live VTE — every byte is fed here; alt-screen toggles feed it 1049h/l.
@@ -9555,6 +9556,14 @@ pub(crate) fn restore_live_focus_deferred(target: &Terminal) {
 /// helper functions they wrap stay module-level because non-reader paths
 /// (restore, resize, submit) share them.
 impl RenderBackend for BlockBackend {
+    fn hard_reset(&self) {
+        // A reset and the next PromptStart can share one batch; layout need
+        // not observe Idle before that new, still unconfirmed prompt.
+        if let Some(chat) = &self.chat_presentation {
+            chat.reset_presentation();
+        }
+    }
+
     fn feed_live(&self, bytes: &[u8]) {
         self.active_vte.feed(bytes);
     }
@@ -15537,6 +15546,7 @@ impl TermView {
                 })
             } else {
                 Rc::new(BlockBackend {
+                    chat_presentation: chat_presentation.clone(),
                     active_rc,
                     active_vte: active_vte_rc,
                     block_list_rc,
@@ -32285,6 +32295,180 @@ mod tests {
         harness.press(KittyKey::Escape, false, false);
         assert_eq!(harness.sink.on_commit("\x1b"), LiveCommitRoute::Typed);
         assert_eq!(harness.written(), b"\x1b");
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; samples real GTK/VTE allocations after paint"]
+    fn chat_completion_never_expands_between_shell_markers() {
+        use gtk4::prelude::*;
+        use vte4::TerminalExt;
+        gtk4::init().unwrap();
+        let view = chat_display_view(crate::config::TerminalMode::Chat);
+        let window = gtk4::Window::builder()
+            .default_width(640)
+            .default_height(560)
+            .child(&view.root)
+            .build();
+        window.present();
+        chat_display_settle();
+        let clip = view.active.borrow().live_clip();
+        let dock = chat_display_widget(view.root.upcast_ref(), "chat-dock");
+        let dock_limit = Cell::new(i32::MAX);
+        let clock = view.root.frame_clock().expect("mapped frame clock");
+        // Ticks run before layout. Sampling after-paint sees the allocation
+        // the user actually saw, including the first frame after each marker.
+        let samples = Rc::new(RefCell::new(Vec::new()));
+        let captured = samples.clone();
+        let state = view.bstate.clone();
+        let sampled_clip = clip.clone();
+        let sampled_dock = dock.clone();
+        let handler = clock.connect_after_paint(move |_| {
+            captured.borrow_mut().push((
+                state.get(),
+                sampled_clip.height(),
+                if sampled_dock.is_mapped() {
+                    sampled_dock.height()
+                } else {
+                    0
+                },
+            ));
+        });
+        let redraw = view.root.downgrade();
+        let updater = clock.connect_update(move |_| {
+            if let Some(root) = redraw.upgrade() {
+                root.queue_draw();
+            }
+        });
+        clock.begin_updating();
+        let phase = |bytes: &[u8], expected: BlockState, cap: Option<i32>| {
+            samples.borrow_mut().clear();
+            view.pty.write_test_slave(bytes);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while samples
+                .borrow()
+                .iter()
+                .filter(|(state, _, _)| *state == expected)
+                .count()
+                < 8
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "eight allocated frames in {expected:?}"
+                );
+                let context = gtk4::glib::MainContext::default();
+                for _ in 0..100 {
+                    if !context.iteration(false) {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let samples = samples.borrow();
+            let heights: Vec<_> = samples
+                .iter()
+                .filter(|(state, _, _)| *state == expected)
+                .map(|(_, height, _)| *height)
+                .collect();
+            let max_dock = samples
+                .iter()
+                .filter(|(state, _, _)| *state == expected)
+                .map(|(_, _, height)| *height)
+                .max()
+                .unwrap();
+            let min = *heights.iter().min().unwrap();
+            let max = *heights.iter().max().unwrap();
+            eprintln!(
+                "{expected:?}: {} after-paint frames, clip={min}..{max}, cap={cap:?}",
+                heights.len()
+            );
+            eprintln!(
+                "input dock={max_dock}px, compact dock limit={}px",
+                dock_limit.get()
+            );
+            assert!(min > 0, "live terminal remains allocated");
+            if let Some(cap) = cap {
+                assert!(
+                    max_dock <= dock_limit.get(),
+                    "{expected:?} input dock expanded to {max_dock}px"
+                );
+                assert!(
+                    max <= cap,
+                    "{expected:?} expanded to {max}px (compact limit {cap}px)"
+                );
+            }
+            max
+        };
+        let prompt_start = b"\x1b]133;A\x07$ ";
+        let prompt_end = b"\x1b]133;B\x07";
+        let start = b"echo hello\r\n\x1b]133;C;cmdline_url=echo%20hello\x07hello\r\n";
+        let end = b"\x1b]133;D;0\x07";
+        let initial = phase(prompt_start, BlockState::CollectingPrompt, None);
+        phase(prompt_end, BlockState::AwaitingCommand, None);
+        chat_display_settle();
+        let compact = clip.height();
+        assert!(
+            initial > compact * 2,
+            "the first incomplete prompt retains native VTE"
+        );
+        for (width, scale) in [(640, 1.0), (320, 1.0), (320, 1.6)] {
+            window.set_default_size(width, 560);
+            view.set_font_scale(scale);
+            chat_display_settle();
+            assert!(
+                window.width() <= width,
+                "narrow window was not actually allocated: requested {width}, got {}",
+                window.width()
+            );
+            assert_eq!(view.active_vte.font_scale(), scale);
+            eprintln!(
+                "allocated window={}x{}, font scale={scale}",
+                window.width(),
+                window.height()
+            );
+            dock_limit.set(dock.height() + 2 * view.active_vte.char_height() as i32);
+            let cap = clip.height() + 2 * view.active_vte.char_height() as i32;
+            assert!(
+                cap < view.root.height() * 3 / 4,
+                "fixture must distinguish compact and native"
+            );
+            phase(start, BlockState::CollectingOutput, Some(cap));
+            // Never combine D/A/B: each intermediate state must survive at
+            // least eight painted frames, including in a narrow, zoomed pane.
+            phase(end, BlockState::PostCommand, Some(cap));
+            phase(prompt_start, BlockState::CollectingPrompt, Some(cap));
+            phase(prompt_end, BlockState::AwaitingCommand, Some(cap));
+            let mut fast = start.to_vec();
+            fast.extend_from_slice(end);
+            phase(&fast, BlockState::PostCommand, Some(cap));
+            assert!(
+                !samples
+                    .borrow()
+                    .iter()
+                    .any(|(state, _, _)| *state == BlockState::CollectingOutput),
+                "fast command completes before a Running frame is painted"
+            );
+            phase(prompt_start, BlockState::CollectingPrompt, Some(cap));
+            phase(prompt_end, BlockState::AwaitingCommand, Some(cap));
+            // RIS and A share a batch: no layout is guaranteed to observe Idle.
+            let reset = b"\x1bc\x1b]133;A\x07$ ";
+            assert!(
+                phase(reset, BlockState::CollectingPrompt, None) > cap,
+                "reset must retire continuity before the next unconfirmed prompt"
+            );
+            phase(prompt_end, BlockState::AwaitingCommand, Some(cap));
+            assert!(phase(b"\x1b[?1049h", BlockState::AltScreen, None) > cap);
+            phase(b"\x1b[?1049l", BlockState::AwaitingCommand, Some(cap));
+            assert!(phase(b"\x1bcraw\r\n", BlockState::RawFallback, None) > cap);
+            assert!(
+                phase(prompt_start, BlockState::CollectingPrompt, None) > cap,
+                "raw takeover cannot retain a prior compact prompt"
+            );
+            phase(prompt_end, BlockState::AwaitingCommand, Some(cap));
+        }
+        clock.end_updating();
+        clock.disconnect(updater);
+        clock.disconnect(handler);
+        window.close();
     }
 
     #[test]
