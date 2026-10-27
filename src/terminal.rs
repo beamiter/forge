@@ -166,6 +166,17 @@ pub(crate) fn apply_terminal_theme(terminal: &Terminal, config: &Config) {
         terminal.set_font(Some(font_desc));
     });
     terminal.set_font_scale(config.default_font_scale);
+    // Chat's native VTEs live on the light reference canvas. Keep the real
+    // terminal and its configured font/ANSI palette; bind only default ink
+    // and paper to that surface so ordinary output remains legible.
+    if terminal.has_css_class("chat-live-terminal")
+        || terminal.has_css_class("chat-command-terminal")
+        || terminal.has_css_class("chat-output-terminal")
+    {
+        terminal.set_color_foreground(&RGBA::new(0.145, 0.204, 0.294, 1.0));
+        terminal.set_color_background(&RGBA::new(0.0, 0.0, 0.0, 0.0));
+        terminal.set_color_cursor(Some(&RGBA::new(0.325, 0.475, 0.82, 1.0)));
+    }
 }
 
 pub(crate) fn create_terminal(config: &Config) -> Terminal {

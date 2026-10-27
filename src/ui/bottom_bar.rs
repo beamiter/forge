@@ -142,7 +142,7 @@ impl UiState {
             title: &title,
             cwd: cwd.as_deref(),
             home: Some(home.as_path()),
-            mode: self.config.borrow().terminal_mode.as_str(),
+            mode: self.config.borrow().terminal_mode.presentation_label(),
             tab_index: index as usize,
             tab_count: self.notebook.n_pages() as usize,
             private,
@@ -201,6 +201,17 @@ impl UiState {
         let content = compose(&snapshot);
         if *self.bottom_bar_content.borrow() == content {
             return;
+        }
+        if self.window.has_css_class("reference-shell") {
+            self.bottom_bar.set_tooltip_text(Some(
+                &content
+                    .left
+                    .iter()
+                    .chain(content.right.iter())
+                    .map(|segment| segment.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+            ));
         }
         set_segments(&self.bottom_bar_left, &content.left);
         set_segments(&self.bottom_bar_right, &content.right);

@@ -15,6 +15,7 @@ fn settle() {
 #[ignore = "requires a GTK display"]
 fn chat_bubbles_keep_alignment_through_resize_and_font_changes() {
     gtk::init().expect("GTK display");
+    crate::ui::reference_shell::install_css();
     let mut config = crate::config::Config::safe_defaults();
     config.terminal_mode = crate::config::TerminalMode::Chat;
     super::install_block_css(&config);
@@ -52,13 +53,16 @@ fn chat_bubbles_keep_alignment_through_resize_and_font_changes() {
         .default_height(600)
         .child(&root)
         .build();
+    window.add_css_class("reference-shell");
+    window.add_css_class("forge-window");
     window.present();
     for width in [900, 420, 760] {
         window.set_default_size(width, 600);
         settle();
         assert!(
             window.width() <= width + 1,
-            "chat content must allow the requested window width"
+            "chat content must allow the requested window width: requested {width}, got {}",
+            window.width()
         );
         for card in &cards {
             card.refit_output_to_viewport();

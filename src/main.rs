@@ -603,11 +603,20 @@ pub fn run() -> glib::ExitCode {
             }
             return;
         }
-        let (config, themes, keybinding_map) = if launch.safe_mode {
+        let (mut config, themes, keybinding_map) = if launch.safe_mode {
             load_safe_config()
         } else {
             load_config()
         };
+        // The public workspace exposes Block (the continuous real terminal)
+        // and Chat. Retain internal legacy modes for managed/old sessions.
+        if !launch.safe_mode {
+            config.terminal_mode = config.terminal_mode.public_presentation();
+        }
+        config.sidebar_visible = true;
+        config.tab_placement = crate::config::TabPlacement::Sidebar;
+        config.sidebar_width = jterm_core::reference_shell::NAVIGATION_WIDTH as u32;
+        config.ai_panel_width = jterm_core::reference_shell::INSPECTOR_WIDTH as u32;
 
         // Cache shell selection once to avoid extra process probes per new tab.
         let shell_argv = Rc::new(RefCell::new(if launch.safe_mode {
@@ -621,8 +630,8 @@ pub fn run() -> glib::ExitCode {
         let available_themes = Rc::new(themes);
         let window = adw::ApplicationWindow::builder()
             .application(app)
-            .default_width(800)
-            .default_height(600)
+            .default_width(jterm_core::reference_shell::REFERENCE_WIDTH as i32)
+            .default_height(jterm_core::reference_shell::REFERENCE_HEIGHT as i32)
             .title("forge")
             .name("win_name")
             .modal(false)
@@ -827,10 +836,8 @@ pub fn run() -> glib::ExitCode {
         leading_actions.append(&toggle_placement_btn);
         leading_actions.append(&vim9_ide_btn);
         top_bar.add_overlay(&leading_actions);
-        top_bar.add_overlay(&top_tab_scroll);
         // Font zoom can exceed the compact minimum. Include tab text in the
         // bar's height while the scroller still clamps its minimum width.
-        top_bar.set_measure_overlay(&top_tab_scroll, true);
 
         // A compact, stateful counterpart to Ctrl+Alt+G. Its checked state
         // follows the lifetime of the approval-gated Shell Agent session;
@@ -1167,7 +1174,6 @@ pub fn run() -> glib::ExitCode {
         let sidebar_stack = gtk4::Stack::new();
         sidebar_stack.set_vexpand(true);
         sidebar_stack.add_named(&sidebar_tabs_page, Some("tabs"));
-        sidebar_stack.add_named(&file_tree_box, Some("files"));
 
         sidebar.append(&sidebar_switcher);
         sidebar.append(&sidebar_stack);
@@ -1178,8 +1184,10 @@ pub fn run() -> glib::ExitCode {
 
         // Content area: resizable sidebar | notebook (draggable divider).
         let right_col = gtk4::Box::new(Orientation::Vertical, 0);
+        right_col.add_css_class("reference-central");
         right_col.set_hexpand(true);
         right_col.set_vexpand(true);
+        right_col.append(&ui::reference_shell::center_header(&top_tab_scroll));
         right_col.append(&notebook);
         right_col.append(&search_bar);
 
@@ -1196,7 +1204,8 @@ pub fn run() -> glib::ExitCode {
         side_stack.add_css_class("forge-font-chrome");
         side_stack.add_named(&ai_panel_widget.root, Some("chats"));
         side_stack.add_named(&tasks_panel_widget.root, Some("tasks"));
-        side_stack.set_visible_child_name("chats");
+        side_stack.add_named(&file_tree_box, Some("files"));
+        let reference_inspector = ui::reference_shell::inspector(&side_stack);
         let ai_paned = gtk4::Paned::new(Orientation::Horizontal);
         ai_paned.set_vexpand(true);
         ai_paned.set_wide_handle(true);
@@ -1209,9 +1218,7 @@ pub fn run() -> glib::ExitCode {
             let config = config.borrow();
             config.ai_enabled && config.ai_panel_visible
         };
-        if ai_initially_visible {
-            ai_paned.set_end_child(Some(&side_stack));
-        }
+        ai_paned.set_end_child(Some(&reference_inspector));
 
         let content_box = gtk4::Paned::new(Orientation::Horizontal);
         content_box.set_vexpand(true);
@@ -1382,12 +1389,21 @@ pub fn run() -> glib::ExitCode {
             tab_connections: Rc::new(RefCell::new(HashMap::new())),
             ai_panel: ai_panel_widget.clone(),
             side_stack: side_stack.clone(),
+            reference_inspector: reference_inspector.clone(),
             tasks_panel: tasks_panel_widget.clone(),
             agent_tasks: Rc::new(RefCell::new(ui::AgentTaskDomain::new())),
             ai_paned: ai_paned.clone(),
             ai_panel_visible: Rc::new(Cell::new(ai_initially_visible)),
             ai_panel_width_restoring: Rc::new(Cell::new(false)),
         });
+
+        ui::reference_shell::install(
+            &ui, &main_box, &content_box, &top_bar, &top_bar_background,
+            &leading_actions, &trailing_actions, &command_palette_btn,
+            &toggle_sidebar_btn, &toggle_placement_btn, &vim9_ide_btn,
+            &add_tab_button, &sessions_button, &minimize_window_button,
+            &maximize_window_button, &close_window_button,
+        );
 
         *ui.unified_navigation_owner.borrow_mut() = Rc::downgrade(&ui);
         ui.observe_ascii_organism_motion();

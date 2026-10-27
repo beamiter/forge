@@ -4645,7 +4645,7 @@ impl UiState {
                         ),
                         (
                             "Terminal mode".to_string(),
-                            config.terminal_mode.as_str().to_string(),
+                            config.terminal_mode.presentation_label().to_string(),
                         ),
                         (
                             "Scrollback".to_string(),
@@ -4889,21 +4889,14 @@ impl UiState {
 
         let terminal_group = adw::PreferencesGroup::new();
         terminal_group.set_title(preferences_group_title("Terminal & Blocks").as_str());
-        let terminal_mode_model = gtk4::StringList::new(&[
-            "Block",
-            "VTE compatibility",
-            "Unified (experimental)",
-            "Chat",
-        ]);
+        let terminal_mode_model = gtk4::StringList::new(&["Block", "Chat"]);
         let terminal_mode_row = adw::ComboRow::builder()
-            .title("Terminal Backend")
+            .title("Terminal Presentation")
             .subtitle("Applies to new and restored local panes")
             .model(&terminal_mode_model)
             .selected(match config.terminal_mode {
-                crate::config::TerminalMode::Block => 0,
-                crate::config::TerminalMode::Vte => 1,
-                crate::config::TerminalMode::Unified => 2,
-                crate::config::TerminalMode::Chat => 3,
+                crate::config::TerminalMode::Chat => 1,
+                _ => 0,
             })
             .build();
         let safe_mode = std::env::var_os("FORGE_SAFE_MODE").is_some();
@@ -5206,10 +5199,8 @@ impl UiState {
         let ui = self.clone();
         terminal_mode_row.connect_selected_notify(move |row| {
             ui.config.borrow_mut().terminal_mode = match row.selected() {
-                0 => crate::config::TerminalMode::Block,
-                2 => crate::config::TerminalMode::Unified,
-                3 => crate::config::TerminalMode::Chat,
-                _ => crate::config::TerminalMode::Vte,
+                1 => crate::config::TerminalMode::Chat,
+                _ => crate::config::TerminalMode::Unified,
             };
             ui.persist_config();
         });

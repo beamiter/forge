@@ -2784,13 +2784,11 @@ impl TermView {
                     &block.output,
                     cols,
                 )
-                .saturating_add(
-                    if self.root.has_css_class("term-chat-root") && !block.is_background() {
-                        super::chat::COMMAND_GAP_PX
-                    } else {
-                        0
-                    },
-                );
+                .saturating_add(if self.root.has_css_class("term-chat-root") {
+                    super::chat::card_extra_height(block.is_background())
+                } else {
+                    0
+                });
             }
         }
 

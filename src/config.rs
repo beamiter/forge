@@ -34,6 +34,24 @@ pub enum TerminalMode {
 }
 
 impl TerminalMode {
+    /// Public Block uses the existing continuous native surface; private
+    /// compatibility variants remain readable in old sessions and configs.
+    pub(crate) fn public_presentation(&self) -> Self {
+        if matches!(self, Self::Chat) {
+            Self::Chat
+        } else {
+            Self::Unified
+        }
+    }
+
+    pub(crate) fn presentation_label(&self) -> &'static str {
+        if matches!(self, Self::Chat) {
+            "Chat"
+        } else {
+            "Block"
+        }
+    }
+
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
             TerminalMode::Block => "block",

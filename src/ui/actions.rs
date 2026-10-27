@@ -516,7 +516,7 @@ impl UiState {
                         // that this action will never touch, so silence reads
                         // as a broken menu item.
                         self.toast_overlay.add_toast(adw::Toast::new(
-                            "Unified mode keeps no blocks to clear — use the shell's own clear.",
+                            "This terminal keeps a continuous screen — use the shell's own clear.",
                         ));
                     }
                 }
@@ -699,7 +699,7 @@ impl UiState {
             self.side_stack
                 .set_visible_child_name(if tasks { "tasks" } else { "chats" });
             if self.ai_paned.end_child().is_none() {
-                self.ai_paned.set_end_child(Some(&self.side_stack));
+                self.ai_paned.set_end_child(Some(&self.reference_inspector));
                 // Attaching after both panels were closed loses the Paned
                 // position; reapply the configured share like the AI path
                 // does (the tasks panel has no width config of its own).
@@ -714,7 +714,17 @@ impl UiState {
                 });
             }
         } else {
-            self.ai_paned.set_end_child(None::<&gtk4::Widget>);
+            // Closing an optional feature returns to the neutral inspector;
+            // it does not remove the shared workspace's right-hand chrome.
+            if matches!(
+                self.side_stack.visible_child_name().as_deref(),
+                Some("tasks" | "chats")
+            ) {
+                self.side_stack.set_visible_child_name("overview");
+            }
+            if self.ai_paned.end_child().is_none() {
+                self.ai_paned.set_end_child(Some(&self.reference_inspector));
+            }
         }
     }
 
@@ -799,7 +809,7 @@ impl UiState {
         let Some(term_view) = self.current_term_view() else {
             log::debug!("AI: no active block-mode tab");
             self.show_ai_error(
-                "Ask selected Block requires an active Block-mode pane. Switch to Block mode and select a finished command.",
+                "This session has no recorded command selection. Select a finished command in a Block or Chat session.",
             );
             return;
         };

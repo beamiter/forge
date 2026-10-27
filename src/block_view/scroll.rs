@@ -80,6 +80,13 @@ pub(crate) struct ScrollDebouncer {
 }
 
 impl ScrollDebouncer {
+    pub(crate) fn reference_state(&self) -> serde_json::Value {
+        let motion = self.motion.borrow();
+        serde_json::json!({"reading":self.user_scrolled_up.get(),"programmatic":self.programmatic_scroll.get(),
+            "drive":format!("{:?}",self.drive.get()),"position":motion.position(),"target":motion.target(),
+            "animating":motion.is_animating(),"pin_active":self.bottom_pin_active.get(),"immediate_follow":self.immediate_follow.get()})
+    }
+
     pub(crate) fn with_scroll_lock(
         user_scrolled_up: Rc<Cell<bool>>,
         programmatic_scroll: Rc<Cell<bool>>,

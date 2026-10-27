@@ -1820,6 +1820,55 @@ fn repo_work_scope_matches(
         && same_checkout(pane_repo, pane_repo_cwd, pane_cwd)
 }
 
+/// Paint the shared reference reconstruction inside the existing presence owner.
+fn reference_organism_graphic() -> gtk4::DrawingArea {
+    let area = gtk4::DrawingArea::new();
+    area.set_content_width(jterm_core::reference_organism::SIZE as i32);
+    area.set_content_height(jterm_core::reference_organism::SIZE as i32);
+    area.set_can_target(false);
+    area.set_draw_func(|_, cr, width, height| {
+        use jterm_core::reference_organism::Command;
+        let _ = cr.save();
+        cr.scale(f64::from(width) / 64.0, f64::from(height) / 64.0);
+        cr.set_line_cap(gtk4::cairo::LineCap::Round);
+        cr.set_line_join(gtk4::cairo::LineJoin::Round);
+        for shape in jterm_core::reference_organism::SHAPES {
+            cr.new_path();
+            for command in shape.path {
+                match *command {
+                    Command::Move(x, y) => cr.move_to(x.into(), y.into()),
+                    Command::Line(x, y) => cr.line_to(x.into(), y.into()),
+                    Command::Cubic(a, b, c, d, e, f) => {
+                        cr.curve_to(a.into(), b.into(), c.into(), d.into(), e.into(), f.into())
+                    }
+                    Command::Close => cr.close_path(),
+                }
+            }
+            if let Some([r, g, b, a]) = shape.fill {
+                cr.set_source_rgba(
+                    f64::from(r) / 255.,
+                    f64::from(g) / 255.,
+                    f64::from(b) / 255.,
+                    f64::from(a) / 255.,
+                );
+                let _ = cr.fill_preserve();
+            }
+            if let Some([r, g, b, a]) = shape.stroke {
+                cr.set_source_rgba(
+                    f64::from(r) / 255.,
+                    f64::from(g) / 255.,
+                    f64::from(b) / 255.,
+                    f64::from(a) / 255.,
+                );
+                cr.set_line_width(shape.stroke_width.into());
+                let _ = cr.stroke();
+            }
+        }
+        let _ = cr.restore();
+    });
+    area
+}
+
 struct OrganismRuntime {
     organism: RefCell<NativeOrganism>,
     motion: Cell<OrganismMotion>,
@@ -1915,6 +1964,14 @@ struct OrganismRuntime {
     card: gtk4::Widget,
     sprite: Label,
     live_body: Label,
+    /// The existing unique owner mounts this one pass-through native surface.
+    /// A shared graphical asset can overlay the measured pose label here;
+    /// neither the presence ledger nor terminal input ownership changes.
+    live_surface: gtk4::Overlay,
+    live_speech: gtk4::Box,
+    live_speech_text: Label,
+    live_awake: Label,
+    live_graphic: gtk4::DrawingArea,
     sticky_avatar: Label,
     badge: Label,
     status: Label,
@@ -2038,6 +2095,53 @@ impl OrganismRuntime {
         live_body.set_can_target(false);
         live_body.set_focusable(false);
         live_body.set_accessible_role(gtk4::AccessibleRole::Presentation);
+        let live_surface = gtk4::Overlay::new();
+        live_surface.set_widget_name("organism-unique-graphic-surface");
+        live_surface.add_css_class("reference-organism-surface");
+        let visual = gtk4::Box::new(Orientation::Horizontal, 6);
+        let figure = gtk4::Box::new(Orientation::Vertical, 0);
+        let live_graphic = reference_organism_graphic();
+        figure.append(&live_graphic);
+        let live_awake = Label::new(Some("● Awake"));
+        live_awake.add_css_class("reference-organism-awake");
+        figure.append(&live_awake);
+        visual.append(&figure);
+        let live_speech = gtk4::Box::new(Orientation::Horizontal, 4);
+        live_speech.add_css_class("reference-organism-speech");
+        live_speech.set_valign(gtk4::Align::Start);
+        let live_speech_text = Label::new(None);
+        live_speech_text.set_wrap(true);
+        live_speech_text.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        live_speech_text.set_max_width_chars(18);
+        live_speech_text.set_xalign(0.0);
+        live_speech_text.set_accessible_role(gtk4::AccessibleRole::Status);
+        live_speech.append(&live_speech_text);
+        let dismiss = gtk4::Button::new();
+        dismiss.set_child(Some(&super::reference_shell::vector_icon(
+            jterm_core::reference_icons::Icon::Close,
+            10,
+        )));
+        dismiss.add_css_class("flat");
+        dismiss.add_css_class("reference-organism-dismiss");
+        dismiss.set_tooltip_text(Some("Dismiss companion speech"));
+        let speech = live_speech.downgrade();
+        dismiss.connect_clicked(move |_| {
+            if let Some(speech) = speech.upgrade() {
+                speech.set_visible(false);
+            }
+        });
+        live_speech.append(&dismiss);
+        live_speech.set_visible(false);
+        visual.append(&live_speech);
+        live_surface.set_child(Some(&visual));
+        // Retain reducer poses for semantic tests/accessibility without
+        // painting the legacy ASCII text over actual terminal cells.
+        live_body.set_opacity(0.0);
+        live_surface.add_overlay(&live_body);
+        live_surface.set_measure_overlay(&live_body, false);
+        live_surface.set_can_target(false);
+        live_surface.set_focusable(false);
+        live_surface.set_accessible_role(gtk4::AccessibleRole::Presentation);
 
         let sticky_avatar = Label::new(Some("/\\_/\\"));
         // Micro-poses are all five ASCII characters; pinning the width keeps
@@ -2128,6 +2232,11 @@ impl OrganismRuntime {
             card: outer.upcast(),
             sprite,
             live_body,
+            live_surface,
+            live_speech,
+            live_speech_text,
+            live_awake,
+            live_graphic,
             sticky_avatar,
             badge,
             status,
@@ -2142,6 +2251,8 @@ impl OrganismRuntime {
         if self.sleeping.replace(sleeping) == sleeping {
             return;
         }
+        self.live_awake
+            .set_text(if sleeping { "● Resting" } else { "● Awake" });
         if sleeping {
             self.activity.body_started_sleeping();
         } else {
@@ -2501,7 +2612,7 @@ impl OrganismRuntime {
         if !self.live_body.is_mapped() {
             return None;
         }
-        let bounds = self.live_body.compute_bounds(&view.widget())?;
+        let bounds = self.live_surface.compute_bounds(&view.widget())?;
         let (x, y, width, height) = (
             f64::from(bounds.x()),
             f64::from(bounds.y()),
@@ -2853,6 +2964,20 @@ impl OrganismRuntime {
         self.presented_surface.set(None);
         self.refresh_inline_sprite();
         self.refresh_growth_badge();
+        if let Some(speech) = reaction.speech {
+            self.live_speech_text.set_text(speech);
+            self.live_speech_text
+                .set_width_chars(speech.chars().count().clamp(3, 18) as i32);
+            let (pixels, _) = self
+                .live_speech_text
+                .create_pango_layout(Some(speech))
+                .pixel_size();
+            self.live_speech_text
+                .set_width_request(pixels.saturating_add(1).clamp(24, 180));
+            self.live_speech.set_visible(true);
+        } else {
+            self.live_speech.set_visible(false);
+        }
         let status = match reaction.speech {
             Some(speech) => format!("{speech}  {}", reaction.description),
             None => reaction.description.clone(),
@@ -3299,12 +3424,17 @@ impl OrganismRuntime {
         // GTK reports zero requisition for an explicitly invisible Label,
         // which would otherwise make a tiny initial allocation self-locking.
         self.live_body.set_visible(true);
-        let (_, body_width, _, _) = self.live_body.measure(Orientation::Horizontal, -1);
-        let (_, body_height, _, _) = self.live_body.measure(Orientation::Vertical, body_width);
+        self.live_graphic
+            .set_content_width(jterm_core::reference_organism::SIZE as i32);
+        self.live_graphic
+            .set_content_height(jterm_core::reference_organism::SIZE as i32);
+        self.live_awake.set_visible(true);
+        let (_, body_width, _, _) = self.live_surface.measure(Orientation::Horizontal, -1);
+        let (_, body_height, _, _) = self.live_surface.measure(Orientation::Vertical, body_width);
         // A size change can tighten the legal x/y band even when the terminal
         // itself did not resize. Snap before interpolating so a wider reaction
         // pose never spends intermediate frames inside the scrollbar gutter.
-        let mut surface = SurfaceBox {
+        let surface = SurfaceBox {
             width: metrics.width,
             height: metrics.height,
             right_gutter: metrics.right_gutter,
@@ -3325,26 +3455,8 @@ impl OrganismRuntime {
             self.territory.get(),
         );
         let full_fits = point.is_some();
-        if !full_fits {
-            // Reuse this exact label as a single-line body when the three-line
-            // pose cannot fit. Measure its actual font, growth and current pose;
-            // never reserve another row or guess a fixed pixel width.
-            let compact = sticky_glyph_with_context(context, sprite_frame);
-            self.live_body.set_text(compact.as_ref());
-            let (_, width, _, _) = self.live_body.measure(Orientation::Horizontal, -1);
-            let (_, height, _, _) = self.live_body.measure(Orientation::Vertical, width);
-            surface.body_width = width;
-            surface.body_height = height;
-            point = surface_point_for_territory(
-                surface,
-                mode,
-                tempo,
-                ambient,
-                vigil,
-                geometry_frame,
-                self.territory.get(),
-            );
-        }
+        // The shared 64px vector fails closed if its full actual footprint
+        // does not fit. A legacy hidden Label cannot authorize a smaller seat.
         let presentation = CompanionSurface::choose(
             self.enabled.get(),
             self.presence.is_owner(self.presence_token),
@@ -3402,7 +3514,13 @@ impl OrganismRuntime {
                     (x, y, (px, py) != (x, y))
                 }
             };
-            if view.move_live_organism_body(self.live_body.upcast_ref(), x, y) {
+            // Geometry alone is insufficient: old output can occupy a legal
+            // idle territory. Never cover real cells while moving or resting.
+            if !view.organism_body_rect_is_blank(x, y, surface.body_width, surface.body_height) {
+                self.hide_live_body(view);
+                return;
+            }
+            if view.move_live_organism_body(self.live_surface.upcast_ref(), x, y) {
                 self.body_in_transit.set(moved);
                 self.body_position.set(Some((x, y)));
                 view.set_live_organism_visible(true);
@@ -4161,7 +4279,7 @@ impl UiState {
                         && root.is_ancestor(&self.window)
                 }) =>
             {
-                inspector::present_capability(&self.window, "Traditional VTE shows a neutral companion. It has no confirmed command outcomes or live organism state to inspect. The offline pose gallery is available in Settings; Block and Unified modes support the living companion.");
+                inspector::present_capability(&self.window, "This session shows a neutral companion without confirmed command outcomes. The offline pose gallery is available in Settings; new Block and Chat sessions support the living companion.");
                 return;
             }
             _ => None,
@@ -4335,7 +4453,7 @@ impl UiState {
         // A single body lives on the active terminal surface. Status and
         // physiology remain available through Inspect companion.
         {
-            if !view.put_live_organism_body(runtime.live_body.upcast_ref(), 0.0, 0.0) {
+            if !view.put_live_organism_body(runtime.live_surface.upcast_ref(), 0.0, 0.0) {
                 log::warn!("could not attach ASCII organism to the live terminal surface");
             }
             if !view.put_sticky_organism_avatar(runtime.sticky_avatar.upcast_ref()) {
@@ -4949,6 +5067,33 @@ mod tests {
 
     #[test]
     #[ignore = "requires DISPLAY"]
+    fn companion_footprint_rejects_real_terminal_ink() {
+        use vte4::TerminalExt;
+        gtk4::init().expect("gtk4 display");
+        let view = crate::block_view::organism_settings_test_view();
+        let window = gtk4::Window::builder()
+            .default_width(640)
+            .default_height(480)
+            .child(&view.widget())
+            .build();
+        window.present();
+        for _ in 0..30 {
+            while gtk4::glib::MainContext::default().iteration(false) {}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        view.vte().feed(b"\x1b[2J\x1b[Hreal terminal output\r\n");
+        for _ in 0..20 {
+            while gtk4::glib::MainContext::default().iteration(false) {}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let row = view.vte().char_height().max(1) as i32;
+        assert!(!view.organism_body_rect_is_blank(0.0, 0.0, 100, row));
+        assert!(view.organism_body_rect_is_blank(0.0, f64::from(row * 4), 100, row * 2));
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
     fn one_companion_crosses_splits_without_cloning_its_body_or_mind() {
         gtk4::init().expect("gtk4 display");
         let presence = OrganismPresence::new();
@@ -4971,7 +5116,7 @@ mod tests {
                     false,
                 );
                 presence.bind(token, view, &runtime);
-                view.put_live_organism_body(runtime.live_body.upcast_ref(), 0.0, 0.0);
+                view.put_live_organism_body(runtime.live_surface.upcast_ref(), 0.0, 0.0);
                 view.put_sticky_organism_avatar(runtime.sticky_avatar.upcast_ref());
                 runtime
             })
@@ -5053,41 +5198,47 @@ mod tests {
                 runtimes[owner].last_human_input.set(None);
             }
         }
-        // Actual native font metrics force a compact fallback, then removing
-        // the style restores the full pose in the very same overlay label.
+        // A fixed 64px native graphic no longer depends on legacy Label
+        // fonts. Oversize its actual native request to test fail-closed safe
+        // placement, then restore the same owner without growing the pane.
         let owner = &runtimes[1];
         owner.surface_behavior.set(Behavior::Idle);
         owner.interrupt_ambient();
-        // Pango attributes override theme CSS deterministically. Find the
-        // actual native full/compact boundary rather than assuming a font's
-        // pixel size or the window manager's allocated viewport height.
-        let mut compact_bounds = None;
-        for pixels in 8..=256 {
-            let attributes = gtk4::pango::AttrList::new();
-            attributes.insert(gtk4::pango::AttrSize::new_size_absolute(
-                pixels * gtk4::pango::SCALE,
-            ));
-            owner.live_body.set_attributes(Some(&attributes));
-            owner.refresh_surface(&views[1], Instant::now());
-            if owner.body_position.get().is_some() && owner.live_body.text().lines().count() == 1 {
-                compact_bounds = Some(owner.surface_signature.get());
-                break;
-            }
-        }
-        let compact_bounds = compact_bounds
-            .expect("a measured compact glyph fits after the full pose outgrows its surface");
+        let pane_size = (views[1].widget().width(), views[1].widget().height());
+        owner.live_graphic.set_size_request(512, 512);
+        owner.refresh_surface(&views[1], Instant::now());
         settle();
-        assert!(owner.live_body.is_mapped());
-        assert_eq!(owner.live_body.text().lines().count(), 1);
-        owner.live_body.set_attributes(None);
+        assert_eq!(
+            owner.live_graphic.measure(Orientation::Horizontal, -1).0,
+            512
+        );
+        assert!(owner.live_surface.measure(Orientation::Vertical, 512).0 >= 512);
+        assert!(
+            owner.body_position.get().is_none(),
+            "oversize native surface must fail closed"
+        );
+        assert!(!owner.live_surface.is_mapped());
+        assert_eq!(
+            (views[1].widget().width(), views[1].widget().height()),
+            pane_size
+        );
+        let oversized_bounds = owner.surface_signature.get();
+        owner.live_graphic.set_size_request(-1, -1);
         owner.refresh_surface(&views[1], Instant::now());
         settle();
         assert!(owner.body_position.get().is_some());
-        assert!(
-            owner.live_body.text().lines().count() > 1,
-            "full pose restored on the same label"
+        assert!(owner.live_surface.is_mapped());
+        assert_eq!(owner.live_graphic.content_width(), 64);
+        assert_eq!(owner.live_graphic.content_height(), 64);
+        assert_eq!(
+            owner.live_graphic.measure(Orientation::Horizontal, -1).0,
+            64
         );
-        assert_ne!(owner.surface_signature.get(), compact_bounds);
+        assert_eq!(
+            (views[1].widget().width(), views[1].widget().height()),
+            pane_size
+        );
+        assert_ne!(owner.surface_signature.get(), oversized_bounds);
         presence.focus_view(None);
         for (runtime, view) in runtimes.iter().zip(&views) {
             assert!(!runtime.live_body.is_mapped());
@@ -5222,7 +5373,7 @@ mod tests {
         presence.bind(token, &view, &runtime);
         OrganismRuntime::install_map_observer(&runtime, &view);
         view.insert_inline_notice(&runtime.card);
-        view.put_live_organism_body(runtime.live_body.upcast_ref(), 0.0, 0.0);
+        view.put_live_organism_body(runtime.live_surface.upcast_ref(), 0.0, 0.0);
         view.put_sticky_organism_avatar(runtime.sticky_avatar.upcast_ref());
         let window = gtk4::Window::new();
         window.set_default_size(640, 480);
@@ -5883,7 +6034,7 @@ mod tests {
         // it: production attachment no longer mounts an organism card.
         runtime.card.set_visible(true);
         view.insert_inline_notice(&runtime.card);
-        view.put_live_organism_body(runtime.live_body.upcast_ref(), 0.0, 0.0);
+        view.put_live_organism_body(runtime.live_surface.upcast_ref(), 0.0, 0.0);
         view.put_sticky_organism_avatar(runtime.sticky_avatar.upcast_ref());
         let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         let entry = gtk4::Entry::new();

@@ -16,6 +16,7 @@ fn settle() {
 #[ignore = "requires an isolated GTK process and display"]
 fn fold_actions_update_visible_and_parked_geometry() {
     gtk::init().expect("GTK display");
+    crate::ui::reference_shell::install_css();
     for mode in [
         crate::config::TerminalMode::Block,
         crate::config::TerminalMode::Chat,
@@ -82,6 +83,8 @@ fn fold_actions_update_visible_and_parked_geometry() {
             .default_height(480)
             .build();
         window.set_child(Some(&view.root));
+        window.add_css_class("forge-window");
+        window.add_css_class("reference-shell");
         window.present();
         settle();
         view.scroll_debouncer.user_scrolled_up.set(true);
@@ -95,6 +98,25 @@ fn fold_actions_update_visible_and_parked_geometry() {
         );
         assert!(view.finished_blocks.borrow()[0].widget().height() > 1);
         assert!(view.finished_blocks.borrow()[31].widget().height_request() > 0);
+        let actual_role_height = if mode == crate::config::TerminalMode::Chat {
+            let cards = view.finished_blocks.borrow();
+            let role = cards[0]
+                .widget()
+                .first_child()
+                .unwrap()
+                .last_child()
+                .unwrap()
+                .first_child()
+                .unwrap();
+            assert!(role.has_css_class("reference-role-header"));
+            assert!(role.is_mapped(), "measure an actual visible native role");
+            let natural = role.measure(gtk::Orientation::Vertical, -1).1;
+            assert_eq!(role.height(), natural);
+            assert_eq!(natural, 16, "shared Shell role and icon height");
+            natural
+        } else {
+            0
+        };
         // A pane-filtered card remains absent from the document even when its
         // cached fold state changes for a later reveal.
         view.block_data.borrow_mut()[30].estimated_height = 0;
@@ -150,7 +172,7 @@ fn fold_actions_update_visible_and_parked_geometry() {
                 };
                 let expected = expected
                     + if mode == crate::config::TerminalMode::Chat {
-                        chat::COMMAND_GAP_PX
+                        actual_role_height + chat::COMMAND_GAP_PX
                     } else {
                         0
                     };
@@ -186,7 +208,7 @@ fn fold_actions_update_visible_and_parked_geometry() {
             };
             let expected = expected
                 + if mode == crate::config::TerminalMode::Chat {
-                    chat::COMMAND_GAP_PX
+                    actual_role_height + chat::COMMAND_GAP_PX
                 } else {
                     0
                 };

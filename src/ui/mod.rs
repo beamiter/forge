@@ -39,6 +39,8 @@ mod pane_node;
 mod pane_tree_edit;
 mod panes;
 pub(crate) mod path_drop;
+pub(crate) mod reference_conversation;
+pub(crate) mod reference_shell;
 mod remote_fs;
 mod search;
 mod search_preview;
@@ -493,6 +495,8 @@ pub(crate) struct UiState {
     /// it is the `ai_paned` end child while either panel is open, so both
     /// share the persisted width.
     pub(crate) side_stack: Stack,
+    /// Permanent native inspector chrome, independent of AI feature opt-in.
+    pub(crate) reference_inspector: gtk4::Box,
     /// Native Codex agent Tasks panel. Always built like the AI panel; the
     /// opt-in `agent_tasks_enabled` config flag gates its actions instead.
     pub(crate) tasks_panel: TasksPanel,

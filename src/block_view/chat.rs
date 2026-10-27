@@ -12,11 +12,16 @@ use std::rc::Rc;
 use vte4::Terminal;
 
 pub(super) const COMMAND_GAP_PX: i32 = 8;
+/// Native role icon sets the minimum height of every observed Shell header.
+pub(super) const SHELL_ROLE_HEIGHT_PX: i32 = 16;
+pub(super) const fn card_extra_height(is_background: bool) -> i32 {
+    SHELL_ROLE_HEIGHT_PX + if is_background { 0 } else { COMMAND_GAP_PX }
+}
 
 /// Reserve a compact home for the companion, growing for everything the real
 /// shell draws, including wrapped commands and completion menus.
 pub(super) fn composer_rows(input: i64, drawn: i64, viewport: i64) -> i64 {
-    input.max(drawn).clamp(4.min(viewport), viewport.max(1))
+    input.max(drawn).clamp(2.min(viewport), viewport.max(1))
 }
 
 pub(super) fn surface(state: BlockState, integrated: bool) -> ChatSurface {
@@ -353,21 +358,12 @@ impl ChatPresentation {
         composer_viewport.add_css_class("chat-composer-viewport");
         composer_viewport.set_child(Some(&composer));
         dock.append(&composer_viewport);
-        let controls = gtk4::Box::new(Orientation::Horizontal, 8);
-        controls.add_css_class("chat-controls");
-        let shell_icon = gtk4::Image::from_icon_name("utilities-terminal-symbolic");
-        shell_icon.add_css_class("chat-shell-icon");
-        shell_icon.set_pixel_size(14);
-        controls.append(&shell_icon);
-        let status = gtk4::Label::new(Some("Shell · Tab completes · ↑ history"));
-        status.add_css_class("chat-input-hint");
-        status.set_hexpand(true);
-        status.set_xalign(0.0);
-        status.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        status.set_width_chars(1);
-        status.set_tooltip_text(Some(status.text().as_str()));
-        status.set_accessible_role(gtk4::AccessibleRole::Status);
-        controls.append(&status);
+        let terminal = active.active_vte.downgrade();
+        let (controls, status) = crate::ui::reference_shell::composer_controls(move || {
+            if let Some(terminal) = terminal.upgrade() {
+                terminal.grab_focus();
+            }
+        });
         let stop = gtk4::Button::from_icon_name("process-stop-symbolic");
         stop.add_css_class("flat");
         stop.set_tooltip_text(Some(
@@ -382,6 +378,10 @@ impl ChatPresentation {
         stop.add_css_class("chat-command-control");
         controls.append(&stop);
         let submit = gtk4::Button::from_icon_name("go-up-symbolic");
+        submit.set_child(Some(&crate::ui::reference_shell::vector_icon(
+            jterm_core::reference_icons::Icon::Send,
+            16,
+        )));
         submit.add_css_class("chat-submit");
         submit.add_css_class("chat-command-control");
         submit.set_tooltip_text(Some("Send Enter immediately when idle. Finish or cancel text composition before using Send; if unavailable or using enhanced keys, use the keyboard"));
@@ -581,13 +581,12 @@ impl ChatPresentation {
         }
         if self.current.replace(surface) != surface {
             if let Some(status) = self.status.upgrade() {
-                status.set_text(if docked {
+                status.set_text(if docked { "Shell" } else { "Running" });
+                status.set_tooltip_text(Some(if docked {
                     "Shell · Tab completes · ↑ history"
                 } else {
                     "Running · input belongs to the process"
-                });
-                // Ellipsis keeps the controls compact, not the meaning hidden.
-                status.set_tooltip_text(Some(status.text().as_str()));
+                }));
             }
         }
         // Restore only after the destination is visible/mapped. Moving a
@@ -623,9 +622,10 @@ impl ChatPresentation {
         }
         if running {
             if let (Some(status), Some(seconds)) = (self.status.upgrade(), seconds) {
-                status.set_text(&format!(
+                status.set_text(&format!("Running · {seconds}s"));
+                status.set_tooltip_text(Some(&format!(
                     "Running · {seconds}s · input belongs to the process"
-                ));
+                )));
             }
         }
     }
@@ -1004,7 +1004,11 @@ mod tests {
             let status = chat.status.upgrade().unwrap();
             assert_eq!(
                 status.tooltip_text().as_deref(),
-                Some(status.text().as_str())
+                Some(if surface == ChatSurface::Prompt {
+                    "Shell · Tab completes · ↑ history"
+                } else {
+                    "Running · input belongs to the process"
+                })
             );
             assert_eq!(status.width_chars(), 1);
             if surface == ChatSurface::Prompt {

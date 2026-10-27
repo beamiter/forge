@@ -1678,7 +1678,9 @@ impl UiState {
         }
         let Some(current_leaf) = self.current_pane_leaf() else {
             self.agent_toggle.set_active(false);
-            self.show_ai_error("Agent mode requires an active Block pane.");
+            self.show_ai_error(
+                "Shell Agent requires a session that can display its inline conversation.",
+            );
             return;
         };
         if current_leaf.is_remote() {
@@ -1690,7 +1692,9 @@ impl UiState {
         }
         let Some(target) = current_leaf.block_view() else {
             self.agent_toggle.set_active(false);
-            self.show_ai_error("Agent mode requires an active Block pane.");
+            self.show_ai_error(
+                "Shell Agent requires a session that can display its inline conversation.",
+            );
             return;
         };
         // The session card *is* the Agent UI — transcript, proposals and the
@@ -1700,7 +1704,7 @@ impl UiState {
         if !target.supports_inline_notices() {
             self.agent_toggle.set_active(false);
             self.show_ai_error(
-                "Shell Agent runs as an inline card in the block conversation. Unified mode has a single continuous terminal surface with no place to mount one, so switch this pane to Block mode to use the Agent. AI Chat remains available.",
+                "This session cannot display the Shell Agent conversation card. Create a Block or Chat session, or use AI Chat in the inspector.",
             );
             return;
         }

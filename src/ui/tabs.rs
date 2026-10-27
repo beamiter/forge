@@ -188,6 +188,10 @@ impl UiState {
             break;
         }
         self.apply_tab_filter(self.tab_search_entry.text().as_str());
+        // New global context/tooltips share the existing title-privacy gate.
+        // Refresh synchronously when privacy changes, before another frame.
+        self.refresh_bottom_bar();
+        self.window.notify("title");
     }
 }
 

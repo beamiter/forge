@@ -87,7 +87,7 @@ Launch options:
                               Start in PATH (directory, or file with --ide)
   -e, --execute COMMAND ...   Run a command instead of the configured shell
       --ide                  Open the native Vim9 IDE for a directory or file
-      --mode block|chat|vte|unified
+      --mode block|chat
                               Override the terminal backend for this window
       --no-restore            Start a fresh workspace
       --safe-mode             Use isolated VTE defaults without restore or persistence
@@ -147,7 +147,7 @@ fn parse_mode(value: &str) -> Result<Mode, String> {
         "vte" => Ok(Mode::Vte),
         "unified" => Ok(Mode::Unified),
         _ => Err(format!(
-            "invalid terminal mode '{value}' (use block, chat, vte or unified)"
+            "invalid terminal presentation '{value}' (use block or chat)"
         )),
     }
 }
@@ -245,9 +245,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedArgs, St
                 let value = args
                     .get(index)
                     .and_then(|value| value.to_str())
-                    .ok_or_else(|| {
-                        "--mode requires 'block', 'chat', 'vte' or 'unified'".to_string()
-                    })?;
+                    .ok_or_else(|| "--mode requires 'block' or 'chat'".to_string())?;
                 parsed.launch.mode = Some(parse_mode(value)?);
             }
             "-e" | "--execute" | "--" => {

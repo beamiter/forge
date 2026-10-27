@@ -625,7 +625,7 @@ impl UiState {
         }
         let Some(target) = pane.block_view() else {
             self.show_ai_error(
-                "AI command suggestions require an active Block pane. Switch this pane to Block mode and try again.",
+                "This session cannot show inline command suggestions. Create a Block or Chat session and try again.",
             );
             return;
         };
@@ -634,7 +634,7 @@ impl UiState {
         // request and dropping its answer off-screen.
         if !target.supports_inline_notices() {
             self.show_ai_error(
-                "AI command suggestions are shown as an inline card in the block conversation, which unified mode has no place for. Switch this pane to Block mode and try again.",
+                "This session cannot display an inline suggestion card. Create a Block or Chat session, or use AI Chat in the inspector.",
             );
             return;
         }

@@ -1451,6 +1451,10 @@ fn fitted_output_rows_for_widget(
 ) -> i64 {
     let viewport_rows = vte
         .ancestor(gtk4::ScrolledWindow::static_type())
+        // Only the terminal canvas contains the live editor for which these
+        // rows are reserved. An inspector/preview scroller must not acquire a
+        // smaller cap merely because its first allocation has now completed.
+        .filter(|widget| widget.has_css_class("block-scroll"))
         .and_then(|widget| widget.downcast::<gtk4::ScrolledWindow>().ok())
         .and_then(|scroll| super::viewport_rows_for(vte, &scroll));
     fitted_output_rows_for_viewport(viewport_rows, fallback_rows, output_rows)
@@ -4009,14 +4013,18 @@ impl FinishedBlock {
         self.widget.add_css_class("chat-pair");
         // Independent chips read left to right; all spare width belongs before
         // the actions, keeping the collapse affordance at the trailing edge.
-        self.header_row.set_spacing(4);
+        self.header_row
+            .set_spacing(jterm_core::reference_shell::METADATA_GAP as i32);
         self.action_box.set_margin_start(0);
         let mut child = self.header_row.first_child();
         while let Some(widget) = child {
             if widget.has_css_class("block-review-button") {
                 widget.set_hexpand(false);
                 if let Some(button) = widget.downcast_ref::<gtk4::Button>() {
-                    let chips = gtk4::Box::new(Orientation::Horizontal, 4);
+                    let chips = gtk4::Box::new(
+                        Orientation::Horizontal,
+                        jterm_core::reference_shell::METADATA_GAP as i32,
+                    );
                     chips.add_css_class("chat-context");
                     for (text, detail) in self.context_segments.iter() {
                         let chip = gtk4::Label::new(Some(text));
@@ -4043,6 +4051,11 @@ impl FinishedBlock {
         result.add_css_class("chat-result");
         result.set_hexpand(true);
         result.set_overflow(gtk4::Overflow::Hidden);
+        result.append(&crate::ui::reference_conversation::role_header(
+            jterm_core::reference_conversation::Role::Shell,
+            "Shell",
+            None,
+        ));
         while let Some(child) = self.content.first_child() {
             self.content.remove(&child);
             result.append(&child);
@@ -4057,25 +4070,27 @@ impl FinishedBlock {
             super::chat::COMMAND_GAP_PX
         });
         self.command_vte.add_css_class("chat-command-terminal");
+        self.command_vte
+            .set_color_foreground(&gtk4::gdk::RGBA::new(0.145, 0.204, 0.294, 1.0));
         self.command_vte.set_hexpand(false);
         let cols = super::chat::command_columns(&self.cmd_text, self.command_vte.column_count());
-        super::command_row::fit(&command, &self.command_vte, cols);
+        super::command_row::fit(&command, &self.command_vte, cols, &self.cmd_text);
         let rows = output_visual_row_count(&self.cmd_text, cols).max(1);
         self.command_vte.set_size(cols, rows);
         self.command_vte
             .set_color_background(&RGBA::new(0.0, 0.0, 0.0, 0.0));
         self.output_vte.add_css_class("chat-output-terminal");
         self.output_vte
+            .set_color_foreground(&gtk4::gdk::RGBA::new(0.145, 0.204, 0.294, 1.0));
+        self.output_vte
             .set_color_background(&RGBA::new(0.0, 0.0, 0.0, 0.0));
         self.content.append(&command);
         self.content.append(&result);
-        if !self.is_background {
-            self.virtualized_height.set(
-                self.virtualized_height
-                    .get()
-                    .saturating_add(super::chat::COMMAND_GAP_PX),
-            );
-        }
+        self.virtualized_height.set(
+            self.virtualized_height
+                .get()
+                .saturating_add(super::chat::card_extra_height(self.is_background)),
+        );
     }
 
     /// Switch this card between the normal and compact densities in place and
@@ -4135,12 +4150,18 @@ impl FinishedBlock {
     /// Keep the parked widget and its saved placeholder in the same geometry
     /// as the document; visible cards converge to measured height after layout.
     pub(crate) fn set_placeholder_height(&self, height: i32) -> i32 {
-        let height = if self.widget.has_css_class("chat-pair") && !self.is_background {
-            height.saturating_add(super::chat::COMMAND_GAP_PX)
+        self.remember_allocated_height(self.presentation_height(height))
+    }
+
+    /// Translate an undecorated estimate exactly once at metadata boundaries.
+    /// Measured GTK allocations already include these rows and must not pass
+    /// through this conversion again.
+    pub(crate) fn presentation_height(&self, height: i32) -> i32 {
+        if self.widget.has_css_class("chat-pair") {
+            height.saturating_add(super::chat::card_extra_height(self.is_background))
         } else {
             height
-        };
-        self.remember_allocated_height(height)
+        }
     }
 
     /// Save a raw card height, already including Chat chrome when measured.
@@ -4250,8 +4271,8 @@ impl FinishedBlock {
             &self.output_vte,
         );
         (self.refit_output)().map(|height| {
-            if self.widget.has_css_class("chat-pair") && !self.is_background {
-                height.saturating_add(super::chat::COMMAND_GAP_PX)
+            if self.widget.has_css_class("chat-pair") {
+                height.saturating_add(super::chat::card_extra_height(self.is_background))
             } else {
                 height
             }
@@ -5448,7 +5469,8 @@ mod tests {
         let chips = review.child().unwrap().downcast::<gtk4::Box>().unwrap();
         assert!(chips.has_css_class("chat-context"));
         assert!(!chips.hexpands(), "metadata must not request extra width");
-        assert_eq!(block.header_row.spacing(), 4);
+        assert_eq!(block.header_row.spacing(), 6);
+        assert_eq!(chips.spacing(), 6);
         assert_eq!(block.action_box.margin_start(), 0);
         let mut chip = chips.first_child();
         let mut count = 0;
@@ -5468,12 +5490,47 @@ mod tests {
         assert!(review.is_sensitive());
         assert_eq!(
             block.virtualized_height.get(),
-            height + super::super::chat::COMMAND_GAP_PX
+            height + super::super::chat::card_extra_height(false)
         );
         block.set_chat_layout();
         assert_eq!(
             block.virtualized_height.get(),
-            height + super::super::chat::COMMAND_GAP_PX
+            height + super::super::chat::card_extra_height(false)
+        );
+        // Background shell output has no command bubble/gap, but its native
+        // Shell role is still present in both restored and parked estimates.
+        let background = FinishedBlock::new(
+            2,
+            "",
+            "",
+            None,
+            "background\r\n",
+            Some(0),
+            &crate::config::Config::safe_defaults(),
+            None,
+            None,
+            Some(&cwd),
+            80,
+        );
+        let undecorated = background.virtualized_height.get();
+        background.set_chat_layout();
+        assert_eq!(background.virtualized_height.get(), undecorated + 16);
+        assert_eq!(
+            background.presentation_height(undecorated),
+            undecorated + 16
+        );
+        assert_eq!(
+            background.set_placeholder_height(undecorated),
+            undecorated + 16
+        );
+        background.set_chat_layout();
+        assert_eq!(
+            background.set_virtualized_preserving_height(true),
+            undecorated + 16
+        );
+        assert_eq!(
+            background.set_virtualized_preserving_height(false),
+            undecorated + 16
         );
         let chat_height = block.set_compact(false);
         block.set_compact(true);
@@ -5519,19 +5576,87 @@ mod tests {
             .child(&root)
             .build();
         window.present();
+        let settle_phase = Cell::new(0u64);
         let settle = || {
-            for _ in 0..25 {
+            let phase = settle_phase.replace(settle_phase.get() + 1);
+            let clock = window.frame_clock().expect("mapped native frame clock");
+            let stable = Rc::new(Cell::new(0u32));
+            let last = Rc::new(RefCell::new(None::<serde_json::Value>));
+            let snapshots = Rc::new(RefCell::new(Vec::new()));
+            let captured = snapshots.clone();
+            let stable_frame = stable.clone();
+            let last_frame = last.clone();
+            let probe = block.clone();
+            let after = clock.connect_after_paint(move |_| {
+                let adj = probe.output_vte.vadjustment().map(|a| (a.lower(),a.upper(),a.page_size(),a.value()));
+                let geometry = serde_json::json!({
+                    "card":probe.widget.height(), "content":probe.content.height(),
+                    "header":probe.header_row.height(), "command":probe.command_vte.height(),
+                    "output":probe.output_vte.height(), "output_parent":probe.output_vte.parent().map(|w|w.height()),
+                    "summary":probe.collapsed_summary.height(), "collapsed":probe.is_collapsed(),
+                    "rows":probe.output_vte.row_count(), "cols":probe.output_vte.column_count(),
+                    "char_height":probe.output_vte.char_height(), "height_request":probe.output_vte.height_request(),
+                    "scrollback":probe.output_vte.scrollback_lines(), "adjustment":adj,
+                    "stamp":probe.render_stamp.get(), "revision":probe.render_stamp.revision(),
+                    "pending":probe.render_stamp.pending_revision()
+                });
+                let generation_settled = probe.render_stamp.pending_revision().is_none()
+                    && (!probe.output_vte.is_mapped() || probe.output_vte.scrollback_lines()==0);
+                let unchanged = last_frame.borrow().as_ref()==Some(&geometry);
+                stable_frame.set(if generation_settled && unchanged { stable_frame.get()+1 } else { 0 });
+                *last_frame.borrow_mut()=Some(geometry.clone());
+                captured.borrow_mut().push(geometry);
+            });
+            let redraw = block.widget.downgrade();
+            let updater = clock.connect_update(move |_| {
+                if let Some(widget) = redraw.upgrade() {
+                    widget.queue_draw();
+                }
+            });
+            clock.begin_updating();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while stable.get() < 8 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "current-generation native geometry must stabilize: {:?}",
+                    last.borrow()
+                );
                 while gtk4::glib::MainContext::default().iteration(false) {}
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            clock.end_updating();
+            clock.disconnect(after);
+            clock.disconnect(updater);
+            if let Some(path) = std::env::var_os("FORGE_FOLD_GEOMETRY") {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .unwrap();
+                writeln!(file,"{}",serde_json::json!({"phase":phase,"after_paint_frames":snapshots.borrow().len(),"snapshots":&*snapshots.borrow()})).unwrap();
             }
         };
         settle();
         let metadata_bounds = review.compute_bounds(&block.header_row).unwrap();
         let action_bounds = block.action_box.compute_bounds(&block.header_row).unwrap();
         assert!(
-            action_bounds.x() >= metadata_bounds.x() + metadata_bounds.width() + 4.0,
+            action_bounds.x() >= metadata_bounds.x() + metadata_bounds.width() + 6.0,
             "spare space belongs between metadata and the trailing actions"
         );
+        let mut previous_end: Option<f32> = None;
+        let mut chip = chips.first_child();
+        while let Some(widget) = chip {
+            let bounds = widget.compute_bounds(&chips).unwrap();
+            if let Some(end) = previous_end {
+                assert!(
+                    (bounds.x() - end - 6.0_f32).abs() <= 1.0,
+                    "metadata keeps a fixed six-pixel gap"
+                );
+            }
+            previous_end = Some(bounds.x() + bounds.width());
+            chip = widget.next_sibling();
+        }
         assert!(block.command_vte.is_mapped());
         assert!(block
             .command_vte

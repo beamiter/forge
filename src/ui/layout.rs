@@ -65,7 +65,7 @@ impl UiState {
         match view {
             SidebarView::Tabs => self.sidebar_stack.set_visible_child_name("tabs"),
             SidebarView::Files => {
-                self.sidebar_stack.set_visible_child_name("files");
+                self.side_stack.set_visible_child_name("files");
                 // Hosts may have been added/removed while the tree was hidden.
                 self.refresh_file_tree_location_selector();
             }
@@ -101,13 +101,9 @@ impl UiState {
 
     /// Flip the tab strip between the sidebar and the top bar, then persist.
     pub(crate) fn toggle_tab_placement(&self) {
-        let next = match self.tab_placement.get() {
-            TabPlacement::Sidebar => TabPlacement::TopBar,
-            TabPlacement::TopBar => TabPlacement::Sidebar,
-        };
-        self.tab_placement.set(next);
-        self.config.borrow_mut().tab_placement = next;
+        // The reference shell keeps its navigation in one stable location.
+        // Existing persisted placement values remain valid for restoration.
+        self.tab_placement.set(TabPlacement::Sidebar);
         self.apply_tab_placement();
-        self.persist_config();
     }
 }

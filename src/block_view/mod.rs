@@ -42,6 +42,12 @@ mod click_cursor;
 mod command_row;
 mod cross_selection;
 mod css;
+
+/// Reuse the existing bounded, sanitized HEAD cache for chrome context.
+pub(crate) fn reference_workspace_branch(cwd: &str) -> Option<String> {
+    css::git_branch_for(cwd)
+}
+
 mod export;
 mod find;
 mod fold_preview;
@@ -10035,8 +10041,8 @@ impl RenderBackend for BlockBackend {
             estimated_finished_block_height_for_rows(&config, cmd, estimator_rows, cols)
         };
         let estimated_height = estimated_height.saturating_add(
-            if self.block_list_rc.has_css_class("chat-transcript") && !record.is_background {
-                chat::COMMAND_GAP_PX
+            if self.block_list_rc.has_css_class("chat-transcript") {
+                chat::card_extra_height(record.is_background)
             } else {
                 0
             },
@@ -14353,6 +14359,7 @@ impl TermView {
         let input_feedback = input_feedback::InputFeedback::new(&active_vte);
         if chat_mode {
             active_vte.add_css_class("chat-live-terminal");
+            apply_terminal_theme(&active_vte, config);
         }
 
         // Unified mode: same widget tree, same live VTE, no block chrome. The
@@ -14384,6 +14391,11 @@ impl TermView {
             holder.add_css_class("block-fullscreen");
         }
 
+        if chat_mode && jterm_core::reference_conversation::fixture_enabled() {
+            block_list.append(&crate::ui::reference_conversation::conversation(
+                &jterm_core::reference_conversation::acceptance_fixture(),
+            ));
+        }
         block_list.append(active.borrow().widget());
 
         // The live VTE is visually compact at a prompt and expands to the full
@@ -14938,7 +14950,14 @@ impl TermView {
                                 _ => (visible_rows, next_high_water),
                             };
                             live_rows_high_water.set(next_high_water);
-                            visible_rows
+                            if chat_presentation.is_some()
+                                && prompt_at_grid_top
+                                && !live_force_full_for_layout.get()
+                            {
+                                next_high_water.clamp(1, viewport_rows.max(1))
+                            } else {
+                                visible_rows
+                            }
                         }
                         // A screen application and the no-integration fallback
                         // own the whole grid while they run.
@@ -15368,12 +15387,12 @@ impl TermView {
                                 active.upgrade().map_or(data.cols as i64, |active| {
                                     active.borrow().grid_cols() as i64
                                 });
-                            collapsed_aware_block_height(
+                            card.presentation_height(collapsed_aware_block_height(
                                 &config.borrow(),
                                 data,
                                 card.is_collapsed(),
                                 fallback_cols,
-                            )
+                            ))
                         } else {
                             0
                         };
@@ -17134,6 +17153,53 @@ impl TermView {
         self.active.borrow().set_live_organism_visible(visible);
     }
 
+    /// Reject a companion seat that contains terminal ink. This is a bounded
+    /// viewport read over the small proposed body rectangle, never a snapshot
+    /// of history or a mutation of the PTY. A one-cell guard absorbs native
+    /// terminal padding and fractional pixel rounding.
+    pub(crate) fn organism_body_rect_is_blank(
+        &self,
+        x: f64,
+        y: f64,
+        width: i32,
+        height: i32,
+    ) -> bool {
+        if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 || width <= 0 || height <= 0 {
+            return false;
+        }
+        let active = self.active.borrow();
+        let terminal = &active.active_vte;
+        if !terminal.is_mapped() || active.live_organism_alt_screen() {
+            return false;
+        }
+        let cell_width = terminal.char_width().max(1) as f64;
+        let cell_height = terminal.char_height().max(1) as f64;
+        let origin = gtk4::prelude::ScrollableExt::vadjustment(terminal)
+            .map(|adjustment| adjustment.value().floor() as i64)
+            .unwrap_or(0);
+        let first_col = ((x / cell_width).floor() as i64).saturating_sub(1).max(0);
+        let last_col = (((x + f64::from(width)) / cell_width).ceil() as i64 + 1)
+            .min(terminal.column_count().saturating_sub(1));
+        let first_row = ((y / cell_height).floor() as i64).saturating_sub(1).max(0);
+        let last_row = (((y + f64::from(height)) / cell_height).ceil() as i64 + 1)
+            .min(terminal.row_count().saturating_sub(1));
+        if last_col < first_col || last_row < first_row {
+            return false;
+        }
+        (first_row..=last_row).all(|row| {
+            terminal
+                .text_range_format(
+                    vte4::Format::Text,
+                    origin + row,
+                    first_col,
+                    origin + row,
+                    last_col,
+                )
+                .0
+                .is_some_and(|text| text.chars().all(char::is_whitespace))
+        })
+    }
+
     pub(crate) fn live_organism_surface_metrics(&self) -> LiveOrganismSurfaceMetrics {
         let active = self.active.borrow();
         let visible_height = active
@@ -18548,13 +18614,11 @@ impl TermView {
                     &block.output,
                     cols,
                 )
-                .saturating_add(
-                    if self.root.has_css_class("term-chat-root") && !block.is_background() {
-                        chat::COMMAND_GAP_PX
-                    } else {
-                        0
-                    },
-                );
+                .saturating_add(if self.root.has_css_class("term-chat-root") {
+                    chat::card_extra_height(block.is_background())
+                } else {
+                    0
+                });
                 mutate_block_data_and_redraw(
                     &self.block_data,
                     self.failure_marker_redraw.as_ref(),
@@ -18712,13 +18776,11 @@ impl TermView {
                     &block.output,
                     cols,
                 )
-                .saturating_add(
-                    if self.root.has_css_class("term-chat-root") && !block.is_background() {
-                        chat::COMMAND_GAP_PX
-                    } else {
-                        0
-                    },
-                );
+                .saturating_add(if self.root.has_css_class("term-chat-root") {
+                    chat::card_extra_height(block.is_background())
+                } else {
+                    0
+                });
             }
         }
 
@@ -18932,7 +18994,12 @@ impl TermView {
                 continue;
             };
             data.estimated_height = if kept {
-                collapsed_aware_block_height(&config, data, card.is_collapsed(), fallback_cols)
+                card.presentation_height(collapsed_aware_block_height(
+                    &config,
+                    data,
+                    card.is_collapsed(),
+                    fallback_cols,
+                ))
             } else {
                 0
             };
@@ -19103,6 +19170,34 @@ impl TermView {
         // this configuration cost one display-wide swap between them, not one
         // each.
         install_block_css(&self.config.borrow());
+    }
+
+    /// Read-only acceptance telemetry. It never reconciles the index, moves
+    /// an adjustment, changes follow intent, or acquires terminal input.
+    pub(crate) fn reference_viewport_state(&self) -> serde_json::Value {
+        let adjustment = self.block_scroll.vadjustment();
+        let index = self.block_document_index.borrow();
+        let data = self.block_data.borrow();
+        let anchor = index.card_at_document_y(adjustment.value().floor() as i64).and_then(|item| {
+            let record = data.get(item)?;
+            let mut node = item;
+            let mut prefix = 0i64;
+            while node > 0 { prefix += index.tree[node]; node -= lowest_set_bit(node); }
+            Some(serde_json::json!({"record_id":record.id,"offset":adjustment.value()-prefix as f64}))
+        });
+        let finished = self.finished_blocks.borrow();
+        let mut visible: Vec<_> = self.visible_indices.borrow().iter().copied().collect();
+        visible.sort_unstable();
+        let outputs: Vec<_> = visible.into_iter().filter_map(|item| finished.get(item)).filter(|card| card.output_vte.is_mapped()).map(|card| {
+            let adjustment = card.output_vte.vadjustment();
+            serde_json::json!({"id":card.id,"adjustment":adjustment.map(|a|(a.lower(),a.value(),a.upper(),a.page_size()))})
+        }).collect();
+        serde_json::json!({"frame_time":self.root.frame_clock().map(|clock|clock.frame_time()),
+            "adjustment":[adjustment.lower(),adjustment.value(),adjustment.upper(),adjustment.page_size()],
+            "reading_anchor":anchor,"index_stale":index.stale,"outputs":outputs,
+            "follow":self.scroll_debouncer.reference_state(),"terminal_has_focus":self.active_vte.has_focus(),
+            "prompt_status":format!("{:?}",self.command_prompt_status()),
+            "native_focus_reveal":self.block_scroll.child().and_downcast::<gtk4::Viewport>().map(|viewport|viewport.is_scroll_to_focus())})
     }
 
     /// Update virtual scrolling viewport state based on scroll position.
@@ -32306,12 +32401,15 @@ mod tests {
         use gtk4::prelude::*;
         use vte4::TerminalExt;
         gtk4::init().unwrap();
+        crate::ui::reference_shell::install_css();
         let view = chat_display_view(crate::config::TerminalMode::Chat);
         let window = gtk4::Window::builder()
             .default_width(640)
             .default_height(560)
             .child(&view.root)
             .build();
+        window.add_css_class("forge-window");
+        window.add_css_class("reference-shell");
         window.present();
         chat_display_settle();
         let clip = view.active.borrow().live_clip();

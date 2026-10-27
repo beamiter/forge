@@ -16,7 +16,7 @@ _forge()
             return
             ;;
         --mode)
-            COMPREPLY=($(compgen -W "block chat vte unified" -- "${current}"))
+            COMPREPLY=($(compgen -W "block chat" -- "${current}"))
             return
             ;;
         --shell-integration|--generate-completion|--completion)
@@ -32,7 +32,7 @@ _forge()
     case "${current}" in
         --mode=*)
             local value="${current#*=}"
-            COMPREPLY=($(compgen -W "block chat vte unified" -- "${value}"))
+            COMPREPLY=($(compgen -W "block chat" -- "${value}"))
             COMPREPLY=("${COMPREPLY[@]/#/--mode=}")
             return
             ;;
