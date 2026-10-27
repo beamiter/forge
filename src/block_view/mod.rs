@@ -53,6 +53,7 @@ mod paste_feedback;
 mod prepared_search;
 mod review;
 mod scroll;
+mod scroll_transfer;
 pub(crate) mod search_preview;
 mod selection_folding;
 mod selection_hold;
@@ -12157,7 +12158,14 @@ impl BlockDocumentIndex {
 
     fn viewport_state(&self, visible_top: i32, visible_bottom: i32) -> ViewportState {
         let total = self.total();
-        let first_visible = self.card_at_document_y(i64::from(visible_top)).unwrap_or(0);
+        if visible_bottom <= visible_top || visible_bottom <= 0 {
+            return ViewportState::empty();
+        }
+        let Some(first_visible) = self.card_at_document_y(i64::from(visible_top)) else {
+            // The live surface follows finished history in the same scroller.
+            // A viewport wholly inside it must not remap the history prefix.
+            return ViewportState::empty();
+        };
         // The last card whose top edge is still above the window's bottom is
         // the one owning the last pixel either the window or the document has,
         // whichever runs out first.
@@ -12204,6 +12212,9 @@ fn compute_viewport_state(
     visible_top: i32,
     visible_bottom: i32,
 ) -> ViewportState {
+    if visible_bottom <= visible_top || visible_bottom <= 0 {
+        return ViewportState::empty();
+    }
     let mut y = 0_i64;
     let mut first = None;
     let mut last = 0;
@@ -12226,9 +12237,12 @@ fn compute_viewport_state(
         }
     }
 
-    ViewportState {
-        first_visible: first.unwrap_or(0),
-        last_visible: last,
+    match first {
+        Some(first_visible) if first_visible <= last => ViewportState {
+            first_visible,
+            last_visible: last,
+        },
+        _ => ViewportState::empty(),
     }
 }
 
@@ -12327,7 +12341,10 @@ fn viewport_page_size_changed(last_page_size: &Cell<Option<f64>>, page_size: f64
 
 fn visible_indices_for_viewport(vp: &ViewportState) -> std::collections::HashSet<usize> {
     let mut new_visible = std::collections::HashSet::new();
-    for i in vp.first_visible..=vp.last_visible.min(vp.first_visible + 1000) {
+    if vp.is_empty() {
+        return new_visible;
+    }
+    for i in vp.first_visible..=vp.last_visible.min(vp.first_visible.saturating_add(1000)) {
         new_visible.insert(i);
     }
     new_visible
@@ -16513,6 +16530,7 @@ impl TermView {
                 scroll_debouncer.watch_gesture(&scroll_ctrl, &block_scroll);
             }
             scroll_ctrl.connect_scroll(move |controller, _dx, dy| {
+                let mut remaining = dy;
                 let surface_unit = scroll_unit_is_surface(controller);
                 let fullscreen = fullscreen_for_scroll.get();
                 if wheel_accumulator_screen.replace(fullscreen) != fullscreen {
@@ -16613,12 +16631,13 @@ impl TermView {
                 ) {
                     if let Some(vte) = vte_for_scroll.upgrade() {
                         if let Some(adj) = vte.vadjustment() {
-                            if scroll_adjustment_by_input(
+                            remaining = scroll_adjustment_by_input(
                                 &adj,
                                 dy,
                                 surface_unit,
                                 vte.char_height() as f64,
-                            ) {
+                            );
+                            if remaining == 0.0 {
                                 return glib::Propagation::Stop;
                             }
                         }
@@ -16631,7 +16650,7 @@ impl TermView {
                 let Some(outer) = outer_for_scroll.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
-                debouncer_for_scroll.scroll_wheel(&outer, dy, surface_unit);
+                debouncer_for_scroll.scroll_wheel(&outer, remaining, surface_unit);
                 glib::Propagation::Stop
             });
             active_vte.add_controller(scroll_ctrl);
@@ -16651,14 +16670,16 @@ impl TermView {
                 scroll_debouncer.watch_gesture(&scrollbar_scroll, &block_scroll);
             }
             scrollbar_scroll.connect_scroll(move |controller, _dx, dy| {
+                let mut remaining = dy;
                 if let Some(vte) = vte_for_scrollbar.upgrade() {
                     if let Some(adj) = vte.vadjustment() {
-                        if scroll_adjustment_by_input(
+                        remaining = scroll_adjustment_by_input(
                             &adj,
                             dy,
                             scroll_unit_is_surface(controller),
                             vte.char_height() as f64,
-                        ) {
+                        );
+                        if remaining == 0.0 {
                             return glib::Propagation::Stop;
                         }
                     }
@@ -16668,7 +16689,7 @@ impl TermView {
                 };
                 debouncer_for_scrollbar.scroll_wheel(
                     &outer,
-                    dy,
+                    remaining,
                     scroll_unit_is_surface(controller),
                 );
                 glib::Propagation::Stop
@@ -26923,6 +26944,78 @@ mod tests {
         assert_eq!(vp.first_visible, 2);
         assert_eq!(vp.last_visible, 3);
         assert_eq!(visible_indices_for_viewport(&vp), HashSet::from([2, 3]));
+    }
+
+    #[test]
+    fn live_output_viewport_does_not_remap_finished_history() {
+        let blocks: VecDeque<BlockData> = std::iter::repeat_n(20, 2_000)
+            .map(block_with_height)
+            .collect();
+        let index = document_index_of(&blocks);
+        for top in [40_000.0, 40_001.0, 400_000.0] {
+            let viewport = viewport_state_for_scroll(&index, top, 600.0, 0)
+                .expect("live-output viewport is valid, not transient tab geometry");
+            assert!(viewport.is_empty(), "no finished card intersects top={top}");
+            assert!(visible_indices_for_viewport(&viewport).is_empty());
+        }
+        let edge = viewport_state_for_scroll(&index, 39_999.0, 600.0, 0).unwrap();
+        assert_eq!(visible_indices_for_viewport(&edge), HashSet::from([1_999]));
+    }
+
+    #[test]
+    fn empty_history_has_no_phantom_visible_card() {
+        let blocks = VecDeque::new();
+        let index = document_index_of(&blocks);
+        let viewport = viewport_state_for_scroll(&index, 0.0, 600.0, 1).unwrap();
+        assert!(viewport.is_empty());
+        assert!(visible_indices_for_viewport(&viewport).is_empty());
+        assert!(viewport_state_for_scroll(&index, 0.0, 0.0, 1).is_none());
+    }
+
+    #[test]
+    fn live_output_hysteresis_keeps_only_the_intersecting_tail() {
+        let blocks: VecDeque<BlockData> =
+            std::iter::repeat_n(20, 10).map(block_with_height).collect();
+        let index = document_index_of(&blocks);
+        let (strict, loose) = viewport_state_pair_for_scroll(&index, 210.0, 20.0, 0, 1).unwrap();
+        assert!(strict.is_empty());
+        assert_eq!(visible_indices_for_viewport(&loose), HashSet::from([9]));
+        assert_eq!(
+            stable_visible_indices(&strict, Some(&loose), &HashSet::from([0, 8, 9])),
+            HashSet::from([9])
+        );
+        assert!(stable_visible_indices(&strict, Some(&loose), &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn all_filtered_history_has_no_visible_range() {
+        let blocks: VecDeque<BlockData> = std::iter::repeat_n(0, 2_000)
+            .map(block_with_height)
+            .collect();
+        let index = document_index_of(&blocks);
+        let viewport = viewport_state_for_scroll(&index, 0.0, 600.0, 1).unwrap();
+        assert!(viewport.is_empty());
+        assert!(visible_indices_for_viewport(&viewport).is_empty());
+    }
+
+    #[test]
+    fn entering_live_output_keeps_parked_history_parked() {
+        let cards: Vec<FakeCard> = (0..2_000).map(|_| FakeCard::virtualized(20)).collect();
+        let mut blocks: VecDeque<BlockData> = std::iter::repeat_n(20, 2_000)
+            .map(block_with_height)
+            .collect();
+        let mut index = document_index_of(&blocks);
+        let mut visible = HashSet::new();
+        let viewport = viewport_state_for_scroll(&index, 45_000.0, 600.0, 1).unwrap();
+        let next = visible_indices_for_viewport(&viewport);
+        super::apply_visible_indices(&cards, &mut blocks, &mut index, &mut visible, next);
+        assert!(visible.is_empty());
+        assert!(cards.iter().all(FakeCard::is_virtualized));
+        assert_eq!(
+            index.total(),
+            40_000,
+            "parking must preserve document height"
+        );
     }
 
     #[test]
