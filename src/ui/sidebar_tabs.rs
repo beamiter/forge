@@ -18,6 +18,17 @@ use gtk4::{Label, Orientation, ToggleButton};
 
 use super::*;
 
+/// Keep a narrow sidebar anchored at x=0. GtkPaned clips an undersized start
+/// child from its leading edge; inactive Files controls need no Tabs width.
+pub(crate) fn configure_layout(stack: &gtk4::Stack, split: &gtk4::Paned) {
+    stack.set_hhomogeneous(false);
+    split.set_shrink_start_child(false);
+}
+
+#[cfg(test)]
+#[path = "sidebar_layout_tests.rs"]
+mod layout_tests;
+
 /// What the mirror needs to know about one strip button.
 struct MirrorRow {
     /// Notebook page widget name (`tab-N`) — the identity every tab operation

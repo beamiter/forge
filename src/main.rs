@@ -1220,7 +1220,7 @@ pub fn run() -> glib::ExitCode {
         content_box.set_end_child(Some(&ai_paned));
         content_box.set_resize_start_child(false);
         content_box.set_resize_end_child(true);
-        content_box.set_shrink_start_child(true);
+        ui::configure_sidebar_layout(&sidebar_stack, &content_box);
         content_box.set_shrink_end_child(true);
         content_box.set_position(config.borrow().sidebar_width as i32);
         let sidebar_last_width = Rc::new(Cell::new(config.borrow().sidebar_width));

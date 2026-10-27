@@ -759,6 +759,7 @@ pub(crate) struct FinishedBlock {
     pub(crate) copy_output_btn: gtk4::Button,
     pub(crate) rerun_btn: gtk4::Button,
     pub(crate) header_row: gtk4::Box,
+    context_segments: Rc<Vec<(String, String)>>,
     pub(super) more_btn: gtk4::Button,
     pub(crate) action_box: gtk4::Box,
     /// Keyboard affordances shown only while this block is selected.
@@ -860,6 +861,7 @@ impl Clone for FinishedBlock {
             copy_output_btn: self.copy_output_btn.clone(),
             rerun_btn: self.rerun_btn.clone(),
             header_row: self.header_row.clone(),
+            context_segments: self.context_segments.clone(),
             more_btn: self.more_btn.clone(),
             action_box: self.action_box.clone(),
             selection_hint: self.selection_hint.clone(),
@@ -1845,6 +1847,12 @@ fn finished_snapshot_stream(display_text: &str) -> Vec<u8> {
     stream
 }
 
+fn hide_chat_snapshot_cursor(vte: &vte4::Terminal) {
+    if vte.has_css_class("chat-command-terminal") || vte.has_css_class("chat-output-terminal") {
+        vte.feed(b"\x1b[?25l");
+    }
+}
+
 /// Render a finished snapshot with enough temporary capture capacity for VTE's
 /// real terminal semantics. The post-feed settle pass expands short/full-height
 /// blocks to the actual retained buffer span, covering ANSI cursor movement,
@@ -2022,6 +2030,7 @@ pub(crate) fn render_bytes_into_finished_vte(
     vte.set_size(cols, visible_rows);
     vte.set_scrollback_lines(scrollback);
     vte.feed(&finished_snapshot_stream(display_text));
+    hide_chat_snapshot_cursor(vte);
     render_state.mark_feed_pending();
     #[cfg(test)]
     super::alt_screen::trace_find_render("render-after-queued-feed", vte);
@@ -2772,6 +2781,7 @@ impl FinishedBlock {
         let cmd_rows = cmd_bytes.iter().filter(|&&b| b == b'\n').count() as i64 + 1;
         let command_vte =
             create_finished_terminal(config, cols, cmd_rows.max(1), cmd_rows.max(1), false);
+        let command_render_cols = Rc::new(Cell::new(0_i64));
         // Defer feeds until the widget is actually mapped — VTE's internal
         // grid resize from set_size() doesn't take effect until the widget is
         // realized, so feeding immediately wraps content at a smaller default
@@ -2782,6 +2792,7 @@ impl FinishedBlock {
             let cmd_bytes_for_map = cmd_bytes.clone();
             let cols_for_map = cols.max(1);
             let cmd_rows_for_map = cmd_rows.max(1);
+            let command_render_cols = command_render_cols.clone();
             let fed = Cell::new(false);
             command_vte.connect_map(move |w| {
                 if fed.get() {
@@ -2792,17 +2803,23 @@ impl FinishedBlock {
                 // onto more rows; size the grid and the pixel request for the
                 // wrapped count or the settle pass fights the allocation.
                 let eff_cols = effective_render_cols(w, cols_for_map);
+                command_render_cols.set(eff_cols);
                 let requested_cmd_rows = if eff_cols < cols_for_map {
                     output_visual_row_count(&String::from_utf8_lossy(&cmd_bytes_for_map), eff_cols)
                         .max(cmd_rows_for_map)
                 } else {
                     cmd_rows_for_map
                 };
-                let (eff_cols, cmd_rows_for_map, _) =
-                    bounded_finished_vte_geometry(eff_cols, requested_cmd_rows, 0);
+                let (eff_cols, cmd_rows_for_map, scrollback) =
+                    bounded_finished_vte_geometry(eff_cols, requested_cmd_rows, 64);
                 w.set_size(eff_cols, cmd_rows_for_map);
-                w.set_scrollback_lines(0);
-                w.feed(&cmd_bytes_for_map);
+                // Keep a recovery ring while the first native allocation
+                // settles; the tail-gated fit retires it after the full feed.
+                w.set_scrollback_lines(scrollback);
+                w.feed(&finished_snapshot_stream(&String::from_utf8_lossy(
+                    &cmd_bytes_for_map,
+                )));
+                hide_chat_snapshot_cursor(w);
                 let tail = snapshot_settle_tail(&String::from_utf8_lossy(&cmd_bytes_for_map));
                 settle_finished_terminal_after_feed(w, tail.as_deref());
                 let ch = w.char_height() as i32;
@@ -3046,6 +3063,9 @@ impl FinishedBlock {
         // the pane's geometry left this block's cap unchanged.
         let refit_output: Rc<dyn Fn() -> Option<i32>> = {
             let output_vte = output_vte.downgrade();
+            let command_vte = command_vte.downgrade();
+            let command_bytes = cmd_bytes.clone();
+            let command_render_cols = command_render_cols.clone();
             let full_for_refit = full_output.clone();
             let displayed_for_refit = displayed_output.clone();
             let current_cap_for_refit = current_viewport_cap.clone();
@@ -3071,6 +3091,33 @@ impl FinishedBlock {
                 // fits them against the current pane when they come back.
                 if !output_vte.is_mapped() {
                     return None;
+                }
+                // Chat gives commands their own width. Resize that snapshot
+                // using its actual columns, independently of the wide output.
+                let chat_command = command_vte
+                    .upgrade()
+                    .filter(|vte| vte.has_css_class("chat-command-terminal") && vte.is_mapped());
+                let command_cols = chat_command
+                    .as_ref()
+                    .map(|vte| effective_render_cols(vte, cols_for_refit));
+                let command_changed =
+                    command_cols.is_some_and(|cols| command_render_cols.get() != cols);
+                if let (Some(vte), Some(cols)) = (&chat_command, command_cols) {
+                    let rows = output_visual_row_count(&cmd_for_refit, cols).max(cmd_rows);
+                    let (cols, rows, scrollback) = bounded_finished_vte_geometry(cols, rows, 64);
+                    if command_changed {
+                        command_render_cols.set(cols);
+                        vte.reset(true, true);
+                        vte.set_size(cols, rows);
+                        vte.set_scrollback_lines(scrollback);
+                        vte.feed(&finished_snapshot_stream(&String::from_utf8_lossy(
+                            &command_bytes,
+                        )));
+                        hide_chat_snapshot_cursor(vte);
+                        let tail = snapshot_settle_tail(&String::from_utf8_lossy(&command_bytes));
+                        settle_finished_terminal_after_feed(vte, tail.as_deref());
+                    }
+                    vte.set_height_request(finished_vte_height_px(rows, vte.char_height() as i32));
                 }
                 let full = full_for_refit.borrow();
                 let displayed = displayed_for_refit.borrow();
@@ -3104,7 +3151,7 @@ impl FinishedBlock {
                     &format!("output-refit stamp={previous_stamp:?} -> {stamp:?}"),
                     &output_vte,
                 );
-                if previous_stamp == stamp {
+                if previous_stamp == stamp && !command_changed {
                     return None;
                 }
                 let (_, visible_rows, _) =
@@ -3124,7 +3171,7 @@ impl FinishedBlock {
                         fit_to_content,
                         &stamp_for_refit,
                     );
-                } else {
+                } else if previous_stamp != stamp {
                     let settle_tail = snapshot_settle_tail(output_display_text(text));
                     rewindow_finished_vte(
                         &output_vte,
@@ -3143,7 +3190,7 @@ impl FinishedBlock {
                 let command_rows = if is_background {
                     0
                 } else {
-                    output_visual_row_count(&cmd_for_refit, eff_cols).max(1)
+                    output_visual_row_count(&cmd_for_refit, command_cols.unwrap_or(eff_cols)).max(1)
                 };
                 Some(finished_block_height_for_rows(
                     cell_height,
@@ -3155,7 +3202,7 @@ impl FinishedBlock {
         };
 
         // Command row: Warp-style accent prompt chevron + the command VTE.
-        let cmd_row = gtk4::Box::new(Orientation::Horizontal, 0);
+        let cmd_row = super::command_row::CommandRow::new();
         let chevron = gtk4::Label::new(Some("\u{276f}")); // ❯
         chevron.add_css_class("block-prompt-chevron");
         chevron.set_valign(gtk4::Align::Start);
@@ -3381,7 +3428,7 @@ impl FinishedBlock {
                 glib::WeakRef<gtk4::SearchEntry>,
                 Rc<dyn Fn()>,
             );
-            type FilterRowBuilder = dyn Fn(&gtk4::Box, &gtk4::Box) -> Option<FilterRowHandles>;
+            type FilterRowBuilder = dyn Fn(&gtk4::Box, &gtk4::Widget) -> Option<FilterRowHandles>;
             let output_vte = output_vte.downgrade();
             let expand_btn = expand_btn.downgrade();
             let filter_btn_weak = filter_btn.downgrade();
@@ -3400,7 +3447,7 @@ impl FinishedBlock {
                 let render_stamp = render_stamp.clone();
                 let displayed_generation = displayed_generation.clone();
                 let visual_rows_cache = visual_rows_cache.clone();
-                Rc::new(move |content: &gtk4::Box, cmd_row: &gtk4::Box| {
+                Rc::new(move |content: &gtk4::Box, cmd_row: &gtk4::Widget| {
                     let filter_row = gtk4::Box::new(Orientation::Horizontal, 4);
                     filter_row.add_css_class("block-filter-row");
                     filter_row.set_visible(false);
@@ -3763,7 +3810,16 @@ impl FinishedBlock {
                     return;
                 };
                 if built.borrow().is_none() {
-                    let handles = build_filter_row(&content, &cmd_row);
+                    let result = cmd_row
+                        .next_sibling()
+                        .and_downcast::<gtk4::Box>()
+                        .filter(|row| row.has_css_class("chat-result"));
+                    let parent = result.as_ref().unwrap_or(&content);
+                    let anchor = result
+                        .as_ref()
+                        .and_then(|row| row.first_child())
+                        .unwrap_or_else(|| cmd_row.clone().upcast::<gtk4::Widget>());
+                    let handles = build_filter_row(parent, &anchor);
                     *built.borrow_mut() = handles;
                 }
                 let built = built.borrow();
@@ -3813,6 +3869,7 @@ impl FinishedBlock {
             copy_output_btn,
             rerun_btn,
             header_row,
+            context_segments: Rc::new(context_parts.into_iter().zip(context_details).collect()),
             more_btn,
             action_box,
             selection_hint,
@@ -3944,34 +4001,48 @@ impl FinishedBlock {
         let Some(command) = self
             .command_vte
             .parent()
-            .and_then(|w| w.downcast::<gtk4::Box>().ok())
+            .and_then(|w| w.parent())
+            .and_then(|w| w.downcast::<super::command_row::CommandRow>().ok())
         else {
             return;
         };
         self.widget.add_css_class("chat-pair");
-        // Chat metadata reads as a compact left-to-right strip. The Block
-        // header's flexible review summary otherwise consumes every spare
-        // pixel and scatters its neighboring badges/actions across the row.
-        // Keep the existing ellipsis, tooltip and review action; only change
-        // expansion for Chat, so narrow panes can still shrink the summary.
-        self.header_row.set_spacing(6);
+        // Independent chips read left to right; all spare width belongs before
+        // the actions, keeping the collapse affordance at the trailing edge.
+        self.header_row.set_spacing(4);
         self.action_box.set_margin_start(0);
         let mut child = self.header_row.first_child();
         while let Some(widget) = child {
             if widget.has_css_class("block-review-button") {
                 widget.set_hexpand(false);
                 if let Some(button) = widget.downcast_ref::<gtk4::Button>() {
-                    if let Some(summary) = button.child() {
-                        summary.set_hexpand(false);
+                    let chips = gtk4::Box::new(Orientation::Horizontal, 4);
+                    chips.add_css_class("chat-context");
+                    for (text, detail) in self.context_segments.iter() {
+                        let chip = gtk4::Label::new(Some(text));
+                        chip.add_css_class("chat-meta-chip");
+                        chip.set_xalign(0.0);
+                        chip.set_single_line_mode(true);
+                        chip.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+                        chip.set_width_chars(1);
+                        chip.set_max_width_chars(32);
+                        chip.set_tooltip_text(Some(detail));
+                        chips.append(&chip);
                     }
+                    button.set_child(Some(&chips));
                 }
             }
             child = widget.next_sibling();
         }
+        let spacer = gtk4::Box::new(Orientation::Horizontal, 0);
+        spacer.set_hexpand(true);
+        self.header_row
+            .insert_child_after(&spacer, self.action_box.prev_sibling().as_ref());
         self.content.remove(&command);
         let result = gtk4::Box::new(Orientation::Vertical, 0);
         result.add_css_class("chat-result");
         result.set_hexpand(true);
+        result.set_overflow(gtk4::Overflow::Hidden);
         while let Some(child) = self.content.first_child() {
             self.content.remove(&child);
             result.append(&child);
@@ -3979,7 +4050,7 @@ impl FinishedBlock {
         command.add_css_class("chat-command");
         command.set_halign(gtk4::Align::End);
         command.set_hexpand(false);
-        command.set_margin_start(12);
+        command.set_margin_start(36);
         command.set_margin_bottom(if self.is_background {
             0
         } else {
@@ -3988,9 +4059,13 @@ impl FinishedBlock {
         self.command_vte.add_css_class("chat-command-terminal");
         self.command_vte.set_hexpand(false);
         let cols = super::chat::command_columns(&self.cmd_text, self.command_vte.column_count());
+        super::command_row::fit(&command, &self.command_vte, cols);
         let rows = output_visual_row_count(&self.cmd_text, cols).max(1);
         self.command_vte.set_size(cols, rows);
         self.command_vte
+            .set_color_background(&RGBA::new(0.0, 0.0, 0.0, 0.0));
+        self.output_vte.add_css_class("chat-output-terminal");
+        self.output_vte
             .set_color_background(&RGBA::new(0.0, 0.0, 0.0, 0.0));
         self.content.append(&command);
         self.content.append(&result);
@@ -5365,20 +5440,31 @@ mod tests {
         };
         assert!(review.hexpands(), "Block keeps its flexible summary");
         assert_eq!(block.action_box.margin_start(), 6);
-        let summary = review.child().unwrap().downcast::<gtk4::Label>().unwrap();
-        let original_tooltip = summary.tooltip_text();
         block.set_chat_layout();
         assert!(
             !review.hexpands(),
             "Chat metadata must not spread its neighbors"
         );
-        assert!(!summary.hexpands(), "summary must not request extra width");
-        assert_eq!(block.header_row.spacing(), 6);
+        let chips = review.child().unwrap().downcast::<gtk4::Box>().unwrap();
+        assert!(chips.has_css_class("chat-context"));
+        assert!(!chips.hexpands(), "metadata must not request extra width");
+        assert_eq!(block.header_row.spacing(), 4);
         assert_eq!(block.action_box.margin_start(), 0);
-        assert_eq!(summary.xalign(), 0.0);
-        assert_eq!(summary.width_chars(), 1);
-        assert_eq!(summary.ellipsize(), gtk4::pango::EllipsizeMode::Middle);
-        assert_eq!(summary.tooltip_text(), original_tooltip);
+        let mut chip = chips.first_child();
+        let mut count = 0;
+        while let Some(widget) = chip {
+            let label = widget.clone().downcast::<gtk4::Label>().unwrap();
+            assert!(!label.hexpands());
+            assert_eq!(label.xalign(), 0.0);
+            assert_eq!(label.width_chars(), 1);
+            assert!(label.tooltip_text().is_some());
+            count += 1;
+            chip = widget.next_sibling();
+        }
+        assert_eq!(
+            count, 3,
+            "directory, timestamp and duration are separate pills"
+        );
         assert!(review.is_sensitive());
         assert_eq!(
             block.virtualized_height.get(),
@@ -5442,10 +5528,9 @@ mod tests {
         settle();
         let metadata_bounds = review.compute_bounds(&block.header_row).unwrap();
         let action_bounds = block.action_box.compute_bounds(&block.header_row).unwrap();
-        assert_eq!(
-            action_bounds.x() - (metadata_bounds.x() + metadata_bounds.width()),
-            6.0,
-            "Chat uses one fixed gap after metadata, not an expanding gutter"
+        assert!(
+            action_bounds.x() >= metadata_bounds.x() + metadata_bounds.width() + 4.0,
+            "spare space belongs between metadata and the trailing actions"
         );
         assert!(block.command_vte.is_mapped());
         assert!(block

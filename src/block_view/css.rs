@@ -464,16 +464,26 @@ pub(crate) fn block_css(config: &Config) -> String {
         .term-chat-root .chat-command {{
             font-family: {font_stack};
             font-size: {font_size};
-            background-color: rgba({agent_r},{agent_g},{agent_b},0.34);
+            background-color: rgba({agent_r},{agent_g},{agent_b},0.24);
             border-radius: 18px 18px 5px 18px;
             padding: 0 10px 0 2px;
         }}
         .term-chat-root .chat-result {{
-            background-color: transparent;
-            border-radius: 0;
-            outline: 1px solid transparent;
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.045);
+            border-radius: 18px 18px 18px 5px;
+            outline: 1px solid rgba({fg_r},{fg_g},{fg_b},0.08);
             outline-offset: -1px;
         }}
+        .term-chat-root .chat-output-terminal {{ background-color: transparent; }}
+        .term-chat-root .chat-command-terminal {{ background-color: transparent; }}
+        .term-chat-root .chat-context .chat-meta-chip {{
+            color: {dim_fg};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.08);
+            border-radius: 999px;
+            font-size: 0.78em;
+            padding: 1px 8px;
+        }}
+        .term-chat-root .block-review-button {{ padding: 0; }}
         .term-chat-root .block-failed .chat-result {{
             outline-color: {err_stripe};
         }}

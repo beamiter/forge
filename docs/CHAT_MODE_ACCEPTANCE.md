@@ -8,9 +8,12 @@ Unified and managed-remote Block behavior are unchanged.
 
 This is a terminal presentation, with no LLM dependency. Completed shell
 commands appear in right-aligned blue capsules; their real ANSI-preserving
-output appears in wide left-aligned cards with the original exit, elapsed-time,
-copy, review, collapse and search actions. Only short commands shrink; log
-output is not squeezed into a chat-width column.
+output appears in wide left-aligned rounded cards with the original exit,
+elapsed-time, copy, review, collapse and search actions. Directory, time and
+duration stay in separate compact pills on the left; the collapse control stays
+at the far right. Short command capsules fit their content and remain right
+aligned through window and font changes; wrapped commands grow vertically.
+Log output retains the pane's reading width.
 
 ## Input ownership
 

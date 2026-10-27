@@ -44,6 +44,7 @@ mod search;
 mod search_preview;
 mod session;
 mod sidebar_tabs;
+pub(crate) use sidebar_tabs::configure_layout as configure_sidebar_layout;
 #[cfg(test)]
 mod tab_geometry_tests;
 mod tab_strip;

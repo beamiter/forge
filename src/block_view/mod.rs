@@ -36,7 +36,10 @@ mod ansi;
 mod blocks;
 mod bounded_bytes;
 mod chat;
+#[cfg(test)]
+mod chat_layout_tests;
 mod click_cursor;
+mod command_row;
 mod cross_selection;
 mod css;
 mod export;
