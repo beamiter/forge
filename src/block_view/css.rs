@@ -1483,6 +1483,11 @@ pub(crate) fn block_css(config: &Config) -> String {
         .term-chat-root .chat-composer:focus-within {{
             outline-color: transparent;
         }}
+        /* A focused editor and its actions read as one surface. This wash
+           changes paint only: terminal columns and footer height stay fixed. */
+        .term-chat-root .chat-composer-card:focus-within .chat-controls {{
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.08);
+        }}
         .term-chat-root .chat-composer-card:focus-within {{
             outline: 2px solid rgba({acc_r},{acc_g},{acc_b},0.55);
             outline-offset: -2px;
@@ -1501,6 +1506,26 @@ mod tests {
     };
     use std::path::Path;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn chat_focus_wash_is_paint_only_and_preserves_the_focus_ring() {
+        let css = block_css(&crate::config::Config::safe_defaults());
+        let wash = rule_body(
+            &css,
+            ".term-chat-root .chat-composer-card:focus-within .chat-controls",
+        );
+        assert!(wash.contains("background-color: rgba("));
+        for geometry in ["margin", "padding", "border", "min-", "font-"] {
+            assert!(
+                !wash.contains(geometry),
+                "focus must not move the input: {wash}"
+            );
+        }
+        assert!(
+            rule_body(&css, ".term-chat-root .chat-composer-card:focus-within")
+                .contains("outline: 2px solid")
+        );
+    }
 
     #[test]
     fn continuous_surface_preserves_geometry_outcomes_and_selection() {

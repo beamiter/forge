@@ -364,6 +364,8 @@ impl ChatPresentation {
         status.set_hexpand(true);
         status.set_xalign(0.0);
         status.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        status.set_width_chars(1);
+        status.set_tooltip_text(Some(status.text().as_str()));
         status.set_accessible_role(gtk4::AccessibleRole::Status);
         controls.append(&status);
         let stop = gtk4::Button::from_icon_name("process-stop-symbolic");
@@ -451,9 +453,9 @@ impl ChatPresentation {
             stop.set_sensitive(false);
         }
         if let Some(label) = self.running_command.upgrade() {
-            label.set_text(&jterm_core::review_input::safe_multiline_display(
-                command, 4096,
-            ));
+            let display = jterm_core::review_input::safe_multiline_display(command, 4096);
+            label.set_text(&display);
+            label.set_tooltip_text(Some(&display));
         }
     }
 
@@ -565,6 +567,7 @@ impl ChatPresentation {
             command.set_visible(surface == ChatSurface::Running);
             if surface == ChatSurface::Prompt {
                 command.set_text("");
+                command.set_tooltip_text(None);
             }
         }
         let decorated = matches!(surface, ChatSurface::Prompt | ChatSurface::Running);
@@ -583,6 +586,8 @@ impl ChatPresentation {
                 } else {
                     "Running · input belongs to the process"
                 });
+                // Ellipsis keeps the controls compact, not the meaning hidden.
+                status.set_tooltip_text(Some(status.text().as_str()));
             }
         }
         // Restore only after the destination is visible/mapped. Moving a
@@ -976,6 +981,12 @@ mod tests {
             }
         };
         settle();
+        chat.set_running_command("printf '<long & literal command>'\nnext line");
+        let command = chat.running_command.upgrade().unwrap();
+        assert_eq!(
+            command.tooltip_text().as_deref(),
+            Some(command.text().as_str())
+        );
         live.set_live_geometry(terminal.char_height() as i32, 24, 3);
         block.set_live_geometry(block.active_vte.char_height() as i32, 24, 3);
         settle();
@@ -990,6 +1001,15 @@ mod tests {
             ChatSurface::Prompt,
         ] {
             let target = chat.sync(&live, surface);
+            let status = chat.status.upgrade().unwrap();
+            assert_eq!(
+                status.tooltip_text().as_deref(),
+                Some(status.text().as_str())
+            );
+            assert_eq!(status.width_chars(), 1);
+            if surface == ChatSurface::Prompt {
+                assert_eq!(command.tooltip_text(), None);
+            }
             settle();
             assert!(
                 block.active_vte.has_focus(),
