@@ -13,6 +13,12 @@ use vte4::Terminal;
 
 pub(super) const COMMAND_GAP_PX: i32 = 8;
 
+/// Reserve a compact home for the companion, growing for everything the real
+/// shell draws, including wrapped commands and completion menus.
+pub(super) fn composer_rows(input: i64, drawn: i64, viewport: i64) -> i64 {
+    input.max(drawn).clamp(4.min(viewport), viewport.max(1))
+}
+
 pub(super) fn surface(state: BlockState, integrated: bool) -> ChatSurface {
     resolve_surface(ChatSessionState {
         shell_integration: integrated && state != BlockState::RawFallback,
@@ -334,7 +340,12 @@ impl ChatPresentation {
         dock.append(&composer_viewport);
         let controls = gtk4::Box::new(Orientation::Horizontal, 8);
         controls.add_css_class("chat-controls");
-        let status = gtk4::Label::new(Some("Shell input · Enter"));
+        let shell_icon = gtk4::Image::from_icon_name("utilities-terminal-symbolic");
+        shell_icon.add_css_class("chat-shell-icon");
+        shell_icon.set_pixel_size(14);
+        controls.append(&shell_icon);
+        let status = gtk4::Label::new(Some("Shell · Tab completes · ↑ history"));
+        status.add_css_class("chat-input-hint");
         status.set_hexpand(true);
         status.set_xalign(0.0);
         status.set_ellipsize(gtk4::pango::EllipsizeMode::End);
@@ -353,7 +364,7 @@ impl ChatPresentation {
         stop.add_css_class("chat-stop");
         stop.add_css_class("chat-command-control");
         controls.append(&stop);
-        let submit = gtk4::Button::with_label("↑");
+        let submit = gtk4::Button::from_icon_name("go-up-symbolic");
         submit.add_css_class("chat-submit");
         submit.add_css_class("chat-command-control");
         submit.set_tooltip_text(Some("Send Enter immediately when idle. Finish or cancel text composition before using Send; if unavailable or using enhanced keys, use the keyboard"));
@@ -453,6 +464,13 @@ impl ChatPresentation {
     }
 
     pub(super) fn set_compact(&self, compact: bool) {
+        if let Some(dock) = self.dock.upgrade() {
+            if compact {
+                dock.add_css_class("chat-dock-compact");
+            } else {
+                dock.remove_css_class("chat-dock-compact");
+            }
+        }
         if let Some(composer) = self.composer.upgrade() {
             if compact {
                 composer.add_css_class("block-compact");
@@ -479,6 +497,11 @@ impl ChatPresentation {
         };
         let clip = active.live_clip();
         let docked = surface.composer_docked();
+        if docked {
+            dock.add_css_class("chat-composer-card");
+        } else {
+            dock.remove_css_class("chat-composer-card");
+        }
         let destination = if docked { &composer } else { anchor };
         let already_mounted = clip.parent().as_ref() == Some(destination.upcast_ref());
         let restore_focus = !already_mounted && active.active_vte.has_focus();
@@ -523,7 +546,7 @@ impl ChatPresentation {
         if self.current.replace(surface) != surface {
             if let Some(status) = self.status.upgrade() {
                 status.set_text(if docked {
-                    "Shell input · Enter"
+                    "Shell · Tab completes · ↑ history"
                 } else {
                     "Running · input belongs to the process"
                 });

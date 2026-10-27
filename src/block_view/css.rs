@@ -486,9 +486,27 @@ pub(crate) fn block_css(config: &Config) -> String {
         }}
         .term-chat-root .chat-composer {{
             border-color: transparent;
-            outline-color: rgba({fg_r},{fg_g},{fg_b},0.22);
+            outline-color: transparent;
             border-radius: 18px;
             box-shadow: none;
+        }}
+        .term-chat-root .chat-canvas {{ background-color: {bg_hex}; }}
+        .term-chat-root .chat-dock {{ margin: 0 8px; }}
+        .term-chat-root .chat-dock.chat-dock-compact {{ margin: 0 4px; }}
+        .term-chat-root .chat-composer,
+        .term-chat-root .chat-composer.block-compact {{
+            margin-left: 0;
+            margin-right: 0;
+        }}
+        /* The shell and its actions share one card. Paint the ring on the
+           dock, transferring the composer's horizontal margin to it so the
+           native grid keeps its column budget in both density settings. */
+        .term-chat-root .chat-composer-card {{
+            background-color: {bg_hex};
+            border-radius: 18px;
+            outline: 1px solid rgba({fg_r},{fg_g},{fg_b},0.18);
+            outline-offset: -1px;
+            box-shadow: inset 0 1px rgba({fg_r},{fg_g},{fg_b},0.04);
         }}
         .term-chat-root .chat-live-anchor {{
             border-width: 0;
@@ -501,18 +519,45 @@ pub(crate) fn block_css(config: &Config) -> String {
         }}
         .term-chat-root .chat-controls {{
             color: {dim_fg};
-            margin: 0 10px 0 14px;
-            min-height: 32px;
+            margin: 0;
+            padding: 0 12px;
+            min-height: 40px;
+        }}
+        .term-chat-root .chat-composer-card .chat-controls {{
+            border-radius: 0 0 15px 15px;
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.025);
+        }}
+        .term-chat-root .chat-shell-icon {{ color: {dim_fg}; }}
+        .term-chat-root .chat-input-hint {{
+            font-size: 0.8em;
         }}
         .term-chat-root .chat-controls button {{
             min-width: 24px;
             min-height: 24px;
             padding: 0 6px;
         }}
-        .term-chat-root .chat-submit {{
-            border-radius: 999px;
-            background-color: rgba({agent_r},{agent_g},{agent_b},0.62);
-            color: {fg_hex};
+        .term-chat-root .chat-controls .chat-submit {{
+            min-width: 28px;
+            min-height: 28px;
+            padding: 0;
+            margin: 4px 0 4px 6px;
+            border: none;
+            border-radius: 10px;
+            background-image: none;
+            background-color: {accent};
+            color: {bg_hex};
+            box-shadow: none;
+            transition: background-color 120ms ease-out;
+        }}
+        .term-chat-root .chat-submit:hover {{
+            background-color: mix({accent}, {fg_hex}, 0.15);
+        }}
+        .term-chat-root .chat-submit:active {{
+            background-color: mix({accent}, {bg_hex}, 0.15);
+        }}
+        .term-chat-root .chat-submit:disabled {{
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.08);
+            color: {dim_fg};
         }}
         .block-onboarding {{
             color: {dim_fg};
@@ -1436,7 +1481,10 @@ pub(crate) fn block_css(config: &Config) -> String {
             box-shadow: inset 0 0 0 3px {accent};
         }}
         .term-chat-root .chat-composer:focus-within {{
-            outline: 2px solid {accent};
+            outline-color: transparent;
+        }}
+        .term-chat-root .chat-composer-card:focus-within {{
+            outline: 2px solid rgba({acc_r},{acc_g},{acc_b},0.55);
             outline-offset: -2px;
         }}
         "#,
@@ -1486,7 +1534,7 @@ mod tests {
         )
         .contains("box-shadow: inset 0 0 0 3px"));
         assert!(
-            rule_body(&css, ".term-chat-root .chat-composer:focus-within")
+            rule_body(&css, ".term-chat-root .chat-composer-card:focus-within")
                 .contains("outline: 2px solid")
         );
     }

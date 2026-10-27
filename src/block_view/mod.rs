@@ -14817,8 +14817,13 @@ impl TermView {
                             | jterm_core::chat_mode::ChatSurface::Fullscreen
                     )
                 );
+                let compact_rows = if chat_presentation.is_some() {
+                    chat::composer_rows
+                } else {
+                    compact_card_rows
+                };
                 let target_rows = if idle && !prompt_at_grid_top && !chat_passthrough {
-                    compact_card_rows(input_rows, 1, viewport_rows)
+                    compact_rows(input_rows, 1, viewport_rows)
                 } else {
                     viewport_rows
                 };
@@ -14928,7 +14933,7 @@ impl TermView {
                             } else {
                                 1
                             };
-                            let rows = compact_card_rows(input_rows, drawn, viewport_rows);
+                            let rows = compact_rows(input_rows, drawn, viewport_rows);
                             // Preserve the compact input height across
                             // CommandStart. Until output begins, VTE's cursor and
                             // adjustment may belong to different grid generations.
