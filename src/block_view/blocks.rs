@@ -3949,6 +3949,25 @@ impl FinishedBlock {
             return;
         };
         self.widget.add_css_class("chat-pair");
+        // Chat metadata reads as a compact left-to-right strip. The Block
+        // header's flexible review summary otherwise consumes every spare
+        // pixel and scatters its neighboring badges/actions across the row.
+        // Keep the existing ellipsis, tooltip and review action; only change
+        // expansion for Chat, so narrow panes can still shrink the summary.
+        self.header_row.set_spacing(6);
+        self.action_box.set_margin_start(0);
+        let mut child = self.header_row.first_child();
+        while let Some(widget) = child {
+            if widget.has_css_class("block-review-button") {
+                widget.set_hexpand(false);
+                if let Some(button) = widget.downcast_ref::<gtk4::Button>() {
+                    if let Some(summary) = button.child() {
+                        summary.set_hexpand(false);
+                    }
+                }
+            }
+            child = widget.next_sibling();
+        }
         self.content.remove(&command);
         let result = gtk4::Box::new(Orientation::Vertical, 0);
         result.add_css_class("chat-result");
@@ -5317,6 +5336,7 @@ mod tests {
         use gtk4::prelude::*;
         use vte4::TerminalExt;
         gtk4::init().expect("gtk init");
+        let cwd = format!("/tmp/{}", "long-directory-".repeat(40));
         let block = FinishedBlock::new(
             7,
             "$ ",
@@ -5328,14 +5348,38 @@ mod tests {
             Some(0),
             &crate::config::Config::safe_defaults(),
             Some(1),
-            None,
-            None,
+            Some(1_700_000_000_000),
+            Some(&cwd),
             80,
         );
         let command = block.command_vte.clone();
         let output = block.output_vte.clone();
         let height = block.virtualized_height.get();
+        let mut metadata = block.header_row.first_child();
+        let review = loop {
+            let widget = metadata.expect("header has a review summary");
+            if widget.has_css_class("block-review-button") {
+                break widget.downcast::<gtk4::Button>().unwrap();
+            }
+            metadata = widget.next_sibling();
+        };
+        assert!(review.hexpands(), "Block keeps its flexible summary");
+        assert_eq!(block.action_box.margin_start(), 6);
+        let summary = review.child().unwrap().downcast::<gtk4::Label>().unwrap();
+        let original_tooltip = summary.tooltip_text();
         block.set_chat_layout();
+        assert!(
+            !review.hexpands(),
+            "Chat metadata must not spread its neighbors"
+        );
+        assert!(!summary.hexpands(), "summary must not request extra width");
+        assert_eq!(block.header_row.spacing(), 6);
+        assert_eq!(block.action_box.margin_start(), 0);
+        assert_eq!(summary.xalign(), 0.0);
+        assert_eq!(summary.width_chars(), 1);
+        assert_eq!(summary.ellipsize(), gtk4::pango::EllipsizeMode::Middle);
+        assert_eq!(summary.tooltip_text(), original_tooltip);
+        assert!(review.is_sensitive());
         assert_eq!(
             block.virtualized_height.get(),
             height + super::super::chat::COMMAND_GAP_PX
@@ -5396,6 +5440,13 @@ mod tests {
             }
         };
         settle();
+        let metadata_bounds = review.compute_bounds(&block.header_row).unwrap();
+        let action_bounds = block.action_box.compute_bounds(&block.header_row).unwrap();
+        assert_eq!(
+            action_bounds.x() - (metadata_bounds.x() + metadata_bounds.width()),
+            6.0,
+            "Chat uses one fixed gap after metadata, not an expanding gutter"
+        );
         assert!(block.command_vte.is_mapped());
         assert!(block
             .command_vte
