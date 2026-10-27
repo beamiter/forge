@@ -778,10 +778,6 @@ impl VteOrganismSurface {
             self.disconnect_host();
             None
         };
-        self.row.set_visible(self.enabled.get() && self.local.get());
-        if !self.current_refresh(&refresh_ticket) {
-            return;
-        }
         let eligible = self.local.get()
             && self.enabled.get()
             && self.alive.get()
@@ -792,6 +788,18 @@ impl VteOrganismSurface {
                 .terminal
                 .upgrade()
                 .is_some_and(|terminal| terminal.is_mapped() && terminal.has_focus());
+        // Preserve the existing geometry envelope when focus moves between
+        // panes. The complete non-owner row, including its title, is unpainted
+        // without changing terminal allocation or reflowing its grid.
+        self.row
+            .set_visible(self.enabled.get() && self.local.get() && self.alive.get());
+        if !self.current_refresh(&refresh_ticket) {
+            return;
+        }
+        self.row.set_opacity(if eligible { 1.0 } else { 0.0 });
+        if !self.current_refresh(&refresh_ticket) {
+            return;
+        }
         self.bind_paint(eligible);
         if !self.current_refresh(&refresh_ticket) {
             return;
@@ -1117,6 +1125,11 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
         gtk4::prelude::RootExt::focus(window).is_some_and(|focused| focused.is_ancestor(&other))
     });
     assert!(!terminal.has_focus());
+    assert_eq!(
+        runtime.row.opacity(),
+        0.0,
+        "non-owner title also disappears"
+    );
     assert!(runtime.paint.borrow().is_none());
     assert!(runtime.geometry_idle.borrow().is_none());
     assert!(runtime.source.borrow().is_none());
@@ -1617,6 +1630,11 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
     runtime.apply_settings(true, OrganismMotion::Full);
     assert!(!runtime.enabled.get());
     assert!(!runtime.row.is_visible());
+    assert_eq!(
+        runtime.row.opacity(),
+        0.0,
+        "outer refresh cannot repaint after settings reentry"
+    );
     assert!(
         runtime.source.borrow().is_none(),
         "retired refresh cannot install a late frame source"
@@ -1687,6 +1705,87 @@ pub(super) fn exercise_existing_native_fixture(window: &gtk4::Window) {
     root.remove(&row);
     assert!(terminal.pty().is_none());
     lifecycle_tests::exercise(window, &main);
+    exercise_unique_split_geometry(window, &main);
+}
+
+#[cfg(test)]
+fn exercise_unique_split_geometry(window: &gtk4::Window, main: &glib::MainContext) {
+    use libadwaita::prelude::*;
+    let host = window.downcast_ref::<libadwaita::Window>().unwrap();
+    let original = host.content();
+    host.set_content(gtk4::Widget::NONE);
+    let mut config = Config::safe_defaults();
+    config.ascii_organism_enabled = true;
+    config.ascii_organism_motion = Some(OrganismMotion::Static);
+    let roots = [
+        gtk4::Box::new(gtk4::Orientation::Vertical, 0),
+        gtk4::Box::new(gtk4::Orientation::Vertical, 0),
+    ];
+    let terminals = [vte4::Terminal::new(), vte4::Terminal::new()];
+    let surfaces: Vec<_> = roots
+        .iter()
+        .zip(&terminals)
+        .map(|(root, terminal)| {
+            terminal.set_hexpand(true);
+            terminal.set_vexpand(true);
+            root.append(terminal);
+            let surface = VteOrganismSurface::new(root, terminal, &config);
+            surface.set_local(true);
+            surface
+        })
+        .collect();
+    let split = gtk4::Paned::new(gtk4::Orientation::Horizontal);
+    split.set_start_child(Some(&roots[0]));
+    split.set_end_child(Some(&roots[1]));
+    host.set_content(Some(&split));
+    let settle = || {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(100) {
+            while main.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    window.present();
+    settle();
+    split.set_position(window.width() / 2);
+    assert!(terminals[0].grab_focus());
+    settle();
+    let grids = || {
+        terminals.each_ref().map(|terminal| {
+            (
+                terminal.width(),
+                terminal.height(),
+                terminal.column_count(),
+                terminal.row_count(),
+            )
+        })
+    };
+    let initial_grids = grids();
+    for owner in [1, 0, 1, 0] {
+        assert!(terminals[owner].grab_focus());
+        settle();
+        assert_eq!(surfaces[owner].row.opacity(), 1.0);
+        assert_eq!(
+            surfaces[1 - owner].row.opacity(),
+            0.0,
+            "non-owner title and body are both absent"
+        );
+        assert_eq!(
+            grids(),
+            initial_grids,
+            "focus cannot resize or reflow either VTE grid"
+        );
+        assert!(surfaces
+            .iter()
+            .all(|surface| surface.source.borrow().is_none()));
+        assert!(terminals.iter().all(|terminal| terminal.pty().is_none()));
+    }
+    println!("VTE_UNIQUE_FOCUS swaps=4 complete_non_owner_row_hidden=true grid_pixels_and_rows_columns_unchanged=true no_pty=true");
+    for surface in &surfaces {
+        surface.retire();
+    }
+    drop(surfaces);
+    host.set_content(original.as_ref());
 }
 
 #[cfg(test)]
@@ -2149,6 +2248,18 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires DISPLAY"]
+    fn one_companion_moves_between_vte_splits_without_resizing_grids() {
+        libadwaita::init().expect("GTK/libadwaita display");
+        let window = libadwaita::Window::builder()
+            .default_width(1000)
+            .default_height(500)
+            .build();
+        exercise_unique_split_geometry(window.upcast_ref(), &glib::MainContext::default());
+        window.close();
+    }
+
+    #[test]
     fn compact_native_path_checks_exact_pose_and_observes_passive_recovery() {
         let source = include_str!("organism_vte.rs");
         let production = source
@@ -2324,7 +2435,9 @@ mod tests {
             .unwrap()
             .0;
         assert!(!settings.contains("self.local.set"));
-        assert!(production.contains("self.row.set_visible(self.enabled.get() && self.local.get())"));
+        assert!(production
+            .contains(".set_visible(self.enabled.get() && self.local.get() && self.alive.get())"));
+        assert!(production.contains("self.row.set_opacity(if eligible { 1.0 } else { 0.0 })"));
     }
 
     #[test]
@@ -2362,7 +2475,9 @@ mod tests {
         assert!(paint.contains("runtime.drawable.replace(drawable) != drawable"));
         assert!(paint.contains("runtime.defer_geometry_refresh()"));
         assert!(!paint.contains("runtime.refresh()"));
-        assert!(production.contains("self.row.set_visible(self.enabled.get() && self.local.get())"));
+        assert!(production
+            .contains(".set_visible(self.enabled.get() && self.local.get() && self.alive.get())"));
+        assert!(production.contains("self.row.set_opacity(if eligible { 1.0 } else { 0.0 })"));
         assert!(production.contains("self.glyph.set_opacity"));
         assert!(production.contains("terminal.connect_commit"));
         assert!(production.contains("host.is_active()"));

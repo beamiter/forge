@@ -50,6 +50,7 @@ mod tab_strip;
 mod tabs;
 mod task_ops;
 mod tasks_panel;
+mod workflow_library;
 mod zoom;
 
 pub(crate) use tab_strip::install_top_tab_geometry_reveal;
@@ -416,6 +417,8 @@ pub(crate) struct UiState {
     /// Window-lifetime, memory-only search intent; never persisted in config
     /// or workspace snapshots.
     pub(crate) cross_block_search_memory: Rc<RefCell<dialogs::CrossBlockSearchMemory>>,
+    pub(crate) workflow_library:
+        jterm_core::workflows::BackgroundRefresh<Vec<crate::workflows::Workflow>>,
     pub(crate) workflows_palette_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     pub(crate) settings_dialog: Rc<RefCell<Option<adw::PreferencesDialog>>>,
     pub(crate) organism_settings_controls:

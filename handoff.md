@@ -1,5 +1,141 @@
 # Engineering handoff
 
+## 2026-10-26 — continuous Block/Chat canvas motion
+
+- The retained transcript now uses the shared `CanvasMotion` with the GTK frame
+  clock. Stream updates retarget one moving live edge instead of synchronously
+  jumping the adjustment and repeatedly pinning it from a 16 ms timer.
+- Wheel distance is independent of viewport size; precision deltas remain
+  exact pixels on the canvas. GTK gesture-end velocity supplies bounded coast.
+  Native scrollbar/search moves interrupt motion, and reading locks prevent
+  new output from pulling the viewport away.
+- Prefix retention rebases real measured geometry. Initial/remapped live views
+  establish their baseline immediately; visible Jump to latest remains smooth.
+  Hidden and settled canvases stop their callbacks, and desktop reduced-motion
+  preferences are respected.
+- Existing completed-card identities, height-preserving virtualization, memory
+  budgets, organism ownership and alternate-screen/Unified behavior remain in
+  their existing owners. Explicitly capped long-output VTEs retain their inner
+  overflow; ordinary fitted output moves the outer document.
+- Added a mapped GTK regression to `scripts/test-gtk-display.sh`; full contract
+  and platform scope are in `docs/transcript-canvas.md`.
+
+### Validation for continuous canvas
+
+- `cargo clippy --all-targets --all-features --locked -- -D warnings`: passed
+  on the final source, including the persisted-history retention caller.
+- `cargo build --locked --bin forge`: passed.
+- Focused scroll tests: 6 passed; 2 display-only tests ignored in the headless
+  invocation. The new mapped GTK/frame-clock test passed separately under
+  Xvfb/D-Bus with `GTK_A11Y=test GDK_BACKEND=x11 GSK_RENDERER=cairo` in 2.21 s.
+  It checks intermediate presentation frames, retained widget identity,
+  fractional input, reading/scrollbar interruption, measured retention rebasing,
+  hidden-tab callback retirement and desktop reduced motion.
+- Functional real-application checks with Xvfb/software rendering via shared
+  `jterm_core/scripts/native-transcript-canvas-smoke.py` passed on binary SHA-256
+  `57f9c18f07b21d46744d5adf614c4ddea0a6f9bf0c48e74fa91b3a537455bac8`.
+  Adding the second short block kept the first output at the same screen Y:
+  Chat 125 → 125 px; Block 117 → 117 px. Actual X11 wheel events aimed at
+  rendered output text produced 7 distinct painted marker positions in Chat
+  and 6 in Block, followed by stable settled images. These are observed
+  positions in functional software-rendering checks, not refresh-rate or FPS
+  measurements. Exact results, screenshots and recordings are in
+  `/tmp/canvas-ui-qa/forge-chat-final` and
+  `/tmp/canvas-ui-qa/forge-block-final`.
+- Format, diff whitespace, and display-runner shell syntax checks passed.
+
+Acceptance here uses X11/software rendering. Physical touchpad tuning, hardware
+GPU/Wayland and fractional-scale pacing remain desktop acceptance work. Explicitly
+capped long-output VTEs retain their bounded internal overflow and controls.
+
+
+## 2026-10-26 — one window companion, continuous habits and optional care
+
+- Removed the permanently mounted organism card. One window owner chooses the
+  live body or running-history compact substitute through shared
+  `CompanionSurface`; every other pane is hidden synchronously on transfer.
+  Static uses the same body at frame zero. Traditional VTE hides its complete
+  neutral row's paint when another split owns focus, preserving its existing
+  geometry envelope so neither VTE grid resizes or reflows.
+- Ambient disposition and the offline voice belong to the window. Background
+  pane reducers keep their command evidence but cannot reset the shared mind;
+  entering a new pane does not replay elapsed ambient time. A stable local
+  identity key selects temperament; the source path is not retained by core.
+- Inspect companion shows text, without a second ASCII portrait. Hello,
+  company, story and break interactions use bounded authored replies and a
+  shared story cursor; context is explicitly a snapshot from panel opening.
+- `ascii_organism_care_enabled` defaults false and is saved through the existing
+  configuration path. One foreground care clock offers ordinary text toasts
+  after sustained observed human activity, only at an idle visible body. Later
+  snoozes 20 minutes; Take a break resets the interval. No additional timer,
+  terminal input, network provider or computer observation is introduced.
+- Added native two-split ownership/Static/typing/zero-PTY and independent
+  traditional-VTE focus/geometry regressions, both registered in the display
+  runner. Config roundtrip covers care opt-in. Actual GTK/Pango measurements
+  select full body, compact body on the same label, or hidden; restoring space
+  restores the full pose without another widget or reserved line.
+- Refresh ticket checks separate row visibility and opacity mutations, so
+  synchronous GTK notifications cannot repaint an obsolete focus owner.
+- Bundled shared core: `90eec597ab93450f7d5ef7a2d8ae392552c59c84`.
+
+### Validation for this change
+
+- `cargo test --locked --lib organism`: **270 passed, 0 failed, 10 ignored**.
+  Display-required fixtures are accounted for separately below.
+- `cargo clippy --all-targets --all-features --locked -- -D warnings`:
+  **passed** on the final source, with no new lint allowance.
+- `cargo fmt -- --check`, `git diff --check` and
+  `bash -n scripts/test-gtk-display.sh`: **passed**.
+- The following **3 native tests passed individually**, each in a fresh
+  Xvfb/D-Bus session with `GTK_A11Y=test GDK_BACKEND=x11 GSK_RENDERER=cairo`
+  and `--exact --ignored --nocapture`:
+  - `ui::organism::inspector::tests::snapshot_dialog_is_scrollable_and_closes_without_an_animation_source`
+    — 1 passed in 0.21 seconds; local story rotation and care-setting callback.
+  - `ui::organism::tests::one_companion_crosses_splits_without_cloning_its_body_or_mind`
+    — 1 passed in 2.09 seconds; Full/Calm/Static owner transfers, shared ambient
+    state, typing retreat, actual Pango full/compact/full recovery, zero PTY writes.
+  - `ui::organism_vte::tests::one_companion_moves_between_vte_splits_without_resizing_grids`
+    — 1 passed in 0.73 seconds on the final binary. Four focus transfers clear
+    the complete non-owner row while both real VTE widgets retain their pixel
+    allocations and row/column counts. Neither widget has a PTY or child.
+
+The existing
+`ui::organism::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers`
+**did not pass locally**: its pre-existing F08 lifetime soak exited with
+SIGSEGV **139**, iteration 0 at `terminal.set_pty(None)`. GDB located the fault
+inside the installed `/lib/x86_64-linux-gnu/libvte-2.91-gtk4.so.0` function
+`vte_terminal_set_pty`. An independent plain-C GTK/VTE control, containing no
+Rust, application or organism code and spawning no shell, also exited 139 at
+`vte_terminal_set_pty(terminal, NULL)` after a bare-PTY attach/unroot sequence.
+This local system-VTE null-detach failure is not counted as a pass. F08 and the
+original full native fixture remain registered with their lifecycle assertions;
+the independent split test provides direct coverage of this change without
+skipping or weakening F08. The complete display suite is not claimed green.
+
+Builds used `CARGO_TARGET_DIR=/tmp/organism-target`,
+`CARGO_PROFILE_TEST_DEBUG=0`, `CARGO_PROFILE_DEV_DEBUG=0`,
+`CARGO_INCREMENTAL=0`, and `CARGO_BUILD_JOBS=4`.
+Native validation covers X11/Cairo, not GPU rendering or Wayland fractional
+scaling. Session evidence is in `validation/forge-organism-tests.log`,
+`forge-clippy.log`, `forge-native-inspector.log`, `forge-native-unique.log`,
+`forge-native-vte-splits.log`, `forge-native-vte-owner.log`,
+`forge-native-vte-owner-gdb.log`, `forge-vte-detach-control.c`,
+`forge-vte-detach-control.log`, and `forge-final-static-checks.log`.
+
+## 2026-10-26 — native pointer and guides on wrapped rows (shared core)
+
+- The bundled core keeps `native_pointer` in wrapped splits, so clicks and
+  drags on continuation rows (also mid touchpad scroll) stay native; only a
+  split showing a closed fold hands clicks to Vim. `colorcolumn` and
+  `cursorcolumn` on wrapped lines are painted natively instead of switching
+  to the compatibility view, and end-of-buffer rows are filled in
+  `EndOfBuffer` across the full width. No frontend code change: the frame
+  contract is unchanged. Contract: `jterm_core/docs/vim9-native-wrap.md`.
+- The bridge now encodes each screen row once per frame (keyframes list runs
+  in row order), cutting Vim CPU per scroll by roughly 5–15%.
+- `packaging/jterm-core-src.tar.gz` is regenerated from the matching
+  `jterm_core` commit with `scripts/package-shared-core.sh`.
+
 ## 2026-10-26 — native soft wrap (shared core render protocol 9)
 
 - The shared core now negotiates render protocol 9: wrapped continuation rows

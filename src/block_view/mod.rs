@@ -3972,6 +3972,7 @@ fn evict_finished_block_prefix(
     block_list: &gtk4::Box,
     widget_pool: &Rc<RefCell<WidgetPool>>,
     refs: BlockRemovalRefs<'_>,
+    scroll_controller: &ScrollDebouncer,
 ) -> usize {
     let evicted: Vec<_> = {
         let mut finished = finished_blocks.borrow_mut();
@@ -3982,6 +3983,17 @@ fn evict_finished_block_prefix(
         return 0;
     }
 
+    let rebase = evicted
+        .iter()
+        .find(|block| block.widget().is_visible())
+        .and_then(|first| {
+            let last = evicted.last()?;
+            scroll::PrefixRebase::capture(
+                first.widget().upcast_ref(),
+                last.widget().upcast_ref(),
+                scroll_controller,
+            )
+        });
     let evicted_count = evicted.len();
     let evicted_ids: Vec<_> = evicted.iter().map(|block| block.id).collect();
     let evicted_id_set: HashSet<_> = evicted_ids.iter().copied().collect();
@@ -4009,6 +4021,9 @@ fn evict_finished_block_prefix(
         let widget = oldest.widget().clone();
         block_list.remove(&widget);
         recycle_finished_block_outer(widget_pool, widget);
+    }
+    if let Some(rebase) = rebase {
+        rebase.apply();
     }
     evicted_count
 }
@@ -10082,6 +10097,7 @@ impl RenderBackend for BlockBackend {
                 visible_indices: &self.visible_indices_rc,
                 failure_marker_redraw: self.failure_marker_redraw.as_ref(),
             },
+            &self.scroll_debouncer,
         );
         mutate_block_data_and_redraw(
             &self.block_data_for_cb,
@@ -10266,6 +10282,7 @@ impl RenderBackend for BlockBackend {
                 visible_indices: &self.visible_indices_rc,
                 failure_marker_redraw: self.failure_marker_redraw.as_ref(),
             },
+            &self.scroll_debouncer,
         );
 
         let preserve = self.config_for_cb.borrow().preserve_live_scrollback;
@@ -14572,6 +14589,9 @@ impl TermView {
             user_scrolled_up.clone(),
             programmatic_scroll.clone(),
         );
+        if !unified {
+            scroll_debouncer.install(&block_scroll, &block_list);
+        }
 
         let block_data_rc: Rc<RefCell<VecDeque<BlockData>>> =
             Rc::new(RefCell::new(VecDeque::new()));
@@ -15785,7 +15805,6 @@ impl TermView {
         // ── Jump-to-bottom FAB click: return to the live prompt ───────────
         {
             let scroll = block_scroll.clone();
-            let programmatic = programmatic_scroll.clone();
             let user_scrolled = user_scrolled_up.clone();
             let unread = unread_count.clone();
             let vte_for_fab = active_vte.downgrade();
@@ -15812,10 +15831,6 @@ impl TermView {
                 if let Some(adj) = vte_for_fab.upgrade().and_then(|vte| vte.vadjustment()) {
                     adj.set_value((adj.upper() - adj.page_size()).max(adj.lower()));
                 }
-                let adj = scroll.vadjustment();
-                programmatic.set(true);
-                adj.set_value((adj.upper() - adj.page_size()).max(adj.lower()));
-                programmatic.set(false);
 
                 // Share the output/layout settling controller. Its single source
                 // coalesces repeated clicks and yields to newer reading intent.
@@ -16489,6 +16504,9 @@ impl TermView {
                     wheel_accumulator.set(WheelAccumulator::new());
                 });
             }
+            if !unified {
+                scroll_debouncer.watch_gesture(&scroll_ctrl, &block_scroll);
+            }
             scroll_ctrl.connect_scroll(move |controller, _dx, dy| {
                 let surface_unit = scroll_unit_is_surface(controller);
                 let fullscreen = fullscreen_for_scroll.get();
@@ -16582,16 +16600,22 @@ impl TermView {
                 // While a command streams, its scrollback is a first-class
                 // reading surface: the wheel scrolls the live VTE itself and
                 // hands off to the outer history only at the buffer's edge.
-                let steps = wheel_steps(dy, surface_unit);
                 if matches!(
                     bstate_for_scroll.get(),
                     BlockState::CollectingOutput
                         | BlockState::PostCommand
                         | BlockState::RawFallback
                 ) {
-                    if let Some(adj) = vte_for_scroll.upgrade().and_then(|vte| vte.vadjustment()) {
-                        if scroll_adjustment_by_wheel(&adj, steps) {
-                            return glib::Propagation::Stop;
+                    if let Some(vte) = vte_for_scroll.upgrade() {
+                        if let Some(adj) = vte.vadjustment() {
+                            if scroll_adjustment_by_input(
+                                &adj,
+                                dy,
+                                surface_unit,
+                                vte.char_height() as f64,
+                            ) {
+                                return glib::Propagation::Stop;
+                            }
                         }
                     }
                 }
@@ -16602,8 +16626,7 @@ impl TermView {
                 let Some(outer) = outer_for_scroll.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
-                forward_outer_scroll(&outer, steps);
-                debouncer_for_scroll.record_wheel_intent(&outer);
+                debouncer_for_scroll.scroll_wheel(&outer, dy, surface_unit);
                 glib::Propagation::Stop
             });
             active_vte.add_controller(scroll_ctrl);
@@ -16619,21 +16642,30 @@ impl TermView {
             let vte_for_scrollbar = active_vte.downgrade();
             let outer_for_scrollbar = block_scroll.downgrade();
             let debouncer_for_scrollbar = scroll_debouncer.clone();
+            if !unified {
+                scroll_debouncer.watch_gesture(&scrollbar_scroll, &block_scroll);
+            }
             scrollbar_scroll.connect_scroll(move |controller, _dx, dy| {
-                let steps = wheel_steps(dy, scroll_unit_is_surface(controller));
-                if let Some(adj) = vte_for_scrollbar
-                    .upgrade()
-                    .and_then(|vte| vte.vadjustment())
-                {
-                    if scroll_adjustment_by_wheel(&adj, steps) {
-                        return glib::Propagation::Stop;
+                if let Some(vte) = vte_for_scrollbar.upgrade() {
+                    if let Some(adj) = vte.vadjustment() {
+                        if scroll_adjustment_by_input(
+                            &adj,
+                            dy,
+                            scroll_unit_is_surface(controller),
+                            vte.char_height() as f64,
+                        ) {
+                            return glib::Propagation::Stop;
+                        }
                     }
                 }
                 let Some(outer) = outer_for_scrollbar.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
-                forward_outer_scroll(&outer, steps);
-                debouncer_for_scrollbar.record_wheel_intent(&outer);
+                debouncer_for_scrollbar.scroll_wheel(
+                    &outer,
+                    dy,
+                    scroll_unit_is_surface(controller),
+                );
                 glib::Propagation::Stop
             });
             live_scrollbar.add_controller(scrollbar_scroll);
@@ -17094,6 +17126,16 @@ impl TermView {
                     .clamp(0, visible_rows.saturating_sub(1)) as i32
             },
         }
+    }
+
+    /// Reading a running block's scrollback gives the one companion a compact
+    /// home in the sticky header, never a second body beside the live surface.
+    pub(crate) fn organism_uses_running_header(&self) -> bool {
+        self.user_scrolled_up.get()
+            && self
+                .sticky_organism_slot
+                .parent()
+                .is_some_and(|header| header.is_mapped())
     }
 
     /// Attach a separate compact avatar to the sticky running-command header.
@@ -18506,6 +18548,7 @@ impl TermView {
                 visible_indices: &self.visible_indices,
                 failure_marker_redraw: self.failure_marker_redraw.as_ref(),
             },
+            &self.scroll_debouncer,
         );
 
         self.visible_indices.borrow_mut().clear();
@@ -18612,6 +18655,7 @@ impl TermView {
                 visible_indices: &self.visible_indices,
                 failure_marker_redraw: self.failure_marker_redraw.as_ref(),
             },
+            &self.scroll_debouncer,
         );
 
         let fallback_cols = self.active.borrow().grid_cols() as i64;

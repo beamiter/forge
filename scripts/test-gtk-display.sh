@@ -52,8 +52,11 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    block_view::scroll::canvas_native_tests::retained_canvas_scrolls_through_frames_and_yields_to_reading
     ui::organism::inspector::tests::snapshot_dialog_is_scrollable_and_closes_without_an_animation_source
     ui::organism::tests::inspection_captures_real_state_without_attention_or_lifecycle_changes
+    ui::organism::tests::one_companion_crosses_splits_without_cloning_its_body_or_mind
+    ui::organism_vte::tests::one_companion_moves_between_vte_splits_without_resizing_grids
     ui::tasks_panel::tests::cached_selected_row_survives_no_focus_move_hide_and_reveal
     ui::tasks_panel::tests::task_filters_route_real_x11_keyboard_by_identity
     ui::tasks_panel::tests::task_filters_keep_identity_hidden_updates_and_keyboard_routing
@@ -64,6 +67,7 @@ tests=(
     terminal::launch_recovery::tests::close_and_exit_retire_pending_commands_and_background_retry_keeps_focus
     block_view::search_navigation_tests::native_search_identity_characterization
     ui::dialogs::native_palette_activation_tests::palette_activation_preserves_snapshot_unfold_failure_focus_and_stale_ownership
+    ui::dialogs::tests::workflow_form_weak_callbacks_release_closed_widgets
     ui::tasks_panel::tests::approval_details_are_paged_read_only_and_stale_controls_cannot_decide
     block_view::incremental_find_tests::block_native_find_controls_keep_query_caret_and_tab_focus
     block_view::incremental_find_tests::chat_native_find_controls_keep_query_caret_and_tab_focus

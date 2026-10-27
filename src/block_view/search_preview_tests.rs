@@ -508,3 +508,30 @@ fn regex_compilation_size_limit_does_not_return_partial_hits() {
         PreviewError::InvalidRegex,
     );
 }
+
+#[test]
+fn publication_handshake_ignores_intermediate_editable_queries() {
+    let worker = Worker::new(Arc::new(snapshot_with(&[(1, Field::Output, "needle")]))).unwrap();
+    let (arrived, release, published, finish) = worker.pause_publication_for("needle");
+    // Force the intermediate changed signal to finish first. Its reply must
+    // not consume the gate intended for the final GtkEditable value.
+    let intermediate = worker.submit("", false).unwrap();
+    wait_until(|| {
+        worker
+            .reply
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|reply| reply.generation == intermediate)
+    });
+    assert!(arrived.try_recv().is_err());
+    let expected = worker.submit("needle", false).unwrap();
+    arrived.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(worker.take_reply().is_none());
+    release.send(()).unwrap();
+    published.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(worker.take_reply().unwrap().generation, expected);
+    finish.send(()).unwrap();
+    worker.stop();
+    wait_until(|| worker.has_exited());
+}

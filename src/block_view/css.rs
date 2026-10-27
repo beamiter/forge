@@ -469,9 +469,9 @@ pub(crate) fn block_css(config: &Config) -> String {
             padding: 0 10px 0 2px;
         }}
         .term-chat-root .chat-result {{
-            background-color: {block_bg_hex};
-            border-radius: 5px 16px 16px 16px;
-            outline: 1px solid rgba({fg_r},{fg_g},{fg_b},0.08);
+            background-color: transparent;
+            border-radius: 0;
+            outline: 1px solid transparent;
             outline-offset: -1px;
         }}
         .term-chat-root .block-failed .chat-result {{
@@ -1406,6 +1406,39 @@ pub(crate) fn block_css(config: &Config) -> String {
             font-size: 0.92em;
             padding: 6px 10px;
         }}
+
+        /* The transcript is one surface, not a stack of elevated panels.
+           Keep every box metric unchanged: native terminal columns, alternate
+           screen winsize, retained measurements and pointer mapping depend on
+           them. Outcome stripes/washes and bookmark images remain independent;
+           only selection gets a ring, never a pointer-driven drop shadow. */
+        .block-list .block-finished {{
+            border-radius: 0;
+        }}
+        .block-list .block-active {{
+            border-radius: 0;
+            outline-color: transparent;
+            box-shadow: none;
+        }}
+        .block-list .block-finished:not(.block-selected) {{
+            box-shadow: none;
+        }}
+        .block-list .block-finished:not(.block-selected):not(.block-hovered):not(.cross-block-text-selected) {{
+            outline-color: transparent;
+        }}
+        .block-list .block-finished:not(.block-failed):not(.block-background):not(.block-selected):not(.block-hovered) {{
+            background-color: transparent;
+        }}
+        .block-list .block-finished.block-selected {{
+            box-shadow: inset 0 0 0 2px rgba({acc_r},{acc_g},{acc_b},0.65);
+        }}
+        .block-list .block-finished.block-selected.block-selection-active {{
+            box-shadow: inset 0 0 0 3px {accent};
+        }}
+        .term-chat-root .chat-composer:focus-within {{
+            outline: 2px solid {accent};
+            outline-offset: -2px;
+        }}
         "#,
     );
     css
@@ -1420,6 +1453,43 @@ mod tests {
     };
     use std::path::Path;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn continuous_surface_preserves_geometry_outcomes_and_selection() {
+        let css = block_css(&crate::config::Config::safe_defaults());
+        for selector in [
+            ".block-list .block-finished",
+            ".block-list .block-active",
+            ".block-list .block-finished:not(.block-selected)",
+            ".block-list .block-finished.block-selected",
+            ".block-list .block-finished.block-selected.block-selection-active",
+        ] {
+            let rule = rule_body(&css, selector);
+            for property in ["margin:", "padding:", "border-width:", "min-height:"] {
+                assert!(!rule.contains(property), "{selector} changed {property}");
+            }
+            assert!(
+                !rule.contains("0 4px 14px"),
+                "no hover elevation: {selector}"
+            );
+        }
+        assert!(rule_body(&css, ".block-list .block-finished").contains("border-radius: 0;"));
+        assert!(rule_body(&css, ".block-list .block-finished:not(.block-failed):not(.block-background):not(.block-selected):not(.block-hovered)")
+            .contains("background-color: transparent;"));
+        assert!(
+            rule_body(&css, ".block-list .block-finished.block-selected")
+                .contains("box-shadow: inset 0 0 0 2px")
+        );
+        assert!(rule_body(
+            &css,
+            ".block-list .block-finished.block-selected.block-selection-active"
+        )
+        .contains("box-shadow: inset 0 0 0 3px"));
+        assert!(
+            rule_body(&css, ".term-chat-root .chat-composer:focus-within")
+                .contains("outline: 2px solid")
+        );
+    }
 
     #[test]
     fn active_card_seams_and_height_budget_match_finished_cards() {
@@ -1684,7 +1754,8 @@ mod tests {
             );
         }
 
-        // A hovered selection keeps both the ring and the lift.
+        // Legacy unscoped cards keep the ring and lift. Transcript-scoped
+        // overrides below must retain only the inset selection ring.
         for selector in [
             ".block-selected.block-hovered",
             ".block-selected.block-selection-active.block-hovered",
@@ -1694,6 +1765,58 @@ mod tests {
                 body.contains("inset") && body.contains("14px"),
                 "`{selector}` must carry the ring AND the hover elevation: {body}"
             );
+        }
+
+        // Continuous transcript overrides win over those legacy combinations,
+        // without claiming outcome borders or introducing another outer shadow.
+        let accent = config.semantic_colors().accent;
+        let selected_shadow = format!(
+            "box-shadow: inset 0 0 0 2px rgba({},{},{},0.65);",
+            (accent.red() * 255.0) as u8,
+            (accent.green() * 255.0) as u8,
+            (accent.blue() * 255.0) as u8,
+        );
+        let active_shadow = format!(
+            "box-shadow: inset 0 0 0 3px {};",
+            super::rgba_to_hex(&accent)
+        );
+        for (selector, expected) in [
+            (
+                ".block-list .block-finished.block-selected",
+                selected_shadow,
+            ),
+            (
+                ".block-list .block-finished.block-selected.block-selection-active",
+                active_shadow,
+            ),
+        ] {
+            let body = rule_body(&css, selector);
+            assert_eq!(
+                body.trim(),
+                expected,
+                "{selector} must only own its inset ring"
+            );
+            assert!(
+                css.find(&format!("{selector} {{")).unwrap()
+                    > css
+                        .find(".block-selected.block-selection-active.block-hovered {")
+                        .unwrap(),
+                "transcript overrides must follow the legacy hover rules"
+            );
+        }
+        assert_eq!(
+            rule_body(&css, ".block-list .block-finished:not(.block-selected)").trim(),
+            "box-shadow: none;",
+            "unselected transcript cards must not acquire elevation or erase outcome cues"
+        );
+
+        for selector in [
+            ".block-list .block-finished",
+            ".block-list .block-finished:not(.block-failed):not(.block-background):not(.block-selected):not(.block-hovered)",
+        ] {
+            let body = rule_body(&css, selector);
+            assert!(!body.contains("box-shadow"), "neutral history cannot add a shadow");
+            assert!(!body.contains("transform"), "neutral history cannot lift or move");
         }
 
         // Nothing else may quietly join the box-shadow contest. Scoped to the
@@ -1708,6 +1831,9 @@ mod tests {
             owners,
             vec![
                 ".block-hovered",
+                ".block-list .block-finished.block-selected",
+                ".block-list .block-finished.block-selected.block-selection-active",
+                ".block-list .block-finished:not(.block-selected)",
                 ".block-selected",
                 ".block-selected.block-hovered",
                 ".block-selected.block-selection-active",
