@@ -732,11 +732,13 @@ impl AgentRuntime {
             return;
         }
 
+        let Some(request) = runtime.session.borrow().model_request_token() else { return; };
+ let epoch = runtime.session.borrow().epoch();
         let client = match crate::ai::client_from_config(&runtime.config.borrow()) {
             Ok(client) => client,
             Err(error) => {
                 let message = error.to_string();
-                let _ = runtime.session.borrow_mut().model_failed(&message);
+                let _ = runtime.session.borrow_mut().model_failed_for(&request, &message);
                 runtime.append("Error", &message);
                 runtime.render_session_state(Some(&message));
                 return;
@@ -810,7 +812,7 @@ impl AgentRuntime {
 
         let rx = RefCell::new(rx);
         gtk4::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-            if !runtime.alive.get() {
+            if !runtime.alive.get() || !request.is_active() || runtime.session.borrow().epoch() != epoch {
                 return gtk4::glib::ControlFlow::Break;
             }
             // Finish the RefCell borrows before handling the result: terminal
@@ -821,7 +823,7 @@ impl AgentRuntime {
                 Ok(Ok(reply)) => {
                     runtime.request_cancellation.borrow_mut().take();
                     runtime.busy.set(false);
-                    let outcome = runtime.session.borrow_mut().accept_model_reply(&reply);
+                    let outcome = runtime.session.borrow_mut().accept_model_reply_for(&request, &reply);
                     match outcome {
                         Ok(ModelOutcome::Proposal {
                             id,
@@ -865,7 +867,7 @@ impl AgentRuntime {
                     } else {
                         error.to_string()
                     };
-                    let _ = runtime.session.borrow_mut().model_failed(&message);
+                    let _ = runtime.session.borrow_mut().model_failed_for(&request, &message);
                     runtime.append(if stopped { "Stopped" } else { "Error" }, &message);
                     runtime.render_session_state(Some(&message));
                     gtk4::glib::ControlFlow::Break
@@ -875,7 +877,7 @@ impl AgentRuntime {
                     runtime.request_cancellation.borrow_mut().take();
                     runtime.busy.set(false);
                     let message = "Agent worker disconnected.";
-                    let _ = runtime.session.borrow_mut().model_failed(message);
+                    let _ = runtime.session.borrow_mut().model_failed_for(&request, message);
                     runtime.append("Error", message);
                     runtime.render_session_state(Some(message));
                     gtk4::glib::ControlFlow::Break
