@@ -12,6 +12,34 @@ use crate::config::{
 };
 use crate::terminal::collect_terminals;
 
+/// Configuration broadcasts include temporarily detached pane trees, unlike
+/// focus and input traversal. Walk incomplete splits and visit each identity
+/// once so a reparenting overlap cannot apply a setting twice.
+fn configuration_leaf_targets<T: Clone + PartialEq>(
+    roots: impl IntoIterator<Item = T>,
+    mut children: impl FnMut(&T) -> Vec<T>,
+    mut is_leaf: impl FnMut(&T) -> bool,
+) -> Vec<T> {
+    let mut pending: Vec<_> = roots.into_iter().collect();
+    pending.reverse();
+    let mut visited = Vec::new();
+    let mut leaves = Vec::new();
+    while let Some(node) = pending.pop() {
+        if visited.contains(&node) {
+            continue;
+        }
+        visited.push(node.clone());
+        if is_leaf(&node) {
+            leaves.push(node);
+        } else {
+            let mut descendants = children(&node);
+            descendants.reverse();
+            pending.extend(descendants);
+        }
+    }
+    leaves
+}
+
 /// Attempts a reload spends waiting for the persistence worker's short
 /// critical section on the revision slot before it gives up and says so.
 const CONFIG_REVISION_READ_ATTEMPTS: u8 = 4;
@@ -142,6 +170,22 @@ impl ConfigDirtyEpoch {
         }
     }
 
+    /// Only the edit generation named by an explicit discard may bypass
+    /// watcher de-duplication. A newer edit retires that permission, even if
+    /// its writer has already made it clean while a reload retry was pending.
+    fn reload_decision(
+        &self,
+        live_revision: Option<&crate::config_store::ConfigRevision>,
+        disk_revision: &crate::config_store::ConfigRevision,
+        discard_epoch: Option<u64>,
+    ) -> ConfigReloadDecision {
+        if discard_epoch == Some(self.edits.get()) {
+            ConfigReloadDecision::Apply
+        } else {
+            decide_config_reload(live_revision, disk_revision, self.has_unsaved_edits())
+        }
+    }
+
     /// Abandon every unsaved edit, because the user chose the file's version.
     fn abandon_unsaved_edits(&self) {
         self.persisted
@@ -165,6 +209,38 @@ impl ConfigPersistCommit {
 }
 
 impl UiState {
+    /// Snapshot every retained pane for settings and stable task lookup.
+    /// During zoom the
+    /// original split has an empty child slot and is outside the Notebook;
+    /// PaneNode's complete-tree invariant intentionally does not apply here.
+    pub(super) fn configuration_leaves(&self) -> Vec<PaneLeaf> {
+        let mut roots: Vec<_> = (0..self.notebook.n_pages())
+            .filter_map(|page| self.notebook.nth_page(Some(page)))
+            .collect();
+        if let Some(state) = self.zoom_state.borrow().as_ref() {
+            roots.push(state.swap.original_page.clone());
+        }
+        configuration_leaf_targets(
+            roots,
+            |widget| {
+                widget
+                    .clone()
+                    .downcast::<gtk4::Paned>()
+                    .map(|paned| {
+                        [paned.start_child(), paned.end_child()]
+                            .into_iter()
+                            .flatten()
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            },
+            |widget| PaneLeaf::from_widget(widget).is_some(),
+        )
+        .iter()
+        .filter_map(PaneLeaf::from_widget)
+        .collect()
+    }
+
     fn show_safe_mode_config_notice(&self) {
         // Safe mode deliberately refuses persistence; that is informational,
         // not an error that should block the settings surface. Its guard is
@@ -235,7 +311,16 @@ impl UiState {
             return;
         }
         let snapshot = self.config.borrow().clone();
-        let path = config_file_path();
+        let path = match config_file_path() {
+            Ok(path) => path,
+            Err(error) => {
+                self.show_config_error(
+                    "Settings were not saved",
+                    &format!("{error}. The in-memory setting is still active."),
+                );
+                return;
+            }
+        };
         let key = crate::persistence::PersistenceKey::for_path("config", &path);
         // The witness names the edit this exact snapshot carries. Redeeming it
         // on the worker thread, immediately after the store published the new
@@ -277,17 +362,9 @@ impl UiState {
         // across `reload_config` would become re-entrant if their ownership is
         // ever unified.
         let config = self.config.borrow().clone();
-        for page in 0..self.notebook.n_pages() {
-            let Some(widget) = self.notebook.nth_page(Some(page)) else {
-                continue;
-            };
-            let Some(node) = PaneNode::from_widget(&widget) else {
-                continue;
-            };
-            for leaf in node.leaves() {
-                if let Some(view) = leaf.block_view() {
-                    view.reload_config(&config);
-                }
+        for leaf in self.configuration_leaves() {
+            if let Some(view) = leaf.block_view() {
+                view.reload_config(&config);
             }
         }
     }
@@ -305,18 +382,44 @@ impl UiState {
     /// live value — and the expensive widget sweep runs once, on the idle after
     /// the burst has been dispatched.
     pub(crate) fn apply_font_scale(&self, new_scale: f64) {
-        self.font_scale.set(new_scale);
-        self.config.borrow_mut().default_font_scale = new_scale;
+        self.apply_font_group_scale(crate::font_zoom::FontGroup::Content, new_scale);
+    }
+
+    pub(crate) fn apply_font_group_scale(
+        &self,
+        group: crate::font_zoom::FontGroup,
+        new_scale: f64,
+    ) {
+        use crate::font_zoom::FontGroup;
+        let new_scale = crate::font_zoom::clamp_scale(new_scale);
+        let pending = match group {
+            FontGroup::Content => {
+                self.font_scale.set(new_scale);
+                self.config.borrow_mut().default_font_scale = new_scale;
+                &self.pending_font_scale
+            }
+            FontGroup::Chrome => {
+                self.config.borrow_mut().chrome_font_scale = new_scale;
+                &self.pending_chrome_font_scale
+            }
+        };
         // The generic persist below is still 400 ms of debounce away, and the
         // config already differs from the file. Mark it dirty now so a reload
         // arriving inside a held Ctrl+wheel gesture cannot undo the zoom.
         self.config_dirty.record_edit();
 
-        if claim_font_scale_sweep(&self.pending_font_scale, new_scale) {
+        if claim_font_scale_sweep(pending, new_scale) {
             let ui = self.clone();
-            glib::idle_add_local_once(move || {
-                if let Some(scale) = ui.pending_font_scale.take() {
-                    ui.set_font_scale_all(scale);
+            glib::idle_add_local_once(move || match group {
+                FontGroup::Content => {
+                    if let Some(scale) = ui.pending_font_scale.take() {
+                        ui.set_font_scale_all(scale);
+                    }
+                }
+                FontGroup::Chrome => {
+                    if ui.pending_chrome_font_scale.take().is_some() {
+                        ui.apply_dynamic_css();
+                    }
                 }
             });
         }
@@ -333,38 +436,34 @@ impl UiState {
 
     pub(crate) fn set_font_scale_all(&self, new_scale: f64) {
         self.font_scale.set(new_scale);
-        for i in 0..self.notebook.n_pages() {
-            if let Some(widget) = self.notebook.nth_page(Some(i)) {
-                let Some(node) = PaneNode::from_widget(&widget) else {
-                    continue;
-                };
-                for leaf in node.leaves() {
-                    if let Some(view) = leaf.block_view() {
-                        // Updates the live surface, every finished renderer,
-                        // and the TermView config used by future blocks.
-                        view.set_font_scale(new_scale);
-                    } else {
-                        leaf.terminal().set_font_scale(new_scale);
-                    }
-                }
+        for leaf in self.configuration_leaves() {
+            if let Some(view) = leaf.block_view() {
+                // Updates the live surface, every finished renderer,
+                // and the TermView config used by future blocks.
+                view.set_font_scale(new_scale);
+            } else {
+                leaf.terminal().set_font_scale(new_scale);
             }
         }
+        // Repaint chrome in the same idle sweep as every live/history VTE.
+        // Reading font_scale also covers explicit reloads and reset-to-1.0.
+        self.apply_dynamic_css();
     }
 
     pub(crate) fn for_each_terminal(&self, f: impl Fn(&Terminal)) {
-        for i in 0..self.notebook.n_pages() {
-            if let Some(widget) = self.notebook.nth_page(Some(i)) {
-                let mut terms = Vec::new();
-                collect_terminals(&widget, &mut terms);
-                for term in terms {
-                    f(&term);
-                }
-            }
+        let mut terminals = Vec::new();
+        for leaf in self.configuration_leaves() {
+            // Keep the existing broadcast to finished Block renderers as
+            // well as the live terminal; a pane owns more than one VTE.
+            collect_terminals(&leaf.root_widget(), &mut terminals);
+        }
+        for term in terminals {
+            f(&term);
         }
     }
 
     pub(crate) fn apply_colors_all(&self) {
-        let config = self.config.borrow();
+        let config = self.config.borrow().clone();
         let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
         self.for_each_terminal(|term| {
             term.set_colors(
@@ -376,7 +475,14 @@ impl UiState {
             term.set_color_cursor(Some(&config.cursor));
             term.set_color_cursor_foreground(Some(&config.cursor_foreground));
         });
-        drop(config);
+        // Complete explicit theme changes through the typed controller too:
+        // snapshot VTE traversal cannot reset its OSC color tracker or CSS.
+        for leaf in self.configuration_leaves() {
+            if let Some(view) = leaf.block_view() {
+                view.reload_config(&config);
+                view.apply_theme();
+            }
+        }
         self.apply_dynamic_css();
     }
 
@@ -389,6 +495,13 @@ impl UiState {
         // untouched, but make labels, buttons, and status text readable.
         let semantic = config.semantic_colors();
         let fg = &semantic.foreground;
+        let menu_css = crate::font::menu_theme_css(&config.font_desc, bg, fg);
+        let font_css = crate::font::window_font_css(
+            &config.font_desc,
+            self.font_scale.get(),
+            &config.chrome_font_size,
+            config.chrome_font_scale,
+        );
         let br = (bg.red() * 255.0) as u8;
         let bg_g = (bg.green() * 255.0) as u8;
         let bb = (bg.blue() * 255.0) as u8;
@@ -446,6 +559,8 @@ impl UiState {
              .file-tree-header, .file-tree-header button, .file-tree-header label,
              .file-tree-root {{ color: rgb({fr},{fg_g},{fb}); }}
              .file-tree-root {{ opacity: 1.0; }}
+             {menu_css}
+             {font_css}
              .tab-strip-btn {{ color: rgb({mut_r},{mut_g},{mut_b}); }}
              .tab-strip-btn:checked {{ color: rgb({fr},{fg_g},{fb}); }}
              .tab-strip-btn.tab-marked {{ background-color: rgba({fr},{fg_g},{fb},0.2); font-weight: bold; }}
@@ -673,20 +788,15 @@ impl UiState {
         let desc = config.font_desc.clone();
         let font_desc = crate::font::terminal_font_description(&desc, &config);
         drop(config);
-        for i in 0..self.notebook.n_pages() {
-            if let Some(widget) = self.notebook.nth_page(Some(i)) {
-                let Some(node) = PaneNode::from_widget(&widget) else {
-                    continue;
-                };
-                for leaf in node.leaves() {
-                    if let Some(view) = leaf.block_view() {
-                        view.set_font(&desc);
-                    } else {
-                        leaf.terminal().set_font(Some(&font_desc));
-                    }
-                }
+        for leaf in self.configuration_leaves() {
+            if let Some(view) = leaf.block_view() {
+                view.set_font(&desc);
+            } else {
+                leaf.terminal().set_font(Some(&font_desc));
             }
         }
+        // Existing popovers share the display provider and update in place.
+        self.apply_dynamic_css();
     }
 
     pub(crate) fn apply_scrollback_all(&self) {
@@ -706,12 +816,23 @@ impl UiState {
             config.cursor_foreground = theme.cursor_foreground;
             config.palette = theme.palette;
         }
+        // Each Block pane owns a Config snapshot used by future cards and
+        // CSS refreshes. Update it before repainting existing renderers, or
+        // a later command/font change can bring the old palette back.
+        self.sync_block_configs();
         self.apply_colors_all();
+        // Finish with Block-specific treatment, including transparent
+        // snapshot cursors that the generic VTE pass would otherwise reset.
+        for leaf in self.configuration_leaves() {
+            if let Some(view) = leaf.block_view() {
+                view.apply_theme();
+            }
+        }
     }
 
     /// Reload configuration from disk and apply changes.
     pub(crate) fn reload_config(&self) {
-        self.reload_config_attempt(CONFIG_REVISION_READ_ATTEMPTS);
+        self.reload_config_attempt(CONFIG_REVISION_READ_ATTEMPTS, None);
     }
 
     /// Tell the user their in-window settings and the file have diverged, and
@@ -760,15 +881,17 @@ impl UiState {
             .set(self.config_persist_generation.get().wrapping_add(1));
         self.font_persist_generation
             .set(self.font_persist_generation.get().wrapping_add(1));
-        // Likewise the queued font-zoom widget sweep: the reload sets every
-        // pane's scale from the file, and a pending sweep would re-apply the
-        // discarded one to the widgets while the config said otherwise.
-        self.pending_font_scale.set(None);
-        self.config_dirty.abandon_unsaved_edits();
-        self.reload_config();
+        // Keep the live edits dirty (and their pending widget sweep intact)
+        // until a validated replacement is ready. Read/parse failures do not
+        // mean the requested discard actually completed.
+        let discard_epoch = self.config_dirty.edits.get();
+        self.reload_config_attempt(CONFIG_REVISION_READ_ATTEMPTS, Some(discard_epoch));
     }
 
-    fn reload_config_attempt(&self, attempts_left: u8) {
+    fn reload_config_attempt(&self, attempts_left: u8, discard_epoch: Option<u64>) {
+        // This request cannot discard any edit made after its confirmation.
+        // Carry only a still-current permission through the bounded retry.
+        let discard_epoch = discard_epoch.filter(|epoch| *epoch == self.config_dirty.edits.get());
         if std::env::var_os("FORGE_SAFE_MODE").is_some() {
             let dialog = adw::AlertDialog::new(
                 Some("Configuration reload disabled"),
@@ -779,7 +902,16 @@ impl UiState {
             dialog.present(Some(&self.window));
             return;
         }
-        let path = config_file_path();
+        let path = match config_file_path() {
+            Ok(path) => path,
+            Err(error) => {
+                self.show_config_error(
+                    "Configuration reload rejected",
+                    &format!("The current settings remain active. {error}"),
+                );
+                return;
+            }
+        };
         let contents = match crate::config_store::read_config_text(&path) {
             Ok(contents) => contents,
             Err(error) => {
@@ -812,7 +944,7 @@ impl UiState {
             if attempts_left > 0 {
                 let ui = self.clone();
                 glib::timeout_add_local_once(CONFIG_REVISION_RETRY_DELAY, move || {
-                    ui.reload_config_attempt(attempts_left - 1);
+                    ui.reload_config_attempt(attempts_left - 1, discard_epoch);
                 });
             } else {
                 self.show_config_error(
@@ -822,10 +954,10 @@ impl UiState {
             }
             return;
         };
-        match decide_config_reload(
+        match self.config_dirty.reload_decision(
             live_revision.as_ref(),
             &disk_revision,
-            self.config_dirty.has_unsaved_edits(),
+            discard_epoch,
         ) {
             ConfigReloadDecision::Skip => {
                 log::debug!("Config reload skipped: file matches the current in-memory revision");
@@ -907,6 +1039,18 @@ impl UiState {
         let ai_visible = new_config.ai_enabled && new_config.ai_panel_visible;
         let previous_remote_hosts = self.config.borrow().remote_hosts.clone();
 
+        if let Some(epoch) = discard_epoch {
+            if epoch != self.config_dirty.edits.get() {
+                return;
+            }
+            // The replacement passed both reads and validation. Retire the
+            // old sweep before installing it so an idle callback cannot put
+            // the discarded scale back over the newly loaded configuration.
+            self.pending_font_scale.set(None);
+            self.pending_chrome_font_scale.set(None);
+            self.config_dirty.abandon_unsaved_edits();
+        }
+
         // New panes/tabs immediately use a changed shell; all other config is
         // replaced as one coherent snapshot instead of retaining stale fields.
         *self.shell_argv.borrow_mut() = choose_shell_argv(new_config.shell.as_deref());
@@ -920,6 +1064,9 @@ impl UiState {
         // TermView owns a shared clone used by long-lived callbacks. Refresh it
         // as well so behavior changes do not require reopening block tabs.
         self.sync_block_configs();
+
+        self.sync_ascii_organism_settings();
+        self.sync_organism_settings_controls();
 
         // Apply all visual changes
         self.window_opacity.set(opacity);
@@ -945,6 +1092,8 @@ impl UiState {
         self.ai_panel.refresh_config_display();
         self.ai_panel.refresh_persisted_privacy();
         self.sync_agent_toggle();
+        // `agent_tasks_enabled` decides whether the Tasks button is offered.
+        self.sync_task_badge();
 
         // Update keybindings
         *self.keybinding_map.borrow_mut() = new_keybindings;
@@ -965,11 +1114,229 @@ fn claim_font_scale_sweep(pending: &Cell<Option<f64>>, scale: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        claim_font_scale_sweep, decide_config_reload, reload_matches_live_revision,
-        reload_read_failure, ConfigDirtyEpoch, ConfigReloadDecision,
+        claim_font_scale_sweep, configuration_leaf_targets, decide_config_reload,
+        reload_matches_live_revision, reload_read_failure, ConfigDirtyEpoch, ConfigReloadDecision,
     };
     use crate::config_store::ConfigRevision;
     use std::cell::Cell;
+
+    #[test]
+    fn explicit_discard_applies_even_when_disk_returns_to_original_revision() {
+        let dirty = ConfigDirtyEpoch::default();
+        let original = ConfigRevision::from_bytes(b"opacity = 0.9\n");
+        let external = ConfigRevision::from_bytes(b"opacity = 0.5\n");
+        dirty.record_edit();
+        assert_eq!(
+            dirty.reload_decision(Some(&original), &external, None),
+            ConfigReloadDecision::Conflict
+        );
+        let intent = Some(dirty.edits.get());
+        // The file returned to A while the A-versus-B prompt was open.
+        assert_eq!(
+            dirty.reload_decision(Some(&original), &original, None),
+            ConfigReloadDecision::Skip
+        );
+        assert_eq!(
+            dirty.reload_decision(Some(&original), &original, intent),
+            ConfigReloadDecision::Apply
+        );
+        // Merely deciding to load is not proof that a replacement was read.
+        assert!(dirty.has_unsaved_edits());
+        dirty.abandon_unsaved_edits();
+        assert!(!dirty.has_unsaved_edits());
+    }
+
+    #[test]
+    fn newer_edits_retire_discard_permission_even_after_their_save_finishes() {
+        let dirty = ConfigDirtyEpoch::default();
+        let original = ConfigRevision::from_bytes(b"opacity = 0.9\n");
+        let external = ConfigRevision::from_bytes(b"opacity = 0.5\n");
+        dirty.record_edit();
+        let intent = Some(dirty.edits.get());
+        dirty.record_edit();
+        assert_eq!(
+            dirty.reload_decision(Some(&original), &external, intent),
+            ConfigReloadDecision::Conflict
+        );
+        assert_eq!(
+            dirty.reload_decision(Some(&original), &original, intent),
+            ConfigReloadDecision::Skip
+        );
+        dirty.commit_handle().commit();
+        assert_eq!(
+            dirty.reload_decision(Some(&original), &original, intent),
+            ConfigReloadDecision::Skip
+        );
+    }
+
+    #[test]
+    fn discard_retires_dirty_state_and_old_sweep_only_after_validated_reload() {
+        // Wiring coverage, not an injected filesystem or GTK execution.
+        let source = include_str!("config_apply.rs");
+        let production = source.split_once("\n#[cfg(test)]").unwrap().0;
+        let discard = production
+            .split_once("fn discard_unsaved_config_edits_and_reload(&self)")
+            .unwrap()
+            .1
+            .split_once("fn reload_config_attempt(")
+            .unwrap()
+            .0;
+        assert!(!discard.contains("abandon_unsaved_edits()"));
+        assert!(!discard.contains("pending_font_scale.set(None)"));
+        assert!(discard.contains("Some(discard_epoch)"));
+        let reload = production
+            .split_once("fn reload_config_attempt(")
+            .unwrap()
+            .1;
+        assert!(reload
+            .contains("discard_epoch.filter(|epoch| *epoch == self.config_dirty.edits.get())"));
+        assert!(reload.contains("ui.reload_config_attempt(attempts_left - 1, discard_epoch)"));
+        let checked = reload
+            .find("if let Some(reason) = reload_read_failure(")
+            .unwrap();
+        let retire = reload.find("self.pending_font_scale.set(None)").unwrap();
+        let clean = reload
+            .find("self.config_dirty.abandon_unsaved_edits()")
+            .unwrap();
+        let install = reload
+            .find("*self.config.borrow_mut() = new_config")
+            .unwrap();
+        assert!(checked < retire && retire < clean && clean < install);
+        assert!(reload[..retire].contains("if epoch != self.config_dirty.edits.get()"));
+    }
+
+    #[test]
+    fn theme_updates_pane_snapshots_before_repainting() {
+        // Structural coverage only: this pins the actual snapshot/paint
+        // wiring without claiming to validate GTK pixels or starting a PTY.
+        let source = include_str!("config_apply.rs");
+        let production = source.split_once("\n#[cfg(test)]").unwrap().0;
+        let theme = production
+            .split_once("pub(crate) fn apply_theme(&self, theme: &Theme) {")
+            .unwrap()
+            .1
+            .split_once("\n    }")
+            .unwrap()
+            .0;
+        for field in [
+            "theme_name = theme.name.clone()",
+            "foreground = theme.foreground",
+            "background = theme.background",
+            "cursor = theme.cursor",
+            "cursor_foreground = theme.cursor_foreground",
+            "palette = theme.palette",
+        ] {
+            assert!(theme.contains(field), "theme snapshot must update {field}");
+        }
+        let sync = theme.find("self.sync_block_configs();").unwrap();
+        let repaint = theme.find("view.apply_theme();").unwrap();
+        let colors = theme.find("self.apply_colors_all();").unwrap();
+        assert!(sync < colors && colors < repaint);
+        assert!(theme.contains("self.configuration_leaves()"));
+
+        let block_source = include_str!("../block_view/mod.rs");
+        let reload = block_source
+            .split_once("pub(crate) fn reload_config(&self, config: &Config) {")
+            .unwrap()
+            .1
+            .split_once("\n    }")
+            .unwrap()
+            .0;
+        assert!(reload.contains("*self.config.borrow_mut() = config.clone();"));
+        let paint = block_source
+            .split_once("pub fn apply_theme(&self) {")
+            .unwrap()
+            .1
+            .split_once("\n    }")
+            .unwrap()
+            .0;
+        let reset = paint
+            .find("self.dynamic_colors.set(Default::default());")
+            .unwrap();
+        let recolor = paint
+            .find("apply_terminal_theme(&self.active_vte, &config)")
+            .unwrap();
+        assert!(
+            reset < recolor,
+            "explicit themes retire the old OSC color overrides"
+        );
+        let broadcast = production
+            .split_once("pub(crate) fn apply_colors_all(&self) {")
+            .unwrap()
+            .1
+            .split_once("\n    }")
+            .unwrap()
+            .0;
+        assert!(broadcast.contains("self.config.borrow().clone()"));
+        assert!(broadcast.contains("self.configuration_leaves()"));
+        assert!(
+            broadcast.find("view.reload_config(&config);").unwrap()
+                < broadcast.find("view.apply_theme();").unwrap()
+        );
+        assert!(paint.contains("let config = self.config.borrow();"));
+        assert!(paint.contains("apply_terminal_theme(&self.active_vte, &config)"));
+        assert!(paint.contains("install_block_css(&config)"));
+        assert!(paint.contains("apply_snapshot_theme_to_vte(&block.output_vte, &config)"));
+        let snapshots = include_str!("../block_view/alt_screen.rs");
+        let snapshot_theme = snapshots
+            .split_once("fn apply_snapshot_theme_to_vte(terminal: &Terminal, config: &Config) {")
+            .unwrap()
+            .1
+            .split_once("\n}")
+            .unwrap()
+            .0;
+        assert!(snapshot_theme.contains("transparent.set_alpha(0.0);"));
+        assert!(snapshot_theme.contains("terminal.set_color_cursor(Some(&transparent));"));
+    }
+
+    #[test]
+    fn settings_reach_zoomed_and_detached_siblings_exactly_once() {
+        // Leaf 10 is promoted into the Notebook. Its old parent (2) has
+        // only leaf 11 left; the outer retained root also holds leaf 12.
+        let leaves = configuration_leaf_targets(
+            [10, 1],
+            |node| match node {
+                1 => vec![2, 12],
+                2 => vec![11],
+                _ => Vec::new(),
+            },
+            |node| *node >= 10,
+        );
+        assert_eq!(leaves, [10, 11, 12]);
+
+        // Reparenting may momentarily expose the same root or leaf through
+        // both inputs. Configuration setters still receive one call each.
+        let overlap = configuration_leaf_targets(
+            [10, 1, 1],
+            |node| match node {
+                1 => vec![2, 12],
+                2 => vec![10, 11],
+                _ => Vec::new(),
+            },
+            |node| *node >= 10,
+        );
+        assert_eq!(overlap, leaves);
+    }
+
+    #[test]
+    fn settings_broadcast_covers_the_same_leaves_before_zoom_and_after_unzoom() {
+        let restored = configuration_leaf_targets(
+            [1],
+            |node| match node {
+                1 => vec![2, 12],
+                2 => vec![10, 11],
+                _ => Vec::new(),
+            },
+            |node| *node >= 10,
+        );
+        assert_eq!(restored, [10, 11, 12]);
+        let empty: Vec<u8> = configuration_leaf_targets([], |_| Vec::new(), |_| false);
+        assert!(empty.is_empty());
+        assert_eq!(
+            configuration_leaf_targets([10], |_| Vec::<u8>::new(), |_| true),
+            [10]
+        );
+    }
 
     /// A wheel gesture arrives as a train of 0.025 notches. Exactly one of them
     /// may schedule the widget sweep, and the sweep must run at the scale the

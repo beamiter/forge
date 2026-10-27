@@ -161,6 +161,7 @@ struct HistoryLoadState {
 
 pub(super) struct HistoryLoadShared {
     state: Mutex<HistoryLoadState>,
+    zone_persistence: Mutex<zone_history::SessionPersistence>,
     revision: Mutex<Option<HistoryRevision>>,
     legacy_authority: Mutex<LegacyHistoryAuthority>,
     applied: AtomicBool,
@@ -177,6 +178,7 @@ impl Default for HistoryLoadShared {
                 pre_apply_save_leases: 0,
                 consume_requested: false,
             }),
+            zone_persistence: Mutex::new(zone_history::SessionPersistence::default()),
             revision: Mutex::new(None),
             legacy_authority: Mutex::new(LegacyHistoryAuthority::MergeOnly),
             applied: AtomicBool::new(true),
@@ -203,15 +205,23 @@ impl HistoryLoadShared {
     /// resource pressure may make ordinary saves require a complete reload,
     /// but must not make a successful Clear reappear on the next launch.
     pub(super) fn discard_for_explicit_clear(&self) {
-        self.explicit_replace_epoch
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
-                Some(
-                    epoch
-                        .checked_add(1)
-                        .expect("explicit Block-history replacement epoch exhausted"),
-                )
-            })
-            .expect("explicit Block-history replacement epoch update is infallible");
+        // compare_exchange_weak keeps this available on older Rust toolchains
+        // without the now-deprecated fetch_update spelling.
+        let mut epoch = self.explicit_replace_epoch.load(Ordering::Acquire);
+        loop {
+            let next = epoch
+                .checked_add(1)
+                .expect("explicit Block-history replacement epoch exhausted");
+            match self.explicit_replace_epoch.compare_exchange_weak(
+                epoch,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => epoch = observed,
+            }
+        }
         self.discarded.store(true, Ordering::Release);
         self.applied.store(true, Ordering::Release);
         let prior = {
@@ -358,8 +368,11 @@ impl HistoryLoadShared {
                 .pre_apply_save_leases
                 .checked_sub(1)
                 .expect("pre-apply history save lease accounting underflow");
-            (state.pre_apply_save_leases == 0 && state.consume_requested)
-                .then(|| std::mem::replace(&mut state.outcome, HistoryLoadOutcome::Idle))
+            (state.pre_apply_save_leases == 0
+                && state.consume_requested
+                && (self.discarded.load(Ordering::Acquire)
+                    || !matches!(state.outcome, HistoryLoadOutcome::Failed { .. })))
+            .then(|| std::mem::replace(&mut state.outcome, HistoryLoadOutcome::Idle))
         };
         drop(prior);
     }
@@ -375,8 +388,12 @@ impl HistoryLoadShared {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             self.applied.store(true, Ordering::Release);
             state.consume_requested = true;
-            (state.pre_apply_save_leases == 0)
-                .then(|| std::mem::replace(&mut state.outcome, HistoryLoadOutcome::Idle))
+            // Failed carries no retained document. Keep its diagnostic so
+            // a later explicit Retry reloads, even after GTK applied the error.
+            (state.pre_apply_save_leases == 0
+                && (self.discarded.load(Ordering::Acquire)
+                    || !matches!(state.outcome, HistoryLoadOutcome::Failed { .. })))
+            .then(|| std::mem::replace(&mut state.outcome, HistoryLoadOutcome::Idle))
         };
         drop(prior);
     }
@@ -1101,7 +1118,7 @@ impl Drop for HistoryFileLock {
 /// the old file. Keeping the temporary file in the same directory guarantees
 /// that the rename cannot cross filesystems. A failed encoder leaves the old
 /// history intact and removes its incomplete temporary file.
-fn atomic_write(
+pub(super) fn atomic_write(
     target: &Path,
     write_contents: impl FnOnce(&mut File) -> io::Result<()>,
 ) -> io::Result<()> {
@@ -2229,6 +2246,51 @@ fn write_history_snapshot_with_intent_parts(
     })
 }
 
+const ZONE_HISTORY_NOTICE_NAME: &str = "zone-history-recovery-notice";
+
+fn zone_history_notice(message: &str, details: &str) -> gtk4::Box {
+    let notice = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+    notice.set_widget_name(ZONE_HISTORY_NOTICE_NAME);
+    notice.add_css_class("block-finished");
+    notice.add_css_class("block-assistant");
+    notice.set_hexpand(true);
+    notice.set_tooltip_text(Some(details));
+    let label = gtk4::Label::new(Some(message));
+    label.set_wrap(true);
+    label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+    label.set_max_width_chars(72);
+    label.set_xalign(0.0);
+    label.set_margin_start(12);
+    label.set_margin_end(12);
+    label.set_margin_top(8);
+    label.set_margin_bottom(8);
+    notice.append(&label);
+    notice
+}
+
+/// Keep synchronous Unified failures observable after the pane is destroyed.
+/// The window drains this process-global queue into its sticky history bar.
+/// Queue only the diagnostic, never the stale snapshot or another save attempt.
+fn report_zone_history_save_result(path: &Path, result: io::Result<()>) -> io::Result<()> {
+    if let Err(error) = &result {
+        let kind = error.kind();
+        let message = error.to_string();
+        let estimated_bytes = message.capacity();
+        if let Err(report_error) = persistence::enqueue_weighted_with_reporting(
+            PersistenceKey::for_path("unified-history-diagnostic", path),
+            BLOCK_HISTORY_PERSIST_OPERATION,
+            estimated_bytes,
+            true, // A later pane's close must not inherit an old failure's deduplication.
+            move || Err(io::Error::new(kind, message)),
+        ) {
+            // Admission failures are themselves parked by the worker; retain
+            // the original save error for callers and shutdown logging too.
+            log::warn!("could not report Unified history save failure: {report_error}");
+        }
+    }
+    result
+}
+
 #[allow(dead_code)]
 impl TermView {
     /// Mark a fallibly prepared pane as rolled back. Exit callbacks and Drop
@@ -2272,35 +2334,55 @@ impl TermView {
         let Some(path) = self.zone_history_path() else {
             return Ok(());
         };
-        if zones.is_empty() {
-            // An empty session must not leave a stale document behind for the
-            // next run to replay.
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-            return Ok(());
-        }
-        let encoded = zone_history::encode_session(zones)?;
-        atomic_write(&path, |file| file.write_all(&encoded))
+        // This path also runs from Drop. Keep shutdown file I/O separate from
+        // notice rendering; a failed restore already left a persistent notice.
+        let result = self
+            .history_load
+            .zone_persistence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .save(&path, zones);
+        report_zone_history_save_result(&path, result)
     }
 
     /// Replay this pane's persisted zones onto the surface before any PTY
-    /// byte reaches it. A failed or unreadable document is logged and skipped:
-    /// a restart with no history is a working pane, and refusing to start is
-    /// not.
+    /// byte reaches it. A failed read keeps the pane usable, but revokes this
+    /// path's save authority and leaves a persistent recovery notice so an
+    /// empty close or later live output cannot erase the unread document.
     fn restore_zone_history(&self) {
         let Some(path) = self.zone_history_path() else {
             return;
         };
-        let zones = match zone_history::read_session(&path) {
+        let (result, refusal) = {
+            let mut state = self
+                .history_load
+                .zone_persistence
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let result = state.restore(&path);
+            (result, state.save_refusal(&path))
+        };
+        let zones = match result {
             Ok(zones) => zones,
             Err(error) => {
                 log::warn!("zone history not restored from {}: {error}", path.display());
+                let message = refusal.expect("a failed restore never grants save authority");
+                self.show_zone_history_notice(&path, &message, &error);
                 return;
             }
         };
+        if let Some(message) = refusal {
+            self.show_zone_history_notice(
+                &path,
+                &message,
+                &io::Error::new(
+                    io::ErrorKind::FileTooLarge,
+                    "history exceeded restore limits",
+                ),
+            );
+        } else {
+            self.clear_zone_history_notice();
+        }
         if zones.is_empty() {
             return;
         }
@@ -2308,27 +2390,62 @@ impl TermView {
         log::debug!("restored {restored} zones from {}", path.display());
     }
 
+    fn clear_zone_history_notice(&self) {
+        let mut child = self.notice_dock.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            if widget.widget_name() == ZONE_HISTORY_NOTICE_NAME {
+                self.remove_inline_notice(&widget);
+            }
+        }
+    }
+
+    fn show_zone_history_notice(&self, path: &Path, message: &str, error: &io::Error) {
+        self.clear_zone_history_notice();
+        let details = jterm_core::review_input::safe_inline_display(
+            &format!("{}: {error}", path.display()),
+            2 * 1024,
+        );
+        let notice = zone_history_notice(message, &details);
+        self.insert_inline_notice(notice.upcast_ref());
+    }
+
     /// Re-attempt whatever this pane's Block history is stuck on.
     ///
     /// A save that refused because the *load* failed cannot be fixed by saving
     /// again — that refusal is the whole point, so an unreadable file never
     /// becomes an excuse to overwrite whatever is actually on disk. Those panes
-    /// restart the load instead, and the ordinary save path picks up from its
-    /// result. Every other failure (a full disk, a permission change, a lock
-    /// timeout) is a save that can simply be tried again.
+    /// restart the load, then — once Loaded (or an early sync restore finishes)
+    /// — enqueue a labeled `"Save Block history"` so Retry matches the tooltip
+    /// ("Reload and save…") and anvil's ReloadFirst→revalidate→save chain.
+    /// Synchronous load-queue refusals clear the pending-save latch and return
+    /// `Err` so the sticky bar can re-show immediately. Every other failure (a
+    /// full disk, a permission change, a lock timeout) is a save that can
+    /// simply be tried again.
     pub(crate) fn retry_history_persistence(self: &Rc<Self>) -> std::io::Result<()> {
         match history_retry_action(&self.history_load.outcome()) {
             HistoryRetryAction::ReloadFirst => {
+                self.retry_save_after_history_load.set(true);
                 self.start_history_load();
-                Ok(())
+                match self.history_load.outcome() {
+                    HistoryLoadOutcome::Failed { kind, message } => {
+                        self.retry_save_after_history_load.set(false);
+                        Err(io::Error::new(kind, message.to_string()))
+                    }
+                    _ => Ok(()),
+                }
             }
-            HistoryRetryAction::SaveAgain => self.save_history(),
+            HistoryRetryAction::SaveAgain => self.save_history_with_failure_report(true),
         }
     }
 
     /// Snapshot block history on the GTK thread and queue all encoding and
     /// durable file I/O on the shared persistence worker.
     pub fn save_history(&self) -> std::io::Result<()> {
+        self.save_history_with_failure_report(false)
+    }
+
+    fn save_history_with_failure_report(&self, report_failure: bool) -> std::io::Result<()> {
         if !self.persist_history_on_drop.get() {
             return Ok(());
         }
@@ -2374,10 +2491,11 @@ impl TermView {
         let estimated_bytes = estimated_snapshot_retained_bytes(&blocks, blocks.capacity());
         let history_load = Arc::clone(&self.history_load);
         let key = PersistenceKey::for_path("block-history", &path);
-        persistence::enqueue_weighted(
+        persistence::enqueue_weighted_with_reporting(
             key,
             BLOCK_HISTORY_PERSIST_OPERATION,
             estimated_bytes,
+            report_failure,
             move || {
                 let _pre_apply_save_lease = pre_apply_save_lease;
                 let loaded_for_save = if _pre_apply_save_lease.is_some() {
@@ -2459,6 +2577,10 @@ impl TermView {
     /// Load and decode Block history on the shared disk worker, then construct
     /// GTK widgets in a short main-thread callback. Commands that finish while
     /// the read is pending remain newer than every restored block.
+    ///
+    /// When [`Self::retry_save_after_history_load`] is latched (sticky Retry
+    /// ReloadFirst), a successful restore enqueues a labeled save; Failed /
+    /// discarded paths clear the latch without saving.
     pub(crate) fn start_history_load(self: &Rc<Self>) {
         // A backend without the Block card document restores its own bounded
         // zone document instead. That replay is synchronous on purpose: it
@@ -2467,6 +2589,7 @@ impl TermView {
         if !self.render_backend.persists_block_history() {
             self.restore_zone_history();
             self.resolve_block_onboarding_after_history();
+            self.finish_reload_first_labeled_save();
             return;
         }
         let (path_opt, compress, load_limit) = {
@@ -2482,6 +2605,7 @@ impl TermView {
         };
         let Some(path) = path_opt else {
             self.resolve_block_onboarding_after_history();
+            self.finish_reload_first_labeled_save();
             return;
         };
         let base = match absolute_history_path(&path) {
@@ -2489,6 +2613,7 @@ impl TermView {
             Err(error) => {
                 log::warn!("refusing invalid Block history path: {error}");
                 self.resolve_block_onboarding_after_history();
+                self.retry_save_after_history_load.set(false);
                 return;
             }
         };
@@ -2508,11 +2633,18 @@ impl TermView {
             let result =
                 read_history_snapshot_reserved(&base, session_id.as_deref(), compress, load_limit);
             load_for_job.complete(&result);
-            result.map(|_| ())
+            if load_for_job.discarded.load(Ordering::Acquire) {
+                Ok(())
+            } else {
+                result.map(|_| ())
+            }
         }) {
             let result = Err(io::Error::new(error.kind(), error.to_string()));
             self.history_load.complete(&result);
             log::warn!("could not queue Block history load: {error}");
+            // Leave retry_save_after_history_load set so
+            // retry_history_persistence can observe Failed and return Err;
+            // it clears the latch before surfacing to the sticky bar.
         }
 
         let weak_view = Rc::downgrade(self);
@@ -2522,6 +2654,7 @@ impl TermView {
                 return glib::ControlFlow::Break;
             };
             if load_for_poll.discarded.load(Ordering::Acquire) {
+                view.retry_save_after_history_load.set(false);
                 view.resolve_block_onboarding_after_history();
                 view.history_load_poll_id.borrow_mut().take();
                 return glib::ControlFlow::Break;
@@ -2531,6 +2664,7 @@ impl TermView {
                     if load_for_poll.applied.load(Ordering::Acquire)
                         || load_for_poll.discarded.load(Ordering::Acquire) =>
                 {
+                    view.retry_save_after_history_load.set(false);
                     view.resolve_block_onboarding_after_history();
                     view.history_load_poll_id.borrow_mut().take();
                     glib::ControlFlow::Break
@@ -2545,13 +2679,20 @@ impl TermView {
                     view.resolve_block_onboarding_after_history();
                     load_for_poll.mark_applied_and_consume();
                     view.history_load_poll_id.borrow_mut().take();
+                    view.finish_reload_first_labeled_save();
                     glib::ControlFlow::Break
                 }
                 HistoryLoadOutcome::Failed { message, .. } => {
                     log::warn!("load Block history: {message}");
-                    // A later save may still succeed (for example, a removable
-                    // drive was remounted). Pre-load shutdown saves preserve the
-                    // unreadable file; subsequent user mutations may retry it.
+                    // Report an explicit retry through the ordinary save key.
+                    // Its pre-apply lease refuses the failed load; a later Clear
+                    // can cancel/replace it and successful saves clear its event.
+                    // A discarded load never reaches this branch.
+                    if view.retry_save_after_history_load.take() {
+                        if let Err(error) = view.save_history_with_failure_report(true) {
+                            log::warn!("report Block history retry failure: {error}");
+                        }
+                    }
                     view.resolve_block_onboarding_after_history();
                     load_for_poll.mark_applied_and_consume();
                     view.history_load_poll_id.borrow_mut().take();
@@ -2560,6 +2701,17 @@ impl TermView {
             }
         });
         *self.history_load_poll_id.borrow_mut() = Some(source);
+    }
+
+    /// Complete a sticky ReloadFirst by enqueueing labeled save once the load
+    /// path has made the on-disk revision honest again.
+    fn finish_reload_first_labeled_save(self: &Rc<Self>) {
+        if !self.retry_save_after_history_load.take() {
+            return;
+        }
+        if let Err(error) = self.save_history_with_failure_report(true) {
+            log::warn!("save Block history after ReloadFirst: {error}");
+        }
     }
 
     /// Close the construction-time empty-state gate from every history-load
@@ -2605,6 +2757,7 @@ impl TermView {
                 visible_indices: &self.visible_indices,
                 failure_marker_redraw: self.failure_marker_redraw.as_ref(),
             },
+            &self.scroll_debouncer,
         );
 
         let skipped = loaded.total_loaded.saturating_sub(restored.len());
@@ -2630,6 +2783,13 @@ impl TermView {
                     &block.cmd,
                     &block.output,
                     cols,
+                )
+                .saturating_add(
+                    if self.root.has_css_class("term-chat-root") && !block.is_background() {
+                        super::chat::COMMAND_GAP_PX
+                    } else {
+                        0
+                    },
                 );
             }
         }
@@ -2691,10 +2851,11 @@ impl TermView {
                         .as_deref()
                         .and_then(crate::block_view::known_output_notice),
                 );
+                // Decorate before map-time native command measurement.
+                self.mount_rebuilt_block(&finished);
                 finished
                     .widget()
                     .insert_before(&self.block_list, Some(&sibling));
-                self.mount_rebuilt_block(&finished);
                 restored_widgets.push(finished);
             }
         }
@@ -2751,6 +2912,7 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::{Path, PathBuf};
+    use std::rc::Rc;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -2804,6 +2966,444 @@ mod tests {
             command_truncated: false,
             output_notice: None,
         }
+    }
+
+    fn wait_for_history_worker(view: &Rc<super::TermView>) {
+        let (sent, received) = std::sync::mpsc::channel();
+        crate::persistence::enqueue(
+            crate::persistence::PersistenceKey::unique_for_path(
+                "fixture-barrier",
+                Path::new("inert"),
+            ),
+            "fixture barrier",
+            move || {
+                sent.send(()).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        received.recv_timeout(Duration::from_secs(5)).unwrap();
+        let context = gtk4::glib::MainContext::default();
+        for _ in 0..20 {
+            while context.pending() {
+                context.iteration(false);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!matches!(
+            view.history_load.outcome(),
+            HistoryLoadOutcome::Pending
+        ));
+    }
+
+    fn hold_history_worker(path: &Path) -> std::sync::mpsc::Sender<()> {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        crate::persistence::enqueue(
+            crate::persistence::PersistenceKey::unique_for_path("retry-fixture-blocker", path),
+            "fixture blocker",
+            move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        release_tx
+    }
+
+    fn retry_failure_from_inert_block_pane(reload_first: bool, clear_retry: bool) {
+        use crate::ui::history_notice::{persistence_failure_surface, PersistenceFailureSurface};
+        gtk4::init().expect("GTK display");
+        let directory = TestDir::new("retry-failure");
+        let path = directory.0.join("history.bin");
+        let original = b"inert damaged saved history";
+        let preserved_path = if reload_first {
+            fs::create_dir(&path).unwrap();
+            path.join("preserved-fixture")
+        } else {
+            path.clone()
+        };
+        if reload_first {
+            write_native_zone_fixture(&preserved_path, original);
+        }
+        let mut config = crate::config::Config::safe_defaults();
+        config.block_history_path = Some(path.to_string_lossy().into_owned());
+        let view = Rc::new(
+            super::TermView::new_with_spawner(
+                &config,
+                &crate::config::TerminalMode::Block,
+                &["inert-fixture-never-executed".to_string()],
+                None,
+                None,
+                &[],
+                |_argv, _cwd, _env, _token| {
+                    crate::pty::OwnedPty::for_tests(crate::pty::PtyForeground::Other)
+                },
+            )
+            .unwrap(),
+        );
+        let window = mount_native_history_view(&view);
+        view.start_history_load();
+        wait_for_history_worker(&view);
+        assert_eq!(
+            matches!(
+                view.history_load.outcome(),
+                HistoryLoadOutcome::Failed { .. }
+            ),
+            reload_first
+        );
+        crate::persistence::drain_failures();
+        if !reload_first {
+            write_native_zone_fixture(&path, original);
+        }
+        view.save_history().unwrap();
+        wait_for_history_worker(&view);
+        let first = crate::persistence::drain_failures();
+        assert!(first
+            .iter()
+            .any(|failure| persistence_failure_surface(&failure.operation)
+                == PersistenceFailureSurface::BlockHistoryBar));
+        // Keep the disk worker occupied so this exercises the asynchronous
+        // retry failure, rather than a synchronous already-finished refusal.
+        let release_tx = hold_history_worker(&path);
+        view.retry_history_persistence().unwrap();
+        release_tx.send(()).unwrap();
+        wait_for_history_worker(&view);
+        wait_for_history_worker(&view);
+        let repeated = crate::persistence::drain_failures();
+        assert!(
+            repeated
+                .iter()
+                .any(|failure| persistence_failure_surface(&failure.operation)
+                    == PersistenceFailureSurface::BlockHistoryBar),
+            "explicit retry must deliver a sticky failure again: {repeated:?}"
+        );
+        assert_eq!(fs::read(&preserved_path).unwrap(), original);
+        if reload_first {
+            let original_directory = directory.0.join("saved-original");
+            fs::rename(&path, &original_directory).unwrap();
+            write_history_snapshot(
+                &path,
+                &path,
+                None,
+                &[sample_block(1, "recovered after repair")],
+                config.block_history_compress,
+                Some(HistoryRevision::Missing),
+            )
+            .unwrap();
+            let release_tx = hold_history_worker(&path);
+            view.retry_history_persistence().unwrap();
+            if clear_retry {
+                view.clear_blocks();
+            }
+            release_tx.send(()).unwrap();
+            wait_for_history_worker(&view);
+            // Successful GTK replay queues the promised save after the first
+            // worker barrier, so also wait for that actual disk write.
+            wait_for_history_worker(&view);
+            assert!(crate::persistence::drain_failures().is_empty());
+            assert!(matches!(
+                view.history_load.outcome(),
+                HistoryLoadOutcome::Idle
+            ));
+            let restored =
+                read_history_snapshot(&path, None, config.block_history_compress, 100).unwrap();
+            if clear_retry {
+                assert!(view.finished_blocks.borrow().is_empty());
+                assert!(restored.blocks.is_empty());
+            } else {
+                assert!(view
+                    .finished_blocks
+                    .borrow()
+                    .iter()
+                    .any(|block| block.cmd_text == "recovered after repair"));
+                assert!(restored
+                    .blocks
+                    .iter()
+                    .any(|block| block.cmd == "recovered after repair"));
+            }
+            assert_eq!(
+                fs::read(original_directory.join("preserved-fixture")).unwrap(),
+                original
+            );
+        }
+        close_native_history_view(window, view);
+        // The barrier starts only after Drop's queued save has finished.
+        let release_tx = hold_history_worker(&path);
+        release_tx.send(()).unwrap();
+        assert!(crate::persistence::drain_failures().is_empty());
+        let preserved_after_drop = if reload_first {
+            directory.0.join("saved-original/preserved-fixture")
+        } else {
+            preserved_path
+        };
+        assert_eq!(fs::read(preserved_after_drop).unwrap(), original);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display"]
+    fn retry_save_again_reports_repeated_failure_from_real_pane() {
+        retry_failure_from_inert_block_pane(false, false);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display"]
+    fn retry_reload_first_reports_repeated_failure_from_real_pane() {
+        retry_failure_from_inert_block_pane(true, false);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display"]
+    fn explicit_clear_cancels_a_pending_history_retry_without_stale_failure() {
+        retry_failure_from_inert_block_pane(true, true);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display"]
+    fn failed_zone_history_notice_wraps_and_explains_recovery() {
+        use gtk4::prelude::*;
+        gtk4::init().expect("GTK display");
+        let message = "Unified history is not being saved because its format is not supported \
+                       by this version. Existing files are kept. Repair or move the history \
+                       file, then reopen this pane.";
+        let notice =
+            super::zone_history_notice(message, "/tmp/session-zones.json: unsupported version");
+        let window = gtk4::Window::builder()
+            .default_width(360)
+            .default_height(180)
+            .child(&notice)
+            .build();
+        window.present();
+        let context = gtk4::glib::MainContext::default();
+        for _ in 0..40 {
+            while context.pending() {
+                context.iteration(false);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let label = notice
+            .first_child()
+            .unwrap()
+            .downcast::<gtk4::Label>()
+            .unwrap();
+        assert_eq!(label.text(), message);
+        assert!(label.wraps());
+        assert!(
+            !label.is_focusable(),
+            "a recovery notice must not become a new focus target"
+        );
+        assert!(label.layout().line_count() > 1);
+        assert!(notice.width() > 0 && notice.width() <= window.width());
+        assert_eq!(notice.widget_name(), super::ZONE_HISTORY_NOTICE_NAME);
+        assert!(notice
+            .tooltip_text()
+            .unwrap()
+            .contains("session-zones.json"));
+        if let Some(path) = std::env::var_os("FORGE_HISTORY_NOTICE_SCREENSHOT") {
+            let paintable = gtk4::WidgetPaintable::new(Some(&window));
+            let snapshot = gtk4::Snapshot::new();
+            paintable.snapshot(&snapshot, window.width() as f64, window.height() as f64);
+            let node = snapshot.to_node().expect("notice render node");
+            let renderer = gtk4::gsk::Renderer::for_surface(&window.surface().unwrap())
+                .expect("notice renderer");
+            renderer
+                .render_texture(&node, None)
+                .save_to_png(path)
+                .unwrap();
+            renderer.unrealize();
+        }
+        window.close();
+    }
+
+    fn inert_unified_history_view(directory: &Path, max_blocks: u32) -> Rc<super::TermView> {
+        let mut config = crate::config::Config::safe_defaults();
+        config.block_history_path =
+            Some(directory.join("history.bin").to_string_lossy().into_owned());
+        config.max_visible_blocks = max_blocks;
+        Rc::new(
+            super::TermView::new_with_spawner(
+                &config,
+                &crate::config::TerminalMode::Unified,
+                &["inert-fixture-never-executed".to_string()],
+                None,
+                Some("history-fixture"),
+                &[],
+                |_argv, _cwd, _env, _token| {
+                    crate::pty::OwnedPty::for_tests(crate::pty::PtyForeground::Other)
+                },
+            )
+            .expect("real Unified pane over an inert PTY"),
+        )
+    }
+
+    fn write_native_zone_fixture(path: &Path, bytes: &[u8]) {
+        fs::write(path, bytes).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn mount_native_history_view(view: &Rc<super::TermView>) -> gtk4::Window {
+        use gtk4::prelude::*;
+        let window = gtk4::Window::builder()
+            .default_width(480)
+            .default_height(240)
+            .child(&view.widget())
+            .build();
+        window.present();
+        let context = gtk4::glib::MainContext::default();
+        for _ in 0..10 {
+            while context.pending() {
+                context.iteration(false);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        window
+    }
+
+    fn close_native_history_view(window: gtk4::Window, view: Rc<super::TermView>) {
+        use gtk4::prelude::*;
+        window.set_child(None::<&gtk4::Widget>);
+        window.close();
+        let weak = Rc::downgrade(&view);
+        drop(view);
+        assert!(weak.upgrade().is_none(), "TermView::drop must actually run");
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display"]
+    fn unified_pane_lifecycle_preserves_failed_and_incomplete_restore_bytes() {
+        use gtk4::prelude::*;
+        gtk4::init().expect("GTK display");
+        let limited = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "zones": [{"cmd": "x".repeat(super::zone_history::MAX_RESTORED_SNAPSHOT_BYTES + 1)}]
+        }))
+        .unwrap();
+        for original in [
+            br#"{"version":2,"future_payload":true}"#.to_vec(),
+            br#"{"version":1,"zones":["#.to_vec(),
+            limited,
+        ] {
+            for later_save in [false, true] {
+                let directory = TestDir::new("native-unified-preserve");
+                let view = inert_unified_history_view(directory.path(), 200);
+                let path = view.zone_history_path().unwrap();
+                write_native_zone_fixture(&path, &original);
+                let window = mount_native_history_view(&view);
+                view.start_history_load();
+                assert!(view.notice_dock.is_visible());
+                assert_eq!(
+                    view.notice_dock.first_child().unwrap().widget_name(),
+                    super::ZONE_HISTORY_NOTICE_NAME
+                );
+                assert!(view.save_history().is_err());
+                assert_eq!(fs::read(&path).unwrap(), original);
+                let expected = if later_save {
+                    // Insert inert record data through the real Unified backend;
+                    // no command or shell is executed by this persistence test.
+                    let zone = serde_json::from_str(
+                        r#"{"cmd":"later live record","output":"kept in memory"}"#,
+                    )
+                    .unwrap();
+                    assert_eq!(view.render_backend.replay_zone_snapshot(vec![zone]), 1);
+                    assert!(view.save_history().is_err());
+                    assert_eq!(fs::read(&path).unwrap(), original);
+                    let repaired =
+                        br#"{"version":1,"zones":[{"cmd":"repaired on disk"}]}"#.to_vec();
+                    write_native_zone_fixture(&path, &repaired);
+                    assert!(view.retry_history_persistence().is_err());
+                    assert_eq!(fs::read(&path).unwrap(), repaired);
+                    repaired
+                } else {
+                    original.clone()
+                };
+                close_native_history_view(window, view);
+                assert_eq!(
+                    fs::read(&path).unwrap(),
+                    expected,
+                    "Drop must preserve the source bytes"
+                );
+                if later_save {
+                    let recovered = inert_unified_history_view(directory.path(), 200);
+                    let window = mount_native_history_view(&recovered);
+                    recovered.start_history_load();
+                    let zones = recovered
+                        .render_backend
+                        .zone_replay_snapshot(64, 4 * 1024 * 1024)
+                        .unwrap();
+                    assert_eq!(zones[0].cmd, "repaired on disk");
+                    assert!(recovered.notice_dock.first_child().is_none());
+                    recovered.save_history().unwrap();
+                    close_native_history_view(window, recovered);
+                    let saved: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                    assert_eq!(saved["zones"][0]["cmd"], "repaired on disk");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display"]
+    fn unified_pane_fresh_drop_reopen_and_runtime_retention_remain_writable() {
+        use gtk4::prelude::*;
+        gtk4::init().expect("GTK display");
+        let directory = TestDir::new("native-unified-fresh");
+        let fresh = inert_unified_history_view(directory.path(), 200);
+        let path = fresh.zone_history_path().unwrap();
+        let window = mount_native_history_view(&fresh);
+        fresh.start_history_load();
+        assert!(fresh.notice_dock.first_child().is_none());
+        let zone =
+            serde_json::from_str(r#"{"cmd":"fresh persisted record","output":"retained output"}"#)
+                .unwrap();
+        assert_eq!(fresh.render_backend.replay_zone_snapshot(vec![zone]), 1);
+        // Deliberately rely on Drop, not an explicit save, for this first write.
+        close_native_history_view(window, fresh);
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["zones"][0]["cmd"], "fresh persisted record");
+
+        let reopened = inert_unified_history_view(directory.path(), 200);
+        let window = mount_native_history_view(&reopened);
+        reopened.start_history_load();
+        let restored = reopened
+            .render_backend
+            .zone_replay_snapshot(64, 4 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].cmd, "fresh persisted record");
+        assert!(reopened.notice_dock.first_child().is_none());
+        reopened.save_history().unwrap();
+        close_native_history_view(window, reopened);
+
+        // The decoder restored both records completely. Applying the user's
+        // smaller live max_visible_blocks afterward is intentional runtime
+        // retention, not the incomplete-decode state which blocks saves.
+        write_native_zone_fixture(
+            &path,
+            br#"{"version":1,"zones":[{"cmd":"older"},{"cmd":"newer"}]}"#,
+        );
+        let limited_runtime = inert_unified_history_view(directory.path(), 1);
+        let window = mount_native_history_view(&limited_runtime);
+        limited_runtime.start_history_load();
+        assert!(limited_runtime.notice_dock.first_child().is_none());
+        limited_runtime.save_history().unwrap();
+        close_native_history_view(window, limited_runtime);
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["zones"].as_array().unwrap().len(), 1);
+        assert_eq!(saved["zones"][0]["cmd"], "newer");
+
+        write_native_zone_fixture(&path, br#"{"version":1,"zones":[]}"#);
+        let empty = inert_unified_history_view(directory.path(), 200);
+        let window = mount_native_history_view(&empty);
+        empty.start_history_load();
+        assert!(empty.notice_dock.first_child().is_none());
+        close_native_history_view(window, empty);
+        assert!(
+            !path.exists(),
+            "a genuinely empty restored session may remove its file"
+        );
     }
 
     #[test]
@@ -2898,6 +3498,40 @@ mod tests {
     }
 
     #[test]
+    fn failed_load_keeps_reload_intent_after_apply_and_last_save_lease() {
+        for leased in [false, true] {
+            let shared = Arc::new(HistoryLoadShared::default());
+            shared.begin();
+            let lease = leased.then(|| shared.acquire_pre_apply_save_lease().unwrap());
+            shared.complete(&Err(io::Error::other("inert load failure")));
+            shared.mark_applied_and_consume();
+            assert_eq!(
+                history_retry_action(&shared.outcome()),
+                HistoryRetryAction::ReloadFirst
+            );
+            drop(lease);
+            assert_eq!(
+                history_retry_action(&shared.outcome()),
+                HistoryRetryAction::ReloadFirst
+            );
+            shared.discard_for_explicit_clear();
+            assert!(matches!(shared.outcome(), HistoryLoadOutcome::Idle));
+        }
+    }
+
+    #[test]
+    fn explicit_clear_releases_failed_state_after_an_outstanding_save_lease() {
+        let shared = Arc::new(HistoryLoadShared::default());
+        shared.begin();
+        let lease = shared.acquire_pre_apply_save_lease().unwrap();
+        shared.complete(&Err(io::Error::other("inert load failure")));
+        shared.mark_applied_and_consume();
+        shared.discard_for_explicit_clear();
+        drop(lease);
+        assert!(matches!(shared.outcome(), HistoryLoadOutcome::Idle));
+    }
+
+    #[test]
     fn applied_outcome_waits_for_pre_apply_save_lease_before_releasing_loaded_arc() {
         let shared = Arc::new(HistoryLoadShared::default());
         shared.begin();
@@ -2974,7 +3608,9 @@ mod tests {
     }
 
     /// The card's output notice survives a save and reload; records saved
-    /// before it existed still decode, with no notice.
+    /// before it existed still decode, with no notice. Truncated and
+    /// PartlyRetained round-trip the same way as EarlierNotRetained — the
+    /// known-set restore gate must not drop either richer variant.
     #[test]
     fn history_keeps_the_output_notice_and_reads_the_schema_before_it() {
         let mut block = sample_block(9, "cargo build");
@@ -2983,8 +3619,24 @@ mod tests {
         let (decoded, _) = decode_block_record(raw.as_slice(), false).unwrap();
         assert_eq!(
             decoded.output_notice.as_deref(),
-            Some("Earlier output not retained")
+            Some(super::super::FINISHED_OUTPUT_NOT_RETAINED)
         );
+
+        for notice in [
+            super::super::FINISHED_OUTPUT_TEXT_TRUNCATED,
+            super::super::FINISHED_OUTPUT_PARTLY_RETAINED,
+        ] {
+            let mut richer = sample_block(11, "cargo test");
+            richer.output_notice = Some(notice.to_string());
+            let raw = rkyv::to_bytes::<rkyv::rancor::Error>(&richer).unwrap();
+            let (decoded, _) = decode_block_record(raw.as_slice(), false).unwrap();
+            assert_eq!(decoded.output_notice.as_deref(), Some(notice));
+            assert_eq!(
+                crate::block_view::known_output_notice(notice),
+                Some(notice),
+                "{notice} must stay in the shared known set"
+            );
+        }
 
         let legacy = super::LegacyBlockDataV3 {
             id: 10,
@@ -3017,6 +3669,738 @@ mod tests {
             decoded.lifecycle_schema,
             super::super::blocks::BLOCK_LIFECYCLE_SCHEMA
         );
+    }
+
+    /// Near-miss / padded / cased Truncated and PartlyRetained strings must
+    /// stay outside the known-set restore gate used when remounting finished
+    /// cards from Block history — exact family strings round-trip above.
+    #[test]
+    fn history_restore_gate_rejects_near_miss_output_notice_strings() {
+        for base in [
+            super::super::FINISHED_OUTPUT_NOT_RETAINED,
+            super::super::FINISHED_OUTPUT_TEXT_TRUNCATED,
+            super::super::FINISHED_OUTPUT_PARTLY_RETAINED,
+        ] {
+            for candidate in [
+                format!(" {base}"),
+                format!("{base} "),
+                format!("\t{base}"),
+                format!("{base}\n"),
+                format!("{base}\r"),
+                format!("\u{00a0}{base}"),
+                format!("{base}\u{200b}"),
+                format!("\u{feff}{base}"),
+                format!("{base}\u{00ad}"),
+                // ZWJ / NNBSP / LS / NEL / ideographic / FA catch-up beside
+                // the sticky unicode wave — still outside the known-set gate.
+                format!("{base}\u{200d}"),
+                format!("\u{202f}{base}"),
+                format!("{base}\u{2028}"),
+                format!("{base}\u{0085}"),
+                format!("\u{3000}{base}"),
+                format!("{base}\u{2061}"),
+                // Punct/thin/hair + en/em/three-per-em + RLI catch-up beside
+                // the sticky quad-space wave — still outside the known-set gate.
+                format!("{base}\u{2008}"),
+                format!("{base}\u{2009}"),
+                format!("{base}\u{200a}"),
+                format!("\u{2000}{base}"),
+                format!("\u{2003}{base}"),
+                format!("{base}\u{2004}"),
+                format!("\u{2067}{base}\u{2069}"),
+                // Hangul fillers / Braille blank / format-control catch-up
+                // beside the sticky hangul wave — still outside the known-set.
+                format!("{base}\u{115f}"),
+                format!("{base}\u{3164}"),
+                format!("\u{2800}{base}"),
+                format!("{base}\u{206a}"),
+                format!("{base}\u{206f}"),
+                // Ogham / MVS / CGJ / VS / Khmer inherent catch-up beside the
+                // sticky ogham wave — still outside the known-set gate.
+                format!("{base}\u{1680}"),
+                format!("{base}\u{180e}"),
+                format!("{base}\u{034f}"),
+                format!("{base}\u{fe00}"),
+                format!("\u{fe0f}{base}"),
+                format!("{base}\u{17b4}"),
+                // Mongolian FVS / mid ZWNBSP / interlinear catch-up beside the
+                // sticky FVS wave — still outside the known-set gate.
+                format!("{base}\u{180b}"),
+                format!("{base}\u{180c}"),
+                format!("{base}\u{180d}"),
+                format!("{base}\u{feff}"),
+                format!("\u{fff9}{base}\u{fffb}"),
+                format!("{base}\u{fffa}"),
+                // Bidi embeddings/overrides + remaining deprecated format
+                // controls beside the sticky bidi wave — still outside the gate.
+                format!("\u{202a}{base}\u{202c}"),
+                format!("\u{202b}{base}\u{202c}"),
+                format!("\u{202d}{base}\u{202c}"),
+                format!("\u{202e}{base}\u{202c}"),
+                format!("{base}\u{206b}"),
+                format!("{base}\u{206c}"),
+                format!("{base}\u{206d}"),
+                format!("{base}\u{206e}"),
+                // Mid-range VS / Mongolian FVS4 catch-up beside the sticky
+                // VS/FVS4 wave — still outside the known-set gate.
+                format!("{base}\u{fe01}"),
+                format!("{base}\u{fe0d}"),
+                format!("{base}\u{180f}"),
+                // Interior mid-range VS / Mongolian nirugu catch-up beside the
+                // sticky FE02/FE0C/nirugu wave — still outside the known-set.
+                format!("{base}\u{fe02}"),
+                format!("{base}\u{fe0c}"),
+                format!("{base}\u{180a}"),
+                // Closer mid-range VS / Mongolian Todo soft hyphen catch-up
+                // beside the sticky FE03/FE0B/1806 wave — still outside the gate.
+                format!("{base}\u{fe03}"),
+                format!("{base}\u{fe0b}"),
+                format!("{base}\u{1806}"),
+                // Inner mid-range VS / Mongolian syllable boundary catch-up
+                // beside the sticky FE04/FE0A/1807 wave — still outside the gate.
+                format!("{base}\u{fe04}"),
+                format!("{base}\u{fe0a}"),
+                format!("{base}\u{1807}"),
+                // Nesting mid-range VS / Mongolian Manchu comma catch-up beside
+                // the sticky FE05/FE09/1808 wave — still outside the gate.
+                format!("{base}\u{fe05}"),
+                format!("{base}\u{fe09}"),
+                format!("{base}\u{1808}"),
+                // Deeper nesting mid-range VS / Mongolian Manchu full stop
+                // catch-up beside sticky FE06/FE08/1809 — still outside the gate.
+                format!("{base}\u{fe06}"),
+                format!("{base}\u{fe08}"),
+                format!("{base}\u{1809}"),
+                // Center mid-range VS / Mongolian birga catch-up beside sticky
+                // FE07/1800 — still outside the gate.
+                format!("{base}\u{fe07}"),
+                format!("{base}\u{1800}"),
+                // Mongolian ellipsis catch-up beside sticky 1801 — still outside
+                // the gate (one edge).
+                format!("{base}\u{1801}"),
+                // Mongolian comma catch-up beside sticky 1802 — still outside
+                // the gate (one edge).
+                format!("{base}\u{1802}"),
+                // Mongolian full stop catch-up beside sticky 1803 — still outside
+                // the gate (one edge).
+                format!("{base}\u{1803}"),
+                // Mongolian colon catch-up beside sticky 1804 — still outside
+                // the gate (one edge).
+                format!("{base}\u{1804}"),
+                // Mongolian four dots catch-up beside sticky 1805 — still outside
+                // the gate (one edge).
+                format!("{base}\u{1805}"),
+                // Fullwidth colon catch-up beside sticky FF1A — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff1a}"),
+                // Fullwidth semicolon catch-up beside sticky FF1B — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff1b}"),
+                // Fullwidth less-than catch-up beside sticky FF1C — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff1c}"),
+                // Fullwidth equals catch-up beside sticky FF1D — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff1d}"),
+                // Fullwidth greater-than catch-up beside sticky FF1E — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff1e}"),
+                // Fullwidth question mark catch-up beside sticky FF1F — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff1f}"),
+                // Fullwidth commercial at catch-up beside sticky FF20 — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff20}"),
+                // Fullwidth latin A catch-up beside sticky FF21 — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff21}"),
+                // Fullwidth latin B catch-up beside sticky FF22 — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff22}"),
+                // Fullwidth latin C catch-up beside sticky FF23 — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff23}"),
+                // Fullwidth latin D catch-up beside sticky FF24 — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff24}"),
+                // Fullwidth latin E catch-up beside sticky FF25 — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff25}"),
+                // Fullwidth latin F catch-up beside sticky FF26 — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff26}"),
+                // Fullwidth latin G catch-up beside sticky FF27 — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff27}"),
+                // Fullwidth latin H catch-up beside sticky FF28 — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff28}"),
+                // Fullwidth latin I catch-up beside sticky FF29 — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff29}"),
+                // Fullwidth latin J catch-up beside sticky FF2A — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff2a}"),
+                // Fullwidth latin K catch-up beside sticky FF2B — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff2b}"),
+                // Fullwidth latin L catch-up beside sticky FF2C — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff2c}"),
+                // Fullwidth latin M catch-up beside sticky FF2D — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff2d}"),
+                // Fullwidth latin N catch-up beside sticky FF2E — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff2e}"),
+                // Fullwidth latin O catch-up beside sticky FF2F — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff2f}"),
+                // Fullwidth latin P catch-up beside sticky FF30 — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff30}"),
+                // Fullwidth latin Q catch-up beside sticky FF31 — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff31}"),
+                // Fullwidth latin R catch-up beside sticky FF32 — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff32}"),
+                // Fullwidth latin S catch-up beside sticky FF33 — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff33}"),
+                // Fullwidth latin T catch-up beside sticky FF34 — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff34}"),
+                // Fullwidth latin U catch-up beside sticky FF35 — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff35}"),
+                // Fullwidth latin V catch-up beside sticky FF36 — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff36}"),
+                // Fullwidth latin W catch-up beside sticky FF37 — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff37}"),
+                // Fullwidth latin X catch-up beside sticky FF38 — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff38}"),
+                // Fullwidth latin Y catch-up beside sticky FF39 — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff39}"),
+                // Fullwidth latin Z catch-up beside sticky FF3A — still outside
+                // the gate (one edge).
+                format!("{base}\u{ff3a}"),
+                // Fullwidth left square bracket catch-up beside sticky FF3B — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff3b}"),
+                // Fullwidth reverse solidus catch-up beside sticky FF3C — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff3c}"),
+                // Fullwidth right square bracket catch-up beside sticky FF3D — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff3d}"),
+                // Fullwidth circumflex catch-up beside sticky FF3E — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff3e}"),
+                // Fullwidth low line catch-up beside sticky FF3F — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff3f}"),
+                // Fullwidth grave catch-up beside sticky FF40 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff40}"),
+                // Fullwidth latin small a catch-up beside sticky FF41 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff41}"),
+                // Fullwidth latin small b catch-up beside sticky FF42 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff42}"),
+                // Fullwidth latin small c catch-up beside sticky FF43 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff43}"),
+                // Fullwidth latin small d catch-up beside sticky FF44 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff44}"),
+                // Fullwidth latin small e catch-up beside sticky FF45 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff45}"),
+                // Fullwidth latin small f catch-up beside sticky FF46 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff46}"),
+                // Fullwidth latin small g catch-up beside sticky FF47 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff47}"),
+                // Fullwidth latin small h catch-up beside sticky FF48 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff48}"),
+                // Fullwidth latin small i catch-up beside sticky FF49 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff49}"),
+                // Fullwidth latin small j catch-up beside sticky FF4A — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff4a}"),
+                // Fullwidth latin small k catch-up beside sticky FF4B — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff4b}"),
+                // Fullwidth latin small l catch-up beside sticky FF4C — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff4c}"),
+                // Fullwidth latin small m catch-up beside sticky FF4D — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff4d}"),
+                // Fullwidth latin small n catch-up beside sticky FF4E — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff4e}"),
+                // Fullwidth latin small o catch-up beside sticky FF4F — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff4f}"),
+                // Fullwidth latin small p catch-up beside sticky FF50 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff50}"),
+                // Fullwidth latin small q catch-up beside sticky FF51 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff51}"),
+                // Fullwidth latin small r catch-up beside sticky FF52 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff52}"),
+                // Fullwidth latin small s catch-up beside sticky FF53 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff53}"),
+                // Fullwidth latin small t catch-up beside sticky FF54 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff54}"),
+                // Fullwidth latin small u catch-up beside sticky FF55 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff55}"),
+                // Fullwidth latin small v catch-up beside sticky FF56 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff56}"),
+                // Fullwidth latin small w catch-up beside sticky FF57 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff57}"),
+                // Fullwidth latin small x catch-up beside sticky FF58 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff58}"),
+                // Fullwidth latin small y catch-up beside sticky FF59 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff59}"),
+                // Fullwidth latin small z catch-up beside sticky FF5A — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff5a}"),
+                // Fullwidth left curly bracket catch-up beside sticky FF5B — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff5b}"),
+                // Fullwidth vertical line catch-up beside sticky FF5C — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff5c}"),
+                // Fullwidth right curly bracket catch-up beside sticky FF5D — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff5d}"),
+                // Fullwidth tilde catch-up beside sticky FF5E — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff5e}"),
+                // Fullwidth left white parenthesis catch-up beside sticky FF5F — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff5f}"),
+                // Fullwidth right white parenthesis catch-up beside sticky FF60 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff60}"),
+                // Halfwidth ideographic full stop catch-up beside sticky FF61 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff61}"),
+                // Halfwidth left corner bracket catch-up beside sticky FF62 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff62}"),
+                // Halfwidth right corner bracket catch-up beside sticky FF63 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff63}"),
+                // Halfwidth ideographic comma catch-up beside sticky FF64 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff64}"),
+                // Halfwidth katakana middle dot catch-up beside sticky FF65 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff65}"),
+                // Halfwidth katakana letter wo catch-up beside sticky FF66 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff66}"),
+                // Halfwidth katakana letter small a catch-up beside sticky FF67 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff67}"),
+                // Halfwidth katakana letter small i catch-up beside sticky FF68 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff68}"),
+                // Halfwidth katakana letter small u catch-up beside sticky FF69 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff69}"),
+                // Halfwidth katakana letter small e catch-up beside sticky FF6A — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff6a}"),
+                // Halfwidth katakana letter small o catch-up beside sticky FF6B — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff6b}"),
+                // Halfwidth katakana letter small tu catch-up beside sticky FF6C — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff6c}"),
+                // Halfwidth katakana letter small ya catch-up beside sticky FF6D — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff6d}"),
+                // Halfwidth katakana letter small yu catch-up beside sticky FF6E — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff6e}"),
+                // Halfwidth katakana letter small yo catch-up beside sticky FF6F — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff6f}"),
+                // Halfwidth katakana-hiragana prolonged sound mark catch-up beside sticky FF70 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff70}"),
+                // Halfwidth katakana letter a catch-up beside sticky FF71 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff71}"),
+                // Halfwidth katakana letter i catch-up beside sticky FF72 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff72}"),
+                // Halfwidth katakana letter u catch-up beside sticky FF73 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff73}"),
+                // Halfwidth katakana letter e catch-up beside sticky FF74 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff74}"),
+                // Halfwidth katakana letter o catch-up beside sticky FF75 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff75}"),
+                // Halfwidth katakana letter ka catch-up beside sticky FF76 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff76}"),
+                // Halfwidth katakana letter ki catch-up beside sticky FF77 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff77}"),
+                // Halfwidth katakana letter ku catch-up beside sticky FF78 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff78}"),
+                // Halfwidth katakana letter ke catch-up beside sticky FF79 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff79}"),
+                // Halfwidth katakana letter ko catch-up beside sticky FF7A — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff7a}"),
+                // Halfwidth katakana letter sa catch-up beside sticky FF7B — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff7b}"),
+                // Halfwidth katakana letter si catch-up beside sticky FF7C — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff7c}"),
+                // Halfwidth katakana letter su catch-up beside sticky FF7D — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff7d}"),
+                // Halfwidth katakana letter se catch-up beside sticky FF7E — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff7e}"),
+                // Halfwidth katakana letter so catch-up beside sticky FF7F — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff7f}"),
+                // Halfwidth katakana letter ta catch-up beside sticky FF80 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff80}"),
+                // Halfwidth katakana letter ti catch-up beside sticky FF81 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff81}"),
+                // Halfwidth katakana letter tu catch-up beside sticky FF82 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff82}"),
+                // Halfwidth katakana letter te catch-up beside sticky FF83 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff83}"),
+                // Halfwidth katakana letter to catch-up beside sticky FF84 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff84}"),
+                // Halfwidth katakana letter na catch-up beside sticky FF85 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff85}"),
+                // Halfwidth katakana letter ni catch-up beside sticky FF86 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff86}"),
+                // Halfwidth katakana letter nu catch-up beside sticky FF87 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff87}"),
+                // Halfwidth katakana letter ne catch-up beside sticky FF88 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff88}"),
+                // Halfwidth katakana letter no catch-up beside sticky FF89 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff89}"),
+                // Halfwidth katakana letter ha catch-up beside sticky FF8A — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff8a}"),
+                // Halfwidth katakana letter hi catch-up beside sticky FF8B — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff8b}"),
+                // Halfwidth katakana letter hu catch-up beside sticky FF8C — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff8c}"),
+                // Halfwidth katakana letter he catch-up beside sticky FF8D — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff8d}"),
+                // Halfwidth katakana letter ho catch-up beside sticky FF8E — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff8e}"),
+                // Halfwidth katakana letter ma catch-up beside sticky FF8F — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff8f}"),
+                // Halfwidth katakana letter mi catch-up beside sticky FF90 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff90}"),
+                // Halfwidth katakana letter mu catch-up beside sticky FF91 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff91}"),
+                // Halfwidth katakana letter me catch-up beside sticky FF92 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff92}"),
+                // Halfwidth katakana letter mo catch-up beside sticky FF93 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff93}"),
+                // Halfwidth katakana letter ya catch-up beside sticky FF94 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff94}"),
+                // Halfwidth katakana letter yu catch-up beside sticky FF95 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff95}"),
+                // Halfwidth katakana letter yo catch-up beside sticky FF96 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff96}"),
+                // Halfwidth katakana letter small tsu catch-up beside sticky FF97 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff97}"),
+                // Halfwidth katakana letter ta catch-up beside sticky FF98 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff98}"),
+                // Halfwidth katakana letter chi catch-up beside sticky FF99 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff99}"),
+                // Halfwidth katakana letter tsu catch-up beside sticky FF9A — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff9a}"),
+                // Halfwidth katakana letter te catch-up beside sticky FF9B — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff9b}"),
+                // Halfwidth katakana letter to catch-up beside sticky FF9C — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff9c}"),
+                // Halfwidth katakana letter na catch-up beside sticky FF9D — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff9d}"),
+                // Halfwidth katakana letter ni catch-up beside sticky FF9E — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff9e}"),
+                // Halfwidth katakana letter nu catch-up beside sticky FF9F — still
+                // outside the gate (one edge).
+                format!("{base}\u{ff9f}"),
+                // Halfwidth hangul filler catch-up beside sticky FFA0 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffa0}"),
+                // Halfwidth hangul letter kiyeok catch-up beside sticky FFA1 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffa1}"),
+                // Halfwidth hangul letter ssangkiyeok catch-up beside sticky FFA2 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffa2}"),
+                // Halfwidth hangul letter kiyeok-sios catch-up beside sticky FFA3 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffa3}"),
+                // Halfwidth hangul letter nieun catch-up beside sticky FFA4 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffa4}"),
+                // Halfwidth hangul letter nieun-cieuc catch-up beside sticky FFA5 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffa5}"),
+                // Halfwidth hangul letter nieun-hieuh catch-up beside sticky FFA6 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffa6}"),
+                // Halfwidth hangul letter tikeut catch-up beside sticky FFA7 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffa7}"),
+                // Halfwidth hangul letter ssangtikeut catch-up beside sticky FFA8 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffa8}"),
+                // Halfwidth hangul letter tikeut-sios catch-up beside sticky FFA9 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffa9}"),
+                // Halfwidth hangul letter rieul catch-up beside sticky FFAA — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffaa}"),
+                // Halfwidth hangul letter rieul-kiyeok catch-up beside sticky FFAB — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffab}"),
+                // Halfwidth hangul letter rieul-mieum catch-up beside sticky FFAC — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffac}"),
+                // Halfwidth hangul letter rieul-pieup catch-up beside sticky FFAD — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffad}"),
+                // Halfwidth hangul letter rieul-sios catch-up beside sticky FFAE — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffae}"),
+                // Halfwidth hangul letter rieul-thieuth catch-up beside sticky FFAF — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffaf}"),
+                // Halfwidth hangul letter rieul-phieuph catch-up beside sticky FFB0 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffb0}"),
+                // Halfwidth hangul letter rieul-hieuh catch-up beside sticky FFB1 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffb1}"),
+                // Halfwidth hangul letter mieum catch-up beside sticky FFB2 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffb2}"),
+                // Halfwidth hangul letter pieup catch-up beside sticky FFB3 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffb3}"),
+                // Halfwidth hangul letter ssangpieup catch-up beside sticky FFB4 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffb4}"),
+                // Halfwidth hangul letter pieup-sios catch-up beside sticky FFB5 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffb5}"),
+                // Halfwidth hangul letter sios catch-up beside sticky FFB6 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffb6}"),
+                // Halfwidth hangul letter ssangsios catch-up beside sticky FFB7 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffb7}"),
+                // Halfwidth hangul letter ieung catch-up beside sticky FFB8 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffb8}"),
+                // Halfwidth hangul letter cieuc catch-up beside sticky FFB9 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffb9}"),
+                // Halfwidth hangul letter ssangcieuc catch-up beside sticky FFBA — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffba}"),
+                // Halfwidth hangul letter chieuch catch-up beside sticky FFBB — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffbb}"),
+                // Halfwidth hangul letter khieukh catch-up beside sticky FFBC — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffbc}"),
+                // Halfwidth hangul letter thieuth catch-up beside sticky FFBD — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffbd}"),
+                // Halfwidth hangul letter phieuph catch-up beside sticky FFBE — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffbe}"),
+                // Halfwidth hangul letter hieuh catch-up beside sticky FFBF — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffbf}"),
+                // Halfwidth cent sign catch-up beside sticky FFE0 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffe0}"),
+                // Halfwidth pound sign catch-up beside sticky FFE1 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffe1}"),
+                // Halfwidth yen sign catch-up beside sticky FFE2 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffe2}"),
+                // Halfwidth macron catch-up beside sticky FFE3 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffe3}"),
+                // Halfwidth broken bar catch-up beside sticky FFE4 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffe4}"),
+                // Halfwidth won sign catch-up beside sticky FFE5 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffe5}"),
+                // Halfwidth double vertical line catch-up beside sticky FFE6 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffe6}"),
+                // Halfwidth forms light vertical catch-up beside sticky FFE8 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffe8}"),
+                // Halfwidth forms light down catch-up beside sticky FFE9 — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffe9}"),
+                // Halfwidth forms light up catch-up beside sticky FFEA — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffea}"),
+                // Halfwidth forms light left catch-up beside sticky FFEB — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffeb}"),
+                // Halfwidth forms light right catch-up beside sticky FFEC — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffec}"),
+                // Halfwidth black square catch-up beside sticky FFED — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffed}"),
+                // Halfwidth white circle catch-up beside sticky FFEE — still
+                // outside the gate (one edge).
+                format!("{base}\u{ffee}"),
+                // Interlinear annotation anchor catch-up beside sticky FFF9 — still
+                // outside the gate (one edge).
+                format!("{base}\u{fff9}"),
+                // Interlinear annotation separator catch-up beside sticky FFFA — still
+                // outside the gate (one edge).
+                format!("{base}\u{fffa}"),
+                // Interlinear annotation terminator catch-up beside sticky FFFB — still
+                // outside the gate (one edge).
+                format!("{base}\u{fffb}"),
+                // Object replacement character catch-up beside sticky FFFC — still
+                // outside the gate (one edge).
+                format!("{base}\u{fffc}"),
+                // Replacement character catch-up beside sticky FFFD — still
+                // outside the gate (one edge).
+                format!("{base}\u{fffd}"),
+                // Linear B syllable B008 A catch-up beside sticky 10000 — still
+                // outside the gate (one edge).
+                format!("{base}\u{10000}"),
+                // Linear B syllable B038 E catch-up beside sticky 10001 — still
+                // outside the gate (one edge).
+                format!("{base}\u{10001}"),
+                // Linear B syllable B028 I catch-up beside sticky 10002 — still
+                // outside the gate (one edge).
+                format!("{base}\u{10002}"),
+                // Linear B syllable B053 O catch-up beside sticky 10003 — still
+                // outside the gate (one edge).
+                format!("{base}\u{10003}"),
+                // Linear B syllable B061 U catch-up beside sticky 10004 — still
+                // outside the gate (one edge).
+                format!("{base}\u{10004}"),
+                // Linear B syllable B010 DA catch-up beside sticky 10005 — still
+                // outside the gate (one edge).
+                format!("{base}\u{10005}"),
+                // Linear B syllable B007 DE catch-up beside sticky 10006 — still
+                // outside the gate (one edge).
+                format!("{base}\u{10006}"),
+                // Linear B syllable B011 DI catch-up beside sticky 10007 — still
+                // outside the gate (one edge).
+                format!("{base}\u{10007}"),
+                // Linear B syllable B012 DO catch-up beside sticky 10008 — still
+                // outside the gate (one edge).
+                format!("{base}\u{10008}"),
+                // Linear B syllable B013 DU catch-up beside sticky 10009 — still
+                // outside the gate (one edge).
+                format!("{base}\u{10009}"),
+                // Linear B syllable B014 DWE catch-up beside sticky 1000A — still
+                // outside the gate (one edge).
+                format!("{base}\u{1000a}"),
+                base.to_ascii_uppercase(),
+                format!("{base}!"),
+            ] {
+                assert_eq!(
+                    crate::block_view::known_output_notice(&candidate),
+                    None,
+                    "near-miss {candidate:?} must not remount as a finished-card notice"
+                );
+                let mut block = sample_block(12, "cargo check");
+                block.output_notice = Some(candidate.clone());
+                let raw = rkyv::to_bytes::<rkyv::rancor::Error>(&block).unwrap();
+                let (decoded, _) = decode_block_record(raw.as_slice(), false).unwrap();
+                // Raw bytes may survive decode, but the remount gate drops them.
+                assert_eq!(
+                    decoded
+                        .output_notice
+                        .as_deref()
+                        .and_then(crate::block_view::known_output_notice),
+                    None,
+                    "restore gate must drop near-miss {candidate:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3631,6 +5015,49 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    /// ReloadFirst must latch a post-load labeled save (anvil revalidate→save
+    /// parity). The sticky tooltip says "Reload and save…"; stopping after
+    /// `start_history_load` alone would hide the bar while live blocks stay
+    /// unsaved. Sync load-queue Failed clears the latch and returns Err.
+    #[test]
+    fn reload_first_chains_labeled_save_after_reload() {
+        let source = include_str!("history.rs");
+        let retry = source
+            .split(
+                "pub(crate) fn retry_history_persistence(self: &Rc<Self>) -> std::io::Result<()> {",
+            )
+            .nth(1)
+            .expect("retry_history_persistence")
+            .split("\n    /// Snapshot block history on the GTK thread")
+            .next()
+            .expect("retry closes before save_history docs");
+        assert!(
+            retry.contains("HistoryRetryAction::ReloadFirst")
+                && retry.contains("retry_save_after_history_load.set(true)")
+                && retry.contains("start_history_load()")
+                && retry.contains("HistoryLoadOutcome::Failed")
+                && retry.contains("retry_save_after_history_load.set(false)"),
+            "ReloadFirst must latch a post-load save and surface sync Failed"
+        );
+        assert!(
+            source.contains("fn finish_reload_first_labeled_save")
+                && source.contains("finish_reload_first_labeled_save()")
+                && source.contains("retry_save_after_history_load.take()"),
+            "Loaded / early sync restore must enqueue labeled save via the latch"
+        );
+        let loaded_arm = source
+            .split("HistoryLoadOutcome::Loaded(loaded) => {")
+            .nth(1)
+            .expect("Loaded poll arm")
+            .split("HistoryLoadOutcome::Failed")
+            .next()
+            .expect("Loaded arm ends before Failed");
+        assert!(
+            loaded_arm.contains("finish_reload_first_labeled_save()"),
+            "async Loaded must chain the labeled save"
+        );
     }
 
     #[test]
@@ -4385,5 +5812,119 @@ mod tests {
         let error = atomic_write(&history, |file| file.write_all(b"payload")).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(!history.exists());
+    }
+    #[test]
+    fn synchronous_zone_failure_outlives_the_saving_pane() {
+        // Isolate the process-global queue from other parallel tests. The
+        // child runs only this test, without GTK or a terminal process.
+        const ENV: &str = "FORGE_TEST_ZONE_DIAGNOSTIC_CHILD";
+        if std::env::var_os(ENV).is_none() {
+            let name = concat!(
+                module_path!(),
+                "::synchronous_zone_failure_outlives_the_saving_pane"
+            );
+            let test_name = name.split_once("::").unwrap().1;
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(ENV, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let directory = TestDir::new("zone-diagnostic");
+        let path = directory.path().join("zones.json");
+        super::atomic_write(&path, |file| {
+            file.write_all(br#"{"version":1,"zones":[{"cmd":"saved command"}]}"#)
+        })
+        .unwrap();
+        let mut first = super::zone_history::SessionPersistence::default();
+        let mut stale = super::zone_history::SessionPersistence::default();
+        let zones = first.restore(&path).unwrap();
+        stale.restore(&path).unwrap();
+        first.save(&path, zones).unwrap();
+        let saved = fs::read(&path).unwrap();
+        let wait = || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            crate::persistence::enqueue(
+                crate::persistence::PersistenceKey::unique_for_path(
+                    "zone-diagnostic-barrier",
+                    &path,
+                ),
+                "zone diagnostic barrier",
+                move || {
+                    tx.send(()).unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap();
+            rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        };
+        super::report_zone_history_save_result(&path, Ok(())).unwrap();
+        wait();
+        assert!(crate::persistence::drain_failures().is_empty());
+        let result = super::report_zone_history_save_result(&path, stale.save(&path, Vec::new()));
+        assert_eq!(
+            result.as_ref().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(result);
+        drop(stale);
+        drop(first); // The diagnostic must outlive the pane's persistence state.
+        wait();
+        let failures = crate::persistence::drain_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].operation,
+            super::BLOCK_HISTORY_PERSIST_OPERATION
+        );
+        assert!(failures[0].error.contains("new history is not being saved"));
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            saved,
+            "reporting never rewrites the snapshot"
+        );
+        // A successful new pane never queued a diagnostic to reset the
+        // worker's failed-target cache. Its later conflict must still report.
+        let _ = super::report_zone_history_save_result(
+            &path,
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "a later pane also could not save",
+            )),
+        );
+        wait();
+        let later = crate::persistence::drain_failures();
+        assert_eq!(later.len(), 1);
+        assert!(later[0].error.contains("later pane"));
+    }
+
+    #[test]
+    fn synchronous_zone_save_routes_even_when_close_discards_the_result() {
+        let source = include_str!("history.rs");
+        let save = source
+            .split("fn save_zone_history(&self)")
+            .nth(1)
+            .unwrap()
+            .split("/// Replay this pane")
+            .next()
+            .unwrap();
+        assert!(save.contains("report_zone_history_save_result(&path, result)"));
+        let view = include_str!("mod.rs");
+        let drop = view
+            .split("impl Drop for TermView")
+            .nth(1)
+            .unwrap()
+            .split("/// Reader-pipeline")
+            .next()
+            .unwrap();
+        assert!(drop.contains("self.save_history()"));
+        let panes = include_str!("../ui/panes.rs");
+        let tabs = include_str!("../ui/tabs.rs");
+        assert!(panes.contains("let _ = view.save_history();"));
+        assert!(tabs.contains("let _ = term_view.save_history();"));
+        let main = include_str!("../main.rs");
+        assert!(main.contains("crate::persistence::drain_failures()"));
+        assert!(main.contains("ui.show_block_history_failure(&failure.error)"));
     }
 }

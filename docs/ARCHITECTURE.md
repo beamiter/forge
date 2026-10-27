@@ -4,6 +4,27 @@
 
 `src/bin/forge.rs` is intentionally tiny and delegates to the library application. `src/cli.rs` handles help, version, human/JSON config validation and diagnostics, config initialization/backup recovery, shell-integration output, and launch overrides before GTK initialization. Headless operations therefore remain usable over SSH and in CI. A normal launch enters `src/main.rs`, which builds the libadwaita application and the shared `UiState`.
 
+## Font resolution
+
+`src/font.rs` checks the display's Pango family catalog after GTK initialization.
+Only an unavailable, standalone default `JetBrainsMono Nerd Font Mono` family is
+replaced with `Monospace` at rendering time, before icon fallback is appended. Generated Pango family-list separators contain no added whitespace: `set_family` treats that whitespace as part of the fallback name. CSS quoting/separators remain a separate path.
+The availability result is cached for the process lifetime; restart after installing
+a new font. The Pango description retains its size, weight and style, and config
+is never rewritten. Custom family names and lists keep their existing behavior.
+
+Font zoom has two independently persisted effective scales: content `font_scale`
+and top-bar/sidebar `chrome_font_scale`. UI base size is stored independently as
+`chrome_font_size`, a size-only Pango description retaining fractional points or
+absolute pixels. Both UI values inherit legacy values once during config loading.
+Capture-phase scroll controllers attach to disjoint region roots (top handle,
+left sidebar, right AI/Tasks stack, center notebook/search column, bottom bar), so pointer ancestry
+selects the group and consumes Ctrl+wheel before Block/VTE handlers. Window-level overlays and separate dialogs have no
+underlying-region zoom handler. Native popup routing and GTK visual behavior
+require a display-backed acceptance pass; headless routing guards do not prove them. Surface deltas normalize through the pinned shared
+wheel constant, preserving fractional steps. Separate idle slots coalesce rendering;
+the existing config debounce persists both values in one atomic snapshot.
+
 ## Terminal models
 
 forge has two explicit terminal models:
@@ -17,6 +38,10 @@ forge has two explicit terminal models:
 
 `UiState` coordinates tabs, panes, sidebars, search, configuration reloads, and actions. The file sidebar uses GTK4's supported model-view stack: `gio::ListStore`, `TreeListModel`, `ListView`, and `TreeExpander`, with a `MultiSelection` driving batch operations (ctrl+click/shift+click come from GTK; right-click on a selected row applies Delete/Copy/Cut/Copy Path to the whole selection, Delete confirms with a count and up to five names, and batch paste/delete continue past per-item failures into a summary toast; a cut deletes only successfully transferred sources). A header toggle opens a type-to-filter row: the tree wraps in a `FilterListModel` whose predicate consults a visible-path set (case-insensitive name matches plus their ancestors) computed from the loaded child stores only — filtering triggers no scans, auto-expands materialized ancestors of matches, and restores prior expansion on clear. Directory scans run on named worker threads; generation checks prevent stale results from repopulating a changed root. Listing and file operations dispatch through `ui::remote_fs`, so the same tree browses the local disk or any configured ssh/docker remote host: a fixed POSIX sh probe script (protocol v3) runs on the far side through the system `ssh`/`docker` binaries (script as one `sh -c` argv element, single-quote-escaped positional parameters, bounded output, hard timeouts) and its NUL-separated listing is parsed back. A header selector switches location; remote start-directory discovery uses the bounded file-op worker rather than GTK's thread, and a terminal button opens a local tab at the visible root or the selected managed SSH/Docker profile. Because `FsLocation::Remote` is index-backed, every settings/reload update reconciles it and the file clipboard by exact full-profile identity: a unique reorder remaps, while removal/replacement/ambiguity clears the old remote state and returns Local. Dropdown model rebuilds suppress their intermediate selection notifications, and every context menu/name/delete intent carries its originating generation plus location, so a dialog left open across a root/target switch cannot apply its old absolute path to the new backend. Copy/Cut also receives a monotonic intent id: a delayed Paste menu resolves that id through the live, already-reconciled clipboard before starting, and a slow cut completion can retire only the same intent, including across a safe profile reorder. Managed-tab OSC 7 following first distinguishes the focused local or remote split leaf, then resolves one validated current profile by full identity (only a restored tab has an explicit per-tab session override), never by display name. A right-click menu offers New File/Folder, Rename, Delete, Copy, Cut, Copy Path, Paste and Refresh on both backends. Paste across locations streams between filesystems without buffering whole payloads (512 MiB cap): `cat`/`put` for files, `tar`/`untar` for directories, and a local-temp relay between two remote hosts; a cut across locations copies first and deletes the source only after the transfer landed. Directory uploads fail closed: the v3 `untar <dir> <name>` refuses an existing `<dir>/<name>` before extracting (a microscopic check-to-extract TOCTOU window remains, documented in the probe header), and a `stat` probe provides the friendly pre-flight refusal. Transfers report throttled progress into a persistent toast (bytes, plus the known total for file uploads) and carry a Cancel action: a shared token kills the in-flight child on the same path as the timeout, partial local temps are unlinked, and the outcome is a neutral "Cancelled" rather than an error. Dropping local files/folders from the OS file manager onto the tree imports them (`gtk4::DropTarget` on `Gdk::FileList` only, hover-highlighting the target row): the drop is planned up-front and refused wholesale beyond 256 items or the 512 MiB byte cap (bounded metadata walk, no symlinked-dir following), then per-item recursive copies (local) or streaming uploads (remote) run on the op worker with the same progress/cancel wiring and a failure summary toast. After a mutation only the affected parent directories are re-listed, with a minimal-diff update that keeps surviving rows' identity so expansion state elsewhere in the tree is preserved; a focused managed remote pane that reports its cwd through OSC 7 pulls the tree onto its uniquely matched current host, while a local sibling follows its own local cwd.
 
+The bottom-bar renderer keeps shared composed segment text intact. Only Cwd
+and Git labels use native middle ellipsization and full-text tooltips, so long
+metadata can shrink without changing grid, exit or tab segment allocation.
+
 The unified palette keeps fuzzy ranking in a pure data layer and combines actions, metadata-only JSONL command history, YAML/TOML workflows, and the review-first natural-language command entry. Prefixes select one source without creating separate search implementations. A `?` request captures one Block `TermView`, shell/cwd and optional selected Block, sends bounded JSON-encoded untrusted context through a cancellable provider request, and renders Stop/Retry/Regenerate plus the result inline instead of mutating AI Chat history or opening a modal.
 
 The native Shell Agent captures one active Block `TermView` as its target and surfaces its cwd, provider/model, shell, safety state, turn budget, transcript, and the persistent review-first command-correction toggle. Selected Block data and pane environment metadata are byte-bounded, JSON-encoded, and carried only as explicitly untrusted user-role context; truncation is visible in the context chip. A pure bounded state machine accepts only strict JSON `say`, `run`, or `done` actions and compacts its own transcript to 128 KiB/128 entries; unknown fields, prose, stale proposal IDs, invalid transitions, multi-line/control-character commands, and malformed transitions fail closed. Natural-language suggestions, corrections and Agent proposals share one GTK command-review component for edit validation, live risk presentation, copy and primary-action semantics. Only an explicit **Approve & Run** may enter the execution transition; **Insert only** instead records a non-executed manual-review transition and writes no Enter. Execution preserves the exact approved visible text, recomputes risk after edits and common shell wrappers, requires a second exact-command confirmation for recognized dangerous operations, refuses approval unless the pinned prompt is idle and empty, then correlates the resulting finished block before feeding its bounded observation back into the next turn.
@@ -29,9 +54,15 @@ GTK widgets are only mutated on the main context. PTY reads, directory enumerati
 
 ## Persistence
 
-Each process owns one active window snapshot. A snapshot becomes available to a future process only after graceful shutdown, using an atomic rename from `.active` to `.state`. Launches atomically claim one ready snapshot, stale active snapshots are recovered after their owner PID exits, and legacy `tabs.state` is migrated without allowing two processes to restore it. Ready snapshots are retained with a bounded count. The same snapshot carries AI schema v2: the current selection plus at most 50 stable chat metadata records, each with archive state, draft, provider-bound Block context, and at most 100 complete user/assistant turns. Schema v1 single-chat payloads migrate automatically; malformed or future AI payloads are discarded independently so tab recovery still succeeds. In-flight user turns never become apparently completed restored conversations.
+Each process owns one active window snapshot. A snapshot becomes available to a future process only after graceful shutdown, using an atomic rename from `.active` to `.state`. Launches atomically claim one ready snapshot, stale active snapshots are recovered after their owner PID exits, and legacy `tabs.state` is migrated without allowing two processes to restore it. Ready snapshots are retained with a bounded count. Tab restore retains at most 32 original tab indices alongside the accepted layouts, remapping the saved active page after invalid or over-budget layouts are rejected. A rejected selection falls back to its nearest surviving predecessor, or the first survivor; metadata appearing after the tab cap is still read without decoding additional layouts. The same snapshot carries AI schema v2: the current selection plus at most 50 stable chat metadata records, each with archive state, draft, provider-bound Block context, and at most 100 complete user/assistant turns. Schema v1 single-chat payloads migrate automatically; malformed or future AI payloads are discarded independently so tab recovery still succeeds. In-flight user turns never become apparently completed restored conversations.
 
 The entire compact AI collection, not each chat independently, has an 8 MiB JSON ceiling. Collection compaction preserves chat metadata and removes only the oldest complete user/assistant pairs, never an in-flight trailing user turn, while marking affected chats `truncated` so data loss is visible. The line-oriented state envelope keeps the existing 20 MiB Pane/Tab budget and adds a dedicated 64 KiB metadata reserve; exact escaped-size compaction uses that headroom and fails closed against the last known-good file if invariants cannot be met. Persistence redaction is collection-wide and includes active, non-active, archived, and draft/context data. In-flight questions are represented as recoverable drafts, never completed turns, and final window close flushes the draft debounce. Safe mode neither restores nor publishes the collection; `--no-restore` retains its existing fresh, persistable-workspace behavior.
+
+Window-state parsing records whether complete layouts were omitted without changing the public parser or selected-tab remapping. The startup loader combines this signal with AI-payload rejection and moves the source aside once before autosave. A failed recovery move blocks session writes for the process's immutable active path; normal saves, preserved-workspace AI refreshes, and publication recheck this gate when they execute. Successful actual reload or a genuinely missing source restores write authority. Recovery copies retain the existing eight-file pruning policy; this is bounded recovery, not indefinite archival.
+
+Block-history load failures retain their small failure outcome after GTK consumption and after the last pre-apply save lease, so explicit Retry still chooses reload. Successful loaded documents release their reservations as before; explicit Clear discards failed state. Explicit retry saves carry a fresh-diagnostic request through same-key coalescing and generation checks, while normal autosaves remain deduplicated. Retry-triggered load failures use the persistent history surface.
+
+Unified zone-history persistence binds save authority to the exact path that was restored. Missing, valid-empty, and restored documents permit ordinary writes; unobserved paths, unsupported versions, damaged documents, read failures, and incomplete restores do not. A bounded suffix returned after shedding records or output is distinguished from a genuinely empty document, so closing that pane cannot erase its unreplayed source bytes. A failed restore remains fail-closed through empty shutdown and later writes, even after an external repair, until real replay/reopen occurs. Version detection precedes decoding today's zone schema. A bounded sequence visitor validates every record while retaining at most the newest 64 in a fixed-capacity queue, without trusting size hints or allocating the complete record array. Snapshot-byte compaction runs after count eviction so output is not discarded prematurely; any eviction keeps the restore incomplete and the source file protected. A persistent native pane notice explains preservation and recovery; it does not delete, repair, or reinterpret the file.
 
 Session snapshots and Block history use owner-only Unix permissions. File contents are written to a uniquely created sibling temporary file, synced, atomically renamed, and followed by a directory sync where applicable. Parsers retain legacy compatibility and reject pathological record sizes. Safe mode and fresh-workspace launches do not restore the AI payload. The separate JSONL command index deliberately stores no output and enforces record/file bounds.
 
@@ -74,3 +105,96 @@ CI runs the tracked-text privacy guard, rustfmt, shell syntax/ShellCheck, the fu
 9. An AI response may update only its originating extant chat; switching or deleting that chat cannot redirect or resurrect the response.
 10. Terminal/Block bytes are bounded and carried as untrusted user-role data, never interpolated into AI system instructions.
 11. Stopping AI work terminates its transport child; stopping an Agent model turn never terminates an already approved shell command.
+
+
+The Files path dialog gives breadcrumb labels middle ellipsization so a long
+component cannot enlarge the dialog beyond its parent. The full safe display
+label remains in the tooltip; navigation callbacks retain the original PathBuf.
+A native vertical ScrolledWindow contains the ancestors while the entry, error
+and ToolbarView header stay outside it. GTK handles ancestor focus reveal; no idle
+callback resets the user's scroll position.
+
+## Finished-card action surface
+
+Each finished card installs a pane-bound `block.show-menu` action group. Its permanent
+Block actions button and pointer context gesture share one weakly guarded menu factory,
+including selection, prompt-ownership checks and verified submission. A per-card weak
+popover slot prevents duplicate menus; menus use a bounded scrolling viewport. Restore
+and undo mount the same action group. Widget pooling removes the group alongside old
+controllers and child widgets so retired block identities cannot survive reuse.
+
+The compact quick-action strip owns its secondary controls even when their child visibility
+is disabled; the menu invokes the existing filter/expand/navigation paths rather than
+forking their state machines. Focus ownership is independent of hover and selection:
+a focused quick-action strip stays sensitive and visible until focus leaves it.
+
+Directory, branch, timestamp and duration share one expanding context label with a
+one-character width floor and middle ellipsis. Its tooltip and accessible label retain
+bounded safe details. This keeps the finished-card header at one row, so the existing
+height estimator, collapse geometry and virtual-scroll anchoring contract remain unchanged.
+
+
+### Bounded Block record review
+
+`block_view/review.rs` is a read-only native transient inspector, mounted through the same
+`BlockBackend::install_finished_block_context_menu` action group as production, restored,
+and undo-restored cards. `block.review` and the menu share one weak window slot per card.
+The modal window does not participate in terminal layout or scroll virtualization.
+
+Snapshots retain only bounded command/metadata strings, never clone output, textures, or
+finished widgets. Admission is capped at 64 records and 256 KiB of command bytes; individual
+metadata fields use a 16 KiB safe-display budget. Any omitted/missing selected record disables
+atomic clipboard copy. Copy re-resolves every captured ID and compares its command against
+the current model, refusing the entire selection if stale or display-sanitized. The module
+has no PTY, command-submission context, or execute/insert callback. Output bytes and line counts
+are metadata only, and unknown completion/timing remain explicit. GTK tests exercise the actual
+production action group, response to eviction, repeated open/close, narrow/wide rendering,
+clipboard order, Escape focus return, and unchanged PTY size/input/scroll anchor.
+
+### Block review navigation
+
+The active selection edge owns a compact, text-labelled Review selection shelf,
+using the same `block.review` production action as metadata and the menu. It is
+hidden for unselected cards. The inspector captures only weak references to its
+invoking history control/card and owner; Close/Escape restores a mapped history
+target before considering the live VTE. This path does not clear selection, unread
+state or move the history scroll anchor. Review remains clipboard-only and bounded;
+output and images remain in the original retained blocks.
+
+## Chat presentation
+
+Chat is an explicit `TerminalMode::Chat` routed through the existing TermView
+and BlockBackend lifecycle. `jterm_core::chat_mode` resolves content-free
+surface ownership; it does not parse or execute commands. The per-pane
+`ChatPresentation` keeps the Block history insertion anchor in the transcript
+and reparents only ActiveBlock's existing native clip between that anchor and
+the dock. Its canvas is the stable viewport authority, avoiding a history-height
+feedback loop when input docks. GTK's existing clip owns painting and hit tests.
+FinishedBlock presentation wraps the original command/output VTE widgets, keeping
+copy/search and record identity. All Chat CSS is scoped to the selected pane.
+No shared configuration reload can restyle a live Block or managed-remote pane.
+
+
+## Exact retained-text search preview
+
+The Find bar's Preview action captures `RenderBackend::records()` through
+`TermView::capture_search_preview`, without VTE extraction, search cursors or
+selection. A failed capture is never published. `block_view::search_preview`
+contains the GTK-free snapshot/regex/range model and a single background worker;
+`ui::search_preview` owns its independent read-only dialog. The snapshot id is
+its immutable content revision. Hits carry document identity and UTF-8 ranges
+plus scalar offsets for TextBuffer; no native-terminal coordinates are inferred.
+
+Only retained completed-record text is searched. Source truncation and missing
+metadata are disclosed; a truncated retained source is a declared scope, while
+an interrupted scan is an error without an exact count. All query/navigation
+callbacks stay bound to one weak pane; detached/dead panes and closed dialogs
+stop publication. Snapshot and monotonically checked query generations gate
+worker replies. There is one replaceable request and one replaceable reply slot,
+so rapid edits cannot create unbounded threads or result queues. Cancellation
+and the deadline are cooperative around regex operations, not hard preemption.
+
+The rendering path applies a TextTag to the exact display text that was searched.
+It never drives VTE or programmatically creates a selection. Existing native
+Find remains a separate feature with its existing cursor semantics. See
+[search preview acceptance](SEARCH_PREVIEW_ACCEPTANCE.md) for limits and tests.

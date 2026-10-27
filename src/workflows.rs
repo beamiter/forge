@@ -70,7 +70,7 @@ const APP: &str = "forge";
 /// `sort_by` line. Stating it here is the whole point — the ordering forge's
 /// users have muscle memory for is a choice, not an accident of which sibling
 /// the code was copied from.
-const LOAD_ORDER: LoadOrder = LoadOrder::ByName;
+pub(crate) const LOAD_ORDER: LoadOrder = LoadOrder::ByName;
 
 /// glib's XDG lookups, which are not the `dirs` crate's.
 ///

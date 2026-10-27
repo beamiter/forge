@@ -96,15 +96,15 @@ impl GitBranchCache {
 }
 
 /// Vertical chrome the `.block-active` holder adds around the live VTE:
-/// 4px top margin + 4px bottom margin + 3px top padding + 3px bottom padding
-/// = 14px. The top/bottom borders became `outline`, which does not take part in
+/// 2px top margin + 2px bottom margin + 3px top padding + 3px bottom padding
+/// = 10px. The top/bottom borders became `outline`, which does not take part in
 /// layout, and the 1px each used to contribute moved into the padding.
 ///
 /// Used by `update_input_height` to subtract this from the visible page size
 /// before computing how many VTE rows fit. Must stay in sync with the
 /// `.block-active` rule below; if the margin/border/padding here changes,
 /// update this constant too.
-pub(crate) const BLOCK_ACTIVE_VCHROME_PX: i32 = 14;
+pub(crate) const BLOCK_ACTIVE_VCHROME_PX: i32 = 10;
 /// Compact mode: 1px top/bottom margin + 1px top/bottom padding (the border
 /// that used to supply those pixels is now a layout-free `outline`).
 pub(crate) const BLOCK_ACTIVE_COMPACT_VCHROME_PX: i32 = 4;
@@ -427,33 +427,19 @@ pub(crate) fn block_css(config: &Config) -> String {
         (bg_b as f32 + (fg_b as f32 - bg_b as f32) * 0.03) as u8,
     );
 
-    // Parse font description to extract font family and size
-    // Format: "FontName Style Size" e.g. "Monospace 14"
-    let parts: Vec<&str> = config.font_desc.split_whitespace().collect();
-    let (font_family, base_size) = if parts.len() >= 2 {
-        // Last part is usually the size. Pango allows float sizes ("Fira Code 12.5"),
-        // so parse as f64 and round rather than rejecting non-integer sizes.
-        if let Ok(size) = parts[parts.len() - 1].parse::<f64>() {
-            let family = parts[..parts.len() - 1].join(" ");
-            (family, size.round().max(1.0) as i32)
-        } else {
-            (config.font_desc.clone(), 14)
-        }
-    } else {
-        (config.font_desc.clone(), 14)
-    };
-    // Block chrome draws command text through GTK labels, so it needs the same
-    // icon fallback the VTE surfaces get; otherwise a prompt's Nerd-Font glyph
-    // lands on whichever font fontconfig happens to sort first. The stack also
-    // escapes each family, so a quote/backslash in a font name can't break the
-    // surrounding CSS string and silently disable the whole stylesheet.
-    let font_stack = crate::font::css_font_stack(&font_family, crate::font::icon_family(config));
-
-    // Apply font scale to the base size
-    let scaled_size = (base_size as f64 * config.default_font_scale)
-        .round()
-        .max(1.0) as i32;
-    let font_size = format!("{}pt", scaled_size);
+    // Parse the configured family through Pango too: style words and a `px`
+    // suffix are not part of a family name. Preserve the ordered icon fallback.
+    let font = crate::font::terminal_font_description(&config.font_desc, config);
+    let font_stack = font
+        .family()
+        .unwrap_or_else(|| "Monospace".into())
+        .split(',')
+        .map(str::trim)
+        .map(|family| crate::font::css_font_stack(family, None))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let font_size =
+        crate::font::effective_font_size_css(&config.font_desc, config.default_font_scale);
 
     let css = format!(
         r#"
@@ -465,6 +451,68 @@ pub(crate) fn block_css(config: &Config) -> String {
         }}
         .block-list {{
             background-color: {bg_hex};
+        }}
+        /* Chat is a per-pane presentation. No selector can restyle Block,
+           Unified, or a managed remote pane in the same window. Native VTE
+           remains the hit-tested surface; there is no painted fake editor. */
+        .term-chat-root .chat-pair {{
+            background-color: transparent;
+            border-color: transparent;
+            outline-color: transparent;
+            box-shadow: none;
+        }}
+        .term-chat-root .chat-command {{
+            font-family: {font_stack};
+            font-size: {font_size};
+            background-color: rgba({agent_r},{agent_g},{agent_b},0.34);
+            border-radius: 18px 18px 5px 18px;
+            padding: 0 10px 0 2px;
+        }}
+        .term-chat-root .chat-result {{
+            background-color: transparent;
+            border-radius: 0;
+            outline: 1px solid transparent;
+            outline-offset: -1px;
+        }}
+        .term-chat-root .block-failed .chat-result {{
+            outline-color: {err_stripe};
+        }}
+        .term-chat-root .block-unknown .chat-result {{
+            outline-color: {warn_stripe};
+        }}
+        .term-chat-root .block-selected .chat-result,
+        .term-chat-root .block-selection-active .chat-result {{
+            outline-color: {accent};
+        }}
+        .term-chat-root .chat-composer {{
+            border-color: transparent;
+            outline-color: rgba({fg_r},{fg_g},{fg_b},0.22);
+            border-radius: 18px;
+            box-shadow: none;
+        }}
+        .term-chat-root .chat-live-anchor {{
+            border-width: 0;
+            outline-width: 0;
+            margin: 0;
+            padding: 0;
+            min-height: 0;
+            background-color: transparent;
+            box-shadow: none;
+        }}
+        .term-chat-root .chat-controls {{
+            color: {dim_fg};
+            margin: 0 10px 0 14px;
+            min-height: 32px;
+        }}
+        .term-chat-root .chat-controls button {{
+            min-width: 24px;
+            min-height: 24px;
+            padding: 0 6px;
+        }}
+        .term-chat-root .chat-submit {{
+            border-radius: 999px;
+            background-color: rgba({agent_r},{agent_g},{agent_b},0.62);
+            color: {fg_hex};
         }}
         .block-onboarding {{
             color: {dim_fg};
@@ -569,6 +617,10 @@ pub(crate) fn block_css(config: &Config) -> String {
            outward when the top/right/bottom border became a layout-free
            `outline`. Widen each by that pixel so a selected card keeps the same
            2px band, and the active end its 3px one. */
+        .cross-block-text-selected {{
+            outline: 2px solid {accent};
+            outline-offset: -2px;
+        }}
         .block-selected {{
             background-color: rgba({acc_r},{acc_g},{acc_b},0.08);
             outline-color: rgba({acc_r},{acc_g},{acc_b},0.48);
@@ -619,7 +671,7 @@ pub(crate) fn block_css(config: &Config) -> String {
             outline-color: rgba({acc_r},{acc_g},{acc_b},0.32);
             outline-offset: -1px;
             border-radius: 10px;
-            margin: 4px 8px;
+            margin: 2px 8px;
             padding: 3px 1px 3px 0;
             background-color: {bg_hex};
             box-shadow: 0 2px 8px rgba(0,0,0,0.18);
@@ -748,6 +800,10 @@ pub(crate) fn block_css(config: &Config) -> String {
         .organism-live-body.organism-warning {{
             color: {warn_hex};
             border-color: rgba({warn_r},{warn_g},{warn_b},0.50);
+        }}
+        .organism-live-body.organism-hover-candidate {{
+            border-color: rgba({fg_r},{fg_g},{fg_b},0.45);
+            transition: none;
         }}
         .organism-sticky-avatar {{
             color: {agent_hex};
@@ -1044,6 +1100,35 @@ pub(crate) fn block_css(config: &Config) -> String {
             font-size: 0.82em;
             font-weight: bold;
         }}
+        .block-review-button {{
+            min-width: 0;
+            min-height: 24px;
+            padding: 0 4px;
+            border-radius: 6px;
+        }}
+        .block-review-button:hover {{
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.08);
+        }}
+        .block-review-selection {{
+            color: {fg_hex};
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.16);
+            border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.42);
+            border-radius: 6px;
+            min-height: 24px;
+            padding: 2px 10px;
+            margin-bottom: 4px;
+            font-family: {font_stack};
+            font-size: 0.85em;
+        }}
+        .block-review-selection:hover,
+        .block-review-selection:focus-visible {{
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.28);
+            outline: 2px solid {accent};
+            outline-offset: 1px;
+        }}
+        .block-review-window textview {{
+            border-radius: 8px;
+        }}
         .block-action-btn {{
             color: {dim_fg};
             min-width: 24px;
@@ -1221,6 +1306,19 @@ pub(crate) fn block_css(config: &Config) -> String {
         .block-show-more:hover {{
             background-color: rgba({acc_r},{acc_g},{acc_b},0.18);
         }}
+        .unified-navigation {{
+            padding: 3px 6px;
+            border-bottom: 1px solid rgba({acc_r},{acc_g},{acc_b},0.20);
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.06);
+        }}
+        .unified-navigation button {{
+            min-width: 22px;
+            min-height: 22px;
+            padding: 2px 4px;
+        }}
+        .unified-navigation label {{
+            font-size: 0.88em;
+        }}
         .jump-bottom-fab {{
             color: {bg_hex};
             background-color: {accent};
@@ -1308,6 +1406,39 @@ pub(crate) fn block_css(config: &Config) -> String {
             font-size: 0.92em;
             padding: 6px 10px;
         }}
+
+        /* The transcript is one surface, not a stack of elevated panels.
+           Keep every box metric unchanged: native terminal columns, alternate
+           screen winsize, retained measurements and pointer mapping depend on
+           them. Outcome stripes/washes and bookmark images remain independent;
+           only selection gets a ring, never a pointer-driven drop shadow. */
+        .block-list .block-finished {{
+            border-radius: 0;
+        }}
+        .block-list .block-active {{
+            border-radius: 0;
+            outline-color: transparent;
+            box-shadow: none;
+        }}
+        .block-list .block-finished:not(.block-selected) {{
+            box-shadow: none;
+        }}
+        .block-list .block-finished:not(.block-selected):not(.block-hovered):not(.cross-block-text-selected) {{
+            outline-color: transparent;
+        }}
+        .block-list .block-finished:not(.block-failed):not(.block-background):not(.block-selected):not(.block-hovered) {{
+            background-color: transparent;
+        }}
+        .block-list .block-finished.block-selected {{
+            box-shadow: inset 0 0 0 2px rgba({acc_r},{acc_g},{acc_b},0.65);
+        }}
+        .block-list .block-finished.block-selected.block-selection-active {{
+            box-shadow: inset 0 0 0 3px {accent};
+        }}
+        .term-chat-root .chat-composer:focus-within {{
+            outline: 2px solid {accent};
+            outline-offset: -2px;
+        }}
         "#,
     );
     css
@@ -1322,6 +1453,55 @@ mod tests {
     };
     use std::path::Path;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn continuous_surface_preserves_geometry_outcomes_and_selection() {
+        let css = block_css(&crate::config::Config::safe_defaults());
+        for selector in [
+            ".block-list .block-finished",
+            ".block-list .block-active",
+            ".block-list .block-finished:not(.block-selected)",
+            ".block-list .block-finished.block-selected",
+            ".block-list .block-finished.block-selected.block-selection-active",
+        ] {
+            let rule = rule_body(&css, selector);
+            for property in ["margin:", "padding:", "border-width:", "min-height:"] {
+                assert!(!rule.contains(property), "{selector} changed {property}");
+            }
+            assert!(
+                !rule.contains("0 4px 14px"),
+                "no hover elevation: {selector}"
+            );
+        }
+        assert!(rule_body(&css, ".block-list .block-finished").contains("border-radius: 0;"));
+        assert!(rule_body(&css, ".block-list .block-finished:not(.block-failed):not(.block-background):not(.block-selected):not(.block-hovered)")
+            .contains("background-color: transparent;"));
+        assert!(
+            rule_body(&css, ".block-list .block-finished.block-selected")
+                .contains("box-shadow: inset 0 0 0 2px")
+        );
+        assert!(rule_body(
+            &css,
+            ".block-list .block-finished.block-selected.block-selection-active"
+        )
+        .contains("box-shadow: inset 0 0 0 3px"));
+        assert!(
+            rule_body(&css, ".term-chat-root .chat-composer:focus-within")
+                .contains("outline: 2px solid")
+        );
+    }
+
+    #[test]
+    fn active_card_seams_and_height_budget_match_finished_cards() {
+        let css = block_css(&crate::config::Config::safe_defaults());
+        let normal = rule_body(&css, ".block-active");
+        let compact = rule_body(&css, ".block-active.block-compact");
+        assert!(normal.contains("margin: 2px 8px;"));
+        assert!(compact.contains("margin: 1px 4px;"));
+        assert!(normal.contains("padding: 3px 1px 3px 0;"));
+        assert_eq!(super::BLOCK_ACTIVE_VCHROME_PX, 2 * 2 + 2 * 3);
+        assert_eq!(super::BLOCK_ACTIVE_COMPACT_VCHROME_PX, 2 + 2);
+    }
 
     /// Collect the declarations of one rule, keyed by its exact selector text.
     fn rule_body<'a>(css: &'a str, selector: &str) -> &'a str {
@@ -1356,6 +1536,47 @@ mod tests {
             rest = &rest[body_start + close + 1..];
         }
         out
+    }
+
+    #[test]
+    fn block_and_chat_use_the_same_exact_font_size_as_window_chrome() {
+        let mut config = crate::config::Config::safe_defaults();
+        config.icon_font = Some("none".into());
+        for desc in ["Monospace Bold Italic 13.5", "Monospace 17px"] {
+            config.font_desc = desc.into();
+            config.default_font_scale = 1.025;
+            let css = block_css(&config);
+            let size = crate::font::effective_font_size_css(desc, 1.025);
+            for selector in [
+                ".term-chat-root .chat-command",
+                ".block-output",
+                ".block-cmd-finished",
+            ] {
+                let rule = rule_body(&css, selector);
+                assert!(
+                    rule.contains(&format!("font-size: {size};")),
+                    "{selector}: {rule}"
+                );
+                assert!(rule.contains("font-family: \"Monospace\";"));
+            }
+        }
+    }
+
+    #[test]
+    fn chat_styles_are_pane_scoped_and_do_not_shrink_output_columns() {
+        let css = block_css(&crate::config::Config::safe_defaults());
+        for line in css
+            .lines()
+            .filter(|line| line.contains(".chat-") && line.contains('{'))
+        {
+            assert!(line.trim_start().starts_with(".term-chat-root"), "{line}");
+        }
+        let result = rule_body(&css, ".term-chat-root .chat-result");
+        assert!(!result.contains("max-width"));
+        assert!(!result.contains("margin-left"));
+        assert!(!result.contains("margin-right"));
+        let anchor = rule_body(&css, ".term-chat-root .chat-live-anchor");
+        assert!(anchor.contains("min-height: 0"));
     }
 
     /// Whether a CSS declaration can change a box's content size: margins,
@@ -1533,7 +1754,8 @@ mod tests {
             );
         }
 
-        // A hovered selection keeps both the ring and the lift.
+        // Legacy unscoped cards keep the ring and lift. Transcript-scoped
+        // overrides below must retain only the inset selection ring.
         for selector in [
             ".block-selected.block-hovered",
             ".block-selected.block-selection-active.block-hovered",
@@ -1543,6 +1765,58 @@ mod tests {
                 body.contains("inset") && body.contains("14px"),
                 "`{selector}` must carry the ring AND the hover elevation: {body}"
             );
+        }
+
+        // Continuous transcript overrides win over those legacy combinations,
+        // without claiming outcome borders or introducing another outer shadow.
+        let accent = config.semantic_colors().accent;
+        let selected_shadow = format!(
+            "box-shadow: inset 0 0 0 2px rgba({},{},{},0.65);",
+            (accent.red() * 255.0) as u8,
+            (accent.green() * 255.0) as u8,
+            (accent.blue() * 255.0) as u8,
+        );
+        let active_shadow = format!(
+            "box-shadow: inset 0 0 0 3px {};",
+            super::rgba_to_hex(&accent)
+        );
+        for (selector, expected) in [
+            (
+                ".block-list .block-finished.block-selected",
+                selected_shadow,
+            ),
+            (
+                ".block-list .block-finished.block-selected.block-selection-active",
+                active_shadow,
+            ),
+        ] {
+            let body = rule_body(&css, selector);
+            assert_eq!(
+                body.trim(),
+                expected,
+                "{selector} must only own its inset ring"
+            );
+            assert!(
+                css.find(&format!("{selector} {{")).unwrap()
+                    > css
+                        .find(".block-selected.block-selection-active.block-hovered {")
+                        .unwrap(),
+                "transcript overrides must follow the legacy hover rules"
+            );
+        }
+        assert_eq!(
+            rule_body(&css, ".block-list .block-finished:not(.block-selected)").trim(),
+            "box-shadow: none;",
+            "unselected transcript cards must not acquire elevation or erase outcome cues"
+        );
+
+        for selector in [
+            ".block-list .block-finished",
+            ".block-list .block-finished:not(.block-failed):not(.block-background):not(.block-selected):not(.block-hovered)",
+        ] {
+            let body = rule_body(&css, selector);
+            assert!(!body.contains("box-shadow"), "neutral history cannot add a shadow");
+            assert!(!body.contains("transform"), "neutral history cannot lift or move");
         }
 
         // Nothing else may quietly join the box-shadow contest. Scoped to the
@@ -1557,6 +1831,9 @@ mod tests {
             owners,
             vec![
                 ".block-hovered",
+                ".block-list .block-finished.block-selected",
+                ".block-list .block-finished.block-selected.block-selection-active",
+                ".block-list .block-finished:not(.block-selected)",
                 ".block-selected",
                 ".block-selected.block-hovered",
                 ".block-selected.block-selection-active",

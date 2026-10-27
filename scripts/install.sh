@@ -7,6 +7,13 @@ umask 077
 APP_ID="io.github.beamiter.forge"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=install-config.sh
+# The helper is checked separately by the installer regression suite.
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/install-config.sh"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/migrate-legacy-binary.sh"
 HOME_DIR="${HOME:-}"
 DESTDIR="${DESTDIR:-}"
 DESTDIR_ACTIVE=0
@@ -15,7 +22,6 @@ if [[ -n "${DESTDIR}" ]]; then
 fi
 PREFIX="${HOME_DIR}/.local"
 BIN_DIR=""
-PREFIX_EXPLICIT=0
 BACKEND="auto"
 BACKEND_EXPLICIT=0
 PREBUILT_BINARY=""
@@ -31,15 +37,19 @@ Usage: ./scripts/install.sh [options]
 
 Options:
   --prefix PATH          Runtime prefix (default: ~/.local)
-  --bin-dir PATH         Runtime binary directory (default: ~/.cargo/bin;
-                         with --prefix, defaults to PREFIX/bin)
+  --bin-dir PATH         Runtime binary directory (default: PREFIX/bin)
   --backend auto|nix|cargo
                          Build backend (default: auto; prefers Nix)
   --binary PATH          Install a prebuilt forge binary instead of building
-  --no-config            Do not install config.toml.example
+  --no-config            Keep the existing config unchanged
   --no-desktop           Do not install desktop, AppStream, or icon files
   --dry-run              Print commands without changing files
   -h, --help             Show this help
+
+Install config.toml on first use. Keep existing values when configuration
+fields are unchanged; when fields change, save a private config.toml.backup.*
+copy before replacing it with bundled defaults. Use --no-config to always keep
+your current settings. If TOML comparison is unavailable, keep the old config.
 
 Environment:
   DESTDIR                Optional staging root for packaging
@@ -193,38 +203,6 @@ install_file_atomic() {
     INSTALL_TEMP=""
 }
 
-# Publish a first-run config without a check-then-copy race. The temporary and
-# destination are in the same directory, so link(2) is atomic and cannot cross
-# filesystems; EEXIST means a concurrent writer won and must be preserved.
-install_config_if_absent() {
-    local source="$1" dest="$2" runtime_dest="$3" directory basename
-    if [[ -e "${dest}" || -L "${dest}" ]]; then
-        printf 'Keeping existing config: %s\n' "${runtime_dest}"
-        return 0
-    fi
-    printf '  install -m 0600 %q %q && ln -- %q %q\n' \
-        "${source}" "${dest}.<temporary>" "${dest}.<temporary>" "${dest}"
-    ((DRY_RUN == 0)) || return 0
-    directory="${dest%/*}"
-    basename="${dest##*/}"
-    INSTALL_TEMP="$(mktemp "${directory}/.${basename}.install.XXXXXX")" \
-        || die "cannot create temporary config beside ${dest}"
-    if ! install -m 0600 "${source}" "${INSTALL_TEMP}"; then
-        cleanup_install_temp
-        die "cannot stage initial config for ${dest}"
-    fi
-    if ln -- "${INSTALL_TEMP}" "${dest}" 2>/dev/null; then
-        cleanup_install_temp
-        return 0
-    fi
-    if [[ -e "${dest}" || -L "${dest}" ]]; then
-        cleanup_install_temp
-        printf 'Keeping concurrently created config: %s\n' "${runtime_dest}"
-        return 0
-    fi
-    cleanup_install_temp
-    die "cannot atomically create initial config at ${dest}"
-}
 
 install_binary_atomic() {
     local source="$1" dest="$2"
@@ -413,13 +391,11 @@ while (($# > 0)); do
             (($# >= 2)) || die "--prefix requires a path"
             PREFIX="$2"
             [[ -n "${PREFIX}" ]] || die "--prefix must not be empty"
-            PREFIX_EXPLICIT=1
             shift 2
             ;;
         --prefix=*)
             PREFIX="${1#*=}"
             [[ -n "${PREFIX}" ]] || die "--prefix must not be empty"
-            PREFIX_EXPLICIT=1
             shift
             ;;
         --bin-dir)
@@ -484,11 +460,7 @@ done
 [[ -n "${HOME_DIR}" ]] || die "HOME is not set"
 validate_absolute_path "--prefix" "${PREFIX}"
 if [[ -z "${BIN_DIR}" ]]; then
-    if ((PREFIX_EXPLICIT == 1)); then
-        BIN_DIR="${PREFIX}/bin"
-    else
-        BIN_DIR="${HOME_DIR}/.cargo/bin"
-    fi
+    BIN_DIR="${PREFIX}/bin"
 fi
 validate_absolute_path "--bin-dir" "${BIN_DIR}"
 if ((DESTDIR_ACTIVE == 1)); then
@@ -541,6 +513,12 @@ if ((INSTALL_DESKTOP == 1)); then
 fi
 if ((INSTALL_CONFIG == 1)); then
     require_source_file "${REPO_ROOT}/config.toml.example"
+fi
+
+if ((INSTALL_CONFIG == 1)); then
+    for command in cp cmp stat chmod ln; do
+        require_command "${command}"
+    done
 fi
 
 require_command install
@@ -649,8 +627,13 @@ fi
 
 if ((INSTALL_CONFIG == 1)); then
     run install -d -m 0700 "${STAGED_CONFIG_DIR}"
-    install_config_if_absent "${REPO_ROOT}/config.toml.example" \
+    install_config_with_backup "${REPO_ROOT}/config.toml.example" \
         "${STAGED_CONFIG_DIR}/config.toml" "${CONFIG_DIR}/config.toml"
+fi
+
+if [[ "${BIN_DIR}" == "${HOME_DIR}/.local/bin" ]]; then
+    validate_staging_target "${DESTDIR}${HOME_DIR}/.cargo/bin"
+    migrate_legacy_binary "${DESTDIR}${HOME_DIR}/.cargo/bin/forge" "${BIN_DIR}/forge"
 fi
 
 printf 'Installed forge to %s\n' "${BIN_DIR}/forge"
@@ -665,14 +648,19 @@ if ((DESTDIR_ACTIVE == 1)); then
     printf 'Staged file: %s\n' "${STAGED_BIN_DIR}/forge"
 fi
 if ((DESTDIR_ACTIVE == 0)); then
-    if ! bin_dir_on_path; then
+    SHADOWING_BIN="$(command -v forge 2>/dev/null || true)"
+    if ! bin_dir_on_path && [[ ! "${SHADOWING_BIN}" -ef "${BIN_DIR}/forge" ]]; then
         printf '\nNote: %s is not in PATH; the launcher entry uses the absolute path,\n' \
             "${BIN_DIR}"
-        printf 'but shells will not find forge until you add it, for example:\n'
-        printf "  echo 'export PATH=\"%s:\$PATH\"' >>~/.profile\n" "${BIN_DIR}"
+        printf 'but shells will not find forge until you add it. In Bash, for this shell:\n'
+        # Quote the directory as one shell word. Nested echo quotes break on
+        # valid apostrophes and can make the suggested command executable data.
+        # PATH expands when the user runs the displayed command.
+        # shellcheck disable=SC2016
+        printf '  export PATH=%q:"$PATH"\n' "${BIN_DIR}"
     fi
-    SHADOWING_BIN="$(command -v forge 2>/dev/null || true)"
-    if [[ -n "${SHADOWING_BIN}" && "${SHADOWING_BIN}" != "${BIN_DIR}/forge" ]]; then
+    if [[ -n "${SHADOWING_BIN}" && "${SHADOWING_BIN}" != "${BIN_DIR}/forge" \
+        && ! "${SHADOWING_BIN}" -ef "${BIN_DIR}/forge" ]]; then
         printf '\nNote: typing %s still runs %s, an older copy earlier in PATH.\n' \
             'forge' "${SHADOWING_BIN}"
         printf 'Remove it, or put %s ahead of it in PATH.\n' "${BIN_DIR}"

@@ -9,7 +9,7 @@ fn test_terminal_mode_block() {
         TerminalMode::Block => {
             // Expected
         }
-        TerminalMode::Vte | TerminalMode::Unified => {
+        TerminalMode::Vte | TerminalMode::Unified | TerminalMode::Chat => {
             panic!("Expected Block mode");
         }
     }
@@ -22,7 +22,7 @@ fn test_terminal_mode_vte() {
         TerminalMode::Vte => {
             // Expected
         }
-        TerminalMode::Block | TerminalMode::Unified => {
+        TerminalMode::Block | TerminalMode::Unified | TerminalMode::Chat => {
             panic!("Expected Vte mode");
         }
     }
@@ -38,4 +38,10 @@ fn test_terminal_mode_clone() {
         }
         _ => panic!("Clone failed"),
     }
+}
+
+#[test]
+fn test_terminal_mode_chat_is_distinct_from_block() {
+    assert_eq!(TerminalMode::Chat.clone(), TerminalMode::Chat);
+    assert_ne!(TerminalMode::Chat, TerminalMode::Block);
 }

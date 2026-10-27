@@ -1,12 +1,18 @@
-//! Native Block-pane body for the experimental ASCII organism.
+//! Native local Block/Unified body for the experimental ASCII organism.
 
-use gtk4::prelude::*;
+mod inline_card;
+mod inspector;
+#[cfg(all(test, target_os = "linux"))]
+mod surface_probe;
+mod watch_adapter;
+
 use gtk4::{Box as GBox, Label, Orientation};
+use libadwaita::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use super::{PaneNode, UiState};
+use super::{PaneLeaf, PaneNode, UiState};
 use crate::block_view::{AltScreenTransition, TermView};
 use crate::config::OrganismMotion;
 #[cfg(test)]
@@ -18,15 +24,41 @@ use jterm_core::organism::{
     VisualGrowthStage, VisualTransition, WatchRhythm,
 };
 use jterm_core::organism_attention::{AttentionArbiter, AttentionCue};
+use jterm_core::organism_clock::{InputActivity, MAX_TICK};
+use jterm_core::organism_companion::{CompanionCare, CompanionSurface, CompanionVoice};
+#[cfg(test)]
+use jterm_core::organism_daily::behavior_explanation;
+use jterm_core::organism_daily::context_explanation;
+#[cfg(test)]
+use jterm_core::organism_daily::GentleInteraction;
+#[cfg(test)]
+use jterm_core::organism_live::LiveAttentionSource;
+use jterm_core::organism_live::{
+    LiveAttention, LiveAttentionCandidate, LiveAttentionEvent, LiveAttentionInput,
+    LiveAttentionOutcome, LiveAttentionSnapshot, LiveAttentionTicket,
+};
 use jterm_core::organism_memory::{
     local_circadian_time_at_ms, unix_ms, CircadianProfile, GrowthProgress, GrowthStage,
     LocalCircadianTime, MemoryEvent, MemoryInsight, RepoContext,
 };
 
+/// Routes an explicit care preference through the window's normal settings path.
+pub(crate) type CareSettingsHandler = Rc<dyn Fn(bool)>;
+
 /// An accepted correction only vouches for a command that starts promptly.
 const CORRECTION_ASSIST_WINDOW: Duration = Duration::from_secs(30);
-const HUMAN_INPUT_RETREAT: Duration = Duration::from_millis(900);
-const SURFACE_FRAME_INTERVAL: Duration = Duration::from_millis(100);
+#[cfg(test)]
+const POINTER_GREETING_DWELL: Duration = LiveAttention::<OrganismPaneToken>::DWELL;
+const POINTER_GREETING_RADIUS: f64 = 32.0;
+
+/// A native resource is always paired with the core visit that requested it.
+struct PointerCandidateSource {
+    ticket: LiveAttentionTicket,
+    source: gtk4::glib::SourceId,
+}
+
+pub(super) const HUMAN_INPUT_RETREAT: Duration = Duration::from_millis(900);
+pub(super) const SURFACE_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 /// Heartbeat while the mind rests or the body is static: life goes on, the
 /// process barely wakes. Kept just under the tick's one-second dt clamp so
 /// routine dispatch latency is still simulated instead of clipped away.
@@ -54,6 +86,24 @@ const TONE_CLASSES: [&str; 5] = [
     "organism-warning",
 ];
 
+/// Pointer state is available only while the device is on this native
+/// surface. In particular, Device::modifier_state is keyboard-only.
+fn pointer_button_state(root: &gtk4::Widget, buttons: gtk4::gdk::ModifierType) -> Option<bool> {
+    let pointer = root.display().default_seat()?.pointer()?;
+    let surface = root.native()?.surface()?;
+    let (_, _, modifiers) = surface.device_position(&pointer)?;
+    Some(modifiers.intersects(buttons))
+}
+
+fn pointer_buttons_down(view: &TermView) -> bool {
+    // Explicit keyboard hello does not require the pointer in this window.
+    // This checks a known local drag, not global pointer state elsewhere.
+    let buttons = gtk4::gdk::ModifierType::BUTTON1_MASK
+        | gtk4::gdk::ModifierType::BUTTON2_MASK
+        | gtk4::gdk::ModifierType::BUTTON3_MASK;
+    pointer_button_state(&view.widget(), buttons) == Some(true)
+}
+
 fn surface_frame_delay(
     motion: OrganismMotion,
     owner: bool,
@@ -67,6 +117,70 @@ fn surface_frame_delay(
     }
 }
 
+/// Keep the existing maintenance heartbeat when a measured body cannot fit,
+/// unless the sticky surface still needs animated frames. Inline cards use
+/// frame zero. A resize is discovered by the next maintenance tick.
+fn surface_frame_delay_after_placement(
+    motion: OrganismMotion,
+    owner: bool,
+    alt_screen: bool,
+    resting: bool,
+    no_safe_placement: bool,
+    sticky_mapped: bool,
+) -> Duration {
+    if no_safe_placement && !sticky_mapped {
+        DORMANT_FRAME_INTERVAL
+    } else {
+        surface_frame_delay(motion, owner, alt_screen, resting)
+    }
+}
+
+/// Only an accepted, currently drawable Full greeting needs live animation.
+/// The final wake is bounded by the original hold, never a fresh two seconds.
+fn greeting_frame_delay(
+    motion: OrganismMotion,
+    owner: bool,
+    alt_screen: bool,
+    body_mapped: bool,
+    remaining: Option<Duration>,
+) -> Option<Duration> {
+    if motion != OrganismMotion::Full || !owner || alt_screen || !body_mapped {
+        return None;
+    }
+    // Some(0) still describes a greeting retained by the last rendered frame.
+    // Schedule its cleanup once; a subsequent refresh clears that source.
+    remaining.map(|left| {
+        left.min(SURFACE_FRAME_INTERVAL)
+            .max(Duration::from_millis(1))
+    })
+}
+
+/// Hidden typing has no animated surface to update. Keep maintenance bounded,
+/// but retain the absolute input retreat deadline rather than adding a delay.
+fn interaction_frame_delay(
+    ordinary: Duration,
+    input_age: Option<Duration>,
+    hidden_typing_frame: bool,
+    greeting: Option<Duration>,
+) -> Duration {
+    if hidden_typing_frame {
+        if let Some(age) = input_age {
+            // The frame may have hidden the body just before the deadline,
+            // while this tail runs just after it. Recheck once at minimum
+            // timer resolution instead of leaving the old hidden frame up.
+            return HUMAN_INPUT_RETREAT
+                .saturating_sub(age)
+                .min(DORMANT_FRAME_INTERVAL)
+                .max(Duration::from_millis(1));
+        }
+    }
+    greeting.unwrap_or(ordinary).max(Duration::from_millis(1))
+}
+
+fn greeting_tightens_deadline(pending: Option<Instant>, now: Instant, delay: Duration) -> bool {
+    pending.is_some_and(|deadline| deadline > now + delay)
+}
+
 /// A focus transfer may replace an already-pending source, but must not start
 /// a second source after the fired callback has taken its id from the slot.
 /// That callback observes the new owner at its tail and schedules the right
@@ -78,37 +192,6 @@ fn focus_transfer_rearm_delay(
     timer_pending: bool,
 ) -> Option<Duration> {
     timer_pending.then(|| surface_frame_delay(motion, owner, alt_screen, false))
-}
-
-fn reaction_hold(reaction: &Reaction) -> Duration {
-    let millis = match reaction.behavior {
-        // Ordinary/quiet passes acknowledge the event without occupying the
-        // output centre for the old fixed eight seconds.
-        Behavior::Idle => 1_500,
-        Behavior::Celebrate if reaction.tone == Tone::Quiet => 1_800,
-        Behavior::Celebrate => 2_500,
-        // Errors need time to be noticed; a repeated streak deliberately sits
-        // longer, but the next input still interrupts it immediately.
-        Behavior::InspectError => 5_000,
-        Behavior::SitNearError => 10_000,
-        Behavior::CelebrateBig => 7_000,
-        Behavior::RestAfterPush => 5_000,
-        Behavior::UnknownOutcome => 4_500,
-        // GlanceAside is live-only and uses its own timer. Keep this arm for
-        // exhaustive safety if a future caller ever wraps it in a Reaction.
-        Behavior::GlanceAside => 1_400,
-        Behavior::WatchCommand
-        | Behavior::Sleep
-        | Behavior::Explore
-        | Behavior::Approach
-        | Behavior::WatchAgent
-        | Behavior::WatchSettled
-        | Behavior::GuardFailure
-        | Behavior::GuardStuck
-        | Behavior::GuardRecovery
-        | Behavior::GuardCautious => 2_500,
-    };
-    Duration::from_millis(millis)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +228,16 @@ struct SurfaceBox {
     /// On-screen grid row of the cursor: the output growth edge after which a
     /// watching/reaction pose may use only fully clear rows.
     cursor_row: i32,
+}
+
+fn measured_placement_blocked(surface: SurfaceBox, placement_found: bool) -> bool {
+    !placement_found
+        && surface.width > 0
+        && surface.height > 0
+        && surface.body_width > 0
+        && surface.body_height > 0
+        && surface.cell_width > 0
+        && surface.cell_height > 0
 }
 
 type SurfaceSignature = (i32, i32, i32, i32, i32, i32, i32);
@@ -250,92 +343,6 @@ fn stable_repo_hash(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct OutputRhythmTracker {
-    command_started: Option<Instant>,
-    third_recent_output: Option<Instant>,
-    second_recent_output: Option<Instant>,
-    last_output: Option<Instant>,
-    resumed_until: Option<Instant>,
-    rhythm: WatchRhythm,
-}
-
-impl OutputRhythmTracker {
-    const BUSY_WINDOW: Duration = Duration::from_millis(1_200);
-    const WAITING_AFTER: Duration = Duration::from_secs(3);
-    const RESUMED_HOLD: Duration = Duration::from_millis(900);
-
-    fn reset(&mut self) {
-        *self = Self::default();
-    }
-
-    fn start(&mut self, now: Instant) {
-        self.reset();
-        self.command_started = Some(now);
-    }
-
-    fn note_output(&mut self, now: Instant) {
-        let quiet_since = self.last_output.or(self.command_started);
-        let was_waiting = quiet_since
-            .is_some_and(|last| now.saturating_duration_since(last) >= Self::WAITING_AFTER);
-        self.third_recent_output = self.second_recent_output;
-        self.second_recent_output = self.last_output;
-        self.last_output = Some(now);
-        if was_waiting {
-            self.rhythm = WatchRhythm::Resumed;
-            self.resumed_until = Some(now + Self::RESUMED_HOLD);
-        } else if self.resumed_until.is_some_and(|until| now < until) {
-            self.rhythm = WatchRhythm::Resumed;
-        } else if self
-            .third_recent_output
-            .is_some_and(|oldest| now.saturating_duration_since(oldest) <= Self::BUSY_WINDOW)
-        {
-            self.rhythm = WatchRhythm::Busy;
-            self.resumed_until = None;
-        } else {
-            self.rhythm = WatchRhythm::Steady;
-        }
-    }
-
-    fn sample(&mut self, now: Instant, command_running: bool) -> WatchRhythm {
-        if !command_running {
-            self.reset();
-            return WatchRhythm::Steady;
-        }
-        if self.resumed_until.is_some_and(|until| now < until) {
-            return WatchRhythm::Resumed;
-        }
-        self.resumed_until = None;
-        if self
-            .last_output
-            .or(self.command_started)
-            .is_some_and(|last| now.saturating_duration_since(last) >= Self::WAITING_AFTER)
-        {
-            self.rhythm = WatchRhythm::Waiting;
-        } else if self
-            .third_recent_output
-            .is_some_and(|oldest| now.saturating_duration_since(oldest) <= Self::BUSY_WINDOW)
-        {
-            self.rhythm = WatchRhythm::Busy;
-        } else {
-            self.rhythm = WatchRhythm::Steady;
-        }
-        self.rhythm
-    }
-}
-
-fn reset_output_rhythm_at_boundary(
-    tracker: &mut OutputRhythmTracker,
-    command_running: bool,
-    now: Instant,
-) {
-    if command_running {
-        tracker.start(now);
-    } else {
-        tracker.reset();
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -852,6 +859,38 @@ enum MemoryBadgeState {
     SaveFailed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GrowthTooltip {
+    Persistent(GrowthProgress),
+    Volatile,
+    SaveFailed,
+}
+
+impl GrowthTooltip {
+    fn new(memory: MemoryBadgeState, growth: GrowthProgress) -> Self {
+        match memory {
+            MemoryBadgeState::Persistent => Self::Persistent(growth),
+            MemoryBadgeState::Volatile => Self::Volatile,
+            MemoryBadgeState::SaveFailed => Self::SaveFailed,
+        }
+    }
+
+    fn text(self) -> String {
+        match self {
+            Self::Persistent(growth) => format!(
+                "{} remembered work day(s) · {} recovery episode(s)",
+                growth.days_seen, growth.lifetime_recoveries
+            ),
+            Self::Volatile => {
+                "Growth is unavailable because repository memory could not be loaded".to_string()
+            }
+            Self::SaveFailed => {
+                "Repository memory could not be queued for durable storage".to_string()
+            }
+        }
+    }
+}
+
 fn growth_badge(stage: GrowthStage, memory: MemoryBadgeState) -> &'static str {
     match (stage, memory) {
         (GrowthStage::Juvenile, MemoryBadgeState::Persistent) => "juvenile · repo memory · no LLM",
@@ -1178,10 +1217,11 @@ const REST_ONSET: Duration = Duration::from_secs(60);
 pub(crate) struct OrganismActivity {
     session_started: Instant,
     attention: RefCell<AttentionArbiter>,
-    input_at: Cell<Option<Instant>>,
+    input_activity: RefCell<InputActivity>,
     commands_running: Cell<u32>,
     active_at: Cell<Option<Instant>>,
     ticked_at: Cell<Option<Instant>>,
+    enabled_bodies: Cell<u32>,
     sleeping_bodies: Cell<u32>,
     circadian_profile: Cell<Option<CircadianProfile>>,
     circadian_profile_day: Cell<Option<i64>>,
@@ -1206,10 +1246,11 @@ impl OrganismActivity {
         Rc::new(Self {
             session_started: Instant::now(),
             attention: RefCell::new(AttentionArbiter::default()),
-            input_at: Cell::new(None),
+            input_activity: RefCell::new(InputActivity::default()),
             commands_running: Cell::new(0),
             active_at: Cell::new(Some(Instant::now())),
             ticked_at: Cell::new(None),
+            enabled_bodies: Cell::new(0),
             sleeping_bodies: Cell::new(0),
             circadian_profile: Cell::new(circadian_profile),
             // Force one fresh cross-window read at the first command, then at
@@ -1218,6 +1259,25 @@ impl OrganismActivity {
             morning_greeted_session: Cell::new(None),
             growth: Cell::new(growth),
         })
+    }
+
+    /// Count enabled runtimes, including offscreen panes whose heartbeat
+    /// continues. Focus and map/unmap changes do not pause physiology.
+    fn body_enabled(&self) {
+        self.enabled_bodies
+            .set(self.enabled_bodies.get().saturating_add(1));
+    }
+
+    fn body_disabled(&self) {
+        debug_assert!(self.enabled_bodies.get() > 0);
+        let remaining = self.enabled_bodies.get().saturating_sub(1);
+        self.enabled_bodies.set(remaining);
+        if remaining == 0 {
+            // No source is advancing the shared mind. A later enable or new
+            // pane starts a fresh interval instead of simulating disabled time.
+            self.ticked_at.set(None);
+            self.input_activity.borrow_mut().clear();
+        }
     }
 
     fn set_growth(&self, growth: GrowthProgress) {
@@ -1273,8 +1333,14 @@ impl OrganismActivity {
     }
 
     fn note_input(&self, now: Instant) {
-        self.input_at.set(Some(now));
-        self.active_at.set(Some(now));
+        if self.ticked_at.get().is_some_and(|at| now < at) {
+            return;
+        }
+        self.input_activity
+            .borrow_mut()
+            .note_input(now.saturating_duration_since(self.session_started));
+        self.active_at
+            .set(Some(self.active_at.get().map_or(now, |at| at.max(now))));
     }
 
     fn note_output(&self, now: Instant) {
@@ -1291,12 +1357,6 @@ impl OrganismActivity {
         self.commands_running
             .set(self.commands_running.get().saturating_sub(1));
         self.active_at.set(Some(now));
-    }
-
-    fn user_active(&self, now: Instant) -> bool {
-        self.input_at
-            .get()
-            .is_some_and(|at| now.saturating_duration_since(at) < HUMAN_INPUT_RETREAT)
     }
 
     fn resting(&self, now: Instant) -> bool {
@@ -1339,19 +1399,52 @@ impl OrganismActivity {
             .unwrap_or(0.0)
     }
 
-    /// Claim the wall-clock slice since the previous claim, in seconds. The
-    /// clock is shared: with several organism panes ticking, every slice is
-    /// consumed exactly once, so simulated time tracks wall time no matter
-    /// how many bodies the mind wears — while at least one body's frame clock
-    /// runs. A long gap (hidden window, suspend) is claimed whole, and the
-    /// reducer then simulates at most one second of it.
-    fn tick_slice(&self, now: Instant) -> f32 {
-        let dt = match self.ticked_at.get() {
-            Some(previous) => now.saturating_duration_since(previous).as_secs_f32(),
-            None => 0.0,
+    /// Claim one monotonic window interval. All native bodies share this
+    /// anchor, while the core owns input and rest-boundary accounting.
+    fn claim_interval(&self, now: Instant) -> Option<(Duration, Duration)> {
+        let Some(previous) = self.ticked_at.get() else {
+            self.ticked_at.set(Some(now));
+            self.input_activity
+                .borrow_mut()
+                .trim_before(now.saturating_duration_since(self.session_started));
+            return None;
         };
+        if now <= previous {
+            return None;
+        }
         self.ticked_at.set(Some(now));
-        dt
+        let elapsed = now.duration_since(previous).min(MAX_TICK);
+        let end = now.saturating_duration_since(self.session_started);
+        Some((end.saturating_sub(elapsed), end))
+    }
+
+    fn advance_life(&self, state: &mut LifeState, now: Instant, phase: CircadianPhase) -> f32 {
+        let Some((start, end)) = self.claim_interval(now) else {
+            return 0.0;
+        };
+        let rest_from = if self.sleeping_rest() {
+            Some(start)
+        } else if self.no_commands_running() {
+            self.active_at
+                .get()
+                .and_then(|at| at.checked_add(REST_ONSET))
+                .map(|at| at.saturating_duration_since(self.session_started))
+        } else {
+            None
+        };
+        self.input_activity
+            .borrow_mut()
+            .tick_life(state, start, end, rest_from, phase)
+    }
+
+    /// Inspect the claimed activity partition in clock/lifecycle regressions.
+    #[cfg(test)]
+    fn tick_slice(&self, now: Instant) -> (f32, f32) {
+        let Some((start, end)) = self.claim_interval(now) else {
+            return (0.0, 0.0);
+        };
+        let active = self.input_activity.borrow_mut().active_during(start, end);
+        (active.as_secs_f32(), (end - start - active).as_secs_f32())
     }
 }
 
@@ -1413,19 +1506,73 @@ struct PresenceEntry {
 struct PresenceState {
     ledger: PresenceLedger,
     entries: Vec<PresenceEntry>,
+    eligible: Vec<std::rc::Weak<TermView>>,
 }
 
-/// Window-shared arbiter for the one spatial body. Every pane keeps its own
-/// reducer and inline/sticky representations, but only the genuinely focused
-/// local Block pane may opt its live overlay into visibility.
+/// Window-shared identity and arbiter for every companion representation.
+/// Pane reducers retain command context, but only the focused local pane may
+/// show the body or its compact substitute. Ambient habits follow the window.
 pub(crate) struct OrganismPresence {
     state: RefCell<PresenceState>,
+    attention: RefCell<LiveAttention<OrganismPaneToken>>,
+    attention_epoch: Instant,
+    ambient: Rc<RefCell<AmbientMind>>,
+    ambient_display: Rc<Cell<AmbientBehavior>>,
+    voice: Rc<RefCell<CompanionVoice>>,
+    care: Rc<RefCell<CompanionCare>>,
+    care_overlay: RefCell<Option<gtk4::glib::WeakRef<libadwaita::ToastOverlay>>>,
+    care_changed: RefCell<Option<CareSettingsHandler>>,
 }
 
 impl OrganismPresence {
     pub(crate) fn new() -> Rc<Self> {
+        let identity = crate::config::default_ascii_organism_memory_path()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "forge-companion".to_owned());
         Rc::new(Self {
             state: RefCell::new(PresenceState::default()),
+            attention: RefCell::new(LiveAttention::default()),
+            attention_epoch: Instant::now(),
+            ambient: Rc::new(RefCell::new(AmbientMind::seeded(
+                CompanionVoice::seed_for_key(&identity),
+            ))),
+            ambient_display: Rc::new(Cell::new(AmbientBehavior::Idle)),
+            care: Rc::new(RefCell::new(CompanionCare::default())),
+            care_overlay: RefCell::new(None),
+            care_changed: RefCell::new(None),
+            voice: Rc::new(RefCell::new(CompanionVoice::from_key(&identity))),
+        })
+    }
+
+    /// Remember supported local panes even while disabled, without creating
+    /// widgets, callbacks, or timers until the feature is explicitly enabled.
+    fn remember_view(&self, view: &Rc<TermView>) {
+        let mut state = self.state.borrow_mut();
+        state.eligible.retain(|view| view.strong_count() > 0);
+        if !state.eligible.iter().any(|entry| {
+            entry
+                .upgrade()
+                .is_some_and(|candidate| Rc::ptr_eq(&candidate, view))
+        }) {
+            state.eligible.push(Rc::downgrade(view));
+        }
+    }
+
+    fn eligible_views(&self) -> Vec<Rc<TermView>> {
+        self.state
+            .borrow()
+            .eligible
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .collect()
+    }
+
+    fn runtime_for(&self, view: &Rc<TermView>) -> Option<Rc<OrganismRuntime>> {
+        self.state.borrow().entries.iter().find_map(|entry| {
+            let candidate = entry.view.upgrade()?;
+            Rc::ptr_eq(&candidate, view)
+                .then(|| entry.runtime.upgrade())
+                .flatten()
         })
     }
 
@@ -1484,8 +1631,16 @@ impl OrganismPresence {
             (changed, new_owner, live_entries)
         };
         if !changed {
+            // Dead weak entries may already have cleared the native ledger.
+            // Reconcile the core owner even when no widget transfer remains.
+            self.attention.borrow_mut().set_owner(new_owner);
             return;
         }
+        self.attention.borrow_mut().set_owner(None);
+
+        self.care
+            .borrow_mut()
+            .observe(self.attention_epoch.elapsed(), false, false);
 
         for (_, view, runtime) in &live_entries {
             runtime.hide_live_body(view);
@@ -1495,9 +1650,17 @@ impl OrganismPresence {
             let mut state = self.state.borrow_mut();
             state.ledger.claim(new_owner);
         }
+        self.attention.borrow_mut().set_owner(new_owner);
         for (token, view, runtime) in &live_entries {
             if Some(*token) == new_owner {
                 let now = Instant::now();
+                // This mind already lived the elapsed interval in the old
+                // pane; changing its seat must not age ambient holds twice.
+                runtime.surface_last_frame.set(Some(now));
+                runtime
+                    .organism
+                    .borrow_mut()
+                    .sync_state(runtime.shared_life.get());
                 runtime.refresh_surface(view, now);
                 runtime.reconcile_sleeping_claim(view, now);
             }
@@ -1517,6 +1680,9 @@ impl OrganismPresence {
             state.ledger.unregister(token);
             view
         };
+        if self.attention.borrow().owner() == Some(&token) {
+            self.attention.borrow_mut().set_owner(None);
+        }
         if let Some(view) = view {
             view.set_live_organism_visible(false);
         }
@@ -1580,19 +1746,35 @@ impl OrganismPresence {
 /// are deduplicated so status refreshes cannot pump the state.
 pub(crate) struct OrganismAgentSignal {
     life: Rc<Cell<LifeState>>,
+    config: Rc<RefCell<crate::config::Config>>,
     last: Cell<Option<AgentPulse>>,
 }
 
 impl OrganismAgentSignal {
-    pub(crate) fn new(life: Rc<Cell<LifeState>>) -> Rc<Self> {
+    pub(crate) fn new(
+        life: Rc<Cell<LifeState>>,
+        config: Rc<RefCell<crate::config::Config>>,
+    ) -> Rc<Self> {
         Rc::new(Self {
             life,
+            config,
             last: Cell::new(None),
         })
     }
 
     pub(crate) fn note_phase(&self, pulse: AgentPulse) {
         if self.last.replace(Some(pulse)) == Some(pulse) {
+            return;
+        }
+        // Consume phases even while off, so re-enabling cannot replay them.
+        // Window configuration is authoritative; a hidden/background pane
+        // must not disable another pane's shared mind. A config update that
+        // still owns its mutable borrow also admits no reward.
+        if !self
+            .config
+            .try_borrow()
+            .is_ok_and(|config| config.ascii_organism_enabled)
+        {
             return;
         }
         self.life
@@ -1640,8 +1822,22 @@ fn repo_work_scope_matches(
 
 struct OrganismRuntime {
     organism: RefCell<NativeOrganism>,
-    motion: OrganismMotion,
+    motion: Cell<OrganismMotion>,
+    enabled: Cell<bool>,
+    awaiting_unobserved_work: Cell<bool>,
+    attention_snapshot: Cell<Option<LiveAttentionSnapshot>>,
+    live_context: Cell<RenderContext>,
+    /// Final post-interaction pose, only while the spatial body is presented.
+    presented_surface: Cell<Option<(Behavior, WatchRhythm)>>,
+    pointer_position: Cell<Option<(f64, f64)>>,
+    pointer_inside: Cell<bool>,
+    pointer_timer: RefCell<Option<PointerCandidateSource>>,
     memory_badge: Cell<MemoryBadgeState>,
+    growth_tooltip: Cell<Option<GrowthTooltip>>,
+    #[cfg(test)]
+    tooltip_submissions: Cell<u64>,
+    #[cfg(test)]
+    spatial_renders: Cell<u64>,
     shared_life: Rc<Cell<LifeState>>,
     activity: Rc<OrganismActivity>,
     presence: Rc<OrganismPresence>,
@@ -1651,10 +1847,9 @@ struct OrganismRuntime {
     presence_cue: Cell<Option<PresenceCue>>,
     presence_cue_frame_origin: Cell<u64>,
     presence_cue_timer: RefCell<Option<gtk4::glib::SourceId>>,
-    /// Pane-local utility disposition; stepped only while this body is
-    /// genuinely idle, interrupted the moment anything else claims it.
-    ambient: RefCell<AmbientMind>,
-    ambient_display: Cell<AmbientBehavior>,
+    /// One ambient mind for the window; background panes cannot advance it.
+    ambient: Rc<RefCell<AmbientMind>>,
+    ambient_display: Rc<Cell<AmbientBehavior>>,
     sleeping: Cell<bool>,
     active_memory_kind: Cell<Option<CommandKind>>,
     active_context_key: RefCell<Option<String>>,
@@ -1673,6 +1868,8 @@ struct OrganismRuntime {
     generation: Cell<u64>,
     settle_timer: RefCell<Option<gtk4::glib::SourceId>>,
     surface_timer: RefCell<Option<gtk4::glib::SourceId>>,
+    surface_deadline: Cell<Option<Instant>>,
+    surface_timer_revision: Cell<Option<u64>>,
     surface_last_frame: Cell<Option<Instant>>,
     surface_frame: Cell<u64>,
     surface_behavior_frame_origin: Cell<u64>,
@@ -1688,6 +1885,8 @@ struct OrganismRuntime {
     /// hidden, so every reappearance snaps into place and the cat only ever
     /// walks where it can be seen.
     body_position: Cell<Option<(f64, f64)>>,
+    measured_no_safe_placement: Cell<bool>,
+    hidden_for_typing: Cell<bool>,
     /// The body moved last frame — drives gait frames during transit.
     body_in_transit: Cell<bool>,
     /// Surface/body geometry the standing spot was computed against. A resize,
@@ -1707,7 +1906,7 @@ struct OrganismRuntime {
     agent_watching: Cell<bool>,
     last_human_input: Cell<Option<Instant>>,
     output_activity: Cell<bool>,
-    output_rhythm: RefCell<OutputRhythmTracker>,
+    output_rhythm: RefCell<watch_adapter::WatchAdapter<OrganismPaneToken>>,
     visible_watch_rhythm: Cell<WatchRhythm>,
     /// The last rhythm boundary offered to attention. A rejected boundary is
     /// remembered until the sensed rhythm changes, so it is dropped rather
@@ -1723,6 +1922,35 @@ struct OrganismRuntime {
 }
 
 impl OrganismRuntime {
+    /// Command reducers are pane-local; only the window owner steers the one
+    /// ambient mind. Background completion and maintenance cannot reset it.
+    fn step_ambient(
+        &self,
+        state: LifeState,
+        idle_for: f32,
+        dt: f32,
+        vigil: RepoVigil,
+    ) -> AmbientBehavior {
+        if self.presence.is_owner(self.presence_token) {
+            self.ambient.borrow_mut().step(state, idle_for, dt, vigil)
+        } else {
+            self.ambient_display.get()
+        }
+    }
+
+    fn record_ambient(&self, behavior: AmbientBehavior) {
+        if self.presence.is_owner(self.presence_token) {
+            self.ambient_display.set(behavior);
+        }
+    }
+
+    fn interrupt_ambient(&self) {
+        if self.presence.is_owner(self.presence_token) {
+            self.ambient.borrow_mut().interrupt();
+            self.ambient_display.set(AmbientBehavior::Idle);
+        }
+    }
+
     fn new(
         shared_life: Rc<Cell<LifeState>>,
         activity: Rc<OrganismActivity>,
@@ -1731,7 +1959,7 @@ impl OrganismRuntime {
         motion: OrganismMotion,
         persistent: bool,
     ) -> Rc<Self> {
-        let outer = GBox::new(Orientation::Vertical, 0);
+        let outer = inline_card::InlineCard::new();
         outer.add_css_class("block-finished");
         outer.add_css_class("block-organism");
         outer.add_css_class("organism-quiet");
@@ -1743,6 +1971,8 @@ impl OrganismRuntime {
         outer.set_margin_end(8);
         outer.set_can_target(false);
         outer.set_focusable(false);
+        // Status data is inspected on demand; it is never another body.
+        outer.set_visible(false);
 
         let content = GBox::new(Orientation::Horizontal, 12);
         content.set_margin_start(12);
@@ -1756,6 +1986,9 @@ impl OrganismRuntime {
         sprite.set_xalign(0.0);
         sprite.set_yalign(0.5);
         sprite.set_selectable(false);
+        // The adjacent status/state labels carry the meaning. Do not make
+        // assistive technology read the decorative ASCII punctuation too.
+        sprite.set_accessible_role(gtk4::AccessibleRole::Presentation);
         content.append(&sprite);
 
         let detail = GBox::new(Orientation::Vertical, 3);
@@ -1818,9 +2051,27 @@ impl OrganismRuntime {
         sticky_avatar.set_focusable(false);
         sticky_avatar.set_accessible_role(gtk4::AccessibleRole::Presentation);
 
+        activity.body_enabled();
         let runtime = Rc::new(Self {
             organism: RefCell::new(NativeOrganism::from_persisted_state(shared_life.get())),
-            motion,
+            motion: Cell::new(motion),
+            enabled: Cell::new(true),
+            awaiting_unobserved_work: Cell::new(false),
+            attention_snapshot: Cell::new(None),
+            live_context: Cell::new(RenderContext::new(
+                Behavior::Idle,
+                BodyLanguage::default(),
+                false,
+            )),
+            presented_surface: Cell::new(None),
+            pointer_position: Cell::new(None),
+            pointer_inside: Cell::new(false),
+            pointer_timer: RefCell::new(None),
+            growth_tooltip: Cell::new(None),
+            #[cfg(test)]
+            tooltip_submissions: Cell::new(0),
+            #[cfg(test)]
+            spatial_renders: Cell::new(0),
             memory_badge: Cell::new(if persistent {
                 MemoryBadgeState::Persistent
             } else {
@@ -1828,13 +2079,13 @@ impl OrganismRuntime {
             }),
             shared_life,
             activity,
-            presence,
+            presence: presence.clone(),
             presence_token,
             presence_cue: Cell::new(None),
             presence_cue_frame_origin: Cell::new(0),
             presence_cue_timer: RefCell::new(None),
-            ambient: RefCell::new(AmbientMind::default()),
-            ambient_display: Cell::new(AmbientBehavior::Idle),
+            ambient: presence.ambient.clone(),
+            ambient_display: presence.ambient_display.clone(),
             sleeping: Cell::new(false),
             active_memory_kind: Cell::new(None),
             active_context_key: RefCell::new(None),
@@ -1848,6 +2099,8 @@ impl OrganismRuntime {
             generation: Cell::new(0),
             settle_timer: RefCell::new(None),
             surface_timer: RefCell::new(None),
+            surface_deadline: Cell::new(None),
+            surface_timer_revision: Cell::new(Some(0)),
             surface_last_frame: Cell::new(None),
             surface_frame: Cell::new(0),
             surface_behavior_frame_origin: Cell::new(0),
@@ -1857,6 +2110,8 @@ impl OrganismRuntime {
             transition_source_override: Cell::new(None),
             command_origin_behavior: Cell::new(None),
             body_position: Cell::new(None),
+            measured_no_safe_placement: Cell::new(false),
+            hidden_for_typing: Cell::new(false),
             body_in_transit: Cell::new(false),
             surface_signature: Cell::new((0, 0, 0, 0, 0, 0, 0)),
             surface_behavior: Cell::new(Behavior::Idle),
@@ -1867,7 +2122,7 @@ impl OrganismRuntime {
             agent_watching: Cell::new(false),
             last_human_input: Cell::new(None),
             output_activity: Cell::new(false),
-            output_rhythm: RefCell::new(OutputRhythmTracker::default()),
+            output_rhythm: RefCell::new(watch_adapter::WatchAdapter::new(presence_token)),
             visible_watch_rhythm: Cell::new(WatchRhythm::Steady),
             offered_watch_rhythm: Cell::new(WatchRhythm::Steady),
             card: outer.upcast(),
@@ -1899,6 +2154,10 @@ impl OrganismRuntime {
     /// or acquiring a durable vigil cannot leave the window-wide rest counter
     /// stale until the next (possibly one-second) heartbeat.
     fn reconcile_sleeping_claim(&self, view: &TermView, now: Instant) {
+        if !self.enabled.get() {
+            self.set_sleeping(false);
+            return;
+        }
         let mode = surface_mode(
             self.surface_behavior.get(),
             self.command_running.get(),
@@ -1910,7 +2169,7 @@ impl OrganismRuntime {
         let vigil = self.organism.borrow().repo_vigil();
         self.set_sleeping(sleeping_claim(
             owner,
-            self.motion,
+            self.motion.get(),
             alt_screen,
             self.body_position.get().is_some(),
             self.presence_cue.get().is_some(),
@@ -1933,6 +2192,9 @@ impl OrganismRuntime {
         signal: PresenceSignal,
         now: Instant,
     ) {
+        if !runtime.enabled.get() {
+            return;
+        }
         let mode = surface_mode(
             runtime.surface_behavior.get(),
             runtime.command_running.get(),
@@ -1941,7 +2203,7 @@ impl OrganismRuntime {
         let alt_screen = view.live_organism_surface_metrics().alt_screen;
         if !can_show_presence_cue(
             runtime.presence.is_owner(runtime.presence_token),
-            runtime.motion,
+            runtime.motion.get(),
             alt_screen,
             runtime.body_position.get().is_some(),
             mode,
@@ -1996,6 +2258,9 @@ impl OrganismRuntime {
         work: RepoWorkState,
         now: Instant,
     ) {
+        if !runtime.enabled.get() {
+            return;
+        }
         let changed = runtime.organism.borrow_mut().sync_repo_work_state(work);
         if !changed {
             return;
@@ -2026,22 +2291,21 @@ impl OrganismRuntime {
         // Derive from the reducer after its defensive normalization instead
         // of trusting a future internal caller to construct the snapshot.
         let ambient = if vigil.is_active() {
-            runtime.ambient.borrow_mut().step(
+            runtime.step_ambient(
                 runtime.shared_life.get(),
                 runtime.activity.idle_for_secs(now),
                 0.0,
                 vigil,
             )
         } else {
-            runtime.ambient.borrow_mut().interrupt();
+            runtime.interrupt_ambient();
             AmbientBehavior::Idle
         };
-        runtime.ambient_display.set(ambient);
+        runtime.record_ambient(ambient);
         let idle = runtime.organism.borrow().idle_reaction();
         runtime.render(&idle);
         runtime.refresh_surface(view, now);
         runtime.reconcile_sleeping_claim(view, now);
-        view.insert_inline_notice(&runtime.card);
     }
 
     fn cancel_territory_intro(&self) {
@@ -2053,18 +2317,487 @@ impl OrganismRuntime {
         self.territory_intro_until.set(active_until);
     }
 
+    fn watch_context_eligible(&self, view: &TermView, now: Instant) -> bool {
+        self.enabled.get()
+            && watch_rhythm_context_presentable(
+                self.presence.is_owner(self.presence_token),
+                self.motion.get(),
+                surface_mode(
+                    self.surface_behavior.get(),
+                    self.command_running.get(),
+                    self.human_input_age(now),
+                ),
+                view.live_organism_surface_metrics().alt_screen,
+            )
+    }
+
     fn reset_watch_rhythm_at_boundary(&self, now: Instant) {
-        reset_output_rhythm_at_boundary(
-            &mut self.output_rhythm.borrow_mut(),
-            self.command_running.get(),
-            now,
-        );
+        self.output_rhythm
+            .borrow_mut()
+            .retire(now.saturating_duration_since(self.presence.attention_epoch));
         self.output_activity.set(false);
         self.visible_watch_rhythm.set(WatchRhythm::Steady);
         self.offered_watch_rhythm.set(WatchRhythm::Steady);
     }
 
+    fn retire_pointer_candidate(&self) {
+        self.live_body.remove_css_class("organism-hover-candidate");
+        if let Some(candidate) = self.pointer_timer.borrow_mut().take() {
+            candidate.source.remove();
+        }
+    }
+
+    fn cancel_pointer_greeting(&self) {
+        self.retire_pointer_candidate();
+        self.attention_snapshot.set(None);
+        self.presence
+            .attention
+            .borrow_mut()
+            .cancel(&self.presence_token);
+        // Physical occupancy survives hard cancellation. A refresh or another
+        // motion inside the same target cannot manufacture a new visit.
+    }
+
+    fn pointer_left(&self, view: &TermView) {
+        self.pointer_position.set(None);
+        self.pointer_left_body(view, self.pointer_body_bounds(view));
+    }
+
+    fn pointer_left_body(&self, view: &TermView, bounds: Option<(f64, f64, f64, f64)>) {
+        // Outside the body is still a valid position on the terminal surface.
+        self.pointer_inside.set(false);
+        let ticket = {
+            let attention = self.presence.attention.borrow();
+            (attention.owner() == Some(&self.presence_token))
+                .then(|| attention.entry_ticket())
+                .flatten()
+        };
+        if let Some(ticket) = ticket {
+            let input = self.attention_input_with_bounds(view, bounds);
+            let snapshot = self
+                .presence
+                .attention
+                .borrow_mut()
+                .advance(
+                    self.presence.attention_epoch.elapsed(),
+                    &self.presence_token,
+                    input,
+                    LiveAttentionEvent::PointerLeft { ticket },
+                )
+                .ok();
+            self.sync_attention_snapshot(snapshot);
+        } else {
+            self.retire_pointer_candidate();
+        }
+    }
+
+    fn sync_attention_snapshot(&self, snapshot: Option<LiveAttentionSnapshot>) {
+        let candidate = snapshot.and_then(|snapshot| snapshot.candidate);
+        let retire = self.pointer_timer.borrow().as_ref().is_some_and(|source| {
+            candidate.is_none_or(|candidate| candidate.ticket != source.ticket)
+        });
+        if retire {
+            self.retire_pointer_candidate();
+        }
+        if snapshot.is_some_and(|snapshot| snapshot.candidate_visible) {
+            self.live_body.add_css_class("organism-hover-candidate");
+        } else {
+            self.live_body.remove_css_class("organism-hover-candidate");
+        }
+        self.attention_snapshot.set(snapshot);
+    }
+
+    fn install_prompt_evidence_observer(runtime: &Rc<Self>, view: &Rc<TermView>) {
+        let runtime_weak = Rc::downgrade(runtime);
+        let view_weak = Rc::downgrade(view);
+        view.connect_prompt_evidence_invalidated(move || {
+            let (Some(runtime), Some(view)) = (runtime_weak.upgrade(), view_weak.upgrade()) else {
+                return;
+            };
+            let previous = runtime.attention_snapshot.get().and_then(|s| s.active);
+            let snapshot = runtime.advance_attention(&view, LiveAttentionEvent::Reconcile);
+            if snapshot.is_some_and(|s| s.active != previous) {
+                runtime.refresh_surface_observing(&view, Instant::now(), false);
+            }
+        });
+    }
+
+    fn attention_input(&self, view: &TermView) -> LiveAttentionInput {
+        self.attention_input_with_bounds(view, self.pointer_body_bounds(view))
+    }
+
+    fn attention_input_with_bounds(
+        &self,
+        view: &TermView,
+        bounds: Option<(f64, f64, f64, f64)>,
+    ) -> LiveAttentionInput {
+        LiveAttentionInput {
+            base_context: self.live_context.get(),
+            activity: view.organism_activity_knowledge(),
+            hard_eligible: self.greeting_is_eligible(view),
+            hover_available: bounds.is_some(),
+            pointer_inside: Self::pointer_within_body(bounds, self.pointer_position.get()),
+        }
+    }
+
+    fn advance_attention(
+        &self,
+        view: &TermView,
+        event: LiveAttentionEvent,
+    ) -> Option<LiveAttentionSnapshot> {
+        let input = self.attention_input(view);
+        let snapshot = self
+            .presence
+            .attention
+            .borrow_mut()
+            .advance(
+                self.presence.attention_epoch.elapsed(),
+                &self.presence_token,
+                input,
+                event,
+            )
+            .ok();
+        // Stale owner/ticket must not mutate a newer candidate's native slot.
+        if let Some(snapshot) = snapshot {
+            self.sync_attention_snapshot(Some(snapshot));
+        }
+        snapshot
+    }
+
+    fn greeting_is_eligible(&self, view: &TermView) -> bool {
+        if !self.enabled.get()
+            || self.motion.get() == OrganismMotion::Static
+            || !self.presence.is_owner(self.presence_token)
+            || !self.live_body.is_mapped()
+            || self.command_running.get()
+            || !view.organism_activity_settled()
+            || pointer_buttons_down(view)
+            || self
+                .human_input_age(Instant::now())
+                .is_some_and(|age| age < HUMAN_INPUT_RETREAT)
+            || view.live_organism_surface_metrics().alt_screen
+        {
+            return false;
+        }
+        true
+    }
+
+    fn pointer_within_body(
+        bounds: Option<(f64, f64, f64, f64)>,
+        position: Option<(f64, f64)>,
+    ) -> bool {
+        let (Some((left, top, right, bottom)), Some((x, y))) = (bounds, position) else {
+            return false;
+        };
+        x.is_finite()
+            && y.is_finite()
+            && x >= left - POINTER_GREETING_RADIUS
+            && x <= right + POINTER_GREETING_RADIUS
+            && y >= top - POINTER_GREETING_RADIUS
+            && y <= bottom + POINTER_GREETING_RADIUS
+    }
+
+    fn pointer_body_bounds(&self, view: &TermView) -> Option<(f64, f64, f64, f64)> {
+        if !self.live_body.is_mapped() {
+            return None;
+        }
+        let bounds = self.live_body.compute_bounds(&view.widget())?;
+        let (x, y, width, height) = (
+            f64::from(bounds.x()),
+            f64::from(bounds.y()),
+            f64::from(bounds.width()),
+            f64::from(bounds.height()),
+        );
+        if ![x, y, width, height].into_iter().all(f64::is_finite) || width <= 0.0 || height <= 0.0 {
+            return None;
+        }
+        Some((x, y, x + width, y + height))
+    }
+
+    fn sync_pointer_geometry(&self, view: &TermView) {
+        // Geometry updates facts only: never release or create a physical visit.
+        self.pointer_inside.set(Self::pointer_within_body(
+            self.pointer_body_bounds(view),
+            self.pointer_position.get(),
+        ));
+    }
+
+    fn observe_pointer(runtime: &Rc<Self>, view: &Rc<TermView>, x: f64, y: f64, dragging: bool) {
+        // GTK may allocate between refresh and motion. Compare both positions
+        // against this one current allocation, not the previous frame's edge.
+        let bounds = runtime.pointer_body_bounds(view);
+        let was_inside = Self::pointer_within_body(bounds, runtime.pointer_position.get());
+        runtime.pointer_position.set(Some((x, y)));
+        let inside = Self::pointer_within_body(bounds, Some((x, y)));
+        if !inside {
+            runtime.pointer_left_body(view, bounds);
+            return;
+        }
+        runtime.pointer_inside.set(true);
+        let entered = !was_inside;
+        let event = if entered {
+            let attention = runtime.presence.attention.borrow();
+            if attention.owner() != Some(&runtime.presence_token) {
+                return;
+            }
+            let Some(ticket) = attention.entry_offer() else {
+                return;
+            };
+            LiveAttentionEvent::PointerEntered { ticket }
+        } else {
+            LiveAttentionEvent::Reconcile
+        };
+        let mut input = runtime.attention_input_with_bounds(view, bounds);
+        input.hard_eligible &= !dragging;
+        let snapshot = runtime
+            .presence
+            .attention
+            .borrow_mut()
+            .advance(
+                runtime.presence.attention_epoch.elapsed(),
+                &runtime.presence_token,
+                input,
+                event,
+            )
+            .ok();
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+        runtime.sync_attention_snapshot(Some(snapshot));
+        let Some(candidate) = snapshot.candidate else {
+            return;
+        };
+        Self::arm_pointer_candidate(runtime, view, candidate);
+    }
+
+    fn arm_pointer_candidate(
+        runtime: &Rc<Self>,
+        view: &Rc<TermView>,
+        candidate: LiveAttentionCandidate,
+    ) {
+        if runtime.pointer_timer.borrow().is_some() {
+            return;
+        }
+        let ticket = candidate.ticket;
+        let weak = Rc::downgrade(runtime);
+        let view_weak = Rc::downgrade(view);
+        let delay = candidate
+            .deadline
+            .saturating_sub(runtime.presence.attention_epoch.elapsed())
+            .max(Duration::from_millis(1));
+        let source = gtk4::glib::timeout_add_local_once(delay, move || {
+            let Some(runtime) = weak.upgrade() else {
+                return;
+            };
+            Self::pointer_candidate_fired(&runtime, &view_weak, ticket);
+        });
+        *runtime.pointer_timer.borrow_mut() = Some(PointerCandidateSource { ticket, source });
+    }
+
+    fn pointer_candidate_fired(
+        runtime: &Rc<Self>,
+        view: &std::rc::Weak<TermView>,
+        ticket: LiveAttentionTicket,
+    ) {
+        // A late callback never takes a newer visit's source or CSS.
+        if !runtime
+            .pointer_timer
+            .borrow()
+            .as_ref()
+            .is_some_and(|source| source.ticket == ticket)
+        {
+            return;
+        }
+        runtime.pointer_timer.borrow_mut().take();
+        let Some(view) = view.upgrade() else {
+            runtime.cancel_pointer_greeting();
+            return;
+        };
+        if let Some(snapshot) =
+            runtime.advance_attention(&view, LiveAttentionEvent::CandidateDue { ticket })
+        {
+            // GLib's millisecond timeout can wake before a fractional deadline.
+            // Re-arm only the same still-pending absolute candidate, never a
+            // new visit or a fresh 600ms dwell.
+            if let Some(candidate) = snapshot.candidate {
+                Self::arm_pointer_candidate(runtime, &view, candidate);
+            }
+            runtime.refresh_surface(&view, Instant::now());
+            Self::rearm_surface_tick_for_greeting(runtime, &view, Instant::now());
+        }
+    }
+
+    fn request_greeting(self: &Rc<Self>, view: &Rc<TermView>) -> bool {
+        let now = Instant::now();
+        // Measure the actual surface before spending the shared attention.
+        self.refresh_surface_observing(view, now, false);
+        let accepted = self
+            .advance_attention(view, LiveAttentionEvent::Explicit)
+            .is_some_and(|snapshot| matches!(snapshot.outcome, LiveAttentionOutcome::Accepted(_)));
+        if accepted {
+            self.refresh_surface(view, Instant::now());
+            Self::rearm_surface_tick_for_greeting(self, view, Instant::now());
+        }
+        accepted
+    }
+
+    fn install_pointer_observer(
+        runtime: &Rc<Self>,
+        view: &Rc<TermView>,
+    ) -> gtk4::EventControllerMotion {
+        let motion = gtk4::EventControllerMotion::new();
+        motion.set_propagation_phase(gtk4::PropagationPhase::Bubble);
+        motion.connect_motion({
+            let runtime = runtime.clone();
+            let view = Rc::downgrade(view);
+            move |controller, x, y| {
+                if let Some(view) = view.upgrade() {
+                    let buttons = gtk4::gdk::ModifierType::BUTTON1_MASK
+                        | gtk4::gdk::ModifierType::BUTTON2_MASK
+                        | gtk4::gdk::ModifierType::BUTTON3_MASK;
+                    Self::observe_pointer(
+                        &runtime,
+                        &view,
+                        x,
+                        y,
+                        controller.current_event_state().intersects(buttons),
+                    );
+                }
+            }
+        });
+        motion.connect_leave({
+            let runtime = runtime.clone();
+            let view = Rc::downgrade(view);
+            move |_| {
+                if let Some(view) = view.upgrade() {
+                    runtime.pointer_left(&view);
+                } else {
+                    runtime.cancel_pointer_greeting();
+                }
+            }
+        });
+        view.widget().add_controller(motion.clone());
+        let press = gtk4::EventControllerLegacy::new();
+        press.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        press.connect_event({
+            let runtime = runtime.clone();
+            move |_, event| {
+                if matches!(
+                    event.event_type(),
+                    gtk4::gdk::EventType::ButtonPress | gtk4::gdk::EventType::TouchBegin
+                ) {
+                    runtime.cancel_pointer_greeting();
+                }
+                gtk4::glib::Propagation::Proceed
+            }
+        });
+        view.widget().add_controller(press);
+        motion
+    }
+
+    /// Read-only tooltip picking includes pass-through decoration without
+    /// changing the widget selected for terminal input or selection.
+    fn card_tooltip_at(
+        &self,
+        view: &TermView,
+        root: &gtk4::Widget,
+        x: i32,
+        y: i32,
+        keyboard: bool,
+    ) -> Option<(gtk4::glib::GString, gtk4::gdk::Rectangle)> {
+        if keyboard
+            || !self.enabled.get()
+            || view.widget() != *root
+            || !root.is_mapped()
+            || !self.card.is_mapped()
+            || !self.card.is_ancestor(root)
+        {
+            return None;
+        }
+        // Tooltips fail closed if the pointer state cannot be established.
+        let buttons = gtk4::gdk::ModifierType::BUTTON1_MASK
+            | gtk4::gdk::ModifierType::BUTTON2_MASK
+            | gtk4::gdk::ModifierType::BUTTON3_MASK
+            | gtk4::gdk::ModifierType::BUTTON4_MASK
+            | gtk4::gdk::ModifierType::BUTTON5_MASK;
+        if pointer_button_state(root, buttons) != Some(false) {
+            return None;
+        }
+        // Pick from the actual top-level so ancestor clipping and overlapping
+        // non-targetable overlays outside this pane also suppress the tip.
+        let top = root.root()?.upcast::<gtk4::Widget>();
+        let point = root.compute_point(&top, &gtk4::graphene::Point::new(x as f32, y as f32))?;
+        let picked = top.pick(
+            f64::from(point.x()),
+            f64::from(point.y()),
+            gtk4::PickFlags::NON_TARGETABLE,
+        )?;
+        for label in [&self.state, &self.status] {
+            let widget: &gtk4::Widget = label.upcast_ref();
+            if !widget.is_mapped()
+                || !widget.is_ancestor(&self.card)
+                || (picked != *widget && !picked.is_ancestor(widget))
+            {
+                continue;
+            }
+            let text = label.tooltip_text().filter(|text| !text.is_empty())?;
+            let bounds = widget.compute_bounds(root)?;
+            let left = bounds.x().floor() as i32;
+            let top = bounds.y().floor() as i32;
+            let right = (bounds.x() + bounds.width()).ceil() as i32;
+            let bottom = (bounds.y() + bounds.height()).ceil() as i32;
+            return Some((
+                text,
+                gtk4::gdk::Rectangle::new(left, top, right - left, bottom - top),
+            ));
+        }
+        None
+    }
+
+    fn install_card_tooltip(runtime: &Rc<Self>, view: &Rc<TermView>) {
+        let root = view.widget();
+        root.set_has_tooltip(true);
+        root.connect_query_tooltip({
+            let runtime = Rc::downgrade(runtime);
+            let view = Rc::downgrade(view);
+            move |root, x, y, keyboard, tooltip| {
+                let (Some(runtime), Some(view)) = (runtime.upgrade(), view.upgrade()) else {
+                    return false;
+                };
+                let Some((text, area)) = runtime.card_tooltip_at(&view, root, x, y, keyboard)
+                else {
+                    return false;
+                };
+                tooltip.set_text(Some(&text));
+                tooltip.set_tip_area(&area);
+                true
+            }
+        });
+        // GTK attributes the forwarded tip to root. Unmapping only the card
+        // therefore needs one native requery; text changes already trigger
+        // their own requery through GtkWidget::set_tooltip_text.
+        runtime.card.connect_unmap({
+            let root = root.downgrade();
+            move |_| {
+                if let Some(root) = root.upgrade() {
+                    root.trigger_tooltip_query();
+                }
+            }
+        });
+    }
+
+    fn set_presented_surface(&self, behavior: Option<(Behavior, WatchRhythm)>) {
+        if self.presented_surface.replace(behavior) != behavior || behavior.is_some() {
+            // Existing visible frames also reconcile the first GTK mapping;
+            // the text/tooltip setters still run only when their value changes.
+            self.refresh_state(self.shared_life.get());
+        }
+    }
+
     fn hide_live_body(&self, view: &TermView) {
+        self.card.set_visible(false);
+        self.sticky_avatar.set_visible(false);
+        self.cancel_pointer_greeting();
         self.reset_watch_rhythm_at_boundary(Instant::now());
         self.clear_presence_cue();
         self.visual_transition.set(None);
@@ -2073,6 +2806,7 @@ impl OrganismRuntime {
         self.body_position.set(None);
         self.body_in_transit.set(false);
         view.set_live_organism_visible(false);
+        self.set_presented_surface(None);
     }
 
     fn bump_generation(&self) -> u64 {
@@ -2088,6 +2822,7 @@ impl OrganismRuntime {
     }
 
     fn advance_generation(&self, preserve_territory_intro: bool) -> u64 {
+        self.cancel_pointer_greeting();
         let territory_intro_pending =
             preserve_territory_intro && self.territory_intro_pending.get();
         self.clear_presence_cue();
@@ -2109,12 +2844,13 @@ impl OrganismRuntime {
             .take()
             .unwrap_or_else(|| self.last_live_behavior.get());
         let transition =
-            visual_transition_for_motion(self.motion, transition_from, reaction.behavior);
+            visual_transition_for_motion(self.motion.get(), transition_from, reaction.behavior);
         self.visual_transition.set(transition);
         self.visual_transition_frame.set(0);
         self.surface_behavior_frame_origin
             .set(self.surface_frame.get());
         self.surface_behavior.set(reaction.behavior);
+        self.presented_surface.set(None);
         self.refresh_inline_sprite();
         self.refresh_growth_badge();
         let status = match reaction.speech {
@@ -2150,19 +2886,15 @@ impl OrganismRuntime {
         if self.badge.text().as_str() != badge {
             self.badge.set_text(badge);
         }
-        let tooltip = match memory {
-            MemoryBadgeState::Persistent => format!(
-                "{} remembered work day(s) · {} recovery episode(s)",
-                growth.days_seen, growth.lifetime_recoveries
-            ),
-            MemoryBadgeState::Volatile => {
-                "Growth is unavailable because repository memory could not be loaded".to_string()
-            }
-            MemoryBadgeState::SaveFailed => {
-                "Repository memory could not be queued for durable storage".to_string()
-            }
-        };
-        self.badge.set_tooltip_text(Some(&tooltip));
+        // Cache semantic inputs before formatting or submitting GTK properties.
+        // Error wording does not depend on growth; persistent wording uses both counts.
+        let tooltip = GrowthTooltip::new(memory, growth);
+        if self.growth_tooltip.replace(Some(tooltip)) != Some(tooltip) {
+            #[cfg(test)]
+            self.tooltip_submissions
+                .set(self.tooltip_submissions.get() + 1);
+            self.badge.set_tooltip_text(Some(&tooltip.text()));
+        }
     }
 
     fn refresh_inline_sprite(&self) {
@@ -2177,13 +2909,86 @@ impl OrganismRuntime {
     }
 
     fn refresh_state(&self, state: LifeState) {
-        let words = state_words(state);
+        let explanation = state_explanation_with_rhythm(
+            self.surface_behavior.get(),
+            self.presented_surface.get(),
+            self.live_body.is_mapped(),
+            state,
+        );
+        let words = format!("{explanation} · {}", state_words(state));
         if self.state.text().as_str() != words {
             self.state.set_text(&words);
         }
-        let detail = state_summary(state);
+        let detail = format!("{explanation}\n{}", state_summary(state));
         if self.state.tooltip_text().as_deref() != Some(detail.as_str()) {
             self.state.set_tooltip_text(Some(&detail));
+        }
+    }
+
+    /// Read existing facts once. Inspection has no refresh/tick/attention path
+    /// and never retains the pane behind the dialog.
+    fn inspection_snapshot(&self, view: &TermView) -> inspector::Snapshot {
+        let now = Instant::now();
+        let running = self.command_running.get();
+        let elapsed = self
+            .command_started_at
+            .get()
+            .map(|at| now.saturating_duration_since(at));
+        let behavior = if running {
+            watching_behavior(self.agent_watching.get(), elapsed)
+        } else if self.surface_behavior.get() == Behavior::Idle {
+            self.ambient_display.get().display()
+        } else {
+            self.surface_behavior.get()
+        };
+        let life = self.shared_life.get();
+        let growth = self.activity.growth();
+        let context = RenderContext::new(behavior, BodyLanguage::from_state(life), false)
+            .with_growth_stage(visual_growth_stage(growth.stage()))
+            .with_watch_rhythm(if running {
+                self.visible_watch_rhythm.get()
+            } else {
+                WatchRhythm::Steady
+            });
+        let activity = if self.awaiting_unobserved_work.get() {
+            "Waiting for the current terminal activity to settle.".to_owned()
+        } else if running {
+            let who = if self.agent_watching.get() {
+                "Shell Agent is working"
+            } else {
+                "A command is running"
+            };
+            elapsed.map_or_else(
+                || who.to_owned(),
+                |elapsed| format!("{who} · {} elapsed", elapsed_label(elapsed)),
+            )
+        } else {
+            match view.organism_activity_knowledge() {
+                jterm_core::organism_live::LiveActivityKnowledge::KnownIdle => {
+                    "At an idle prompt.".to_owned()
+                }
+                jterm_core::organism_live::LiveActivityKnowledge::Busy => {
+                    "The terminal is busy; no new companion command outcome is available."
+                        .to_owned()
+                }
+                jterm_core::organism_live::LiveActivityKnowledge::Unknown => {
+                    "Current command activity is not yet confirmed.".to_owned()
+                }
+            }
+        };
+        inspector::Snapshot {
+            context,
+            life,
+            growth,
+            activity,
+            latest: self.status_base.borrow().clone(),
+            memory: GrowthTooltip::new(self.memory_badge.get(), growth).text(),
+            motion: match self.motion.get() {
+                OrganismMotion::Full => "Full · movement and animated poses",
+                OrganismMotion::Calm => "Calm · still poses that follow observed events",
+                OrganismMotion::Static => "Static · one still companion",
+            },
+            vigil: self.organism.borrow().repo_vigil(),
         }
     }
 
@@ -2204,8 +3009,8 @@ impl OrganismRuntime {
         let mut organism = self.organism.borrow_mut();
         organism.sync_state(self.shared_life.get());
         organism.roll_over_day();
-        self.ambient.borrow_mut().interrupt();
-        self.ambient_display.set(AmbientBehavior::Idle);
+        self.interrupt_ambient();
+        self.record_ambient(AmbientBehavior::Idle);
         self.set_sleeping(false);
         true
     }
@@ -2241,8 +3046,8 @@ impl OrganismRuntime {
         self.territory_intro_pending.set(false);
         self.territory_intro_until.set(None);
         if released_vigil {
-            self.ambient.borrow_mut().interrupt();
-            self.ambient_display.set(AmbientBehavior::Idle);
+            self.interrupt_ambient();
+            self.record_ambient(AmbientBehavior::Idle);
             self.set_sleeping(false);
         }
         released_vigil
@@ -2259,18 +3064,52 @@ impl OrganismRuntime {
         self.render(&idle);
     }
 
+    /// Hidden panes keep their semantic heartbeat, but need no sticky glyph
+    /// writes. Mapping catches presentation up synchronously without changing
+    /// presence ownership, timers, or the physiology clock.
+    fn install_map_observer(runtime: &Rc<Self>, view: &Rc<TermView>) {
+        let runtime_weak = Rc::downgrade(runtime);
+        let view_weak = Rc::downgrade(view);
+        view.widget().connect_map(move |_| {
+            if let (Some(runtime), Some(view)) = (runtime_weak.upgrade(), view_weak.upgrade()) {
+                runtime.refresh_surface(&view, Instant::now());
+            }
+        });
+    }
+
     fn refresh_surface(&self, view: &TermView, now: Instant) {
+        self.refresh_surface_observing(view, now, true);
+    }
+
+    fn refresh_surface_observing(&self, view: &TermView, now: Instant, advance: bool) {
+        // An early return or new owner must not inherit an old geometry verdict.
+        self.measured_no_safe_placement.set(false);
+        self.hidden_for_typing.set(false);
+        if !self.enabled.get() {
+            self.hide_live_body(view);
+            self.sticky_avatar.set_visible(false);
+            return;
+        }
+        if self.awaiting_unobserved_work.get() {
+            if !view.organism_activity_settled() {
+                self.hide_live_body(view);
+                self.sticky_avatar.set_visible(false);
+                self.status
+                    .set_text("Waiting for the current terminal activity to settle");
+                return;
+            }
+            self.awaiting_unobserved_work.set(false);
+            let idle = self.organism.borrow().idle_reaction();
+            self.render(&idle);
+        }
         // Growth is window-shared. Even static or unfocused bodies refresh
         // their badge on the low-frequency heartbeat after another pane ages
         // the organism into its next stage.
         self.refresh_growth_badge();
         self.refresh_inline_sprite();
-        if self.motion == OrganismMotion::Static {
-            // The inline card is the whole visual surface; the live body and
-            // sticky avatar were never attached. Consume a first-look rather
-            // than carrying it behind an unavailable surface.
+        if self.motion.get() == OrganismMotion::Static {
+            // Static keeps the same unique surface at frame zero.
             self.cancel_territory_intro();
-            return;
         }
         let behavior = self.surface_behavior.get();
         let mode = surface_mode(
@@ -2318,19 +3157,20 @@ impl OrganismRuntime {
         // advances its target slower than once per frame, so transit alone
         // would stutter the walk animation. Calm motion freezes the frame at
         // zero: first frames only, no wandering, no bob, no flourishes.
-        let (geometry_frame, baseline_frame, live_frame) = if self.motion == OrganismMotion::Full {
-            let global = self.surface_frame.get();
-            let (baseline, live) = animation_frames(
-                global,
-                self.surface_behavior_frame_origin.get(),
-                self.presence_cue_frame_origin.get(),
-                mode,
-                self.presence_cue.get(),
-            );
-            (global, baseline, live)
-        } else {
-            (0, 0, 0)
-        };
+        let (geometry_frame, baseline_frame, live_frame) =
+            if self.motion.get() == OrganismMotion::Full {
+                let global = self.surface_frame.get();
+                let (baseline, live) = animation_frames(
+                    global,
+                    self.surface_behavior_frame_origin.get(),
+                    self.presence_cue_frame_origin.get(),
+                    mode,
+                    self.presence_cue.get(),
+                );
+                (global, baseline, live)
+            } else {
+                (0, 0, 0)
+            };
         let language = BodyLanguage::from_state(self.shared_life.get());
         let tempo = wander_tempo(language);
         let wander_walking = match ambient {
@@ -2361,37 +3201,61 @@ impl OrganismRuntime {
         } else {
             live_frame
         };
-        let sprite = sprite_frame_with_context(
-            RenderContext::new(display_behavior, language, walking)
-                .with_growth_stage(growth)
-                .with_watch_rhythm(rhythm)
-                .with_transition(transition),
-            sprite_frame,
-        );
-        if self.live_body.text().as_str() != sprite.as_ref() {
-            self.live_body.set_text(sprite.as_ref());
-        }
+        let context = RenderContext::new(display_behavior, language, walking)
+            .with_growth_stage(growth)
+            .with_watch_rhythm(rhythm)
+            .with_transition(transition);
+        self.live_context.set(context);
+        self.sync_pointer_geometry(view);
+        let snapshot = if advance {
+            self.advance_attention(view, LiveAttentionEvent::Reconcile)
+        } else {
+            // Explicit admission must remeasure without first accepting an
+            // overdue pointer candidate. The following request owns the event.
+            let input = self.attention_input(view);
+            let snapshot = self
+                .presence
+                .attention
+                .borrow()
+                .snapshot(
+                    self.presence.attention_epoch.elapsed(),
+                    &self.presence_token,
+                    input,
+                )
+                .ok();
+            self.sync_attention_snapshot(snapshot);
+            snapshot
+        };
+        let context = snapshot.map_or(context, |snapshot| snapshot.presentation);
         self.last_live_behavior.set(display_behavior);
         // The sticky one-line form mirrors the same displayed behavior with a
         // fixed-width micro-pose, so scrollback readers see the mood too.
-        // Cross-pane cues belong only to the one spatial body. The focused
-        // pane's sticky and inline forms retain their own local semantics.
+        // This compact form is an alternate seat for the same companion;
+        // arbitration below admits either the running header or spatial body.
         let glyph = sticky_glyph_with_context(
             RenderContext::new(baseline_behavior, language, false)
                 .with_growth_stage(growth)
                 .with_watch_rhythm(rhythm),
             baseline_frame,
         );
-        if self.sticky_avatar.text().as_str() != glyph.as_ref() {
+        if view.widget().is_mapped() && self.sticky_avatar.text().as_str() != glyph.as_ref() {
             self.sticky_avatar.set_text(glyph.as_ref());
         }
 
         if !self.presence.is_owner(self.presence_token) {
             self.hide_live_body(view);
-            // Sticky and inline forms remain pane-local evidence; only the
-            // spatial overlay participates in one-body focus arbitration.
-            self.sticky_avatar.set_visible(mode != SurfaceMode::Typing);
+            self.sticky_avatar.set_visible(false);
             return;
+        }
+
+        // Pane-local command reconciliation still runs for non-owners.
+        // Render spatial pixels only after arbitration, including the first
+        // refresh when focus returns (there is no stale sprite cache).
+        #[cfg(test)]
+        self.spatial_renders.set(self.spatial_renders.get() + 1);
+        let sprite = sprite_frame_with_context(context, sprite_frame);
+        if self.live_body.text().as_str() != sprite.as_ref() {
+            self.live_body.set_text(sprite.as_ref());
         }
 
         if suppress_live_body_for_focus(mode) {
@@ -2400,6 +3264,7 @@ impl OrganismRuntime {
             // the retreat window instead of visibly running back into view.
             self.hide_live_body(view);
             self.sticky_avatar.set_visible(false);
+            self.hidden_for_typing.set(true);
             return;
         }
 
@@ -2414,6 +3279,22 @@ impl OrganismRuntime {
             self.sticky_avatar.set_visible(false);
             return;
         }
+        let compact = view.organism_uses_running_header() && self.command_running.get();
+        let seat = CompanionSurface::choose(
+            self.enabled.get(),
+            self.presence.is_owner(self.presence_token),
+            view.widget().is_mapped() && !metrics.alt_screen,
+            suppress_live_body_for_focus(mode),
+            !compact,
+            compact,
+        );
+        if seat != CompanionSurface::Body {
+            self.hide_live_body(view);
+            self.sticky_avatar
+                .set_visible(seat == CompanionSurface::Compact);
+            return;
+        }
+        self.sticky_avatar.set_visible(false);
         // Keep the child measurable while the non-measuring overlay is hidden.
         // GTK reports zero requisition for an explicitly invisible Label,
         // which would otherwise make a tiny initial allocation self-locking.
@@ -2423,7 +3304,7 @@ impl OrganismRuntime {
         // A size change can tighten the legal x/y band even when the terminal
         // itself did not resize. Snap before interpolating so a wider reaction
         // pose never spends intermediate frames inside the scrollbar gutter.
-        let surface = SurfaceBox {
+        let mut surface = SurfaceBox {
             width: metrics.width,
             height: metrics.height,
             right_gutter: metrics.right_gutter,
@@ -2433,13 +3314,8 @@ impl OrganismRuntime {
             body_height,
             cursor_row: metrics.cursor_row,
         };
-        let signature = surface_signature(surface);
-        if self.surface_signature.replace(signature) != signature {
-            self.body_position.set(None);
-            self.body_in_transit.set(false);
-        }
         let vigil = self.organism.borrow().repo_vigil();
-        let point = surface_point_for_territory(
+        let mut point = surface_point_for_territory(
             surface,
             mode,
             tempo,
@@ -2448,7 +3324,62 @@ impl OrganismRuntime {
             geometry_frame,
             self.territory.get(),
         );
+        let full_fits = point.is_some();
+        if !full_fits {
+            // Reuse this exact label as a single-line body when the three-line
+            // pose cannot fit. Measure its actual font, growth and current pose;
+            // never reserve another row or guess a fixed pixel width.
+            let compact = sticky_glyph_with_context(context, sprite_frame);
+            self.live_body.set_text(compact.as_ref());
+            let (_, width, _, _) = self.live_body.measure(Orientation::Horizontal, -1);
+            let (_, height, _, _) = self.live_body.measure(Orientation::Vertical, width);
+            surface.body_width = width;
+            surface.body_height = height;
+            point = surface_point_for_territory(
+                surface,
+                mode,
+                tempo,
+                ambient,
+                vigil,
+                geometry_frame,
+                self.territory.get(),
+            );
+        }
+        let presentation = CompanionSurface::choose(
+            self.enabled.get(),
+            self.presence.is_owner(self.presence_token),
+            view.widget().is_mapped() && !metrics.alt_screen,
+            suppress_live_body_for_focus(mode),
+            full_fits,
+            point.is_some(),
+        );
+        if presentation == CompanionSurface::Hidden {
+            point = None;
+        }
+        let signature = surface_signature(surface);
+        let previous_signature = self.surface_signature.replace(signature);
+        if previous_signature != signature {
+            if (
+                previous_signature.0,
+                previous_signature.1,
+                previous_signature.2,
+                previous_signature.3,
+                previous_signature.4,
+            ) != (
+                signature.0,
+                signature.1,
+                signature.2,
+                signature.3,
+                signature.4,
+            ) {
+                self.cancel_pointer_greeting();
+            }
+            self.body_position.set(None);
+            self.body_in_transit.set(false);
+        }
 
+        self.measured_no_safe_placement
+            .set(view.widget().is_mapped() && measured_placement_blocked(surface, point.is_some()));
         if let Some(target) = point {
             let previous = self.body_position.get();
             let (x, y, moved) = match previous {
@@ -2456,7 +3387,7 @@ impl OrganismRuntime {
                 None => (target.x, target.y, false),
                 // Calm motion never animates a walk; poses snap, and a snap
                 // is not a walk — no transit gait afterwards.
-                Some(_) if self.motion != OrganismMotion::Full => (target.x, target.y, false),
+                Some(_) if self.motion.get() != OrganismMotion::Full => (target.x, target.y, false),
                 Some((px, py)) => {
                     let x = approach(px, target.x, f64::from(metrics.cell_width.max(1)));
                     let mut y = approach(py, target.y, f64::from(metrics.cell_height.max(1)));
@@ -2475,6 +3406,7 @@ impl OrganismRuntime {
                 self.body_in_transit.set(moved);
                 self.body_position.set(Some((x, y)));
                 view.set_live_organism_visible(true);
+                self.set_presented_surface(Some((context.behavior, context.watch_rhythm)));
             } else {
                 // A detached/reparenting surface is not a place the body can
                 // visibly sleep. Fail closed until the next measured frame.
@@ -2483,9 +3415,121 @@ impl OrganismRuntime {
         } else {
             self.hide_live_body(view);
         }
+        self.sync_pointer_geometry(view);
         // The Block layer decides whether the sticky running header is active;
         // this child only follows the same accepted-input retreat window.
-        self.sticky_avatar.set_visible(mode != SurfaceMode::Typing);
+        self.sticky_avatar.set_visible(false);
+    }
+
+    fn apply_settings(
+        runtime: &Rc<Self>,
+        view: &Rc<TermView>,
+        enabled: bool,
+        motion: OrganismMotion,
+    ) {
+        let was_enabled = runtime.enabled.replace(enabled);
+        let old_motion = runtime.motion.replace(motion);
+        if was_enabled == enabled && old_motion == motion {
+            return;
+        }
+        if was_enabled != enabled {
+            if enabled {
+                runtime.activity.body_enabled();
+            } else {
+                runtime.activity.body_disabled();
+            }
+        }
+        if !enabled || motion == OrganismMotion::Static {
+            runtime.hide_live_body(view);
+            runtime.sticky_avatar.set_visible(false);
+        }
+        runtime.card.set_visible(false);
+        runtime.surface_deadline.set(None);
+        if let Some(source) = runtime.surface_timer.borrow_mut().take() {
+            source.remove();
+        }
+        runtime.surface_last_frame.set(None);
+        if !enabled {
+            runtime.bump_generation();
+            if runtime.command_running.replace(false) {
+                runtime.activity.command_finished(Instant::now());
+            }
+            runtime.command_started_at.set(None);
+            runtime.agent_watching.set(false);
+            runtime.active_memory_kind.set(None);
+            runtime.active_repo_context.borrow_mut().take();
+            runtime.command_origin_behavior.set(None);
+            runtime.reset_watch_rhythm_at_boundary(Instant::now());
+            return;
+        }
+        if !was_enabled {
+            // Cwd may have changed while presentation was disabled. Never
+            // carry another checkout's guard into the newly visible pane.
+            runtime.clear_repo_work_after_leave(&view.cwd());
+            runtime
+                .awaiting_unobserved_work
+                .set(!view.organism_activity_settled());
+            runtime
+                .organism
+                .borrow_mut()
+                .sync_state(runtime.shared_life.get());
+            let idle = runtime.organism.borrow().idle_reaction();
+            runtime.render(&idle);
+        }
+        runtime.refresh_surface(view, Instant::now());
+        Self::start_surface_tick(runtime, view);
+    }
+
+    /// One clock and one toast belong to the window. Only observed recent
+    /// human input counts; output, hidden panes and modal UI never imply work.
+    fn observe_care(&self, view: &TermView, now: Instant) {
+        if !self.presence.is_owner(self.presence_token) {
+            return;
+        }
+        let root = view.widget();
+        let focused = root
+            .root()
+            .and_downcast::<gtk4::Window>()
+            .is_some_and(|window| {
+                window.is_active()
+                    && gtk4::prelude::GtkWindowExt::focus(&window)
+                        .is_some_and(|focus| focus == root || focus.is_ancestor(&root))
+            });
+        let age = self.human_input_age(now);
+        let engaged = self.enabled.get()
+            && focused
+            && !view.live_organism_surface_metrics().alt_screen
+            && age.is_some_and(|age| age < Duration::from_secs(5 * 60));
+        let can_offer = engaged
+            && age.is_some_and(|age| age >= HUMAN_INPUT_RETREAT)
+            && self.activity.no_commands_running()
+            && view.organism_activity_settled()
+            && self.surface_behavior.get() == Behavior::Idle
+            && !self.organism.borrow().repo_vigil().is_active()
+            && self.live_body.is_mapped()
+            && !pointer_buttons_down(view);
+        let overlay = self
+            .presence
+            .care_overlay
+            .borrow()
+            .as_ref()
+            .and_then(|overlay| overlay.upgrade());
+        let prompt = self.presence.care.borrow_mut().observe(
+            now.saturating_duration_since(self.presence.attention_epoch),
+            engaged,
+            can_offer && overlay.is_some(),
+        );
+        if let (Some(prompt), Some(overlay)) = (prompt, overlay) {
+            let toast = libadwaita::Toast::builder()
+                .title(prompt.text())
+                .button_label("Later")
+                .timeout(8)
+                .build();
+            let care = self.presence.care.clone();
+            let epoch = self.presence.attention_epoch;
+            toast.connect_button_clicked(move |_| care.borrow_mut().snooze(epoch.elapsed()));
+            overlay.add_toast(toast);
+        }
     }
 
     fn start_surface_tick(runtime: &Rc<Self>, view: &Rc<TermView>) {
@@ -2494,8 +3538,75 @@ impl OrganismRuntime {
         Self::schedule_surface_frame(
             runtime,
             view,
-            surface_frame_delay(runtime.motion, owner, alt_screen, false),
+            surface_frame_delay(runtime.motion.get(), owner, alt_screen, false),
         );
+    }
+
+    fn greeting_frame_delay(&self, view: &TermView, now: Instant) -> Option<Duration> {
+        // Refresh owns source retirement. If this tail crosses the hold
+        // deadline after that refresh drew the greeting, retain Some(0) so
+        // the stale last frame is cleared promptly instead of resting 900ms.
+        let remaining = self.attention_snapshot.get().and_then(|snapshot| {
+            snapshot.active.map(|active| {
+                active.deadline.saturating_sub(
+                    now.saturating_duration_since(self.presence.attention_epoch)
+                        .max(snapshot.observed_at),
+                )
+            })
+        });
+        greeting_frame_delay(
+            self.motion.get(),
+            self.presence.is_owner(self.presence_token),
+            view.live_organism_surface_metrics().alt_screen,
+            self.live_body.is_mapped(),
+            remaining,
+        )
+    }
+
+    fn next_surface_frame_delay(&self, view: &TermView, now: Instant) -> Duration {
+        let ordinary = surface_frame_delay_after_placement(
+            self.motion.get(),
+            self.presence.is_owner(self.presence_token),
+            view.live_organism_surface_metrics().alt_screen,
+            self.activity.resting(now),
+            self.measured_no_safe_placement.get(),
+            self.sticky_avatar.is_mapped(),
+        );
+        let next = interaction_frame_delay(
+            ordinary,
+            self.human_input_age(now),
+            self.motion.get() == OrganismMotion::Full
+                && self.presence.is_owner(self.presence_token)
+                && !view.live_organism_surface_metrics().alt_screen
+                && self.hidden_for_typing.get()
+                && !self.live_body.is_mapped()
+                && !self.sticky_avatar.is_mapped(),
+            self.greeting_frame_delay(view, now),
+        );
+        let watch_now = now.saturating_duration_since(self.presence.attention_epoch);
+        watch_adapter::frame_delay(
+            next,
+            self.output_rhythm.borrow().snapshot(watch_now),
+            watch_now,
+        )
+    }
+
+    fn rearm_surface_tick_for_greeting(runtime: &Rc<Self>, view: &Rc<TermView>, now: Instant) {
+        let Some(delay) = runtime.greeting_frame_delay(view, now) else {
+            return;
+        };
+        if !greeting_tightens_deadline(runtime.surface_deadline.get(), now, delay) {
+            return;
+        }
+        let source = runtime.surface_timer.borrow_mut().take();
+        let Some(source) = source else {
+            // A fired callback owns its tail scheduling. Never introduce a
+            // second source while it is inside synchronous GTK callbacks.
+            return;
+        };
+        runtime.surface_deadline.set(None);
+        source.remove();
+        Self::schedule_surface_frame(runtime, view, delay);
     }
 
     fn rearm_surface_tick_for_focus(runtime: &Rc<Self>, view: &Rc<TermView>) {
@@ -2504,7 +3615,7 @@ impl OrganismRuntime {
         let (source, delay) = {
             let mut slot = runtime.surface_timer.borrow_mut();
             let Some(delay) =
-                focus_transfer_rearm_delay(runtime.motion, owner, alt_screen, slot.is_some())
+                focus_transfer_rearm_delay(runtime.motion.get(), owner, alt_screen, slot.is_some())
             else {
                 // A fired callback takes the id before doing any work. It will
                 // see the new owner and choose its next delay at the tail; a
@@ -2517,8 +3628,21 @@ impl OrganismRuntime {
                 delay,
             )
         };
+        runtime.surface_deadline.set(None);
         source.remove();
         Self::schedule_surface_frame(runtime, view, delay);
+    }
+
+    /// An already-dispatched old callback cannot take the replacement source.
+    fn consume_surface_frame_callback(&self, revision: u64) -> bool {
+        if self.surface_timer_revision.get() != Some(revision)
+            || self.surface_timer.borrow().is_none()
+        {
+            return false;
+        }
+        self.surface_timer.borrow_mut().take();
+        self.surface_deadline.set(None);
+        true
     }
 
     /// Self-rescheduling frame driver. A glib timeout wakes at most ten times
@@ -2527,21 +3651,36 @@ impl OrganismRuntime {
     /// one-second heartbeat while the mind rests, the body is static, or this
     /// pane does not own the one live presence.
     fn schedule_surface_frame(runtime: &Rc<Self>, view: &Rc<TermView>, delay: Duration) {
+        if !runtime.enabled.get() {
+            return;
+        }
         debug_assert!(
             runtime.surface_timer.borrow().is_none(),
             "a surface runtime must never own two pending frame sources"
         );
+        let Some(revision) = runtime
+            .surface_timer_revision
+            .get()
+            .and_then(|old| old.checked_add(1))
+        else {
+            runtime.surface_timer_revision.set(None);
+            runtime.surface_deadline.set(None);
+            return;
+        };
+        runtime.surface_timer_revision.set(Some(revision));
         let runtime_weak = Rc::downgrade(runtime);
         let view_weak = Rc::downgrade(view);
+        runtime.surface_deadline.set(Some(Instant::now() + delay));
         let source = gtk4::glib::timeout_add_local_once(delay, move || {
             let Some(runtime) = runtime_weak.upgrade() else {
                 return;
             };
-            // Cleared before ANY other guard: a runtime kept alive past its
-            // view (agent-lost idle closures, parser-owned callback vectors)
-            // must never leave this fired source's id behind for Drop to
-            // remove — glib panics on removing a dead source.
-            runtime.surface_timer.borrow_mut().take();
+            if !runtime.consume_surface_frame_callback(revision) {
+                return;
+            }
+            if !runtime.enabled.get() {
+                return;
+            }
             let Some(view) = view_weak.upgrade() else {
                 return;
             };
@@ -2571,15 +3710,13 @@ impl OrganismRuntime {
             // clock and evolve the one shared mind. Persistence is untouched —
             // the evolved state only reaches disk with the next lifecycle
             // event, exactly as before.
-            let dt = runtime.activity.tick_slice(now);
-            if dt > 0.0 {
-                let mut life = runtime.shared_life.get();
-                life.tick(
-                    dt,
-                    runtime.activity.user_active(now),
-                    runtime.activity.resting(now) || runtime.activity.sleeping_rest(),
-                    runtime.activity.circadian_phase(local.bucket),
-                );
+            let mut life = runtime.shared_life.get();
+            let elapsed = runtime.activity.advance_life(
+                &mut life,
+                now,
+                runtime.activity.circadian_phase(local.bucket),
+            );
+            if elapsed > 0.0 {
                 runtime.shared_life.set(life);
                 runtime.refresh_state(life);
             }
@@ -2590,21 +3727,25 @@ impl OrganismRuntime {
                 let pane_dt = previous_frame
                     .map(|last| now.saturating_duration_since(last).as_secs_f32())
                     .unwrap_or(0.0);
-                let ambient = runtime.ambient.borrow_mut().step(
+                let ambient = runtime.step_ambient(
                     runtime.shared_life.get(),
                     runtime.activity.idle_for_secs(now),
                     pane_dt,
                     runtime.organism.borrow().repo_vigil(),
                 );
-                runtime.ambient_display.set(ambient);
+                runtime.record_ambient(ambient);
             } else {
-                runtime.ambient.borrow_mut().interrupt();
-                runtime.ambient_display.set(AmbientBehavior::Idle);
+                runtime.interrupt_ambient();
+                runtime.record_ambient(AmbientBehavior::Idle);
             }
+            let watch_eligible = runtime.watch_context_eligible(&view, now);
+            let watch_reader = view.watch_observation_snapshot();
+            let watch_now = now.saturating_duration_since(runtime.presence.attention_epoch);
             let desired_rhythm = runtime
                 .output_rhythm
                 .borrow_mut()
-                .sample(now, runtime.command_running.get());
+                .advance(watch_now, watch_reader, watch_eligible)
+                .rhythm;
             let rhythm_plan = watch_rhythm_plan(
                 desired_rhythm,
                 runtime.visible_watch_rhythm.get(),
@@ -2612,7 +3753,7 @@ impl OrganismRuntime {
             );
             let rhythm_context_presentable = watch_rhythm_context_presentable(
                 runtime.presence.is_owner(runtime.presence_token),
-                runtime.motion,
+                runtime.motion.get(),
                 mode,
                 alt_screen,
             );
@@ -2636,6 +3777,7 @@ impl OrganismRuntime {
                 .surface_frame
                 .set(runtime.surface_frame.get().wrapping_add(1 + pulse));
             runtime.refresh_surface(&view, now);
+            runtime.observe_care(&view, now);
 
             // Geometry and GTK mapping are known only after the neutral frame
             // has performed its fail-closed placement. Spend shared attention
@@ -2686,13 +3828,12 @@ impl OrganismRuntime {
                     }
                 }
             }
-            let next = surface_frame_delay(
-                runtime.motion,
-                runtime.presence.is_owner(runtime.presence_token),
-                alt_screen,
-                runtime.activity.resting(now),
-            );
-            Self::schedule_surface_frame(&runtime, &view, next);
+            let next = runtime.next_surface_frame_delay(&view, Instant::now());
+            // A synchronous settings callback may already have replaced the
+            // source while this frame was rendering. Never create a second.
+            if runtime.surface_timer.borrow().is_none() {
+                Self::schedule_surface_frame(&runtime, &view, next);
+            }
         });
         *runtime.surface_timer.borrow_mut() = Some(source);
     }
@@ -2700,6 +3841,75 @@ impl OrganismRuntime {
     fn mark_volatile(&self) {
         self.memory_badge.set(MemoryBadgeState::SaveFailed);
         self.refresh_growth_badge();
+    }
+
+    fn install_agent_execution_lost_observer(runtime: &Rc<Self>, view: &Rc<TermView>) {
+        let runtime = runtime.clone();
+        let view_weak = Rc::downgrade(view);
+        view.connect_agent_execution_lost(move |_generation, _reason| {
+            if !runtime.enabled.get() {
+                return;
+            }
+            if !runtime.command_running.get() {
+                // Nothing is running: either nothing ever started, or the
+                // finish was already consumed with correct attribution.
+                return;
+            }
+            if !runtime.agent_watching.get() {
+                // The running command is not agent-attributed (e.g. the
+                // human pressed Enter on an inserted reviewed command and
+                // the verification poll aborted afterwards): the agent's
+                // command never ran, and the human's live command must
+                // keep its slot and its outcome.
+                return;
+            }
+            OrganismRuntime::defer_agent_execution_lost(&runtime, view_weak.clone());
+        });
+    }
+
+    /// Defer correlation loss so an authoritative finish in this parser turn wins.
+    /// A queued task must not keep a closed pane alive or change shared life
+    /// after its view is gone. Hidden-but-live panes still own their outcomes.
+    fn defer_agent_execution_lost(runtime: &Rc<Self>, view_weak: std::rc::Weak<TermView>) {
+        let observed_generation = runtime.generation.get();
+        let runtime_weak = Rc::downgrade(runtime);
+        gtk4::glib::idle_add_local_once(move || {
+            let (Some(runtime), Some(view)) = (runtime_weak.upgrade(), view_weak.upgrade()) else {
+                return;
+            };
+            // A finish (or a fresh start) in the meantime owns the
+            // outcome; only a still-unresolved running command falls
+            // to this restrained warning.
+            if runtime.generation.get() != observed_generation || !runtime.command_running.get() {
+                return;
+            }
+            if runtime.command_running.replace(false) {
+                runtime.activity.command_finished(Instant::now());
+            }
+            runtime.command_started_at.set(None);
+            runtime.agent_watching.set(false);
+            runtime.reset_watch_rhythm_at_boundary(Instant::now());
+            runtime.visible_watch_rhythm.set(WatchRhythm::Steady);
+            runtime.offered_watch_rhythm.set(WatchRhythm::Steady);
+            runtime.output_activity.set(false);
+            runtime.command_origin_behavior.set(None);
+            let generation = runtime.bump_generation();
+            let reaction = {
+                let mut organism = runtime.organism.borrow_mut();
+                organism.sync_state(runtime.shared_life.get());
+                let reaction = organism.agent_execution_lost();
+                runtime.shared_life.set(organism.state());
+                reaction
+            };
+            runtime.render(&reaction);
+            runtime.refresh_surface(&view, Instant::now());
+            OrganismRuntime::settle_later(
+                &runtime,
+                view_weak,
+                generation,
+                reaction.hold_duration(),
+            );
+        });
     }
 
     fn settle_later(
@@ -2714,7 +3924,7 @@ impl OrganismRuntime {
                 return;
             };
             runtime.settle_timer.borrow_mut().take();
-            if runtime.generation.get() != generation {
+            if !runtime.enabled.get() || runtime.generation.get() != generation {
                 return;
             }
             let view = view.upgrade();
@@ -2731,13 +3941,13 @@ impl OrganismRuntime {
             // Do not leave a one-heartbeat flash of generic idle between the
             // reaction and its durable repo intention, especially in Calm or
             // Static mode where that heartbeat is deliberately slow.
-            let ambient = runtime.ambient.borrow_mut().step(
+            let ambient = runtime.step_ambient(
                 runtime.shared_life.get(),
                 runtime.activity.idle_for_secs(Instant::now()),
                 0.0,
                 vigil,
             );
-            runtime.ambient_display.set(ambient);
+            runtime.record_ambient(ambient);
             if should_begin_territory_intro(
                 runtime.territory_intro_pending.replace(false),
                 runtime.territory.get(),
@@ -2752,7 +3962,6 @@ impl OrganismRuntime {
                 let now = Instant::now();
                 runtime.refresh_surface(&view, now);
                 runtime.reconcile_sleeping_claim(&view, now);
-                view.insert_inline_notice(&runtime.card);
             }
         });
         *runtime.settle_timer.borrow_mut() = Some(source);
@@ -2761,6 +3970,10 @@ impl OrganismRuntime {
 
 impl Drop for OrganismRuntime {
     fn drop(&mut self) {
+        if self.enabled.get() {
+            self.activity.body_disabled();
+        }
+        self.cancel_pointer_greeting();
         self.clear_presence_cue();
         self.presence.unregister(self.presence_token);
         self.set_sleeping(false);
@@ -2776,6 +3989,40 @@ impl Drop for OrganismRuntime {
             source.remove();
         }
     }
+}
+
+/// Describe the actual visible surface. Hidden/static bodies fall back to
+/// the inline card's own pose rather than an internal typing/watch placeholder.
+#[cfg(test)]
+fn state_explanation(
+    inline: Behavior,
+    presented: Option<Behavior>,
+    live_mapped: bool,
+) -> &'static str {
+    let behavior = if live_mapped {
+        presented.unwrap_or(inline)
+    } else {
+        inline
+    };
+    behavior_explanation(behavior)
+}
+
+/// Rhythm is an admitted observation attached to the final placed watch
+/// context, never a prediction of command progress or a raw tracker edge.
+fn state_explanation_with_rhythm(
+    inline: Behavior,
+    presented: Option<(Behavior, WatchRhythm)>,
+    live_mapped: bool,
+    state: LifeState,
+) -> String {
+    let (behavior, rhythm) = if live_mapped {
+        presented.unwrap_or((inline, WatchRhythm::Steady))
+    } else {
+        (inline, WatchRhythm::Steady)
+    };
+    let context = RenderContext::new(behavior, BodyLanguage::from_state(state), false)
+        .with_watch_rhythm(rhythm);
+    context_explanation(context).to_owned()
 }
 
 fn state_summary(state: LifeState) -> String {
@@ -2834,7 +4081,115 @@ fn percent(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * 100.0).round() as u8
 }
 
+/// Original invocation target. Native-only weak references never enter the
+/// serialized Action or any worker queue.
+#[derive(Clone)]
+pub(crate) enum OrganismGreetingTarget {
+    Block(std::rc::Weak<TermView>),
+    Vte(gtk4::glib::WeakRef<gtk4::Widget>),
+    Unavailable,
+}
+
 impl UiState {
+    pub(super) fn organism_greeting_target(&self) -> OrganismGreetingTarget {
+        match self.current_pane_leaf() {
+            Some(PaneLeaf::Block(view)) => OrganismGreetingTarget::Block(Rc::downgrade(&view)),
+            Some(PaneLeaf::Vte(view)) => OrganismGreetingTarget::Vte(view.widget().downgrade()),
+            None => OrganismGreetingTarget::Unavailable,
+        }
+    }
+
+    pub(crate) fn greet_ascii_organism_for(&self, target: &OrganismGreetingTarget) {
+        let view = match target {
+            OrganismGreetingTarget::Block(view) => view.upgrade(),
+            OrganismGreetingTarget::Vte(root)
+                if root
+                    .upgrade()
+                    .is_some_and(|root| root.is_ancestor(&self.window)) =>
+            {
+                self.toast_overlay.add_toast(libadwaita::Toast::new(
+                    super::organism_vte::VTE_ORGANISM_HELLO_UNAVAILABLE,
+                ));
+                return;
+            }
+            _ => None,
+        };
+        let Some(view) = view else {
+            self.toast_overlay.add_toast(libadwaita::Toast::new(
+                "The original pane is no longer available.",
+            ));
+            return;
+        };
+        // The palette has already closed. Reconcile actual focus once, then
+        // require its original weak Block target to own the visible body.
+        self.sync_organism_presence();
+        let accepted = self
+            .organism_presence
+            .runtime_for(&view)
+            .is_some_and(|runtime| runtime.request_greeting(&view));
+        if !accepted {
+            self.toast_overlay.add_toast(libadwaita::Toast::new(
+                "Hello is unavailable. Use an idle, visible companion in Full or Calm mode and wait between greetings.",
+            ));
+        }
+    }
+
+    pub(crate) fn inspect_ascii_organism_for(&self, target: &OrganismGreetingTarget) {
+        if std::env::var_os("FORGE_SAFE_MODE").is_some() {
+            self.toast_overlay.add_toast(libadwaita::Toast::new(
+                "ASCII companion is unavailable in safe mode.",
+            ));
+            return;
+        }
+        if !self.config.borrow().ascii_organism_enabled {
+            self.toast_overlay.add_toast(libadwaita::Toast::new(
+                "ASCII companion is off. Enable it in Settings to begin.",
+            ));
+            return;
+        }
+        let view = match target {
+            OrganismGreetingTarget::Block(view) => view.upgrade().filter(|view| {
+                self.current_term_view()
+                    .is_some_and(|current| Rc::ptr_eq(&current, view))
+                    && view.widget().is_ancestor(&self.window)
+                    && !PaneLeaf::Block(view.clone()).is_remote()
+            }),
+            OrganismGreetingTarget::Vte(root)
+                if root.upgrade().is_some_and(|root| {
+                    self.current_pane_leaf()
+                        .is_some_and(|pane| pane.root_widget() == root && !pane.is_remote())
+                        && root.is_ancestor(&self.window)
+                }) =>
+            {
+                inspector::present_capability(&self.window, "Traditional VTE shows a neutral companion. It has no confirmed command outcomes or live organism state to inspect. The offline pose gallery is available in Settings; Block and Unified modes support the living companion.");
+                return;
+            }
+            _ => None,
+        };
+        let Some(runtime) = view
+            .as_ref()
+            .and_then(|view| self.organism_presence.runtime_for(view))
+            .filter(|runtime| runtime.enabled.get())
+        else {
+            self.toast_overlay.add_toast(libadwaita::Toast::new(
+                "The original local companion pane is no longer available.",
+            ));
+            return;
+        };
+        let snapshot = runtime.inspection_snapshot(
+            view.as_ref()
+                .expect("a runtime belongs to the validated view"),
+        );
+        inspector::present(
+            &self.window,
+            snapshot,
+            self.organism_presence.voice.clone(),
+            self.organism_presence.care.clone(),
+            self.organism_presence.attention_epoch,
+            self.organism_presence.care_changed.borrow().clone(),
+        );
+    }
+
     /// Revoke synchronously when Notebook announces a page transition. GTK's
     /// selected-page property still names the old page inside `switch-page`,
     /// so resolution is intentionally deferred, but old ownership must end
@@ -2856,8 +4211,91 @@ impl UiState {
             .focus_view(focused.flatten().as_ref());
     }
 
+    /// Install once per window. Automatic motion follows later desktop
+    /// preference changes without retaining the window through global Settings.
+    pub(crate) fn observe_ascii_organism_motion(self: &Rc<Self>) {
+        *self.organism_presence.care_overlay.borrow_mut() = Some(self.toast_overlay.downgrade());
+        self.organism_presence
+            .care
+            .borrow_mut()
+            .set_enabled(self.config.borrow().ascii_organism_care_enabled);
+        let ui = Rc::downgrade(self);
+        *self.organism_presence.care_changed.borrow_mut() = Some(Rc::new(move |enabled| {
+            let Some(ui) = ui.upgrade() else {
+                return;
+            };
+            if std::env::var_os("FORGE_SAFE_MODE").is_some() {
+                return;
+            }
+            ui.config.borrow_mut().ascii_organism_care_enabled = enabled;
+            ui.persist_config();
+        }));
+        let Some(desktop) = gtk4::Settings::default() else {
+            return;
+        };
+        let ui = Rc::downgrade(self);
+        let handler = desktop.connect_gtk_enable_animations_notify(move |_| {
+            let Some(ui) = ui.upgrade() else {
+                return;
+            };
+            let follows_desktop = {
+                let config = ui.config.borrow();
+                config.ascii_organism_enabled && config.ascii_organism_motion.is_none()
+            };
+            if follows_desktop {
+                ui.sync_ascii_organism_settings();
+            }
+        });
+        let handler = RefCell::new(Some(handler));
+        self.window.connect_destroy(move |_| {
+            if let Some(handler) = handler.borrow_mut().take() {
+                desktop.disconnect(handler);
+            }
+        });
+    }
+
+    pub(crate) fn sync_ascii_organism_settings(&self) {
+        self.organism_presence
+            .care
+            .borrow_mut()
+            .set_enabled(self.config.borrow().ascii_organism_care_enabled);
+        let (enabled, motion) = {
+            let config = self.config.borrow();
+            let motion = config.ascii_organism_motion.unwrap_or_else(|| {
+                if gtk4::Settings::default()
+                    .is_none_or(|settings| settings.is_gtk_enable_animations())
+                {
+                    OrganismMotion::Full
+                } else {
+                    OrganismMotion::Calm
+                }
+            });
+            (config.ascii_organism_enabled, motion)
+        };
+        for view in self.organism_presence.eligible_views() {
+            if enabled {
+                self.attach_ascii_organism_to_view(&view, false);
+            }
+            if let Some(runtime) = self.organism_presence.runtime_for(&view) {
+                OrganismRuntime::apply_settings(&runtime, &view, enabled, motion);
+            }
+        }
+        for leaf in self.configuration_leaves() {
+            if let PaneLeaf::Vte(view) = leaf {
+                view.sync_organism(enabled, motion);
+            }
+        }
+        self.sync_organism_presence();
+    }
+
     pub(crate) fn attach_ascii_organism_to_view(&self, view: &Rc<TermView>, remote: bool) {
-        if remote || !self.config.borrow().ascii_organism_enabled {
+        if remote {
+            return;
+        }
+        self.organism_presence.remember_view(view);
+        if !self.config.borrow().ascii_organism_enabled
+            || self.organism_presence.runtime_for(view).is_some()
+        {
             return;
         }
 
@@ -2887,18 +4325,16 @@ impl UiState {
             motion,
             persistent,
         );
+        runtime
+            .awaiting_unobserved_work
+            .set(!view.organism_activity_settled());
         self.organism_presence.bind(presence_token, view, &runtime);
-        // Two surfaces, deliberately: the card is the organism's home in the
-        // block conversation, the live body below is its home on the terminal
-        // surface itself. A pane that cannot host inline cards (Unified) keeps
-        // only the overlay — which is also why that overlay must be suppressed
-        // for alt-screen apps there, see `UnifiedBackend::enter_alt_screen_chrome`.
-        if !view.insert_inline_notice(&runtime.card) {
-            log::debug!(
-                "organism card not mounted in this pane; the live-surface body is its only home"
-            );
-        }
-        if motion != OrganismMotion::Static {
+        OrganismRuntime::install_map_observer(&runtime, view);
+        OrganismRuntime::install_pointer_observer(&runtime, view);
+        OrganismRuntime::install_card_tooltip(&runtime, view);
+        // A single body lives on the active terminal surface. Status and
+        // physiology remain available through Inspect companion.
+        {
             if !view.put_live_organism_body(runtime.live_body.upcast_ref(), 0.0, 0.0) {
                 log::warn!("could not attach ASCII organism to the live terminal surface");
             }
@@ -2906,9 +4342,7 @@ impl UiState {
                 log::warn!("could not attach ASCII organism to the sticky running header");
             }
         }
-        // Per-body seeding keeps split-window bodies from napping and pacing
-        // in perfect lockstep.
-        *runtime.ambient.borrow_mut() = AmbientMind::seeded(pane_token(view) as u64);
+        OrganismRuntime::install_prompt_evidence_observer(&runtime, view);
         runtime.refresh_surface(view, Instant::now());
         OrganismRuntime::start_surface_tick(&runtime, view);
 
@@ -2916,10 +4350,14 @@ impl UiState {
             let runtime = runtime.clone();
             let view_weak = Rc::downgrade(view);
             view.connect_human_input(move |_kind| {
+                if !runtime.enabled.get() {
+                    return;
+                }
                 let now = Instant::now();
                 let entering_retreat = runtime
                     .human_input_age(now)
                     .is_none_or(|age| age >= HUMAN_INPUT_RETREAT);
+                runtime.cancel_pointer_greeting();
                 runtime.last_human_input.set(Some(now));
                 runtime.activity.note_input(now);
                 runtime.reset_watch_rhythm_at_boundary(now);
@@ -2928,6 +4366,9 @@ impl UiState {
                 runtime.cancel_territory_intro();
                 runtime.set_sleeping(false);
                 if entering_retreat {
+                    // The sticky form follows the same input retreat immediately,
+                    // including when Calm mode has a dormant frame pending.
+                    runtime.sticky_avatar.set_visible(false);
                     // Keep the accepted-input hot path O(1): hide once, then
                     // keep the single frame callback suppressed for the whole
                     // retreat window. Repeated keys only extend time. Forgetting
@@ -2935,6 +4376,7 @@ impl UiState {
                     // no typing-triggered run competes with the prompt.
                     runtime.body_position.set(None);
                     runtime.body_in_transit.set(false);
+                    runtime.set_presented_surface(None);
                     if let Some(view) = view_weak.upgrade() {
                         // Clear desired visibility even behind the alternate-
                         // screen override, so rmcup cannot briefly restore a
@@ -2949,6 +4391,9 @@ impl UiState {
             let runtime = runtime.clone();
             let view_weak = Rc::downgrade(view);
             view.connect_alt_screen_transition(move |transition| {
+                if !runtime.enabled.get() {
+                    return;
+                }
                 let now = Instant::now();
                 runtime.reset_watch_rhythm_at_boundary(now);
                 runtime.clear_presence_cue();
@@ -2959,6 +4404,8 @@ impl UiState {
                 runtime.set_sleeping(false);
                 runtime.body_position.set(None);
                 runtime.body_in_transit.set(false);
+                runtime.set_presented_surface(None);
+                runtime.sticky_avatar.set_visible(false);
                 if let Some(view) = view_weak.upgrade() {
                     view.set_live_organism_visible(false);
                 }
@@ -2968,27 +4415,40 @@ impl UiState {
         {
             let runtime = runtime.clone();
             let view_weak = Rc::downgrade(view);
+            view.connect_watch_observation(move |event| {
+                let Some(view) = view_weak.upgrade() else {
+                    return;
+                };
+                // Sample native facts before borrowing the reducer; fanout can
+                // synchronously query or reconcile this runtime again.
+                let eligible = runtime.watch_context_eligible(&view, event.at);
+                let current = view.watch_observation_snapshot();
+                if current != event.snapshot {
+                    return;
+                }
+                let output_pulse = runtime.output_rhythm.borrow_mut().event(
+                    event
+                        .at
+                        .saturating_duration_since(runtime.presence.attention_epoch),
+                    event,
+                    current,
+                    eligible,
+                );
+                if output_pulse {
+                    runtime.output_activity.set(true);
+                }
+            });
+        }
+
+        {
+            let runtime = runtime.clone();
+            let view_weak = Rc::downgrade(view);
             view.connect_activity(move || {
+                if !runtime.enabled.get() {
+                    return;
+                }
                 let now = Instant::now();
                 let view = view_weak.upgrade();
-                let rhythm_presentable_at_origin = view.as_ref().is_some_and(|view| {
-                    watch_rhythm_context_presentable(
-                        runtime.presence.is_owner(runtime.presence_token),
-                        runtime.motion,
-                        surface_mode(
-                            runtime.surface_behavior.get(),
-                            runtime.command_running.get(),
-                            runtime.human_input_age(now),
-                        ),
-                        view.live_organism_surface_metrics().alt_screen,
-                    )
-                });
-                if rhythm_presentable_at_origin {
-                    runtime.output_activity.set(true);
-                    runtime.output_rhythm.borrow_mut().note_output(now);
-                } else {
-                    runtime.reset_watch_rhythm_at_boundary(now);
-                }
                 runtime.activity.note_output(now);
                 runtime.clear_presence_cue();
                 // Preserve arrival eligibility while its introducing command
@@ -3003,6 +4463,7 @@ impl UiState {
                 // and restores the body below the new cursor edge.
                 runtime.body_position.set(None);
                 runtime.body_in_transit.set(false);
+                runtime.set_presented_surface(None);
                 if let Some(view) = view {
                     view.set_live_organism_visible(false);
                 }
@@ -3013,6 +4474,9 @@ impl UiState {
             let runtime = runtime.clone();
             let view_weak = Rc::downgrade(view);
             view.connect_cwd_changed(move |_display_cwd| {
+                if !runtime.enabled.get() {
+                    return;
+                }
                 // A running command still owns its start-time repo context for
                 // the authoritative finish. Its settle path rechecks the cwd;
                 // idle cwd changes can release the guard immediately. The
@@ -3039,6 +4503,10 @@ impl UiState {
             let correction = self.organism_correction.clone();
             let pane = pane_token(view);
             view.connect_command_started(move |event| {
+                if !runtime.enabled.get() {
+                    return;
+                }
+                runtime.awaiting_unobserved_work.set(false);
                 let now = Instant::now();
                 let command_origin = runtime.surface_behavior.get();
                 runtime.bump_generation();
@@ -3046,7 +4514,7 @@ impl UiState {
                 runtime
                     .command_origin_behavior
                     .set(command_origin.is_repo_vigil().then_some(command_origin));
-                runtime.output_rhythm.borrow_mut().start(now);
+                runtime.reset_watch_rhythm_at_boundary(now);
                 runtime.visible_watch_rhythm.set(WatchRhythm::Steady);
                 runtime.offered_watch_rhythm.set(WatchRhythm::Steady);
                 runtime.output_activity.set(false);
@@ -3210,7 +4678,6 @@ impl UiState {
                 runtime.render(&reaction);
                 if let Some(view) = view_weak.upgrade() {
                     runtime.refresh_surface(&view, Instant::now());
-                    view.insert_inline_notice(&runtime.card);
                 }
             });
         }
@@ -3221,12 +4688,17 @@ impl UiState {
             let memory = self.organism_memory.clone();
             let shared_life = self.organism_life.clone();
             view.connect_command_finished(move |event| {
+                // Enabling mid-command must not invent a start or replay the
+                // work that happened while the companion was disabled.
+                if !runtime.enabled.get() || !runtime.command_running.get() {
+                    return;
+                }
                 let generation = runtime.bump_generation_for_command_finish();
                 if runtime.command_running.replace(false) {
                     runtime.activity.command_finished(Instant::now());
                 }
                 runtime.command_started_at.set(None);
-                runtime.output_rhythm.borrow_mut().reset();
+                runtime.reset_watch_rhythm_at_boundary(Instant::now());
                 runtime.visible_watch_rhythm.set(WatchRhythm::Steady);
                 runtime.offered_watch_rhythm.set(WatchRhythm::Steady);
                 runtime.output_activity.set(false);
@@ -3439,13 +4911,12 @@ impl UiState {
                 runtime.render(&reaction);
                 if let Some(view) = view_weak.upgrade() {
                     runtime.refresh_surface(&view, Instant::now());
-                    view.insert_inline_notice(&runtime.card);
                 }
                 OrganismRuntime::settle_later(
                     &runtime,
                     view_weak.clone(),
                     generation,
-                    reaction_hold(&reaction),
+                    reaction.hold_duration(),
                 );
                 // Dispatch last, after this pane has committed its own
                 // reducer/memory/render work. Only the typed failure fact
@@ -3465,83 +4936,9 @@ impl UiState {
             // handle, so defer one main-loop turn and let an arriving finish
             // win — it carries the verified outcome and, because nothing is
             // cleared here, the correct agent attribution.
-            let runtime = runtime.clone();
-            let view_weak = Rc::downgrade(view);
-            let shared_life = self.organism_life.clone();
-            view.connect_agent_execution_lost(move |_generation, _reason| {
-                if !runtime.command_running.get() {
-                    // Nothing is running: either nothing ever started, or the
-                    // finish was already consumed with correct attribution.
-                    return;
-                }
-                if !runtime.agent_watching.get() {
-                    // The running command is not agent-attributed (e.g. the
-                    // human pressed Enter on an inserted reviewed command and
-                    // the verification poll aborted afterwards): the agent's
-                    // command never ran, and the human's live command must
-                    // keep its slot and its outcome.
-                    return;
-                }
-                let runtime = runtime.clone();
-                let view_weak = view_weak.clone();
-                let shared_life = shared_life.clone();
-                let observed_generation = runtime.generation.get();
-                gtk4::glib::idle_add_local_once(move || {
-                    // A finish (or a fresh start) in the meantime owns the
-                    // outcome; only a still-unresolved running command falls
-                    // to this restrained warning.
-                    if runtime.generation.get() != observed_generation
-                        || !runtime.command_running.get()
-                    {
-                        return;
-                    }
-                    if runtime.command_running.replace(false) {
-                        runtime.activity.command_finished(Instant::now());
-                    }
-                    runtime.command_started_at.set(None);
-                    runtime.agent_watching.set(false);
-                    runtime.output_rhythm.borrow_mut().reset();
-                    runtime.visible_watch_rhythm.set(WatchRhythm::Steady);
-                    runtime.offered_watch_rhythm.set(WatchRhythm::Steady);
-                    runtime.output_activity.set(false);
-                    runtime.command_origin_behavior.set(None);
-                    let generation = runtime.bump_generation();
-                    let reaction = {
-                        let mut organism = runtime.organism.borrow_mut();
-                        organism.sync_state(shared_life.get());
-                        let reaction = organism.agent_execution_lost();
-                        shared_life.set(organism.state());
-                        reaction
-                    };
-                    runtime.render(&reaction);
-                    if let Some(view) = view_weak.upgrade() {
-                        runtime.refresh_surface(&view, Instant::now());
-                        view.insert_inline_notice(&runtime.card);
-                    }
-                    OrganismRuntime::settle_later(
-                        &runtime,
-                        view_weak,
-                        generation,
-                        reaction_hold(&reaction),
-                    );
-                });
-            });
+            OrganismRuntime::install_agent_execution_lost_observer(&runtime, view);
         }
 
-        {
-            // CommandEnd arrives before the finished GTK block is committed at
-            // the next PromptStart. Re-pin only; the reducer already consumed
-            // the authoritative lifecycle event above.
-            let runtime = runtime.clone();
-            let view_weak = Rc::downgrade(view);
-            view.connect_block_finished(
-                move |_command, _exit_code, _agent_generation, _duration_ms| {
-                    if let Some(view) = view_weak.upgrade() {
-                        view.insert_inline_notice(&runtime.card);
-                    }
-                },
-            );
-        }
         self.sync_organism_presence();
     }
 }
@@ -3551,105 +4948,1623 @@ mod tests {
     use super::*;
 
     #[test]
-    fn output_rhythm_uses_only_pulse_count_and_monotonic_quiet_time() {
-        let start = Instant::now();
-        let mut rhythm = OutputRhythmTracker::default();
-        rhythm.start(start);
-        rhythm.note_output(start);
-        rhythm.note_output(start + Duration::from_millis(300));
-        rhythm.note_output(start + Duration::from_millis(600));
-        assert_eq!(
-            rhythm.sample(start + Duration::from_millis(600), true),
-            WatchRhythm::Busy
-        );
-        assert_eq!(
-            rhythm.sample(start + Duration::from_secs(2), true),
-            WatchRhythm::Steady
-        );
-        assert_eq!(
-            rhythm.sample(start + Duration::from_millis(3_600), true),
-            WatchRhythm::Waiting
-        );
+    #[ignore = "requires DISPLAY"]
+    fn one_companion_crosses_splits_without_cloning_its_body_or_mind() {
+        gtk4::init().expect("gtk4 display");
+        let presence = OrganismPresence::new();
+        let life = Rc::new(Cell::new(LifeState::default()));
+        let activity = OrganismActivity::new(None, GrowthProgress::default());
+        let views = [
+            crate::block_view::organism_settings_test_view(),
+            crate::block_view::organism_settings_test_view(),
+        ];
+        let runtimes: Vec<_> = views
+            .iter()
+            .map(|view| {
+                let token = presence.reserve();
+                let runtime = OrganismRuntime::new(
+                    life.clone(),
+                    activity.clone(),
+                    presence.clone(),
+                    token,
+                    OrganismMotion::Calm,
+                    false,
+                );
+                presence.bind(token, view, &runtime);
+                view.put_live_organism_body(runtime.live_body.upcast_ref(), 0.0, 0.0);
+                view.put_sticky_organism_avatar(runtime.sticky_avatar.upcast_ref());
+                runtime
+            })
+            .collect();
+        assert!(Rc::ptr_eq(&runtimes[0].ambient, &runtimes[1].ambient));
+        assert!(Rc::ptr_eq(
+            &runtimes[0].ambient_display,
+            &runtimes[1].ambient_display
+        ));
+        let split = gtk4::Paned::new(Orientation::Horizontal);
+        split.set_start_child(Some(&views[0].widget()));
+        split.set_end_child(Some(&views[1].widget()));
+        split.set_position(600);
+        let window = gtk4::Window::builder()
+            .default_width(1200)
+            .default_height(500)
+            .build();
+        window.set_child(Some(&split));
+        window.present();
+        let main = gtk4::glib::MainContext::default();
+        let settle = || {
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(120) {
+                while main.iteration(false) {}
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        settle();
+        for view in &views {
+            crate::block_view::organism_settings_test_clean_prompt(view);
+        }
+        for motion in [
+            OrganismMotion::Full,
+            OrganismMotion::Calm,
+            OrganismMotion::Static,
+        ] {
+            for (runtime, view) in runtimes.iter().zip(&views) {
+                OrganismRuntime::apply_settings(runtime, view, true, motion);
+            }
+            for owner in [0usize, 1, 0, 1] {
+                presence.focus_view(Some(&views[owner]));
+                settle();
+                for (runtime, view) in runtimes.iter().zip(&views) {
+                    runtime.refresh_surface(view, Instant::now());
+                    assert!(!runtime.card.is_visible());
+                    assert!(runtime.card.parent().is_none(), "no inline or split clone");
+                }
+                assert!(
+                    runtimes[owner].body_position.get().is_some(),
+                    "eligible owner must paint: {motion:?}"
+                );
+                assert!(runtimes[owner].live_body.is_mapped());
+                assert!(runtimes[1 - owner].body_position.get().is_none());
+                assert!(!runtimes[1 - owner].sticky_avatar.is_visible());
+                assert_eq!(
+                    runtimes
+                        .iter()
+                        .filter(|runtime| runtime.live_body.is_mapped())
+                        .count(),
+                    1
+                );
 
-        rhythm.note_output(start + Duration::from_millis(3_700));
-        assert_eq!(
-            rhythm.sample(start + Duration::from_millis(4_000), true),
-            WatchRhythm::Resumed
+                let disposition =
+                    runtimes[owner].step_ambient(life.get(), 180.0, 0.0, RepoVigil::Failure);
+                runtimes[owner].record_ambient(disposition);
+                runtimes[1 - owner].interrupt_ambient();
+                runtimes[1 - owner].record_ambient(AmbientBehavior::Idle);
+                assert_eq!(
+                    runtimes[owner].ambient.borrow().current(),
+                    disposition,
+                    "background panes cannot reset the companion's ambient mind"
+                );
+                assert_eq!(runtimes[owner].ambient_display.get(), disposition);
+                runtimes[owner].last_human_input.set(Some(Instant::now()));
+                runtimes[owner].refresh_surface(&views[owner], Instant::now());
+                assert!(runtimes
+                    .iter()
+                    .all(|runtime| !runtime.live_body.is_mapped()));
+                runtimes[owner].last_human_input.set(None);
+            }
+        }
+        // Actual native font metrics force a compact fallback, then removing
+        // the style restores the full pose in the very same overlay label.
+        let owner = &runtimes[1];
+        owner.surface_behavior.set(Behavior::Idle);
+        owner.interrupt_ambient();
+        // Pango attributes override theme CSS deterministically. Find the
+        // actual native full/compact boundary rather than assuming a font's
+        // pixel size or the window manager's allocated viewport height.
+        let mut compact_bounds = None;
+        for pixels in 8..=256 {
+            let attributes = gtk4::pango::AttrList::new();
+            attributes.insert(gtk4::pango::AttrSize::new_size_absolute(
+                pixels * gtk4::pango::SCALE,
+            ));
+            owner.live_body.set_attributes(Some(&attributes));
+            owner.refresh_surface(&views[1], Instant::now());
+            if owner.body_position.get().is_some() && owner.live_body.text().lines().count() == 1 {
+                compact_bounds = Some(owner.surface_signature.get());
+                break;
+            }
+        }
+        let compact_bounds = compact_bounds
+            .expect("a measured compact glyph fits after the full pose outgrows its surface");
+        settle();
+        assert!(owner.live_body.is_mapped());
+        assert_eq!(owner.live_body.text().lines().count(), 1);
+        owner.live_body.set_attributes(None);
+        owner.refresh_surface(&views[1], Instant::now());
+        settle();
+        assert!(owner.body_position.get().is_some());
+        assert!(
+            owner.live_body.text().lines().count() > 1,
+            "full pose restored on the same label"
         );
-        assert_eq!(
-            rhythm.sample(start + Duration::from_millis(4_700), true),
-            WatchRhythm::Steady
-        );
-        assert_eq!(
-            rhythm.sample(start + Duration::from_secs(5), false),
-            WatchRhythm::Steady
-        );
-        assert_eq!(rhythm.last_output, None);
-        assert_eq!(rhythm.command_started, None);
+        assert_ne!(owner.surface_signature.get(), compact_bounds);
+        presence.focus_view(None);
+        for (runtime, view) in runtimes.iter().zip(&views) {
+            assert!(!runtime.live_body.is_mapped());
+            assert!(!runtime.sticky_avatar.is_visible());
+            OrganismRuntime::apply_settings(runtime, view, false, OrganismMotion::Static);
+            assert!(crate::block_view::organism_settings_test_pty_bytes(view).is_empty());
+        }
+        window.close();
     }
 
     #[test]
-    fn output_rhythm_handles_silent_commands_and_a_true_sliding_window() {
-        let start = Instant::now();
-        let mut silent = OutputRhythmTracker::default();
-        silent.start(start);
-        assert_eq!(
-            silent.sample(start + Duration::from_millis(2_999), true),
-            WatchRhythm::Steady
-        );
-        assert_eq!(
-            silent.sample(start + Duration::from_secs(3), true),
-            WatchRhythm::Waiting
-        );
-        silent.note_output(start + Duration::from_millis(3_100));
-        assert_eq!(
-            silent.sample(start + Duration::from_millis(3_100), true),
-            WatchRhythm::Resumed
-        );
+    fn idle_explanation_reflects_life_but_never_relabels_an_outcome() {
+        let life = LifeState {
+            energy: 0.1,
+            ..LifeState::default()
+        };
+        let describe = |behavior| state_explanation_with_rhythm(behavior, None, false, life);
+        assert!(describe(Behavior::Idle).starts_with("Dozing"));
+        assert!(describe(Behavior::WatchCommand)
+            .starts_with(behavior_explanation(Behavior::WatchCommand)));
+        assert!(describe(Behavior::UnknownOutcome)
+            .starts_with(behavior_explanation(Behavior::UnknownOutcome)));
+        assert!(describe(Behavior::InspectError)
+            .starts_with(behavior_explanation(Behavior::InspectError)));
+    }
 
-        let mut sliding = OutputRhythmTracker::default();
-        sliding.start(start);
-        sliding.note_output(start);
-        sliding.note_output(start + Duration::from_millis(1_100));
-        sliding.note_output(start + Duration::from_millis(1_210));
-        assert_eq!(
-            sliding.sample(start + Duration::from_millis(1_210), true),
-            WatchRhythm::Steady
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn inspection_captures_real_state_without_attention_or_lifecycle_changes() {
+        gtk4::init().expect("gtk display");
+        let view = crate::block_view::organism_settings_test_view();
+        let presence = OrganismPresence::new();
+        let token = presence.reserve();
+        let life = Rc::new(Cell::new(LifeState::default()));
+        let growth = GrowthProgress {
+            days_seen: 14,
+            lifetime_recoveries: 3,
+        };
+        let activity = OrganismActivity::new(None, growth);
+        let runtime = OrganismRuntime::new(
+            life.clone(),
+            activity.clone(),
+            presence.clone(),
+            token,
+            OrganismMotion::Calm,
+            true,
         );
-        sliding.note_output(start + Duration::from_millis(1_220));
+        presence.bind(token, &view, &runtime);
+        runtime.command_running.set(true);
+        activity.command_started(Instant::now());
+        runtime
+            .command_started_at
+            .set(Some(Instant::now() - Duration::from_secs(42)));
+        runtime.agent_watching.set(true);
+        runtime.visible_watch_rhythm.set(WatchRhythm::Waiting);
+        runtime.surface_behavior.set(Behavior::WatchAgent);
+        *runtime.status_base.borrow_mut() = "Watching the local Shell Agent work".to_owned();
+        let state = state_summary(life.get());
+        let generation = runtime.generation.get();
+        let frame = runtime.surface_frame.get();
+        let snapshot = runtime.inspection_snapshot(&view);
+        assert_eq!(snapshot.context.behavior, Behavior::WatchAgent);
+        assert_eq!(snapshot.context.watch_rhythm, WatchRhythm::Waiting);
+        assert_eq!(snapshot.growth, growth);
+        assert!(snapshot.activity.contains("42s elapsed"));
+        assert_eq!(snapshot.latest, "Watching the local Shell Agent work");
+        assert!(context_explanation(snapshot.context).contains("has not finished"));
+        assert_eq!(state_summary(life.get()), state);
+        assert_eq!(runtime.generation.get(), generation);
+        assert_eq!(runtime.surface_frame.get(), frame);
+        assert_eq!(activity.commands_running.get(), 1);
+        assert!(runtime.surface_timer.borrow().is_none());
+        assert!(runtime.pointer_timer.borrow().is_none());
+        assert!(runtime.settle_timer.borrow().is_none());
+        assert!(crate::block_view::organism_settings_test_pty_bytes(&view).is_empty());
+        let weak_runtime = Rc::downgrade(&runtime);
+        let weak_view = Rc::downgrade(&view);
+        drop(runtime);
+        drop(view);
+        assert!(weak_runtime.upgrade().is_none());
+        assert!(weak_view.upgrade().is_none());
         assert_eq!(
-            sliding.sample(start + Duration::from_millis(1_220), true),
-            WatchRhythm::Busy,
-            "the most recent three pulses, not a tumbling first-pulse window, define busy"
+            snapshot.growth, growth,
+            "owned snapshots cannot retain a pane"
         );
     }
 
     #[test]
-    fn presentation_boundary_consumes_rhythm_and_restarts_visible_quiet_time() {
-        let start = Instant::now();
-        let boundary = start + Duration::from_secs(4);
-        let mut rhythm = OutputRhythmTracker::default();
-        rhythm.start(start);
-        rhythm.note_output(start);
-        rhythm.note_output(start + Duration::from_millis(100));
-        rhythm.note_output(start + Duration::from_millis(200));
-        assert_eq!(
-            rhythm.sample(start + Duration::from_millis(200), true),
-            WatchRhythm::Busy
+    fn growth_tooltip_keys_cover_counts_and_memory_transitions() {
+        let initial = GrowthProgress::default();
+        let days = GrowthProgress {
+            days_seen: 1,
+            ..initial
+        };
+        let recovery = GrowthProgress {
+            lifetime_recoveries: 1,
+            ..initial
+        };
+        let key = GrowthTooltip::new(MemoryBadgeState::Persistent, initial);
+        assert_ne!(key, GrowthTooltip::new(MemoryBadgeState::Persistent, days));
+        assert_ne!(
+            key,
+            GrowthTooltip::new(MemoryBadgeState::Persistent, recovery)
         );
+        for memory in [MemoryBadgeState::Volatile, MemoryBadgeState::SaveFailed] {
+            assert_ne!(key, GrowthTooltip::new(memory, initial));
+            assert_eq!(
+                GrowthTooltip::new(memory, initial),
+                GrowthTooltip::new(memory, days)
+            );
+        }
+        assert_ne!(GrowthTooltip::Volatile, GrowthTooltip::SaveFailed);
+    }
 
-        reset_output_rhythm_at_boundary(&mut rhythm, true, boundary);
-        assert_eq!(rhythm.sample(boundary, true), WatchRhythm::Steady);
-        assert_eq!(
-            rhythm.sample(boundary + Duration::from_millis(2_999), true),
-            WatchRhythm::Steady,
-            "hidden busy/waiting edges must not replay after presentation resumes"
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn hidden_sticky_heartbeat_catches_up_on_map_without_retaining_pane() {
+        gtk4::init().expect("gtk4 display");
+        let view = crate::block_view::organism_settings_test_view();
+        let root = view.widget();
+        let presence = OrganismPresence::new();
+        let token = presence.reserve();
+        let activity = OrganismActivity::new(None, GrowthProgress::default());
+        let runtime = OrganismRuntime::new(
+            Rc::new(Cell::new(LifeState::default())),
+            activity,
+            presence.clone(),
+            token,
+            OrganismMotion::Full,
+            true,
+        );
+        presence.bind(token, &view, &runtime);
+        OrganismRuntime::install_map_observer(&runtime, &view);
+        view.insert_inline_notice(&runtime.card);
+        view.put_live_organism_body(runtime.live_body.upcast_ref(), 0.0, 0.0);
+        view.put_sticky_organism_avatar(runtime.sticky_avatar.upcast_ref());
+        let window = gtk4::Window::new();
+        window.set_default_size(640, 480);
+        window.set_child(Some(&root));
+        window.present();
+        let main = gtk4::glib::MainContext::default();
+        let start = Instant::now();
+        while !root.is_mapped() && start.elapsed() < Duration::from_secs(3) {
+            while main.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(root.is_mapped());
+        presence.focus_view(Some(&view));
+        presence.focus_view(None);
+        root.set_visible(false);
+        assert!(!root.is_mapped());
+        runtime.sticky_avatar.set_text("hidden stale fixture");
+        let frames = runtime.surface_frame.get();
+        OrganismRuntime::schedule_surface_frame(&runtime, &view, Duration::from_millis(1));
+        let start = Instant::now();
+        while runtime.surface_frame.get() == frames && start.elapsed() < Duration::from_secs(3) {
+            while main.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            runtime.surface_frame.get() > frames,
+            "hidden heartbeat still advances"
         );
         assert_eq!(
-            rhythm.sample(boundary + Duration::from_secs(3), true),
-            WatchRhythm::Waiting,
-            "a new visible quiet interval may create a fresh edge"
+            runtime.sticky_avatar.text().as_str(),
+            "hidden stale fixture"
         );
+        assert!(!presence.is_owner(token));
+        root.set_visible(true);
+        assert!(root.is_mapped());
+        // No timer or main-loop turn may be needed to repair the hidden glyph.
+        assert_ne!(
+            runtime.sticky_avatar.text().as_str(),
+            "hidden stale fixture"
+        );
+        let caught_up = runtime.sticky_avatar.text();
+        runtime.refresh_surface(&view, Instant::now());
+        assert_eq!(runtime.sticky_avatar.text(), caught_up);
+        assert!(
+            !presence.is_owner(token),
+            "mapping cannot claim live presence"
+        );
+        presence.focus_view(Some(&view));
+        assert!(presence.is_owner(token));
+        let weak_runtime = Rc::downgrade(&runtime);
+        let weak_view = Rc::downgrade(&view);
+        window.set_child(None::<&gtk4::Widget>);
+        drop(runtime);
+        drop(view);
+        assert!(weak_runtime.upgrade().is_none());
+        assert!(weak_view.upgrade().is_none());
+        // Keep the signal owner alive after its pane/runtime have gone away.
+        // A remap invokes the same production weak callback and must be inert.
+        window.set_child(Some(&root));
+        assert!(weak_runtime.upgrade().is_none());
+        assert!(weak_view.upgrade().is_none());
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn idle_refresh_skips_unchanged_tooltip_and_non_owner_spatial_render() {
+        gtk4::init().expect("gtk display");
+        let view = crate::block_view::organism_settings_test_view();
+        let presence = OrganismPresence::new();
+        let token = presence.reserve();
+        let activity = OrganismActivity::new(None, GrowthProgress::default());
+        let runtime = OrganismRuntime::new(
+            Rc::new(Cell::new(LifeState::default())),
+            activity.clone(),
+            presence.clone(),
+            token,
+            OrganismMotion::Full,
+            true,
+        );
+        presence.bind(token, &view, &runtime);
+        runtime.sprite.set_text("stale inline fixture");
+        runtime.sticky_avatar.set_text("stale sticky fixture");
+        let submissions = runtime.tooltip_submissions.get();
+        for _ in 0..4 {
+            runtime.refresh_surface(&view, Instant::now());
+        }
+        assert_eq!(runtime.tooltip_submissions.get(), submissions);
+        assert_eq!(runtime.spatial_renders.get(), 0);
+        assert_ne!(runtime.sprite.text().as_str(), "stale inline fixture");
+        // This fixture never maps: sticky presentation deliberately waits for
+        // the map observer, while inline semantics and tooltip caching remain live.
+        assert_eq!(
+            runtime.sticky_avatar.text().as_str(),
+            "stale sticky fixture"
+        );
+        for growth in [
+            GrowthProgress {
+                days_seen: 1,
+                lifetime_recoveries: 0,
+            },
+            GrowthProgress {
+                days_seen: 1,
+                lifetime_recoveries: 1,
+            },
+        ] {
+            activity.growth.set(growth);
+            let before = runtime.tooltip_submissions.get();
+            runtime.refresh_surface(&view, Instant::now());
+            assert_eq!(runtime.tooltip_submissions.get(), before + 1);
+            assert_eq!(
+                runtime.badge.tooltip_text().as_deref(),
+                Some(GrowthTooltip::Persistent(growth).text().as_str())
+            );
+        }
+        for memory in [
+            MemoryBadgeState::SaveFailed,
+            MemoryBadgeState::Volatile,
+            MemoryBadgeState::Persistent,
+        ] {
+            runtime.memory_badge.set(memory);
+            let before = runtime.tooltip_submissions.get();
+            runtime.refresh_growth_badge();
+            runtime.refresh_growth_badge();
+            assert_eq!(runtime.tooltip_submissions.get(), before + 1);
+            assert_eq!(
+                runtime.badge.tooltip_text().as_deref(),
+                Some(
+                    GrowthTooltip::new(memory, activity.growth())
+                        .text()
+                        .as_str()
+                )
+            );
+        }
+        for motion in [OrganismMotion::Full, OrganismMotion::Calm] {
+            runtime.motion.set(motion);
+            runtime.live_body.set_text("stale fixture");
+            let before = runtime.spatial_renders.get();
+            // Exercise the real focus authority and its synchronous refresh.
+            presence.focus_view(Some(&view));
+            assert_eq!(runtime.spatial_renders.get(), before + 1);
+            assert_ne!(runtime.live_body.text().as_str(), "stale fixture");
+            presence.focus_view(None);
+            runtime.refresh_surface(&view, Instant::now());
+            assert_eq!(runtime.spatial_renders.get(), before + 1);
+        }
+        let before = runtime.spatial_renders.get();
+        runtime.motion.set(OrganismMotion::Static);
+        presence.focus_view(Some(&view));
+        runtime.refresh_surface(&view, Instant::now());
+        assert_eq!(runtime.spatial_renders.get(), before);
+        runtime.enabled.set(false);
+        runtime.motion.set(OrganismMotion::Full);
+        runtime.refresh_surface(&view, Instant::now());
+        assert_eq!(runtime.spatial_renders.get(), before);
+    }
+
+    /// Send a real X11 pointer motion through gtk4's event dispatch, rather
+    /// than calling the observer closure or emitting its signal directly.
+    #[cfg(target_os = "linux")]
+    fn move_native_pointer(window: &gtk4::Window, x: i32, y: i32) {
+        use std::ffi::{c_char, c_int, c_uint, c_ulong, c_void};
+        // SAFETY: symbols below use libX11's published ABI; display and surface
+        // remain live until XSync completes. Only this test's pointer is moved.
+        unsafe {
+            let library = libc::dlopen(c"libX11.so.6".as_ptr(), libc::RTLD_NOW);
+            assert!(!library.is_null());
+            let open: unsafe extern "C" fn(*const c_char) -> *mut c_void =
+                std::mem::transmute(libc::dlsym(library, c"XOpenDisplay".as_ptr()));
+            let root: unsafe extern "C" fn(*mut c_void) -> c_ulong =
+                std::mem::transmute(libc::dlsym(library, c"XDefaultRootWindow".as_ptr()));
+            let translate: unsafe extern "C" fn(
+                *mut c_void,
+                c_ulong,
+                c_ulong,
+                c_int,
+                c_int,
+                *mut c_int,
+                *mut c_int,
+                *mut c_ulong,
+            ) -> c_int =
+                std::mem::transmute(libc::dlsym(library, c"XTranslateCoordinates".as_ptr()));
+            let warp: unsafe extern "C" fn(
+                *mut c_void,
+                c_ulong,
+                c_ulong,
+                c_int,
+                c_int,
+                c_uint,
+                c_uint,
+                c_int,
+                c_int,
+            ) -> c_int = std::mem::transmute(libc::dlsym(library, c"XWarpPointer".as_ptr()));
+            let sync: unsafe extern "C" fn(*mut c_void, c_int) -> c_int =
+                std::mem::transmute(libc::dlsym(library, c"XSync".as_ptr()));
+            let close: unsafe extern "C" fn(*mut c_void) -> c_int =
+                std::mem::transmute(libc::dlsym(library, c"XCloseDisplay".as_ptr()));
+            let xid_symbol = libc::dlsym(libc::RTLD_DEFAULT, c"gdk_x11_surface_get_xid".as_ptr());
+            assert!(!xid_symbol.is_null(), "display regression needs X11");
+            let xid: unsafe extern "C" fn(*mut c_void) -> c_ulong = std::mem::transmute(xid_symbol);
+            let display = open(std::ptr::null());
+            assert!(!display.is_null());
+            let surface = window.surface().expect("mapped native window");
+            let mut root_x = 0;
+            let mut root_y = 0;
+            let mut child = 0;
+            assert_ne!(
+                translate(
+                    display,
+                    xid(surface.as_ptr().cast()),
+                    root(display),
+                    x,
+                    y,
+                    &mut root_x,
+                    &mut root_y,
+                    &mut child
+                ),
+                0
+            );
+            warp(display, 0, root(display), 0, 0, 0, 0, root_x, root_y);
+            sync(display, 0);
+            close(display);
+            libc::dlclose(library);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn native_pointer_button(pressed: bool) {
+        use std::ffi::{c_char, c_int, c_uint, c_ulong, c_void};
+        // SAFETY: these are the published X11/XTest ABIs. The test owns the
+        // private display and releases the button before closing the fixture.
+        unsafe {
+            let x11 = libc::dlopen(c"libX11.so.6".as_ptr(), libc::RTLD_NOW);
+            let xtst = libc::dlopen(c"libXtst.so.6".as_ptr(), libc::RTLD_NOW);
+            assert!(!x11.is_null() && !xtst.is_null());
+            let open: unsafe extern "C" fn(*const c_char) -> *mut c_void =
+                std::mem::transmute(libc::dlsym(x11, c"XOpenDisplay".as_ptr()));
+            let button: unsafe extern "C" fn(*mut c_void, c_uint, c_int, c_ulong) -> c_int =
+                std::mem::transmute(libc::dlsym(xtst, c"XTestFakeButtonEvent".as_ptr()));
+            let sync: unsafe extern "C" fn(*mut c_void, c_int) -> c_int =
+                std::mem::transmute(libc::dlsym(x11, c"XSync".as_ptr()));
+            let close: unsafe extern "C" fn(*mut c_void) -> c_int =
+                std::mem::transmute(libc::dlsym(x11, c"XCloseDisplay".as_ptr()));
+            let display = open(std::ptr::null());
+            assert!(!display.is_null());
+            assert_ne!(button(display, 1, c_int::from(pressed), 0), 0);
+            sync(display, 0);
+            close(display);
+            libc::dlclose(xtst);
+            libc::dlclose(x11);
+        }
+    }
+
+    fn probe_window_greeting(
+        presence: &OrganismPresence,
+        token: OrganismPaneToken,
+    ) -> LiveAttentionOutcome {
+        let mut copy = presence.attention.borrow().clone();
+        copy.advance(
+            presence.attention_epoch.elapsed(),
+            &token,
+            LiveAttentionInput {
+                base_context: RenderContext::new(Behavior::Idle, BodyLanguage::default(), false),
+                activity: jterm_core::organism_live::LiveActivityKnowledge::KnownIdle,
+                hard_eligible: true,
+                hover_available: false,
+                pointer_inside: false,
+            },
+            LiveAttentionEvent::Explicit,
+        )
+        .expect("current owner")
+        .outcome
+    }
+
+    /// Reuse this fixture's mapped window and inert terminal. No new process,
+    /// display, PTY, timer or production redraw hook is created here.
+    #[cfg(target_os = "linux")]
+    fn assert_inline_card_repaint(window: &gtk4::Window, runtime: &OrganismRuntime) {
+        use super::surface_probe::{PaintSerial, PixelRect, SurfaceProbe};
+        assert!(
+            !std::env::var("GSK_DEBUG")
+                .unwrap_or_default()
+                .split([',', ':', ' '])
+                .any(|flag| flag == "full-redraw" || flag == "all"),
+            "incremental regression cannot run with forced full redraw"
+        );
+        assert!(runtime.surface_timer.borrow().is_none());
+        move_native_pointer(window, 0, 0);
+        let fixture_started = Instant::now();
+        let main = gtk4::glib::MainContext::default();
+        let paint = PaintSerial::new(window).unwrap();
+        let probe = SurfaceProbe::new(window).unwrap();
+        eprintln!(
+            "inline paint renderer: {:?}",
+            window
+                .renderer()
+                .map(|renderer| renderer.type_().name().to_string())
+        );
+        let wait = |ready: &dyn Fn() -> bool| {
+            let started = Instant::now();
+            while !ready() && started.elapsed() < Duration::from_secs(2) {
+                while main.iteration(false) {}
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(ready(), "inline paint fixture did not settle");
+        };
+        let log_state = |stage: &str| {
+            let origin = runtime
+                .card
+                .compute_point(window, &gtk4::graphene::Point::new(0.0, 0.0));
+            eprintln!("paint-state {stage}: elapsed_us={} frame={} clock_time={:?} snapshots={} window_active={} focus={:?} animations={:?} content_size={}x{} local_border={:?} window_border={:?} content_origin={origin:?} recorded={:?} status_bounds={:?} sprite_bounds={:?} css={:?} state={:?}",
+                fixture_started.elapsed().as_micros(), paint.current(), window.frame_clock().map(|clock| clock.frame_time()),
+                inline_card::snapshot_count(&runtime.card), window.is_active(), gtk4::prelude::RootExt::focus(window).map(|widget| widget.type_().name().to_string()),
+                gtk4::Settings::default().map(|settings| settings.is_gtk_enable_animations()), runtime.card.width(), runtime.card.height(),
+                runtime.card.compute_bounds(&runtime.card), runtime.card.compute_bounds(window), inline_card::recorded_geometry(&runtime.card),
+                runtime.status.compute_bounds(window), runtime.sprite.compute_bounds(window), runtime.card.css_classes(), runtime.card.state_flags());
+        };
+        let status = runtime.status.text();
+        let state = runtime.state.text();
+        let margin = runtime.card.margin_start();
+        let size = window.default_size();
+        let starting_width = window.width();
+        let provider = gtk4::CssProvider::new();
+        const STEADY: &str = ".organism-paint-fixture { transition: none; }";
+        provider.load_from_string(STEADY);
+        struct FixtureStyle(gtk4::gdk::Display, gtk4::CssProvider);
+        impl Drop for FixtureStyle {
+            fn drop(&mut self) {
+                gtk4::style_context_remove_provider_for_display(&self.0, &self.1);
+            }
+        }
+        let display = gtk4::prelude::WidgetExt::display(window);
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+        );
+        let _style = FixtureStyle(display, provider.clone());
+        runtime.card.add_css_class("organism-paint-fixture");
+
+        for stage in 0..6 {
+            log_state(&format!("stage-{stage}-before-change"));
+            let old = runtime.card.compute_bounds(window).unwrap();
+            let old_width = window.width();
+            let before = paint.current();
+            match stage {
+                0 => runtime
+                    .status
+                    .set_text("quiet · iiiiiiiiii jjjjj ÍÍÍÍ inspecting"),
+                1 => runtime
+                    .status
+                    .set_text("quiet · waiting for a real Block event"),
+                2 => {
+                    runtime.card.set_margin_start(margin + 9);
+                    runtime.status.set_text("quiet · i");
+                }
+                3 => {
+                    runtime.card.set_margin_start(margin);
+                    window.set_default_size(if old_width > 420 { 360 } else { 700 }, size.1);
+                    runtime.status.set_text("quiet · waiting for a real Block event with iii jjj and a deliberately long explanation that wraps onto the second line");
+                }
+                4 => {
+                    provider.load_from_string(".organism-paint-fixture { transition: none; } .organism-paint-fixture label { font-size: 14.667px; } .organism-paint-fixture .organism-status { color: #d2d9e3; }");
+                    runtime
+                        .status
+                        .set_text("quiet · waiting for a real Block event");
+                    runtime.state.set_text("Quietly keeping you company between commands. · sleepy · subdued · curious · a deliberately long ellipsized state");
+                }
+                _ => {
+                    provider.load_from_string(STEADY);
+                    window.set_default_size(size.0, size.1);
+                    runtime.status.set_text(&status);
+                    runtime.state.set_text(&state);
+                }
+            }
+            wait(&|| {
+                paint.current() > before
+                    && (stage != 3 || window.width() != old_width)
+                    && (stage != 5 || window.width() == starting_width)
+            });
+            let current = runtime.card.compute_bounds(window).unwrap();
+            // GTK's native snapshot adds this offset when drawing into the surface.
+            let (tx, ty) = window.surface_transform();
+            let full = probe.full_rect().unwrap();
+            let rect = |r: gtk4::graphene::Rect| {
+                [
+                    f64::from(r.x()),
+                    f64::from(r.y()),
+                    f64::from(r.width()),
+                    f64::from(r.height()),
+                ]
+            };
+            let [left, top, right, bottom] = super::surface_probe::surface_rect(
+                rect(old),
+                rect(current),
+                (tx, ty),
+                probe.scale(),
+                (full.width, full.height),
+            );
+            eprintln!("inline-card-{stage}: native transform=({tx}, {ty})");
+            assert!(right > left && bottom > top);
+            let roi = PixelRect {
+                x: left,
+                y: top,
+                width: (right - left) as u32,
+                height: (bottom - top) as u32,
+            };
+            let name = format!("inline-card-{stage}");
+            probe.log_metadata(&runtime.status, roi, &name);
+            log_state(&format!("stage-{stage}-before-incremental"));
+            let incremental = probe.capture(roi).unwrap();
+            log_state(&format!("stage-{stage}-after-incremental"));
+            let before = paint.current();
+            probe.expose_full().unwrap();
+            wait(&|| paint.current() > before);
+            assert_eq!(
+                runtime.card.compute_bounds(window).unwrap(),
+                current,
+                "expose must not change geometry"
+            );
+            log_state(&format!("stage-{stage}-before-complete"));
+            let complete = probe.capture(roi).unwrap();
+            log_state(&format!("stage-{stage}-after-complete"));
+            if incremental.pixels != complete.pixels {
+                incremental.log_differences(&complete, &name);
+                let directory = std::env::var_os("GTK_PAINT_DIAGNOSTICS_DIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::env::temp_dir().join("gtk-paint-diagnostics"));
+                std::fs::create_dir_all(&directory).unwrap();
+                incremental
+                    .write_ppm(&directory.join(format!("{name}-incremental.ppm")))
+                    .unwrap();
+                complete
+                    .write_ppm(&directory.join(format!("{name}-complete.ppm")))
+                    .unwrap();
+                // Observe drift without replacing the original failing pair.
+                match probe.capture(roi) {
+                    Ok(delayed) => {
+                        complete.log_differences(&delayed, &format!("{name}-same-state-readback"));
+                        delayed
+                            .write_ppm(&directory.join(format!("{name}-delayed.ppm")))
+                            .unwrap();
+                    }
+                    Err(error) => eprintln!("diagnostic same-state readback failed: {error}"),
+                }
+                let serial = paint.current();
+                if let Err(error) = probe.expose_full() {
+                    eprintln!("diagnostic second expose failed: {error}");
+                } else {
+                    let started = Instant::now();
+                    while paint.current() <= serial && started.elapsed() < Duration::from_secs(2) {
+                        while main.iteration(false) {}
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    if paint.current() <= serial {
+                        eprintln!("diagnostic second expose timed out without a new paint");
+                    }
+                    log_state(&format!("stage-{stage}-diagnostic-second-expose"));
+                    match probe.capture(roi) {
+                        Ok(second) => {
+                            complete.log_differences(&second, &format!("{name}-second-complete"));
+                            second
+                                .write_ppm(&directory.join(format!("{name}-second-complete.ppm")))
+                                .unwrap();
+                        }
+                        Err(error) => {
+                            eprintln!("diagnostic second expose readback failed: {error}")
+                        }
+                    }
+                }
+            }
+            incremental.assert_same_pixels(&complete, &name);
+            inline_card::assert_native_paint_contract(&runtime.card);
+        }
+
+        let before = paint.current();
+        runtime.card.remove_css_class("organism-paint-fixture");
+        probe.expose_full().unwrap();
+        wait(&|| paint.current() > before);
+        let snapshots = inline_card::snapshot_count(&runtime.card);
+        let still_at = Instant::now();
+        while still_at.elapsed() < Duration::from_millis(120) {
+            while main.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            inline_card::snapshot_count(&runtime.card),
+            snapshots,
+            "unchanged inline card must reuse its cached snapshot"
+        );
+        assert!(runtime.surface_timer.borrow().is_none());
+        assert_eq!(runtime.status.text(), status);
+        assert_eq!(runtime.state.text(), state);
+        assert_eq!(runtime.card.margin_start(), margin);
+        assert_eq!(window.default_size(), size);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn deferred_agent_loss_retires_closed_panes_but_keeps_hidden_outcomes() {
+        gtk4::init().expect("gtk display");
+        let main = gtk4::glib::MainContext::default();
+        let drain = || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while main.pending() {
+                assert!(Instant::now() < deadline, "bounded native event drain");
+                main.iteration(false);
+            }
+        };
+        let snapshot = |state: LifeState| {
+            [
+                state.energy,
+                state.mood,
+                state.curiosity,
+                state.boredom,
+                state.stress,
+                state.social_need,
+                state.attachment,
+                state.confidence,
+            ]
+        };
+        for case in 0..4 {
+            let view = crate::block_view::organism_settings_test_view();
+            let presence = OrganismPresence::new();
+            let token = presence.reserve();
+            let life = Rc::new(Cell::new(LifeState::default()));
+            let before = life.get();
+            let activity = OrganismActivity::new(None, GrowthProgress::default());
+            let runtime = OrganismRuntime::new(
+                life.clone(),
+                activity.clone(),
+                presence.clone(),
+                token,
+                OrganismMotion::Static,
+                false,
+            );
+            presence.bind(token, &view, &runtime);
+            // Install the production signal closure: the view owns runtime,
+            // never the reverse. The deferred task must add no strong owner.
+            OrganismRuntime::install_agent_execution_lost_observer(&runtime, &view);
+            runtime.command_running.set(true);
+            runtime.agent_watching.set(true);
+            activity.command_started(Instant::now());
+            let view_weak = Rc::downgrade(&view);
+            let runtime_owners = Rc::strong_count(&runtime);
+            OrganismRuntime::defer_agent_execution_lost(&runtime, view_weak.clone());
+            assert_eq!(
+                Rc::strong_count(&runtime),
+                runtime_owners,
+                "queued loss must not retain runtime"
+            );
+            match case {
+                0 => {
+                    drop(runtime); // Do not let the test itself mask a leaked task owner.
+                    drop(view);
+                    assert!(view_weak.upgrade().is_none());
+                    drain();
+                    assert_eq!(snapshot(life.get()), snapshot(before));
+                }
+                1 => {
+                    // A temporary external runtime reference must not permit
+                    // loss to mutate life after the actual view has closed.
+                    drop(view);
+                    assert!(view_weak.upgrade().is_none());
+                    drain();
+                    assert_eq!(snapshot(life.get()), snapshot(before));
+                    assert!(runtime.settle_timer.borrow().is_none());
+                    drop(runtime);
+                }
+                2 => {
+                    // No focused owner models a hidden/background pane, not
+                    // closure. Its genuine loss must still settle exactly once.
+                    assert!(!presence.is_owner(token));
+                    drain();
+                    let mut expected = NativeOrganism::from_persisted_state(before);
+                    expected.agent_execution_lost();
+                    assert_eq!(snapshot(life.get()), snapshot(expected.state()));
+                    assert!(!runtime.command_running.get());
+                    assert_eq!(activity.commands_running.get(), 0);
+                    assert!(runtime.settle_timer.borrow().is_some());
+                    drop(runtime);
+                    drop(view);
+                }
+                _ => {
+                    // The production finish path advances this generation and
+                    // returns the running slot before the queued idle executes.
+                    runtime.bump_generation_for_command_finish();
+                    runtime.command_running.set(false);
+                    activity.command_finished(Instant::now());
+                    let mut finished = before;
+                    finished.curiosity = 0.42;
+                    life.set(finished);
+                    drain();
+                    assert_eq!(
+                        snapshot(life.get()),
+                        snapshot(finished),
+                        "deferred loss overwrote authoritative finish"
+                    );
+                    assert!(runtime.settle_timer.borrow().is_none());
+                    drop(runtime);
+                    drop(view);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn live_settings_reuse_body_preserve_focus_and_stop_disabled_timers() {
+        libadwaita::init().expect("GTK/libadwaita display");
+        let view = crate::block_view::organism_settings_test_view();
+        let presence = OrganismPresence::new();
+        presence.remember_view(&view);
+        presence.remember_view(&view);
+        assert_eq!(presence.eligible_views().len(), 1);
+        let token = presence.reserve();
+        let life = Rc::new(Cell::new(LifeState::default()));
+        let activity = OrganismActivity::new(None, GrowthProgress::default());
+        let runtime = OrganismRuntime::new(
+            life.clone(),
+            activity,
+            presence.clone(),
+            token,
+            OrganismMotion::Static,
+            false,
+        );
+        presence.bind(token, &view, &runtime);
+        let runtime_owners = Rc::strong_count(&runtime);
+        let view_owners = Rc::strong_count(&view);
+        OrganismRuntime::install_card_tooltip(&runtime, &view);
+        OrganismRuntime::install_prompt_evidence_observer(&runtime, &view);
+        assert_eq!(Rc::strong_count(&runtime), runtime_owners);
+        assert_eq!(Rc::strong_count(&view), view_owners);
+        assert!(Rc::ptr_eq(&presence.runtime_for(&view).unwrap(), &runtime));
+        assert!(!runtime.live_body.can_target());
+        assert!(!runtime.live_body.is_focusable());
+        assert!(!runtime.card.can_target());
+        assert_eq!(
+            runtime.sprite.accessible_role(),
+            gtk4::AccessibleRole::Presentation
+        );
+        assert_eq!(
+            runtime.live_body.accessible_role(),
+            gtk4::AccessibleRole::Presentation
+        );
+        assert_eq!(
+            runtime.sticky_avatar.accessible_role(),
+            gtk4::AccessibleRole::Presentation
+        );
+        assert_eq!(
+            runtime.status.accessible_role(),
+            gtk4::AccessibleRole::Status
+        );
+        assert_eq!(runtime.state.accessible_role(), gtk4::AccessibleRole::Label);
+        assert!(!runtime.status.text().is_empty());
+        assert!(!runtime.state.text().is_empty());
+        // Exercise the old passive metadata widget in isolation, then detach
+        // it: production attachment no longer mounts an organism card.
+        runtime.card.set_visible(true);
+        view.insert_inline_notice(&runtime.card);
+        view.put_live_organism_body(runtime.live_body.upcast_ref(), 0.0, 0.0);
+        view.put_sticky_organism_avatar(runtime.sticky_avatar.upcast_ref());
+        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let entry = gtk4::Entry::new();
+        content.append(&entry);
+        content.append(&view.widget());
+        let screenshot_width = std::env::var("ORGANISM_LIVE_SCREENSHOT_WIDTH")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(700)
+            .clamp(280, 900);
+        let tooltip_overlay = gtk4::Overlay::new();
+        tooltip_overlay.set_child(Some(&content));
+        // Keep palette dialogs inside this existing test host, without creating
+        // an additional native window. Production host types are unchanged.
+        let window = libadwaita::Window::builder()
+            .default_width(screenshot_width)
+            .default_height(500)
+            .content(&tooltip_overlay)
+            .build()
+            .upcast::<gtk4::Window>();
+        window.present();
+        entry.grab_focus();
+        let main = gtk4::glib::MainContext::default();
+        let mapped_at = Instant::now();
+        while mapped_at.elapsed() < Duration::from_millis(120) {
+            while main.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(view.widget().is_mapped());
+        crate::block_view::organism_settings_test_clean_prompt(&view);
+        #[cfg(target_os = "linux")]
+        assert_inline_card_repaint(&window, &runtime);
+        let wait_for_tooltip_layout = |ready: &dyn Fn() -> bool| {
+            let started = Instant::now();
+            while !ready() && started.elapsed() < Duration::from_secs(2) {
+                while main.iteration(false) {}
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(ready(), "tooltip fixture layout did not settle");
+        };
+        let tooltip: gtk4::Tooltip = gtk4::glib::Object::new();
+        let pane_root = view.widget();
+        let bounds = runtime.state.compute_bounds(&pane_root).unwrap();
+        let tip_x = (bounds.x() + bounds.width() / 2.0) as i32;
+        let tip_y = (bounds.y() + bounds.height() / 2.0) as i32;
+        #[cfg(target_os = "linux")]
+        {
+            let point = pane_root
+                .compute_point(
+                    &window,
+                    &gtk4::graphene::Point::new(tip_x as f32, tip_y as f32),
+                )
+                .unwrap();
+            move_native_pointer(&window, point.x() as i32, point.y() as i32);
+        }
+        let pointer = pane_root
+            .display()
+            .default_seat()
+            .unwrap()
+            .pointer()
+            .unwrap();
+        let surface = window.surface().unwrap();
+        wait_for_tooltip_layout(&|| surface.device_position(&pointer).is_some());
+        #[cfg(target_os = "linux")]
+        let wait_for_button = |pressed: bool| {
+            let started = Instant::now();
+            loop {
+                while main.iteration(false) {}
+                let observed = surface
+                    .device_position(&pointer)
+                    .map(|(_, _, mask)| mask.contains(gtk4::gdk::ModifierType::BUTTON1_MASK));
+                if observed == Some(pressed) {
+                    break true;
+                }
+                if started.elapsed() >= Duration::from_secs(2) {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let query = |keyboard: bool| {
+            pane_root.emit_by_name::<bool>("query-tooltip", &[&tip_x, &tip_y, &keyboard, &tooltip])
+        };
+        assert!(
+            query(false),
+            "native query reaches the pass-through state label"
+        );
+        assert!(!query(true), "keyboard tooltip coordinates are not defined");
+        assert_eq!(
+            runtime
+                .card_tooltip_at(&view, &pane_root, tip_x, tip_y, false)
+                .unwrap()
+                .0,
+            runtime.state.tooltip_text().unwrap()
+        );
+        assert!(runtime
+            .card_tooltip_at(&view, &entry.clone().upcast(), tip_x, tip_y, false)
+            .is_none());
+        assert!(runtime
+            .card_tooltip_at(&view, &pane_root, -100, -100, false)
+            .is_none());
+        let focus_before_tooltip = gtk4::prelude::RootExt::focus(&window);
+        // A pass-through overlay must block only the explanation, while the
+        // actual input pick remains unchanged beneath that decoration.
+        let cover = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        cover.set_hexpand(true);
+        cover.set_vexpand(true);
+        cover.set_can_target(false);
+        let input_pick =
+            pane_root.pick(f64::from(tip_x), f64::from(tip_y), gtk4::PickFlags::DEFAULT);
+        tooltip_overlay.add_overlay(&cover);
+        wait_for_tooltip_layout(&|| cover.width() > 0 && cover.height() > 0);
+        assert!(!query(false), "top-level overlay hides the card tooltip");
+        assert_eq!(
+            pane_root.pick(f64::from(tip_x), f64::from(tip_y), gtk4::PickFlags::DEFAULT),
+            input_pick
+        );
+        tooltip_overlay.remove_overlay(&cover);
+        while main.iteration(false) {}
+        assert!(query(false));
+        runtime.card.set_visible(false);
+        assert!(
+            !query(false),
+            "unmapped cards cannot keep a forwarded tooltip"
+        );
+        runtime.card.set_visible(true);
+        wait_for_tooltip_layout(&|| query(false));
+        assert_eq!(gtk4::prelude::RootExt::focus(&window), focus_before_tooltip);
+        assert!(!runtime.card.can_target());
+        #[cfg(target_os = "linux")]
+        {
+            native_pointer_button(true);
+            let pressed_seen = wait_for_button(true);
+            let while_pressed = query(false);
+            // Release before any assertion, including an observation timeout.
+            native_pointer_button(false);
+            let released_seen = wait_for_button(false);
+            assert!(pressed_seen, "native pointer press was not observed");
+            assert!(released_seen, "native pointer release was not observed");
+            assert!(!while_pressed, "held selection cannot show a card tooltip");
+            // The synthetic native press may move focus through the card;
+            // restore the entry required by the existing settings assertions.
+            entry.grab_focus();
+        }
+
+        view.remove_inline_notice(&runtime.card);
+        runtime.card.set_visible(false);
+        presence.focus_view(Some(&view));
+        let before = life.get();
+        for _ in 0..4 {
+            OrganismRuntime::apply_settings(&runtime, &view, false, OrganismMotion::Static);
+            assert!(runtime.surface_timer.borrow().is_none());
+            assert!(!runtime.card.is_visible());
+            assert!(crate::block_view::organism_settings_test_onboarding(&view));
+            assert!(!runtime.sticky_avatar.is_visible());
+            assert!(!runtime.sleeping.get());
+            *runtime.last_repo_root.borrow_mut() = Some("/synthetic/previous-checkout".into());
+            *runtime.last_repo_cwd.borrow_mut() = Some("/synthetic/previous-checkout".into());
+            runtime
+                .organism
+                .borrow_mut()
+                .restore_repo_context(3, false, 0, 3);
+            assert!(runtime.organism.borrow().repo_vigil().is_active());
+            OrganismRuntime::apply_settings(&runtime, &view, true, OrganismMotion::Full);
+            assert!(!runtime.organism.borrow().repo_vigil().is_active());
+            assert!(runtime.last_repo_root.borrow().is_none());
+            assert!(runtime.surface_timer.borrow().is_some());
+            assert!(!runtime.card.is_visible());
+            assert!(crate::block_view::organism_settings_test_onboarding(&view));
+            OrganismRuntime::apply_settings(&runtime, &view, true, OrganismMotion::Static);
+            assert!(
+                runtime.body_position.get().is_some(),
+                "Static retains the unique body"
+            );
+            assert!(!runtime.sticky_avatar.is_visible());
+            assert_eq!(presence.state.borrow().entries.len(), 1);
+        }
+        window.set_default_size(380, 500);
+        while main.iteration(false) {}
+        assert!(crate::block_view::organism_settings_test_onboarding(&view));
+        crate::block_view::organism_settings_test_first_command(&view);
+        OrganismRuntime::apply_settings(&runtime, &view, false, OrganismMotion::Static);
+        assert!(!crate::block_view::organism_settings_test_onboarding(&view));
+        window.set_default_size(screenshot_width, 500);
+        runtime.last_human_input.set(Some(Instant::now()));
+        OrganismRuntime::apply_settings(&runtime, &view, true, OrganismMotion::Full);
+        assert!(
+            runtime.body_position.get().is_none(),
+            "typing retreat survives motion changes"
+        );
+        assert!(gtk4::prelude::GtkWindowExt::focus(&window)
+            .is_some_and(|focus| focus.is_ancestor(&entry) || focus == entry));
+        assert_eq!(
+            state_summary(life.get()),
+            state_summary(before),
+            "settings previews/toggles do not grow the organism"
+        );
+        OrganismRuntime::apply_settings(&runtime, &view, false, OrganismMotion::Full);
+        let main = gtk4::glib::MainContext::default();
+        while main.iteration(false) {}
+        assert!(
+            runtime.surface_timer.borrow().is_none(),
+            "queued work cannot revive a disabled timer"
+        );
+        crate::block_view::organism_settings_test_running(&view, true);
+        OrganismRuntime::apply_settings(&runtime, &view, true, OrganismMotion::Full);
+        assert!(runtime.awaiting_unobserved_work.get());
+        assert!(runtime.body_position.get().is_none());
+        assert!(
+            !runtime.command_running.get(),
+            "enabling does not fabricate a command start"
+        );
+        assert_eq!(
+            runtime.status.text().as_str(),
+            "Waiting for the current terminal activity to settle"
+        );
+        crate::block_view::organism_settings_test_running(&view, false);
+        runtime.refresh_surface(&view, Instant::now());
+        assert!(!runtime.awaiting_unobserved_work.get());
+        runtime.last_human_input.set(None);
+        runtime.command_running.set(true);
+        runtime.visible_watch_rhythm.set(WatchRhythm::Waiting);
+        runtime.refresh_surface(&view, Instant::now());
+        while main.iteration(false) {}
+        runtime.visible_watch_rhythm.set(WatchRhythm::Waiting);
+        runtime.refresh_surface(&view, Instant::now());
+        assert!(runtime.live_body.is_mapped());
+        assert!(runtime
+            .state
+            .text()
+            .contains("Keeping watch while output is quiet; the command has not finished."));
+        assert!(runtime
+            .state
+            .tooltip_text()
+            .unwrap()
+            .contains("Keeping watch while output is quiet; the command has not finished."));
+        let authoritative_status = runtime.status.text();
+        runtime.visible_watch_rhythm.set(WatchRhythm::Resumed);
+        runtime.refresh_surface(&view, Instant::now());
+        assert!(runtime
+            .state
+            .text()
+            .contains("Perking up as command output resumes."));
+        assert_eq!(runtime.status.text(), authoritative_status);
+        runtime.hide_live_body(&view);
+        assert!(!runtime
+            .state
+            .text()
+            .contains("Perking up as command output resumes."));
+        runtime.command_running.set(false);
+        OrganismRuntime::apply_settings(&runtime, &view, false, OrganismMotion::Full);
+
+        // Exercise the real motion controller on a stationary calm body.
+        #[cfg(target_os = "linux")]
+        {
+            runtime.last_human_input.set(None);
+            OrganismRuntime::apply_settings(&runtime, &view, true, OrganismMotion::Calm);
+            if let Some(source) = runtime.surface_timer.borrow_mut().take() {
+                source.remove();
+            }
+            OrganismRuntime::install_pointer_observer(&runtime, &view);
+            let settle = |duration: Duration| {
+                let start = Instant::now();
+                while start.elapsed() < duration {
+                    while main.iteration(false) {}
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            };
+            runtime.refresh_surface(&view, Instant::now());
+            settle(Duration::from_millis(80));
+            runtime.refresh_surface(&view, Instant::now());
+            settle(Duration::from_millis(80));
+            assert!(
+                runtime.live_body.is_mapped(),
+                "pointer greetings require a genuinely visible body"
+            );
+            let bounds = runtime
+                .live_body
+                .compute_bounds(&window)
+                .expect("body bounds");
+            let x = (bounds.x() + bounds.width() / 2.0) as i32;
+            let y = (bounds.y() + bounds.height() / 2.0) as i32;
+            let life_before = format!("{:?}", life.get());
+            crate::block_view::organism_settings_test_pty_bytes(&view);
+            move_native_pointer(&window, 1, 1);
+            settle(Duration::from_millis(40));
+            move_native_pointer(&window, x, y);
+            settle(Duration::from_millis(100));
+            assert!(
+                runtime.pointer_timer.borrow().is_some(),
+                "native pointer must reach the passive observer"
+            );
+            assert!(runtime.live_body.has_css_class("organism-hover-candidate"));
+            let before_human = runtime.last_human_input.get();
+            let before_cooldown = probe_window_greeting(&presence, token);
+            view.write_input(b"\r")
+                .expect("nonexecuting queue accepts CR");
+            assert_eq!(
+                view.organism_activity_knowledge(),
+                jterm_core::organism_live::LiveActivityKnowledge::Unknown
+            );
+            assert!(runtime.pointer_timer.borrow().is_none());
+            assert_eq!(runtime.last_human_input.get(), before_human);
+            assert_eq!(probe_window_greeting(&presence, token), before_cooldown);
+            assert_eq!(
+                crate::block_view::organism_settings_test_pty_bytes(&view),
+                b"\r"
+            );
+            crate::block_view::organism_settings_test_clean_prompt(&view);
+            runtime.refresh_surface(&view, Instant::now());
+            assert!(
+                runtime.pointer_timer.borrow().is_none(),
+                "prompt recovery is not a pointer entry"
+            );
+            move_native_pointer(&window, 1, 1);
+            settle(Duration::from_millis(40));
+            move_native_pointer(&window, x, y);
+            settle(Duration::from_millis(100));
+            assert!(runtime.pointer_timer.borrow().is_some());
+            let retired_ticket = runtime.pointer_timer.borrow().as_ref().unwrap().ticket;
+            // Compare CSS geometry synchronously with the same sprite: an
+            // animation frame changing between measurements is unrelated.
+            runtime
+                .live_body
+                .remove_css_class("organism-hover-candidate");
+            let plain_width = runtime.live_body.measure(gtk4::Orientation::Horizontal, -1);
+            let plain_height = runtime.live_body.measure(gtk4::Orientation::Vertical, -1);
+            runtime.live_body.add_css_class("organism-hover-candidate");
+            assert_eq!(
+                runtime.live_body.measure(gtk4::Orientation::Horizontal, -1),
+                plain_width
+            );
+            assert_eq!(
+                runtime.live_body.measure(gtk4::Orientation::Vertical, -1),
+                plain_height
+            );
+            native_pointer_button(true);
+            settle(Duration::from_millis(40));
+            assert!(!runtime.live_body.has_css_class("organism-hover-candidate"));
+            assert!(
+                runtime.pointer_timer.borrow().is_none(),
+                "press without motion cancels pending dwell without consuming the click"
+            );
+            settle(POINTER_GREETING_DWELL);
+            assert!(
+                runtime
+                    .attention_snapshot
+                    .get()
+                    .is_none_or(|snapshot| snapshot.active.is_none()),
+                "held selection never greets"
+            );
+            native_pointer_button(false);
+            settle(Duration::from_millis(40));
+            move_native_pointer(&window, 1, 1);
+            settle(Duration::from_millis(40));
+            move_native_pointer(&window, x, y);
+            settle(Duration::from_millis(100));
+            assert!(runtime.pointer_timer.borrow().is_some());
+            let source = runtime
+                .pointer_timer
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .source
+                .as_raw();
+            let candidate_deadline = runtime
+                .attention_snapshot
+                .get()
+                .unwrap()
+                .candidate
+                .unwrap()
+                .deadline;
+            OrganismRuntime::pointer_candidate_fired(
+                &runtime,
+                &Rc::downgrade(&view),
+                retired_ticket,
+            );
+            assert_eq!(
+                runtime
+                    .pointer_timer
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .source
+                    .as_raw(),
+                source,
+                "late callback cannot consume a newer native source"
+            );
+            assert!(runtime.live_body.has_css_class("organism-hover-candidate"));
+            let retired_pane = OrganismRuntime::new(
+                life.clone(),
+                runtime.activity.clone(),
+                presence.clone(),
+                presence.reserve(),
+                OrganismMotion::Calm,
+                false,
+            );
+            retired_pane.cancel_pointer_greeting();
+            drop(retired_pane);
+            assert_eq!(
+                runtime
+                    .pointer_timer
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .source
+                    .as_raw(),
+                source,
+                "retired pane cancellation and Drop cannot retire the owner's native source"
+            );
+            assert_eq!(presence.attention.borrow().owner(), Some(&token));
+            runtime.refresh_surface(&view, Instant::now());
+            assert_eq!(
+                runtime
+                    .attention_snapshot
+                    .get()
+                    .unwrap()
+                    .candidate
+                    .unwrap()
+                    .deadline,
+                candidate_deadline,
+                "old pane cannot mutate the shared candidate"
+            );
+            OrganismRuntime::apply_settings(&runtime, &view, true, OrganismMotion::Full);
+            OrganismRuntime::apply_settings(&runtime, &view, true, OrganismMotion::Calm);
+            assert_eq!(
+                runtime
+                    .attention_snapshot
+                    .get()
+                    .unwrap()
+                    .candidate
+                    .unwrap()
+                    .deadline,
+                candidate_deadline,
+                "motion preference cannot restart dwell"
+            );
+            move_native_pointer(&window, x + 1, y);
+            settle(Duration::from_millis(40));
+            assert_eq!(
+                runtime
+                    .pointer_timer
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .source
+                    .as_raw(),
+                source,
+                "motion within the hit zone never allocates another timer"
+            );
+            settle(POINTER_GREETING_DWELL);
+            assert!(!runtime.live_body.has_css_class("organism-hover-candidate"));
+            assert!(
+                runtime.attention_snapshot.get().unwrap().active.is_some(),
+                "dwell admitted greeting"
+            );
+            if let Some(ms) = std::env::var("ORGANISM_LIVE_SCREENSHOT_PAUSE_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                println!("ORGANISM_LIVE_READY");
+                let until = Instant::now() + Duration::from_millis(ms.min(1_500));
+                while Instant::now() < until {
+                    runtime.refresh_surface(&view, Instant::now());
+                    settle(Duration::from_millis(50));
+                }
+            }
+            assert_eq!(
+                runtime
+                    .attention_snapshot
+                    .get()
+                    .unwrap()
+                    .presentation
+                    .behavior,
+                Behavior::Approach
+            );
+            move_native_pointer(&window, 1, 1);
+            settle(Duration::from_millis(40));
+            assert!(runtime.pointer_timer.borrow().is_none());
+            move_native_pointer(&window, x, y);
+            settle(POINTER_GREETING_DWELL + Duration::from_millis(80));
+            assert!(
+                !runtime.request_greeting(&view),
+                "repeated entry and explicit requests share the window cooldown"
+            );
+            assert!(!runtime.live_body.has_css_class("organism-hover-candidate"));
+            assert_eq!(
+                format!("{:?}", life.get()),
+                life_before,
+                "greeting never changes real physiology"
+            );
+            assert!(
+                crate::block_view::organism_settings_test_pty_bytes(&view).is_empty(),
+                "pointer greeting sends no terminal input"
+            );
+            presence.focus_view(None);
+            assert!(runtime.pointer_timer.borrow().is_none());
+            assert!(runtime.body_position.get().is_none());
+            OrganismRuntime::observe_pointer(&runtime, &view, f64::from(x), f64::from(y), false);
+            assert!(
+                runtime.pointer_timer.borrow().is_none(),
+                "an unfocused body cannot schedule hover work"
+            );
+            presence.focus_view(Some(&view));
+            runtime.command_running.set(true);
+            runtime.cancel_pointer_greeting();
+            OrganismRuntime::observe_pointer(&runtime, &view, f64::from(x), f64::from(y), false);
+            assert!(
+                runtime.pointer_timer.borrow().is_none(),
+                "busy work does not accept a greeting"
+            );
+            runtime.command_running.set(false);
+            // Explicit hello shares the real pointer cooldown. It does not
+            // need a pointer nearby and leaving does not erase its short hold.
+            assert!(!runtime.request_greeting(&view));
+            move_native_pointer(&window, 1, 1);
+            settle(GentleInteraction::COOLDOWN);
+            OrganismRuntime::apply_settings(&runtime, &view, true, OrganismMotion::Full);
+            native_pointer_button(true);
+            let pressed_seen = wait_for_button(true);
+            let local_drag = pointer_buttons_down(&view);
+            let explicit_during_drag = runtime.request_greeting(&view);
+            OrganismRuntime::observe_pointer(&runtime, &view, f64::from(x), f64::from(y), true);
+            let pointer_during_drag = runtime
+                .attention_snapshot
+                .get()
+                .is_some_and(|snapshot| snapshot.active.is_some() || snapshot.candidate.is_some());
+            native_pointer_button(false);
+            let released_seen = wait_for_button(false);
+            assert!(
+                pressed_seen && released_seen,
+                "native drag lifecycle was not observed"
+            );
+            assert!(local_drag && !pointer_buttons_down(&view));
+            assert!(!explicit_during_drag && !pointer_during_drag);
+            assert!(runtime
+                .attention_snapshot
+                .get()
+                .is_none_or(|snapshot| snapshot.active.is_none()));
+            // Immediate acceptance below, after release, proves rejection did
+            // not spend a fresh cooldown.
+            runtime
+                .activity
+                .active_at
+                .set(Some(Instant::now() - REST_ONSET));
+            if let Some(source) = runtime.surface_timer.borrow_mut().take() {
+                source.remove();
+            }
+            OrganismRuntime::schedule_surface_frame(&runtime, &view, DORMANT_FRAME_INTERVAL);
+            let dormant_source = runtime.surface_timer.borrow().as_ref().unwrap().as_raw();
+            let dormant_revision = runtime.surface_timer_revision.get().unwrap();
+            let frame_before = runtime.surface_frame.get();
+            runtime.refresh_surface(&view, Instant::now());
+            assert!(runtime.request_greeting(&view));
+            assert_ne!(
+                runtime.surface_timer.borrow().as_ref().unwrap().as_raw(),
+                dormant_source,
+                "admission replaces a pending dormant source immediately"
+            );
+            assert_eq!(
+                runtime.next_surface_frame_delay(&view, Instant::now()),
+                SURFACE_FRAME_INTERVAL
+            );
+            let active_source = runtime.surface_timer.borrow().as_ref().unwrap().as_raw();
+            let active_deadline = runtime.surface_deadline.get();
+            assert!(!runtime.consume_surface_frame_callback(dormant_revision));
+            assert_eq!(
+                runtime.surface_timer.borrow().as_ref().unwrap().as_raw(),
+                active_source,
+                "an already-dispatched old callback cannot consume the replacement source"
+            );
+            assert_eq!(runtime.surface_deadline.get(), active_deadline);
+            assert_eq!(runtime.surface_frame.get(), frame_before);
+            let greeting_frame = runtime.surface_frame.get();
+            settle(Duration::from_millis(250));
+            assert!(
+                runtime.surface_frame.get() > greeting_frame,
+                "the accepted Full greeting advances before a dormant heartbeat"
+            );
+            assert!(runtime.surface_timer.borrow().is_some());
+            let explicit_deadline = runtime
+                .attention_snapshot
+                .get()
+                .unwrap()
+                .active
+                .unwrap()
+                .deadline;
+            let explicit_before = runtime.attention_snapshot.get().unwrap().active;
+            let human_before = runtime.last_human_input.get();
+            view.write_input(b"\r")
+                .expect("nonexecuting queue accepts CR");
+            assert_eq!(
+                view.organism_activity_knowledge(),
+                jterm_core::organism_live::LiveActivityKnowledge::Unknown
+            );
+            assert_eq!(
+                runtime.attention_snapshot.get().unwrap().active,
+                explicit_before,
+                "Unknown preserves the accepted Explicit hold and original deadline"
+            );
+            assert_eq!(runtime.last_human_input.get(), human_before);
+            assert_eq!(
+                crate::block_view::organism_settings_test_pty_bytes(&view),
+                b"\r"
+            );
+            crate::block_view::organism_settings_test_clean_prompt(&view);
+            OrganismRuntime::apply_settings(&runtime, &view, true, OrganismMotion::Calm);
+            assert_eq!(
+                runtime
+                    .attention_snapshot
+                    .get()
+                    .unwrap()
+                    .active
+                    .unwrap()
+                    .deadline,
+                explicit_deadline,
+                "Calm preserves the accepted hold"
+            );
+            OrganismRuntime::apply_settings(&runtime, &view, true, OrganismMotion::Full);
+            assert_eq!(
+                runtime
+                    .attention_snapshot
+                    .get()
+                    .unwrap()
+                    .active
+                    .unwrap()
+                    .deadline,
+                explicit_deadline,
+                "Full resumes presentation without extending it"
+            );
+            runtime.pointer_left(&view);
+            runtime.refresh_surface(&view, Instant::now());
+            assert_eq!(
+                runtime
+                    .presented_surface
+                    .get()
+                    .map(|(behavior, _)| behavior),
+                Some(Behavior::Approach)
+            );
+            assert!(runtime.pointer_timer.borrow().is_none());
+            assert!(runtime
+                .attention_snapshot
+                .get()
+                .and_then(|snapshot| snapshot.active)
+                .is_some_and(|active| active.source == LiveAttentionSource::Explicit
+                    && active.deadline == explicit_deadline));
+            move_native_pointer(&window, x, y);
+            settle(Duration::from_millis(40));
+            native_pointer_button(true);
+            settle(Duration::from_millis(40));
+            assert!(runtime
+                .attention_snapshot
+                .get()
+                .is_none_or(|snapshot| snapshot.active.is_none()));
+            native_pointer_button(false);
+            settle(Duration::from_millis(40));
+            assert!(!runtime.request_greeting(&view));
+            OrganismRuntime::apply_settings(&runtime, &view, false, OrganismMotion::Calm);
+            assert!(runtime.pointer_timer.borrow().is_none());
+        }
+        OrganismRuntime::apply_settings(&runtime, &view, true, OrganismMotion::Static);
+        let still_body = runtime.live_body.clone();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(1_000) {
+            while main.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(runtime.live_body, still_body, "Static reuses the same body");
+        let context = runtime.live_context.get();
+        let text = runtime.live_body.text();
+        assert!(
+            text.as_str() == sprite_frame_with_context(context, 0).as_ref()
+                || text.as_str() == sticky_glyph_with_context(context, 0).as_ref(),
+            "Static keeps frame zero while observed ambient state may change"
+        );
+        assert!(runtime.body_position.get().is_some());
+        OrganismRuntime::apply_settings(&runtime, &view, false, OrganismMotion::Static);
+        assert!(runtime.surface_timer.borrow().is_none());
+        assert!(runtime.pointer_timer.borrow().is_none());
+        println!("DAILY_RUNTIME_COUNTS disabled_frame_timers=0 disabled_hover_timers=0 static_frame_zero=true");
+        super::super::organism_vte::exercise_existing_native_fixture(&window);
+        window.close();
     }
 
     #[test]
@@ -3837,12 +6752,4150 @@ mod tests {
             ),
             VisualTransition::between(Behavior::Celebrate, Behavior::GuardRecovery)
         );
+        // Full motion must mirror every bridge core recognizes — including the
+        // vigil-tier arcs (SitNearError→GuardFailure, Failure→Stuck,
+        // Recovery→Cautious). On an older pin `between` is None and Full stays
+        // None; after core fbfcafa both sides become Some together.
+        let semantic_bridges: &[(Behavior, Behavior)] = &[
+            (Behavior::SitNearError, Behavior::GuardFailure),
+            (Behavior::SitNearError, Behavior::GuardStuck),
+            (Behavior::SitNearError, Behavior::GuardRecovery),
+            (Behavior::SitNearError, Behavior::GuardCautious),
+            (Behavior::SitNearError, Behavior::Celebrate),
+            (Behavior::SitNearError, Behavior::CelebrateBig),
+            (Behavior::SitNearError, Behavior::UnknownOutcome),
+            (Behavior::SitNearError, Behavior::Idle),
+            (Behavior::SitNearError, Behavior::RestAfterPush),
+            (Behavior::InspectError, Behavior::GuardFailure),
+            (Behavior::InspectError, Behavior::GuardRecovery),
+            (Behavior::InspectError, Behavior::GuardCautious),
+            (Behavior::InspectError, Behavior::GuardStuck),
+            (Behavior::InspectError, Behavior::Celebrate),
+            (Behavior::InspectError, Behavior::CelebrateBig),
+            (Behavior::InspectError, Behavior::SitNearError),
+            (Behavior::InspectError, Behavior::UnknownOutcome),
+            (Behavior::InspectError, Behavior::Idle),
+            (Behavior::InspectError, Behavior::RestAfterPush),
+            (Behavior::Celebrate, Behavior::GuardRecovery),
+            (Behavior::Celebrate, Behavior::GuardCautious),
+            (Behavior::Celebrate, Behavior::GuardFailure),
+            (Behavior::Celebrate, Behavior::GuardStuck),
+            (Behavior::Celebrate, Behavior::RestAfterPush),
+            (Behavior::Celebrate, Behavior::Idle),
+            (Behavior::Celebrate, Behavior::InspectError),
+            (Behavior::Celebrate, Behavior::SitNearError),
+            (Behavior::Celebrate, Behavior::UnknownOutcome),
+            (Behavior::CelebrateBig, Behavior::GuardRecovery),
+            (Behavior::CelebrateBig, Behavior::GuardCautious),
+            (Behavior::CelebrateBig, Behavior::GuardFailure),
+            (Behavior::CelebrateBig, Behavior::GuardStuck),
+            (Behavior::CelebrateBig, Behavior::RestAfterPush),
+            (Behavior::CelebrateBig, Behavior::Idle),
+            (Behavior::CelebrateBig, Behavior::InspectError),
+            (Behavior::CelebrateBig, Behavior::SitNearError),
+            (Behavior::CelebrateBig, Behavior::UnknownOutcome),
+            (Behavior::RestAfterPush, Behavior::Idle),
+            (Behavior::RestAfterPush, Behavior::InspectError),
+            (Behavior::RestAfterPush, Behavior::SitNearError),
+            (Behavior::RestAfterPush, Behavior::UnknownOutcome),
+            (Behavior::RestAfterPush, Behavior::Celebrate),
+            (Behavior::RestAfterPush, Behavior::CelebrateBig),
+            // WatchSettled finish arcs (6 Some) — pairs core
+            // `watch_settled_finish_arcs_cover_pass_fail_rest_and_idle`; counted
+            // inside between() 93 (no new Some after that pin).
+            (Behavior::WatchSettled, Behavior::Celebrate),
+            (Behavior::WatchSettled, Behavior::CelebrateBig),
+            (Behavior::WatchSettled, Behavior::InspectError),
+            (Behavior::WatchSettled, Behavior::SitNearError),
+            (Behavior::WatchSettled, Behavior::RestAfterPush),
+            (Behavior::WatchSettled, Behavior::Idle),
+            (Behavior::WatchCommand, Behavior::Celebrate),
+            (Behavior::WatchCommand, Behavior::CelebrateBig),
+            (Behavior::WatchCommand, Behavior::InspectError),
+            (Behavior::WatchCommand, Behavior::SitNearError),
+            (Behavior::WatchCommand, Behavior::RestAfterPush),
+            (Behavior::WatchCommand, Behavior::Idle),
+            (Behavior::WatchAgent, Behavior::Celebrate),
+            (Behavior::WatchAgent, Behavior::InspectError),
+            (Behavior::WatchAgent, Behavior::SitNearError),
+            (Behavior::WatchAgent, Behavior::RestAfterPush),
+            (Behavior::WatchAgent, Behavior::Idle),
+            (Behavior::UnknownOutcome, Behavior::Idle),
+            (Behavior::UnknownOutcome, Behavior::InspectError),
+            (Behavior::UnknownOutcome, Behavior::Celebrate),
+            (Behavior::UnknownOutcome, Behavior::CelebrateBig),
+            (Behavior::UnknownOutcome, Behavior::SitNearError),
+            (Behavior::UnknownOutcome, Behavior::GuardFailure),
+            (Behavior::UnknownOutcome, Behavior::GuardStuck),
+            (Behavior::UnknownOutcome, Behavior::GuardRecovery),
+            (Behavior::UnknownOutcome, Behavior::GuardCautious),
+            (Behavior::UnknownOutcome, Behavior::RestAfterPush),
+            (Behavior::GuardFailure, Behavior::GuardStuck),
+            (Behavior::GuardFailure, Behavior::GuardRecovery),
+            (Behavior::GuardFailure, Behavior::GuardCautious),
+            (Behavior::GuardFailure, Behavior::RestAfterPush),
+            (Behavior::GuardFailure, Behavior::Idle),
+            (Behavior::GuardStuck, Behavior::GuardFailure),
+            (Behavior::GuardStuck, Behavior::GuardRecovery),
+            (Behavior::GuardStuck, Behavior::GuardCautious),
+            (Behavior::GuardStuck, Behavior::RestAfterPush),
+            (Behavior::GuardStuck, Behavior::Idle),
+            (Behavior::GuardRecovery, Behavior::GuardFailure),
+            (Behavior::GuardRecovery, Behavior::GuardStuck),
+            (Behavior::GuardRecovery, Behavior::GuardCautious),
+            (Behavior::GuardRecovery, Behavior::RestAfterPush),
+            (Behavior::GuardRecovery, Behavior::Idle),
+            (Behavior::GuardRecovery, Behavior::InspectError),
+            (Behavior::GuardRecovery, Behavior::SitNearError),
+            (Behavior::GuardRecovery, Behavior::UnknownOutcome),
+            (Behavior::GuardCautious, Behavior::GuardFailure),
+            (Behavior::GuardCautious, Behavior::GuardStuck),
+            (Behavior::GuardCautious, Behavior::GuardRecovery),
+            (Behavior::GuardCautious, Behavior::RestAfterPush),
+            (Behavior::GuardCautious, Behavior::Idle),
+        ];
+        assert_eq!(
+            semantic_bridges.len(),
+            93,
+            "semantic_bridges list must match core visual_transition_between_recognizes_ninety_three_intentional_arcs"
+        );
+        // Celebrate{,Big}/RestAfterPush/GuardRecovery↔UnknownOutcome /
+        // Unknown→GuardCautious / Unknown→GuardStuck / Unknown→GuardFailure /
+        // Unknown→Idle / Unknown→Celebrate / Unknown→CelebrateBig /
+        // Unknown→SitNearError / Unknown→InspectError /
+        // Unknown→RestAfterPush / GuardCautious→Idle / GuardFailure→Idle /
+        // GuardStuck→Idle stay inside between() 93 and this UI bridge list
+        // (no len bump; already counted in the 93).
+        for pair in [
+            (Behavior::Celebrate, Behavior::UnknownOutcome),
+            (Behavior::CelebrateBig, Behavior::UnknownOutcome),
+            (Behavior::RestAfterPush, Behavior::UnknownOutcome),
+            (Behavior::GuardRecovery, Behavior::UnknownOutcome),
+            (Behavior::UnknownOutcome, Behavior::GuardRecovery),
+            (Behavior::UnknownOutcome, Behavior::GuardCautious),
+            (Behavior::UnknownOutcome, Behavior::GuardStuck),
+            (Behavior::UnknownOutcome, Behavior::GuardFailure),
+            (Behavior::UnknownOutcome, Behavior::Idle),
+            (Behavior::UnknownOutcome, Behavior::Celebrate),
+            (Behavior::UnknownOutcome, Behavior::CelebrateBig),
+            (Behavior::UnknownOutcome, Behavior::SitNearError),
+            (Behavior::UnknownOutcome, Behavior::InspectError),
+            (Behavior::UnknownOutcome, Behavior::RestAfterPush),
+            (Behavior::GuardCautious, Behavior::Idle),
+            (Behavior::GuardFailure, Behavior::Idle),
+            (Behavior::GuardStuck, Behavior::Idle),
+            (Behavior::GuardRecovery, Behavior::Idle),
+            (Behavior::Celebrate, Behavior::Idle),
+            (Behavior::CelebrateBig, Behavior::Idle),
+            (Behavior::RestAfterPush, Behavior::Idle),
+            (Behavior::InspectError, Behavior::Idle),
+            (Behavior::SitNearError, Behavior::Idle),
+            (Behavior::WatchCommand, Behavior::Idle),
+            (Behavior::WatchAgent, Behavior::Idle),
+            (Behavior::WatchSettled, Behavior::Idle),
+            (Behavior::WatchAgent, Behavior::Celebrate),
+            (Behavior::WatchCommand, Behavior::Celebrate),
+            (Behavior::WatchCommand, Behavior::CelebrateBig),
+            (Behavior::WatchCommand, Behavior::InspectError),
+            (Behavior::WatchCommand, Behavior::SitNearError),
+            (Behavior::WatchCommand, Behavior::RestAfterPush),
+            (Behavior::WatchAgent, Behavior::InspectError),
+            (Behavior::WatchAgent, Behavior::SitNearError),
+            (Behavior::WatchAgent, Behavior::RestAfterPush),
+            (Behavior::WatchSettled, Behavior::Celebrate),
+            (Behavior::WatchSettled, Behavior::CelebrateBig),
+            (Behavior::WatchSettled, Behavior::InspectError),
+            (Behavior::WatchSettled, Behavior::SitNearError),
+            (Behavior::WatchSettled, Behavior::RestAfterPush),
+            (Behavior::InspectError, Behavior::GuardFailure),
+            (Behavior::SitNearError, Behavior::GuardStuck),
+            (Behavior::SitNearError, Behavior::GuardFailure),
+            (Behavior::SitNearError, Behavior::GuardCautious),
+            (Behavior::SitNearError, Behavior::GuardRecovery),
+            (Behavior::InspectError, Behavior::GuardStuck),
+            (Behavior::InspectError, Behavior::GuardCautious),
+            (Behavior::InspectError, Behavior::GuardRecovery),
+            (Behavior::InspectError, Behavior::Celebrate),
+            (Behavior::InspectError, Behavior::CelebrateBig),
+            (Behavior::InspectError, Behavior::SitNearError),
+            (Behavior::InspectError, Behavior::UnknownOutcome),
+            (Behavior::InspectError, Behavior::RestAfterPush),
+            (Behavior::SitNearError, Behavior::Celebrate),
+            (Behavior::SitNearError, Behavior::CelebrateBig),
+            (Behavior::SitNearError, Behavior::UnknownOutcome),
+            (Behavior::SitNearError, Behavior::RestAfterPush),
+            (Behavior::GuardFailure, Behavior::GuardStuck),
+            (Behavior::GuardFailure, Behavior::GuardRecovery),
+            (Behavior::GuardFailure, Behavior::GuardCautious),
+            (Behavior::GuardFailure, Behavior::RestAfterPush),
+            (Behavior::GuardStuck, Behavior::GuardFailure),
+            (Behavior::GuardStuck, Behavior::GuardRecovery),
+            (Behavior::GuardStuck, Behavior::GuardCautious),
+            (Behavior::GuardStuck, Behavior::RestAfterPush),
+            (Behavior::GuardRecovery, Behavior::GuardFailure),
+            (Behavior::GuardRecovery, Behavior::GuardStuck),
+            (Behavior::GuardRecovery, Behavior::GuardCautious),
+            (Behavior::GuardRecovery, Behavior::RestAfterPush),
+            (Behavior::GuardRecovery, Behavior::InspectError),
+            (Behavior::GuardRecovery, Behavior::SitNearError),
+            (Behavior::GuardCautious, Behavior::GuardFailure),
+            (Behavior::GuardCautious, Behavior::GuardStuck),
+            (Behavior::GuardCautious, Behavior::GuardRecovery),
+            (Behavior::GuardCautious, Behavior::RestAfterPush),
+            (Behavior::Celebrate, Behavior::GuardRecovery),
+            (Behavior::Celebrate, Behavior::GuardCautious),
+            (Behavior::Celebrate, Behavior::GuardFailure),
+            (Behavior::Celebrate, Behavior::GuardStuck),
+            (Behavior::Celebrate, Behavior::RestAfterPush),
+            (Behavior::Celebrate, Behavior::InspectError),
+            (Behavior::Celebrate, Behavior::SitNearError),
+            (Behavior::CelebrateBig, Behavior::GuardRecovery),
+            (Behavior::CelebrateBig, Behavior::GuardCautious),
+            (Behavior::CelebrateBig, Behavior::GuardFailure),
+            (Behavior::CelebrateBig, Behavior::GuardStuck),
+            (Behavior::CelebrateBig, Behavior::RestAfterPush),
+            (Behavior::CelebrateBig, Behavior::InspectError),
+            (Behavior::CelebrateBig, Behavior::SitNearError),
+            (Behavior::RestAfterPush, Behavior::InspectError),
+            (Behavior::RestAfterPush, Behavior::SitNearError),
+            (Behavior::RestAfterPush, Behavior::Celebrate),
+            (Behavior::RestAfterPush, Behavior::CelebrateBig),
+            (Behavior::RestAfterPush, Behavior::UnknownOutcome),
+            (Behavior::Celebrate, Behavior::UnknownOutcome),
+            (Behavior::CelebrateBig, Behavior::UnknownOutcome),
+            (Behavior::WatchSettled, Behavior::Celebrate),
+            (Behavior::WatchSettled, Behavior::CelebrateBig),
+            (Behavior::WatchSettled, Behavior::InspectError),
+            (Behavior::WatchSettled, Behavior::SitNearError),
+            (Behavior::WatchSettled, Behavior::RestAfterPush),
+            (Behavior::WatchSettled, Behavior::Idle),
+            (Behavior::WatchCommand, Behavior::Celebrate),
+            (Behavior::WatchCommand, Behavior::CelebrateBig),
+            (Behavior::WatchCommand, Behavior::InspectError),
+            (Behavior::WatchCommand, Behavior::SitNearError),
+            (Behavior::WatchCommand, Behavior::RestAfterPush),
+            (Behavior::WatchCommand, Behavior::Idle),
+            (Behavior::WatchAgent, Behavior::Celebrate),
+            (Behavior::WatchAgent, Behavior::InspectError),
+            (Behavior::WatchAgent, Behavior::SitNearError),
+            (Behavior::WatchAgent, Behavior::RestAfterPush),
+            (Behavior::WatchAgent, Behavior::Idle),
+            (Behavior::UnknownOutcome, Behavior::Idle),
+            (Behavior::UnknownOutcome, Behavior::InspectError),
+            (Behavior::UnknownOutcome, Behavior::Celebrate),
+            (Behavior::UnknownOutcome, Behavior::CelebrateBig),
+            (Behavior::UnknownOutcome, Behavior::SitNearError),
+            (Behavior::UnknownOutcome, Behavior::GuardFailure),
+            (Behavior::UnknownOutcome, Behavior::GuardStuck),
+            (Behavior::UnknownOutcome, Behavior::GuardCautious),
+            (Behavior::UnknownOutcome, Behavior::GuardRecovery),
+            (Behavior::UnknownOutcome, Behavior::RestAfterPush),
+            (Behavior::GuardFailure, Behavior::Idle),
+            (Behavior::GuardStuck, Behavior::Idle),
+            (Behavior::GuardRecovery, Behavior::Idle),
+            (Behavior::GuardCautious, Behavior::Idle),
+            (Behavior::Celebrate, Behavior::Idle),
+            (Behavior::CelebrateBig, Behavior::Idle),
+            (Behavior::RestAfterPush, Behavior::Idle),
+            (Behavior::InspectError, Behavior::Idle),
+            (Behavior::SitNearError, Behavior::Idle),
+            (Behavior::InspectError, Behavior::GuardFailure),
+            (Behavior::InspectError, Behavior::GuardStuck),
+            (Behavior::InspectError, Behavior::GuardCautious),
+            (Behavior::InspectError, Behavior::GuardRecovery),
+            (Behavior::InspectError, Behavior::Celebrate),
+            (Behavior::InspectError, Behavior::CelebrateBig),
+            (Behavior::InspectError, Behavior::SitNearError),
+            (Behavior::InspectError, Behavior::UnknownOutcome),
+            (Behavior::InspectError, Behavior::RestAfterPush),
+            (Behavior::SitNearError, Behavior::GuardFailure),
+            (Behavior::SitNearError, Behavior::GuardStuck),
+            (Behavior::SitNearError, Behavior::GuardCautious),
+            (Behavior::SitNearError, Behavior::GuardRecovery),
+            (Behavior::SitNearError, Behavior::Celebrate),
+            (Behavior::SitNearError, Behavior::CelebrateBig),
+            (Behavior::SitNearError, Behavior::UnknownOutcome),
+            (Behavior::SitNearError, Behavior::RestAfterPush),
+            (Behavior::GuardFailure, Behavior::GuardStuck),
+            (Behavior::GuardFailure, Behavior::GuardRecovery),
+            (Behavior::GuardFailure, Behavior::GuardCautious),
+            (Behavior::GuardFailure, Behavior::RestAfterPush),
+            (Behavior::GuardStuck, Behavior::GuardFailure),
+            (Behavior::GuardStuck, Behavior::GuardRecovery),
+            (Behavior::GuardStuck, Behavior::GuardCautious),
+            (Behavior::GuardStuck, Behavior::RestAfterPush),
+            (Behavior::GuardCautious, Behavior::GuardFailure),
+            (Behavior::GuardCautious, Behavior::GuardStuck),
+            (Behavior::GuardCautious, Behavior::GuardRecovery),
+            (Behavior::GuardCautious, Behavior::RestAfterPush),
+            (Behavior::GuardRecovery, Behavior::GuardFailure),
+            (Behavior::GuardRecovery, Behavior::GuardStuck),
+            (Behavior::GuardRecovery, Behavior::GuardCautious),
+            (Behavior::GuardRecovery, Behavior::RestAfterPush),
+            (Behavior::GuardRecovery, Behavior::InspectError),
+            (Behavior::GuardRecovery, Behavior::SitNearError),
+            (Behavior::GuardRecovery, Behavior::UnknownOutcome),
+            (Behavior::Celebrate, Behavior::GuardRecovery),
+            (Behavior::Celebrate, Behavior::GuardCautious),
+            (Behavior::Celebrate, Behavior::GuardFailure),
+            (Behavior::Celebrate, Behavior::GuardStuck),
+            (Behavior::Celebrate, Behavior::RestAfterPush),
+            (Behavior::Celebrate, Behavior::InspectError),
+            (Behavior::Celebrate, Behavior::SitNearError),
+            (Behavior::Celebrate, Behavior::UnknownOutcome),
+            (Behavior::CelebrateBig, Behavior::GuardRecovery),
+            (Behavior::CelebrateBig, Behavior::GuardCautious),
+            (Behavior::CelebrateBig, Behavior::GuardFailure),
+            (Behavior::CelebrateBig, Behavior::GuardStuck),
+            (Behavior::CelebrateBig, Behavior::RestAfterPush),
+            (Behavior::CelebrateBig, Behavior::InspectError),
+            (Behavior::CelebrateBig, Behavior::SitNearError),
+            (Behavior::CelebrateBig, Behavior::UnknownOutcome),
+            (Behavior::RestAfterPush, Behavior::InspectError),
+            (Behavior::RestAfterPush, Behavior::SitNearError),
+            (Behavior::RestAfterPush, Behavior::Celebrate),
+            (Behavior::RestAfterPush, Behavior::CelebrateBig),
+            (Behavior::RestAfterPush, Behavior::UnknownOutcome),
+            (Behavior::RestAfterPush, Behavior::Idle),
+            (Behavior::GuardStuck, Behavior::Idle),
+            (Behavior::GuardCautious, Behavior::Idle),
+            (Behavior::GuardRecovery, Behavior::Idle),
+            (Behavior::GuardFailure, Behavior::Idle),
+            (Behavior::Celebrate, Behavior::Idle),
+            (Behavior::CelebrateBig, Behavior::Idle),
+            (Behavior::UnknownOutcome, Behavior::Idle),
+            (Behavior::WatchSettled, Behavior::Idle),
+            (Behavior::WatchCommand, Behavior::Idle),
+            (Behavior::WatchAgent, Behavior::Idle),
+            (Behavior::WatchSettled, Behavior::Celebrate),
+            (Behavior::WatchSettled, Behavior::CelebrateBig),
+            (Behavior::WatchSettled, Behavior::InspectError),
+            (Behavior::WatchSettled, Behavior::SitNearError),
+        ] {
+            assert!(
+                semantic_bridges.contains(&pair),
+                "UI bridges must list {pair:?} beside core between() 93"
+            );
+            assert!(
+                VisualTransition::between(pair.0, pair.1).is_some(),
+                "core between() must keep {pair:?}"
+            );
+        }
+        for &(from, to) in semantic_bridges {
+            assert_eq!(
+                visual_transition_for_motion(OrganismMotion::Full, from, to),
+                VisualTransition::between(from, to)
+            );
+        }
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
                 visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::GuardRecovery,),
                 None
             );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::SitNearError,
+                    Behavior::GuardFailure,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::WatchCommand, Behavior::Celebrate,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::WatchAgent, Behavior::RestAfterPush,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchSettled,
+                    Behavior::RestAfterPush,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::UnknownOutcome,
+                    Behavior::GuardFailure,
+                ),
+                None
+            );
+            // Celebrate*/Rest/GuardRecovery↔Unknown / Unknown→GuardCautious /
+            // Unknown→GuardStuck / Unknown→GuardFailure / Unknown→Idle snaps
+            // under Calm/Static (Full animates; dedicated hold pins cover the
+            // same arcs).
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::UnknownOutcome,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::CelebrateBig,
+                    Behavior::UnknownOutcome,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::RestAfterPush,
+                    Behavior::UnknownOutcome,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::GuardRecovery,
+                    Behavior::UnknownOutcome,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::UnknownOutcome,
+                    Behavior::GuardRecovery,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::UnknownOutcome,
+                    Behavior::GuardCautious,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::UnknownOutcome,
+                    Behavior::GuardStuck,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::UnknownOutcome,
+                    Behavior::GuardFailure,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::UnknownOutcome, Behavior::Idle,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::UnknownOutcome, Behavior::Celebrate,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::UnknownOutcome,
+                    Behavior::CelebrateBig,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::UnknownOutcome,
+                    Behavior::SitNearError,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::UnknownOutcome,
+                    Behavior::InspectError,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::UnknownOutcome,
+                    Behavior::RestAfterPush,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::GuardCautious, Behavior::Idle,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::GuardFailure, Behavior::Idle,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::GuardStuck, Behavior::Idle,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::GuardRecovery, Behavior::Idle,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::Idle,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::CelebrateBig, Behavior::Idle,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::RestAfterPush, Behavior::Idle,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::InspectError, Behavior::Idle,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::SitNearError, Behavior::Idle,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::WatchCommand, Behavior::Idle,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::WatchAgent, Behavior::Idle,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::WatchSettled, Behavior::Idle,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::WatchAgent, Behavior::Celebrate,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::WatchCommand, Behavior::Celebrate,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchCommand,
+                    Behavior::CelebrateBig,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchCommand,
+                    Behavior::InspectError,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchCommand,
+                    Behavior::SitNearError,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchCommand,
+                    Behavior::RestAfterPush,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::WatchAgent, Behavior::InspectError,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::WatchAgent, Behavior::SitNearError,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::WatchAgent, Behavior::RestAfterPush,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::WatchSettled, Behavior::Celebrate,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchSettled,
+                    Behavior::CelebrateBig,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchSettled,
+                    Behavior::InspectError,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchSettled,
+                    Behavior::SitNearError,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchSettled,
+                    Behavior::RestAfterPush,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::InspectError,
+                    Behavior::GuardFailure,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::SitNearError, Behavior::GuardStuck,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::SitNearError,
+                    Behavior::GuardFailure,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::SitNearError,
+                    Behavior::GuardCautious,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::SitNearError,
+                    Behavior::GuardRecovery,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::InspectError, Behavior::GuardStuck,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::InspectError,
+                    Behavior::GuardCautious,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::InspectError,
+                    Behavior::GuardRecovery,
+                ),
+                None
+            );
         }
+        // WatchAgent→CelebrateBig stays None by design (agent passes never
+        // CelebrateBig). Pin Full so a core bridge cannot appear silently.
+        assert_eq!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchAgent,
+                Behavior::CelebrateBig,
+            ),
+            None
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::WatchAgent, Behavior::CelebrateBig),
+            None
+        );
+        // WatchAgent→UnknownOutcome stays None: agent finishes never land on
+        // the unknown-hold pose. Pin Full so a core bridge cannot appear silently.
+        assert_eq!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchAgent,
+                Behavior::UnknownOutcome,
+            ),
+            None
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::WatchAgent, Behavior::UnknownOutcome),
+            None
+        );
+        // WatchCommand→UnknownOutcome stays None: missing exit status snaps
+        // (no bridge frames), beside the WatchAgent None pin.
+        assert_eq!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchCommand,
+                Behavior::UnknownOutcome,
+            ),
+            None
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::WatchCommand, Behavior::UnknownOutcome),
+            None
+        );
+        // WatchSettled→UnknownOutcome stays None: long-watch missing exit snaps.
+        assert_eq!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchSettled,
+                Behavior::UnknownOutcome,
+            ),
+            None
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::WatchSettled, Behavior::UnknownOutcome),
+            None
+        );
+        // Watch* never bridges to Guard* (finishes do not skip into repo vigil).
+        for from in [
+            Behavior::WatchCommand,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+        ] {
+            for to in [
+                Behavior::GuardFailure,
+                Behavior::GuardStuck,
+                Behavior::GuardRecovery,
+                Behavior::GuardCautious,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(VisualTransition::between(from, to), None);
+            }
+        }
+        // Guard* never bridges to Celebrate* (vigil does not celebrate).
+        for from in [
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardRecovery,
+            Behavior::GuardCautious,
+        ] {
+            for to in [Behavior::Celebrate, Behavior::CelebrateBig] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(VisualTransition::between(from, to), None);
+            }
+        }
+        // Failure/Stuck/Cautious never skip Watch into Inspect/Sit/Unknown
+        // (Recovery does, as a finish-overwrite).
+        for from in [
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardCautious,
+        ] {
+            for to in [
+                Behavior::InspectError,
+                Behavior::SitNearError,
+                Behavior::UnknownOutcome,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(VisualTransition::between(from, to), None);
+            }
+        }
+        // Celebrate* never bridges to Watch* (new command mid-hold snaps).
+        for from in [Behavior::Celebrate, Behavior::CelebrateBig] {
+            for to in [
+                Behavior::WatchCommand,
+                Behavior::WatchAgent,
+                Behavior::WatchSettled,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(VisualTransition::between(from, to), None);
+            }
+        }
+        // Error/unknown holds never bridge to Watch* (same new-command snap).
+        for from in [
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::UnknownOutcome,
+        ] {
+            for to in [
+                Behavior::WatchCommand,
+                Behavior::WatchAgent,
+                Behavior::WatchSettled,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(VisualTransition::between(from, to), None);
+            }
+        }
+        // Rest/Guard* never bridge to Watch* (same new-command snap;
+        // Failure/Stuck/Cautious join Recovery — idle vigil before start).
+        for from in [
+            Behavior::RestAfterPush,
+            Behavior::GuardRecovery,
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardCautious,
+        ] {
+            for to in [
+                Behavior::WatchCommand,
+                Behavior::WatchAgent,
+                Behavior::WatchSettled,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(VisualTransition::between(from, to), None);
+            }
+        }
+        // Idle/Rest never bridges to Guard* (open vigil appearing snaps).
+        for from in [Behavior::Idle, Behavior::RestAfterPush] {
+            for to in [
+                Behavior::GuardFailure,
+                Behavior::GuardStuck,
+                Behavior::GuardRecovery,
+                Behavior::GuardCautious,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(VisualTransition::between(from, to), None);
+            }
+        }
+        // SitNear→Inspect and Celebrate↔CelebrateBig stay None (Inspect→SitNear
+        // animates; reverse/tier swaps have no reducer story).
+        assert_eq!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::SitNearError,
+                Behavior::InspectError,
+            ),
+            None
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::SitNearError, Behavior::InspectError),
+            None
+        );
+        for (from, to) in [
+            (Behavior::Celebrate, Behavior::CelebrateBig),
+            (Behavior::CelebrateBig, Behavior::Celebrate),
+        ] {
+            assert_eq!(
+                visual_transition_for_motion(OrganismMotion::Full, from, to),
+                None,
+                "Full {from:?}→{to:?}"
+            );
+            assert_eq!(VisualTransition::between(from, to), None);
+        }
+        // GlanceAside is never a bridge source or target under Full motion
+        // (ambient Explore/Sleep/Approach join the common overwrite set —
+        // live cue overlays without inventing GlanceAside↔ambient bridges).
+        for other in [
+            Behavior::Idle,
+            Behavior::Celebrate,
+            Behavior::CelebrateBig,
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::RestAfterPush,
+            Behavior::UnknownOutcome,
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardRecovery,
+            Behavior::GuardCautious,
+            Behavior::WatchCommand,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+            Behavior::Explore,
+            Behavior::Sleep,
+            Behavior::Approach,
+        ] {
+            assert_eq!(
+                visual_transition_for_motion(OrganismMotion::Full, Behavior::GlanceAside, other,),
+                None,
+                "Full GlanceAside→{other:?}"
+            );
+            assert_eq!(
+                visual_transition_for_motion(OrganismMotion::Full, other, Behavior::GlanceAside,),
+                None,
+                "Full {other:?}→GlanceAside"
+            );
+            assert_eq!(
+                VisualTransition::between(Behavior::GlanceAside, other),
+                None
+            );
+            assert_eq!(
+                VisualTransition::between(other, Behavior::GlanceAside),
+                None
+            );
+        }
+    }
+
+    /// CelebrateBig finish arcs under Full motion: fifteen Some bridges mirror
+    /// Celebrate except WatchAgent (quiet nod). Pairs core
+    /// `celebrate_big_finish_arcs_mirror_celebrate_except_watch_agent`.
+    #[test]
+    fn celebrate_big_finish_arcs_run_under_full_motion() {
+        let inbound = [
+            Behavior::WatchSettled,
+            Behavior::WatchCommand,
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::UnknownOutcome,
+            Behavior::RestAfterPush,
+        ];
+        for from in inbound {
+            assert!(
+                visual_transition_for_motion(OrganismMotion::Full, from, Behavior::CelebrateBig,)
+                    .is_some(),
+                "Full {from:?}→CelebrateBig"
+            );
+            assert!(
+                VisualTransition::between(from, Behavior::CelebrateBig).is_some(),
+                "core {from:?}→CelebrateBig"
+            );
+        }
+        let outbound = [
+            Behavior::GuardRecovery,
+            Behavior::GuardCautious,
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::RestAfterPush,
+            Behavior::Idle,
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::UnknownOutcome,
+        ];
+        for to in outbound {
+            assert!(
+                visual_transition_for_motion(OrganismMotion::Full, Behavior::CelebrateBig, to,)
+                    .is_some(),
+                "Full CelebrateBig→{to:?}"
+            );
+            assert!(
+                VisualTransition::between(Behavior::CelebrateBig, to).is_some(),
+                "core CelebrateBig→{to:?}"
+            );
+        }
+        assert_eq!(inbound.len() + outbound.len(), 15);
+        assert_eq!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchAgent,
+                Behavior::CelebrateBig,
+            ),
+            None
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::WatchAgent, Behavior::CelebrateBig),
+            None
+        );
+        // Tier overwrite stays intentional None (pairs core finish-arc pin).
+        assert_eq!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::Celebrate,
+                Behavior::CelebrateBig,
+            ),
+            None
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::Celebrate, Behavior::CelebrateBig),
+            None
+        );
+        assert_eq!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::CelebrateBig,
+                Behavior::Celebrate,
+            ),
+            None
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::CelebrateBig, Behavior::Celebrate),
+            None
+        );
+    }
+
+    /// Tip lockstep: CelebrateBig still owns exactly fifteen Some arcs inside
+    /// the core `between()` recount of 93. If a new CelebrateBig bridge lands,
+    /// bump both this pin and `visual_transition_between_recognizes_ninety_three_*`.
+    #[test]
+    fn celebrate_big_some_arcs_stay_fifteen_beside_between_ninety_three() {
+        let behaviors = [
+            Behavior::Idle,
+            Behavior::WatchCommand,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::Celebrate,
+            Behavior::CelebrateBig,
+            Behavior::RestAfterPush,
+            Behavior::UnknownOutcome,
+            Behavior::GlanceAside,
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardRecovery,
+            Behavior::GuardCautious,
+            Behavior::Sleep,
+            Behavior::Explore,
+            Behavior::Approach,
+        ];
+        let mut total = 0usize;
+        let mut celebrate_big = 0usize;
+        for &from in &behaviors {
+            for &to in &behaviors {
+                if VisualTransition::between(from, to).is_some() {
+                    total += 1;
+                    if from == Behavior::CelebrateBig || to == Behavior::CelebrateBig {
+                        celebrate_big += 1;
+                        assert!(
+                            visual_transition_for_motion(OrganismMotion::Full, from, to).is_some(),
+                            "Full must mirror core CelebrateBig arc {from:?}→{to:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(total, 93, "between() Some count drifted; sync UI contracts");
+        assert_eq!(
+            celebrate_big, 15,
+            "CelebrateBig Some arcs drifted; sync finish-arc UI table"
+        );
+    }
+
+    /// WatchSettled finish arcs under Full motion: six Some bridges
+    /// (Celebrate{,Big}/Inspect/Sit/Rest/Idle). Unknown stays intentional
+    /// snap. Pairs core `watch_settled_finish_arcs_cover_pass_fail_rest_and_idle`.
+    #[test]
+    fn watch_settled_finish_arcs_run_under_full_motion() {
+        let arcs = [
+            Behavior::Celebrate,
+            Behavior::CelebrateBig,
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::RestAfterPush,
+            Behavior::Idle,
+        ];
+        for to in arcs {
+            assert!(
+                visual_transition_for_motion(OrganismMotion::Full, Behavior::WatchSettled, to,)
+                    .is_some(),
+                "Full WatchSettled→{to:?}"
+            );
+            assert!(
+                VisualTransition::between(Behavior::WatchSettled, to).is_some(),
+                "core WatchSettled→{to:?}"
+            );
+        }
+        assert_eq!(arcs.len(), 6);
+        assert_eq!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchSettled,
+                Behavior::UnknownOutcome,
+            ),
+            None
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::WatchSettled, Behavior::UnknownOutcome),
+            None
+        );
+    }
+
+    /// Watch*→Guard* stays None under Full motion — finishes resolve to
+    /// Celebrate/Inspect/Sit/Rest (or Unknown snap), never skip into a repo
+    /// vigil. Pairs core `watch_poses_never_bridge_to_repo_vigil_guards`.
+    #[test]
+    fn watch_poses_never_bridge_to_repo_vigil_under_full_motion() {
+        for from in [
+            Behavior::WatchCommand,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+        ] {
+            for to in [
+                Behavior::GuardFailure,
+                Behavior::GuardStuck,
+                Behavior::GuardRecovery,
+                Behavior::GuardCautious,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "core {from:?}→{to:?}"
+                );
+            }
+        }
+    }
+
+    /// Watch*→Explore/Sleep/Approach stays None under Full motion — ambient
+    /// utility arrives from mind rescoring, not from a Watch finish. Pairs
+    /// core `watch_poses_never_bridge_to_ambient_utility`. between() stays 93.
+    #[test]
+    fn watch_poses_never_bridge_to_ambient_under_full_motion() {
+        for from in [
+            Behavior::WatchCommand,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+        ] {
+            for to in [Behavior::Explore, Behavior::Sleep, Behavior::Approach] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "core {from:?}→{to:?}"
+                );
+            }
+        }
+    }
+
+    /// Guard*→Celebrate* stays None under Full motion — repo vigils push or
+    /// escalate among themselves; celebrations come from command-finish on
+    /// error holds. Pairs core `repo_vigil_guards_never_bridge_to_celebrate`.
+    /// between() stays 93.
+    #[test]
+    fn repo_vigil_guards_never_bridge_to_celebrate_under_full_motion() {
+        for from in [
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardRecovery,
+            Behavior::GuardCautious,
+        ] {
+            for to in [Behavior::Celebrate, Behavior::CelebrateBig] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "core {from:?}→{to:?}"
+                );
+            }
+        }
+    }
+
+    /// Celebrate*→Watch* stays None under Full motion — a new command mid-hold
+    /// snaps into Watch* without bridge frames. Pairs core
+    /// `celebrate_holds_never_bridge_to_watch_poses`. between() stays 93.
+    #[test]
+    fn celebrate_holds_never_bridge_to_watch_under_full_motion() {
+        for from in [Behavior::Celebrate, Behavior::CelebrateBig] {
+            for to in [
+                Behavior::WatchCommand,
+                Behavior::WatchAgent,
+                Behavior::WatchSettled,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "core {from:?}→{to:?}"
+                );
+            }
+        }
+    }
+
+    /// Hold/rest→Explore/Sleep/Approach stays None under Full motion — ambient
+    /// utility arrives from mind rescoring after clear-vigil, not from a hold
+    /// finish. Pairs core `hold_and_rest_poses_never_bridge_to_ambient_utility`.
+    /// between() stays 93.
+    #[test]
+    fn hold_and_rest_never_bridge_to_ambient_under_full_motion() {
+        for from in [
+            Behavior::Celebrate,
+            Behavior::CelebrateBig,
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::UnknownOutcome,
+            Behavior::RestAfterPush,
+        ] {
+            for to in [Behavior::Explore, Behavior::Sleep, Behavior::Approach] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "core {from:?}→{to:?}"
+                );
+            }
+        }
+    }
+
+    /// Guard*→Explore/Sleep/Approach stays None under Full motion — ambient
+    /// utility arrives from mind after clear-vigil Idle. Pairs core
+    /// `repo_vigil_guards_never_bridge_to_ambient_utility`. between() stays 93.
+    #[test]
+    fn repo_vigil_guards_never_bridge_to_ambient_under_full_motion() {
+        for from in [
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardRecovery,
+            Behavior::GuardCautious,
+        ] {
+            for to in [Behavior::Explore, Behavior::Sleep, Behavior::Approach] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "core {from:?}→{to:?}"
+                );
+            }
+        }
+    }
+
+    /// WatchCommand↔WatchAgent↔WatchSettled stays None under Full motion —
+    /// elapsed-onset settled vigil and agent crouch are live SurfaceMode remaps,
+    /// not reducer bridges. Pairs core
+    /// `watch_pose_mode_switches_have_no_visual_transition`. between() stays 93.
+    #[test]
+    fn watch_pose_mode_switches_have_no_visual_transition_under_full_motion() {
+        for (from, to) in [
+            (Behavior::WatchCommand, Behavior::WatchAgent),
+            (Behavior::WatchCommand, Behavior::WatchSettled),
+            (Behavior::WatchAgent, Behavior::WatchCommand),
+            (Behavior::WatchAgent, Behavior::WatchSettled),
+            (Behavior::WatchSettled, Behavior::WatchCommand),
+            (Behavior::WatchSettled, Behavior::WatchAgent),
+        ] {
+            assert_eq!(
+                visual_transition_for_motion(OrganismMotion::Full, from, to),
+                None,
+                "Full {from:?}→{to:?}"
+            );
+            assert_eq!(
+                VisualTransition::between(from, to),
+                None,
+                "core {from:?}→{to:?}"
+            );
+        }
+    }
+
+    /// Idle/Rest→Guard* stays None under Full motion — open vigil snaps from
+    /// idle/rest without bridge frames. Pairs core
+    /// `idle_and_rest_never_bridge_to_repo_vigil_guards`. between() stays 93.
+    #[test]
+    fn idle_and_rest_never_bridge_to_repo_vigil_under_full_motion() {
+        for from in [Behavior::Idle, Behavior::RestAfterPush] {
+            for to in [
+                Behavior::GuardFailure,
+                Behavior::GuardStuck,
+                Behavior::GuardRecovery,
+                Behavior::GuardCautious,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "core {from:?}→{to:?}"
+                );
+            }
+        }
+    }
+
+    /// Rest/Guard*→Watch* stays None under Full motion — a new command mid-rest
+    /// or mid-vigil snaps into Watch* without bridge frames. Pairs core
+    /// `rest_and_repo_vigil_never_bridge_to_watch_poses`. between() stays 93.
+    #[test]
+    fn rest_and_repo_vigil_never_bridge_to_watch_under_full_motion() {
+        for from in [
+            Behavior::RestAfterPush,
+            Behavior::GuardRecovery,
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardCautious,
+        ] {
+            for to in [
+                Behavior::WatchCommand,
+                Behavior::WatchAgent,
+                Behavior::WatchSettled,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "core {from:?}→{to:?}"
+                );
+            }
+        }
+    }
+
+    /// Inspect/Sit/Unknown→Watch* stays None under Full motion — a new command
+    /// mid-hold snaps into Watch* without bridge frames. Pairs core
+    /// `error_and_unknown_holds_never_bridge_to_watch_poses`. between() stays 93.
+    #[test]
+    fn error_and_unknown_holds_never_bridge_to_watch_under_full_motion() {
+        for from in [
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::UnknownOutcome,
+        ] {
+            for to in [
+                Behavior::WatchCommand,
+                Behavior::WatchAgent,
+                Behavior::WatchSettled,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "core {from:?}→{to:?}"
+                );
+            }
+        }
+    }
+
+    /// GuardFailure/Stuck/Cautious→Inspect/Sit/Unknown stays None under Full
+    /// motion — only GuardRecovery animates those overwrites. Pairs core
+    /// `failure_stuck_cautious_never_bridge_to_error_or_unknown_holds`.
+    /// between() stays 93.
+    #[test]
+    fn failure_stuck_cautious_never_bridge_to_error_holds_under_full_motion() {
+        for from in [
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardCautious,
+        ] {
+            for to in [
+                Behavior::InspectError,
+                Behavior::SitNearError,
+                Behavior::UnknownOutcome,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "core {from:?}→{to:?}"
+                );
+            }
+        }
+    }
+
+    /// GuardFailure/Stuck/Cautious→Celebrate* stays None under Full motion —
+    /// success finishes reach Celebrate through Watch*, and vigil→Watch is
+    /// already intentional None. Pairs core
+    /// `failure_stuck_cautious_never_bridge_to_celebrate_holds`. between() stays 93.
+    #[test]
+    fn failure_stuck_cautious_never_bridge_to_celebrate_under_full_motion() {
+        for from in [
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardCautious,
+        ] {
+            for to in [Behavior::Celebrate, Behavior::CelebrateBig] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?} (success finishes via Watch*)"
+                );
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "core {from:?}→{to:?}"
+                );
+            }
+        }
+    }
+
+    /// WatchAgent→CelebrateBig stays None under Full motion — agent passes never
+    /// CelebrateBig (quiet nod only). Pairs core
+    /// `watch_agent_never_bridges_to_celebrate_big`. between() stays 93.
+    #[test]
+    fn watch_agent_never_bridges_to_celebrate_big_under_full_motion() {
+        assert_eq!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchAgent,
+                Behavior::CelebrateBig,
+            ),
+            None,
+            "Full WatchAgent→CelebrateBig"
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::WatchAgent, Behavior::CelebrateBig),
+            None,
+            "core WatchAgent→CelebrateBig"
+        );
+    }
+
+    /// Watch*→UnknownOutcome stays None under Full motion — missing exit snaps
+    /// without inventing an unknown-hold bridge. Pairs core
+    /// `watch_*_never_bridges_to_unknown_outcome`. between() stays 93.
+    #[test]
+    fn watch_poses_never_bridge_to_unknown_outcome_under_full_motion() {
+        for from in [
+            Behavior::WatchCommand,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+        ] {
+            assert_eq!(
+                visual_transition_for_motion(OrganismMotion::Full, from, Behavior::UnknownOutcome,),
+                None,
+                "Full {from:?}→UnknownOutcome"
+            );
+            assert_eq!(
+                VisualTransition::between(from, Behavior::UnknownOutcome),
+                None,
+                "core {from:?}→UnknownOutcome"
+            );
+        }
+    }
+
+    /// SitNear↔Inspect and Celebrate↔CelebrateBig stay None under Full motion —
+    /// tier overwrites snap without inventing bridges. Pairs core
+    /// `sit_near_and_celebrate_tier_overwrites_stay_none`. between() stays 93.
+    #[test]
+    fn sit_near_and_celebrate_tier_overwrites_stay_none_under_full_motion() {
+        for (from, to) in [
+            (Behavior::SitNearError, Behavior::InspectError),
+            (Behavior::Celebrate, Behavior::CelebrateBig),
+            (Behavior::CelebrateBig, Behavior::Celebrate),
+        ] {
+            assert_eq!(
+                visual_transition_for_motion(OrganismMotion::Full, from, to),
+                None,
+                "Full {from:?}→{to:?}"
+            );
+            assert_eq!(
+                VisualTransition::between(from, to),
+                None,
+                "core {from:?}→{to:?}"
+            );
+        }
+    }
+
+    /// Celebrate{,Big}→UnknownOutcome animates under Full motion (unknown
+    /// overwrite from a celebrate hold) and snaps under Calm/Static. Pairs core
+    /// celebrate→unknown bridges inside between() 93.
+    #[test]
+    fn celebrate_holds_bridge_to_unknown_outcome_under_full_motion_only() {
+        for from in [Behavior::Celebrate, Behavior::CelebrateBig] {
+            assert!(
+                visual_transition_for_motion(OrganismMotion::Full, from, Behavior::UnknownOutcome,)
+                    .is_some(),
+                "Full {from:?}→UnknownOutcome"
+            );
+            assert!(
+                VisualTransition::between(from, Behavior::UnknownOutcome).is_some(),
+                "core {from:?}→UnknownOutcome"
+            );
+            for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+                assert_eq!(
+                    visual_transition_for_motion(motion, from, Behavior::UnknownOutcome),
+                    None,
+                    "{motion:?} {from:?}→UnknownOutcome"
+                );
+            }
+        }
+    }
+
+    /// RestAfterPush→UnknownOutcome animates under Full motion (unknown
+    /// overwrite from a rest hold) and snaps under Calm/Static. Pairs core
+    /// `RestAfterPushToUnknownOutcome` inside between() 93 beside Celebrate*.
+    #[test]
+    fn rest_hold_bridges_to_unknown_outcome_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::RestAfterPush,
+                Behavior::UnknownOutcome,
+            )
+            .is_some(),
+            "Full RestAfterPush→UnknownOutcome"
+        );
+        assert!(
+            VisualTransition::between(Behavior::RestAfterPush, Behavior::UnknownOutcome).is_some(),
+            "core RestAfterPush→UnknownOutcome"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::RestAfterPush,
+                    Behavior::UnknownOutcome,
+                ),
+                None,
+                "{motion:?} RestAfterPush→UnknownOutcome"
+            );
+        }
+    }
+
+    /// SitNearError/InspectError→UnknownOutcome animates under Full motion
+    /// (unknown overwrite from a vigil/inspect hold) and snaps under Calm/Static.
+    /// Pairs core SitNear/Inspect→Unknown bridges inside between() 93 beside
+    /// Celebrate*/Rest→Unknown.
+    #[test]
+    fn sit_near_and_inspect_bridge_to_unknown_outcome_under_full_motion_only() {
+        for from in [Behavior::SitNearError, Behavior::InspectError] {
+            assert!(
+                visual_transition_for_motion(OrganismMotion::Full, from, Behavior::UnknownOutcome,)
+                    .is_some(),
+                "Full {from:?}→UnknownOutcome"
+            );
+            assert!(
+                VisualTransition::between(from, Behavior::UnknownOutcome).is_some(),
+                "core {from:?}→UnknownOutcome"
+            );
+            for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+                assert_eq!(
+                    visual_transition_for_motion(motion, from, Behavior::UnknownOutcome),
+                    None,
+                    "{motion:?} {from:?}→UnknownOutcome"
+                );
+            }
+        }
+    }
+
+    /// GuardRecovery→UnknownOutcome animates under Full motion (unknown
+    /// overwrite from a recovery vigil) and snaps under Calm/Static. Pairs core
+    /// `GuardRecoveryToUnknownOutcome` inside between() 93 beside
+    /// Celebrate*/Rest/SitNear/Inspect→Unknown.
+    #[test]
+    fn guard_recovery_bridges_to_unknown_outcome_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardRecovery,
+                Behavior::UnknownOutcome,
+            )
+            .is_some(),
+            "Full GuardRecovery→UnknownOutcome"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardRecovery, Behavior::UnknownOutcome).is_some(),
+            "core GuardRecovery→UnknownOutcome"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::GuardRecovery,
+                    Behavior::UnknownOutcome,
+                ),
+                None,
+                "{motion:?} GuardRecovery→UnknownOutcome"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_outcome_bridges_to_guard_recovery_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::UnknownOutcome,
+                Behavior::GuardRecovery,
+            )
+            .is_some(),
+            "Full UnknownOutcome→GuardRecovery"
+        );
+        assert!(
+            VisualTransition::between(Behavior::UnknownOutcome, Behavior::GuardRecovery).is_some(),
+            "core UnknownOutcome→GuardRecovery"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::UnknownOutcome,
+                    Behavior::GuardRecovery,
+                ),
+                None,
+                "{motion:?} UnknownOutcome→GuardRecovery"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_outcome_bridges_to_guard_cautious_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::UnknownOutcome,
+                Behavior::GuardCautious,
+            )
+            .is_some(),
+            "Full UnknownOutcome→GuardCautious"
+        );
+        assert!(
+            VisualTransition::between(Behavior::UnknownOutcome, Behavior::GuardCautious).is_some(),
+            "core UnknownOutcome→GuardCautious"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::UnknownOutcome,
+                    Behavior::GuardCautious,
+                ),
+                None,
+                "{motion:?} UnknownOutcome→GuardCautious"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_outcome_bridges_to_guard_stuck_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::UnknownOutcome,
+                Behavior::GuardStuck,
+            )
+            .is_some(),
+            "Full UnknownOutcome→GuardStuck"
+        );
+        assert!(
+            VisualTransition::between(Behavior::UnknownOutcome, Behavior::GuardStuck).is_some(),
+            "core UnknownOutcome→GuardStuck"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::UnknownOutcome,
+                    Behavior::GuardStuck,
+                ),
+                None,
+                "{motion:?} UnknownOutcome→GuardStuck"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_outcome_bridges_to_guard_failure_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::UnknownOutcome,
+                Behavior::GuardFailure,
+            )
+            .is_some(),
+            "Full UnknownOutcome→GuardFailure"
+        );
+        assert!(
+            VisualTransition::between(Behavior::UnknownOutcome, Behavior::GuardFailure).is_some(),
+            "core UnknownOutcome→GuardFailure"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::UnknownOutcome,
+                    Behavior::GuardFailure,
+                ),
+                None,
+                "{motion:?} UnknownOutcome→GuardFailure"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_outcome_bridges_to_idle_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::UnknownOutcome,
+                Behavior::Idle,
+            )
+            .is_some(),
+            "Full UnknownOutcome→Idle"
+        );
+        assert!(
+            VisualTransition::between(Behavior::UnknownOutcome, Behavior::Idle).is_some(),
+            "core UnknownOutcome→Idle"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::UnknownOutcome, Behavior::Idle,),
+                None,
+                "{motion:?} UnknownOutcome→Idle"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_outcome_bridges_to_celebrate_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::UnknownOutcome,
+                Behavior::Celebrate,
+            )
+            .is_some(),
+            "Full UnknownOutcome→Celebrate"
+        );
+        assert!(
+            VisualTransition::between(Behavior::UnknownOutcome, Behavior::Celebrate).is_some(),
+            "core UnknownOutcome→Celebrate"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::UnknownOutcome, Behavior::Celebrate,),
+                None,
+                "{motion:?} UnknownOutcome→Celebrate"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_outcome_bridges_to_celebrate_big_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::UnknownOutcome,
+                Behavior::CelebrateBig,
+            )
+            .is_some(),
+            "Full UnknownOutcome→CelebrateBig"
+        );
+        assert!(
+            VisualTransition::between(Behavior::UnknownOutcome, Behavior::CelebrateBig).is_some(),
+            "core UnknownOutcome→CelebrateBig"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::UnknownOutcome,
+                    Behavior::CelebrateBig,
+                ),
+                None,
+                "{motion:?} UnknownOutcome→CelebrateBig"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_outcome_bridges_to_sit_near_error_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::UnknownOutcome,
+                Behavior::SitNearError,
+            )
+            .is_some(),
+            "Full UnknownOutcome→SitNearError"
+        );
+        assert!(
+            VisualTransition::between(Behavior::UnknownOutcome, Behavior::SitNearError).is_some(),
+            "core UnknownOutcome→SitNearError"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::UnknownOutcome,
+                    Behavior::SitNearError,
+                ),
+                None,
+                "{motion:?} UnknownOutcome→SitNearError"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_outcome_bridges_to_inspect_error_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::UnknownOutcome,
+                Behavior::InspectError,
+            )
+            .is_some(),
+            "Full UnknownOutcome→InspectError"
+        );
+        assert!(
+            VisualTransition::between(Behavior::UnknownOutcome, Behavior::InspectError).is_some(),
+            "core UnknownOutcome→InspectError"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::UnknownOutcome,
+                    Behavior::InspectError,
+                ),
+                None,
+                "{motion:?} UnknownOutcome→InspectError"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_outcome_bridges_to_rest_after_push_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::UnknownOutcome,
+                Behavior::RestAfterPush,
+            )
+            .is_some(),
+            "Full UnknownOutcome→RestAfterPush"
+        );
+        assert!(
+            VisualTransition::between(Behavior::UnknownOutcome, Behavior::RestAfterPush).is_some(),
+            "core UnknownOutcome→RestAfterPush"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::UnknownOutcome,
+                    Behavior::RestAfterPush,
+                ),
+                None,
+                "{motion:?} UnknownOutcome→RestAfterPush"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_cautious_bridges_to_idle_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardCautious,
+                Behavior::Idle,
+            )
+            .is_some(),
+            "Full GuardCautious→Idle"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardCautious, Behavior::Idle).is_some(),
+            "core GuardCautious→Idle"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::GuardCautious, Behavior::Idle,),
+                None,
+                "{motion:?} GuardCautious→Idle"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_failure_bridges_to_idle_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardFailure,
+                Behavior::Idle,
+            )
+            .is_some(),
+            "Full GuardFailure→Idle"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardFailure, Behavior::Idle).is_some(),
+            "core GuardFailure→Idle"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::GuardFailure, Behavior::Idle,),
+                None,
+                "{motion:?} GuardFailure→Idle"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_stuck_bridges_to_idle_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardStuck,
+                Behavior::Idle,
+            )
+            .is_some(),
+            "Full GuardStuck→Idle"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardStuck, Behavior::Idle).is_some(),
+            "core GuardStuck→Idle"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::GuardStuck, Behavior::Idle,),
+                None,
+                "{motion:?} GuardStuck→Idle"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_recovery_bridges_to_idle_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardRecovery,
+                Behavior::Idle,
+            )
+            .is_some(),
+            "Full GuardRecovery→Idle"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardRecovery, Behavior::Idle).is_some(),
+            "core GuardRecovery→Idle"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::GuardRecovery, Behavior::Idle,),
+                None,
+                "{motion:?} GuardRecovery→Idle"
+            );
+        }
+    }
+
+    #[test]
+    fn celebrate_bridges_to_idle_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::Celebrate,
+                Behavior::Idle,
+            )
+            .is_some(),
+            "Full Celebrate→Idle"
+        );
+        assert!(
+            VisualTransition::between(Behavior::Celebrate, Behavior::Idle).is_some(),
+            "core Celebrate→Idle"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::Idle,),
+                None,
+                "{motion:?} Celebrate→Idle"
+            );
+        }
+    }
+
+    #[test]
+    fn celebrate_big_bridges_to_idle_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::CelebrateBig,
+                Behavior::Idle,
+            )
+            .is_some(),
+            "Full CelebrateBig→Idle"
+        );
+        assert!(
+            VisualTransition::between(Behavior::CelebrateBig, Behavior::Idle).is_some(),
+            "core CelebrateBig→Idle"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::CelebrateBig, Behavior::Idle,),
+                None,
+                "{motion:?} CelebrateBig→Idle"
+            );
+        }
+    }
+
+    #[test]
+    fn rest_after_push_bridges_to_idle_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::RestAfterPush,
+                Behavior::Idle,
+            )
+            .is_some(),
+            "Full RestAfterPush→Idle"
+        );
+        assert!(
+            VisualTransition::between(Behavior::RestAfterPush, Behavior::Idle).is_some(),
+            "core RestAfterPush→Idle"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::RestAfterPush, Behavior::Idle,),
+                None,
+                "{motion:?} RestAfterPush→Idle"
+            );
+        }
+    }
+
+    #[test]
+    fn inspect_error_bridges_to_idle_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::InspectError,
+                Behavior::Idle,
+            )
+            .is_some(),
+            "Full InspectError→Idle"
+        );
+        assert!(
+            VisualTransition::between(Behavior::InspectError, Behavior::Idle).is_some(),
+            "core InspectError→Idle"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::InspectError, Behavior::Idle,),
+                None,
+                "{motion:?} InspectError→Idle"
+            );
+        }
+    }
+
+    #[test]
+    fn sit_near_error_bridges_to_idle_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::SitNearError,
+                Behavior::Idle,
+            )
+            .is_some(),
+            "Full SitNearError→Idle"
+        );
+        assert!(
+            VisualTransition::between(Behavior::SitNearError, Behavior::Idle).is_some(),
+            "core SitNearError→Idle"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::SitNearError, Behavior::Idle,),
+                None,
+                "{motion:?} SitNearError→Idle"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_command_bridges_to_idle_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchCommand,
+                Behavior::Idle,
+            )
+            .is_some(),
+            "Full WatchCommand→Idle"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchCommand, Behavior::Idle).is_some(),
+            "core WatchCommand→Idle"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::WatchCommand, Behavior::Idle,),
+                None,
+                "{motion:?} WatchCommand→Idle"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_agent_bridges_to_idle_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchAgent,
+                Behavior::Idle,
+            )
+            .is_some(),
+            "Full WatchAgent→Idle"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchAgent, Behavior::Idle).is_some(),
+            "core WatchAgent→Idle"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::WatchAgent, Behavior::Idle,),
+                None,
+                "{motion:?} WatchAgent→Idle"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_settled_bridges_to_idle_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchSettled,
+                Behavior::Idle,
+            )
+            .is_some(),
+            "Full WatchSettled→Idle"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchSettled, Behavior::Idle).is_some(),
+            "core WatchSettled→Idle"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::WatchSettled, Behavior::Idle,),
+                None,
+                "{motion:?} WatchSettled→Idle"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_agent_bridges_to_celebrate_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchAgent,
+                Behavior::Celebrate,
+            )
+            .is_some(),
+            "Full WatchAgent→Celebrate"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchAgent, Behavior::Celebrate).is_some(),
+            "core WatchAgent→Celebrate"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::WatchAgent, Behavior::Celebrate,),
+                None,
+                "{motion:?} WatchAgent→Celebrate"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_command_bridges_to_celebrate_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchCommand,
+                Behavior::Celebrate,
+            )
+            .is_some(),
+            "Full WatchCommand→Celebrate"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchCommand, Behavior::Celebrate).is_some(),
+            "core WatchCommand→Celebrate"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::WatchCommand, Behavior::Celebrate,),
+                None,
+                "{motion:?} WatchCommand→Celebrate"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_command_bridges_to_celebrate_big_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchCommand,
+                Behavior::CelebrateBig,
+            )
+            .is_some(),
+            "Full WatchCommand→CelebrateBig"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchCommand, Behavior::CelebrateBig).is_some(),
+            "core WatchCommand→CelebrateBig"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchCommand,
+                    Behavior::CelebrateBig,
+                ),
+                None,
+                "{motion:?} WatchCommand→CelebrateBig"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_command_bridges_to_inspect_error_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchCommand,
+                Behavior::InspectError,
+            )
+            .is_some(),
+            "Full WatchCommand→InspectError"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchCommand, Behavior::InspectError).is_some(),
+            "core WatchCommand→InspectError"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchCommand,
+                    Behavior::InspectError,
+                ),
+                None,
+                "{motion:?} WatchCommand→InspectError"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_command_bridges_to_sit_near_error_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchCommand,
+                Behavior::SitNearError,
+            )
+            .is_some(),
+            "Full WatchCommand→SitNearError"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchCommand, Behavior::SitNearError).is_some(),
+            "core WatchCommand→SitNearError"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchCommand,
+                    Behavior::SitNearError,
+                ),
+                None,
+                "{motion:?} WatchCommand→SitNearError"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_command_bridges_to_rest_after_push_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchCommand,
+                Behavior::RestAfterPush,
+            )
+            .is_some(),
+            "Full WatchCommand→RestAfterPush"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchCommand, Behavior::RestAfterPush).is_some(),
+            "core WatchCommand→RestAfterPush"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchCommand,
+                    Behavior::RestAfterPush,
+                ),
+                None,
+                "{motion:?} WatchCommand→RestAfterPush"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_agent_bridges_to_inspect_error_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchAgent,
+                Behavior::InspectError,
+            )
+            .is_some(),
+            "Full WatchAgent→InspectError"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchAgent, Behavior::InspectError).is_some(),
+            "core WatchAgent→InspectError"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::WatchAgent, Behavior::InspectError,),
+                None,
+                "{motion:?} WatchAgent→InspectError"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_agent_bridges_to_sit_near_error_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchAgent,
+                Behavior::SitNearError,
+            )
+            .is_some(),
+            "Full WatchAgent→SitNearError"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchAgent, Behavior::SitNearError).is_some(),
+            "core WatchAgent→SitNearError"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::WatchAgent, Behavior::SitNearError,),
+                None,
+                "{motion:?} WatchAgent→SitNearError"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_agent_bridges_to_rest_after_push_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchAgent,
+                Behavior::RestAfterPush,
+            )
+            .is_some(),
+            "Full WatchAgent→RestAfterPush"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchAgent, Behavior::RestAfterPush).is_some(),
+            "core WatchAgent→RestAfterPush"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::WatchAgent, Behavior::RestAfterPush,),
+                None,
+                "{motion:?} WatchAgent→RestAfterPush"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_settled_bridges_to_celebrate_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchSettled,
+                Behavior::Celebrate,
+            )
+            .is_some(),
+            "Full WatchSettled→Celebrate"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchSettled, Behavior::Celebrate).is_some(),
+            "core WatchSettled→Celebrate"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::WatchSettled, Behavior::Celebrate,),
+                None,
+                "{motion:?} WatchSettled→Celebrate"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_settled_bridges_to_celebrate_big_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchSettled,
+                Behavior::CelebrateBig,
+            )
+            .is_some(),
+            "Full WatchSettled→CelebrateBig"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchSettled, Behavior::CelebrateBig).is_some(),
+            "core WatchSettled→CelebrateBig"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchSettled,
+                    Behavior::CelebrateBig,
+                ),
+                None,
+                "{motion:?} WatchSettled→CelebrateBig"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_settled_bridges_to_inspect_error_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchSettled,
+                Behavior::InspectError,
+            )
+            .is_some(),
+            "Full WatchSettled→InspectError"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchSettled, Behavior::InspectError).is_some(),
+            "core WatchSettled→InspectError"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchSettled,
+                    Behavior::InspectError,
+                ),
+                None,
+                "{motion:?} WatchSettled→InspectError"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_settled_bridges_to_sit_near_error_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchSettled,
+                Behavior::SitNearError,
+            )
+            .is_some(),
+            "Full WatchSettled→SitNearError"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchSettled, Behavior::SitNearError).is_some(),
+            "core WatchSettled→SitNearError"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchSettled,
+                    Behavior::SitNearError,
+                ),
+                None,
+                "{motion:?} WatchSettled→SitNearError"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_settled_bridges_to_rest_after_push_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchSettled,
+                Behavior::RestAfterPush,
+            )
+            .is_some(),
+            "Full WatchSettled→RestAfterPush"
+        );
+        assert!(
+            VisualTransition::between(Behavior::WatchSettled, Behavior::RestAfterPush).is_some(),
+            "core WatchSettled→RestAfterPush"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchSettled,
+                    Behavior::RestAfterPush,
+                ),
+                None,
+                "{motion:?} WatchSettled→RestAfterPush"
+            );
+        }
+    }
+
+    #[test]
+    fn inspect_error_bridges_to_guard_failure_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::InspectError,
+                Behavior::GuardFailure,
+            )
+            .is_some(),
+            "Full InspectError→GuardFailure"
+        );
+        assert!(
+            VisualTransition::between(Behavior::InspectError, Behavior::GuardFailure).is_some(),
+            "core InspectError→GuardFailure"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::InspectError,
+                    Behavior::GuardFailure,
+                ),
+                None,
+                "{motion:?} InspectError→GuardFailure"
+            );
+        }
+    }
+
+    #[test]
+    fn sit_near_error_bridges_to_guard_stuck_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::SitNearError,
+                Behavior::GuardStuck,
+            )
+            .is_some(),
+            "Full SitNearError→GuardStuck"
+        );
+        assert!(
+            VisualTransition::between(Behavior::SitNearError, Behavior::GuardStuck).is_some(),
+            "core SitNearError→GuardStuck"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::SitNearError, Behavior::GuardStuck,),
+                None,
+                "{motion:?} SitNearError→GuardStuck"
+            );
+        }
+    }
+
+    #[test]
+    fn sit_near_error_bridges_to_guard_failure_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::SitNearError,
+                Behavior::GuardFailure,
+            )
+            .is_some(),
+            "Full SitNearError→GuardFailure"
+        );
+        assert!(
+            VisualTransition::between(Behavior::SitNearError, Behavior::GuardFailure).is_some(),
+            "core SitNearError→GuardFailure"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::SitNearError,
+                    Behavior::GuardFailure,
+                ),
+                None,
+                "{motion:?} SitNearError→GuardFailure"
+            );
+        }
+    }
+
+    #[test]
+    fn sit_near_error_bridges_to_guard_cautious_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::SitNearError,
+                Behavior::GuardCautious,
+            )
+            .is_some(),
+            "Full SitNearError→GuardCautious"
+        );
+        assert!(
+            VisualTransition::between(Behavior::SitNearError, Behavior::GuardCautious).is_some(),
+            "core SitNearError→GuardCautious"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::SitNearError,
+                    Behavior::GuardCautious,
+                ),
+                None,
+                "{motion:?} SitNearError→GuardCautious"
+            );
+        }
+    }
+
+    #[test]
+    fn sit_near_error_bridges_to_guard_recovery_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::SitNearError,
+                Behavior::GuardRecovery,
+            )
+            .is_some(),
+            "Full SitNearError→GuardRecovery"
+        );
+        assert!(
+            VisualTransition::between(Behavior::SitNearError, Behavior::GuardRecovery).is_some(),
+            "core SitNearError→GuardRecovery"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::SitNearError,
+                    Behavior::GuardRecovery,
+                ),
+                None,
+                "{motion:?} SitNearError→GuardRecovery"
+            );
+        }
+    }
+
+    #[test]
+    fn inspect_error_bridges_to_guard_stuck_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::InspectError,
+                Behavior::GuardStuck,
+            )
+            .is_some(),
+            "Full InspectError→GuardStuck"
+        );
+        assert!(
+            VisualTransition::between(Behavior::InspectError, Behavior::GuardStuck).is_some(),
+            "core InspectError→GuardStuck"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::InspectError, Behavior::GuardStuck,),
+                None,
+                "{motion:?} InspectError→GuardStuck"
+            );
+        }
+    }
+
+    #[test]
+    fn inspect_error_bridges_to_guard_cautious_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::InspectError,
+                Behavior::GuardCautious,
+            )
+            .is_some(),
+            "Full InspectError→GuardCautious"
+        );
+        assert!(
+            VisualTransition::between(Behavior::InspectError, Behavior::GuardCautious).is_some(),
+            "core InspectError→GuardCautious"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::InspectError,
+                    Behavior::GuardCautious,
+                ),
+                None,
+                "{motion:?} InspectError→GuardCautious"
+            );
+        }
+    }
+
+    #[test]
+    fn inspect_error_bridges_to_guard_recovery_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::InspectError,
+                Behavior::GuardRecovery,
+            )
+            .is_some(),
+            "Full InspectError→GuardRecovery"
+        );
+        assert!(
+            VisualTransition::between(Behavior::InspectError, Behavior::GuardRecovery).is_some(),
+            "core InspectError→GuardRecovery"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::InspectError,
+                    Behavior::GuardRecovery,
+                ),
+                None,
+                "{motion:?} InspectError→GuardRecovery"
+            );
+        }
+    }
+
+    #[test]
+    fn inspect_error_bridges_to_celebrate_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::InspectError,
+                Behavior::Celebrate,
+            )
+            .is_some(),
+            "Full InspectError→Celebrate"
+        );
+        assert!(
+            VisualTransition::between(Behavior::InspectError, Behavior::Celebrate).is_some(),
+            "core InspectError→Celebrate"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::InspectError, Behavior::Celebrate,),
+                None,
+                "{motion:?} InspectError→Celebrate"
+            );
+        }
+    }
+
+    #[test]
+    fn inspect_error_bridges_to_celebrate_big_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::InspectError,
+                Behavior::CelebrateBig,
+            )
+            .is_some(),
+            "Full InspectError→CelebrateBig"
+        );
+        assert!(
+            VisualTransition::between(Behavior::InspectError, Behavior::CelebrateBig).is_some(),
+            "core InspectError→CelebrateBig"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::InspectError,
+                    Behavior::CelebrateBig,
+                ),
+                None,
+                "{motion:?} InspectError→CelebrateBig"
+            );
+        }
+    }
+
+    #[test]
+    fn inspect_error_bridges_to_sit_near_error_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::InspectError,
+                Behavior::SitNearError,
+            )
+            .is_some(),
+            "Full InspectError→SitNearError"
+        );
+        assert!(
+            VisualTransition::between(Behavior::InspectError, Behavior::SitNearError).is_some(),
+            "core InspectError→SitNearError"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::InspectError,
+                    Behavior::SitNearError,
+                ),
+                None,
+                "{motion:?} InspectError→SitNearError"
+            );
+        }
+    }
+
+    #[test]
+    fn inspect_error_bridges_to_unknown_outcome_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::InspectError,
+                Behavior::UnknownOutcome,
+            )
+            .is_some(),
+            "Full InspectError→UnknownOutcome"
+        );
+        assert!(
+            VisualTransition::between(Behavior::InspectError, Behavior::UnknownOutcome).is_some(),
+            "core InspectError→UnknownOutcome"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::InspectError,
+                    Behavior::UnknownOutcome,
+                ),
+                None,
+                "{motion:?} InspectError→UnknownOutcome"
+            );
+        }
+    }
+
+    #[test]
+    fn inspect_error_bridges_to_rest_after_push_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::InspectError,
+                Behavior::RestAfterPush,
+            )
+            .is_some(),
+            "Full InspectError→RestAfterPush"
+        );
+        assert!(
+            VisualTransition::between(Behavior::InspectError, Behavior::RestAfterPush).is_some(),
+            "core InspectError→RestAfterPush"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::InspectError,
+                    Behavior::RestAfterPush,
+                ),
+                None,
+                "{motion:?} InspectError→RestAfterPush"
+            );
+        }
+    }
+
+    #[test]
+    fn sit_near_error_bridges_to_celebrate_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::SitNearError,
+                Behavior::Celebrate,
+            )
+            .is_some(),
+            "Full SitNearError→Celebrate"
+        );
+        assert!(
+            VisualTransition::between(Behavior::SitNearError, Behavior::Celebrate).is_some(),
+            "core SitNearError→Celebrate"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::SitNearError, Behavior::Celebrate,),
+                None,
+                "{motion:?} SitNearError→Celebrate"
+            );
+        }
+    }
+
+    #[test]
+    fn sit_near_error_bridges_to_celebrate_big_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::SitNearError,
+                Behavior::CelebrateBig,
+            )
+            .is_some(),
+            "Full SitNearError→CelebrateBig"
+        );
+        assert!(
+            VisualTransition::between(Behavior::SitNearError, Behavior::CelebrateBig).is_some(),
+            "core SitNearError→CelebrateBig"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::SitNearError,
+                    Behavior::CelebrateBig,
+                ),
+                None,
+                "{motion:?} SitNearError→CelebrateBig"
+            );
+        }
+    }
+
+    #[test]
+    fn sit_near_error_bridges_to_unknown_outcome_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::SitNearError,
+                Behavior::UnknownOutcome,
+            )
+            .is_some(),
+            "Full SitNearError→UnknownOutcome"
+        );
+        assert!(
+            VisualTransition::between(Behavior::SitNearError, Behavior::UnknownOutcome).is_some(),
+            "core SitNearError→UnknownOutcome"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::SitNearError,
+                    Behavior::UnknownOutcome,
+                ),
+                None,
+                "{motion:?} SitNearError→UnknownOutcome"
+            );
+        }
+    }
+
+    #[test]
+    fn sit_near_error_bridges_to_rest_after_push_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::SitNearError,
+                Behavior::RestAfterPush,
+            )
+            .is_some(),
+            "Full SitNearError→RestAfterPush"
+        );
+        assert!(
+            VisualTransition::between(Behavior::SitNearError, Behavior::RestAfterPush).is_some(),
+            "core SitNearError→RestAfterPush"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::SitNearError,
+                    Behavior::RestAfterPush,
+                ),
+                None,
+                "{motion:?} SitNearError→RestAfterPush"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_failure_bridges_to_guard_stuck_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardFailure,
+                Behavior::GuardStuck,
+            )
+            .is_some(),
+            "Full GuardFailure→GuardStuck"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardFailure, Behavior::GuardStuck).is_some(),
+            "core GuardFailure→GuardStuck"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::GuardFailure, Behavior::GuardStuck,),
+                None,
+                "{motion:?} GuardFailure→GuardStuck"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_failure_bridges_to_guard_recovery_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardFailure,
+                Behavior::GuardRecovery,
+            )
+            .is_some(),
+            "Full GuardFailure→GuardRecovery"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardFailure, Behavior::GuardRecovery).is_some(),
+            "core GuardFailure→GuardRecovery"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::GuardFailure,
+                    Behavior::GuardRecovery,
+                ),
+                None,
+                "{motion:?} GuardFailure→GuardRecovery"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_failure_bridges_to_guard_cautious_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardFailure,
+                Behavior::GuardCautious,
+            )
+            .is_some(),
+            "Full GuardFailure→GuardCautious"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardFailure, Behavior::GuardCautious).is_some(),
+            "core GuardFailure→GuardCautious"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::GuardFailure,
+                    Behavior::GuardCautious,
+                ),
+                None,
+                "{motion:?} GuardFailure→GuardCautious"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_failure_bridges_to_rest_after_push_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardFailure,
+                Behavior::RestAfterPush,
+            )
+            .is_some(),
+            "Full GuardFailure→RestAfterPush"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardFailure, Behavior::RestAfterPush).is_some(),
+            "core GuardFailure→RestAfterPush"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::GuardFailure,
+                    Behavior::RestAfterPush,
+                ),
+                None,
+                "{motion:?} GuardFailure→RestAfterPush"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_stuck_bridges_to_guard_failure_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardStuck,
+                Behavior::GuardFailure,
+            )
+            .is_some(),
+            "Full GuardStuck→GuardFailure"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardStuck, Behavior::GuardFailure).is_some(),
+            "core GuardStuck→GuardFailure"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::GuardStuck, Behavior::GuardFailure,),
+                None,
+                "{motion:?} GuardStuck→GuardFailure"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_stuck_bridges_to_guard_recovery_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardStuck,
+                Behavior::GuardRecovery,
+            )
+            .is_some(),
+            "Full GuardStuck→GuardRecovery"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardStuck, Behavior::GuardRecovery).is_some(),
+            "core GuardStuck→GuardRecovery"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::GuardStuck, Behavior::GuardRecovery,),
+                None,
+                "{motion:?} GuardStuck→GuardRecovery"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_stuck_bridges_to_guard_cautious_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardStuck,
+                Behavior::GuardCautious,
+            )
+            .is_some(),
+            "Full GuardStuck→GuardCautious"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardStuck, Behavior::GuardCautious).is_some(),
+            "core GuardStuck→GuardCautious"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::GuardStuck, Behavior::GuardCautious,),
+                None,
+                "{motion:?} GuardStuck→GuardCautious"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_stuck_bridges_to_rest_after_push_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardStuck,
+                Behavior::RestAfterPush,
+            )
+            .is_some(),
+            "Full GuardStuck→RestAfterPush"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardStuck, Behavior::RestAfterPush).is_some(),
+            "core GuardStuck→RestAfterPush"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::GuardStuck, Behavior::RestAfterPush,),
+                None,
+                "{motion:?} GuardStuck→RestAfterPush"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_recovery_bridges_to_guard_failure_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardRecovery,
+                Behavior::GuardFailure,
+            )
+            .is_some(),
+            "Full GuardRecovery→GuardFailure"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardRecovery, Behavior::GuardFailure).is_some(),
+            "core GuardRecovery→GuardFailure"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::GuardRecovery,
+                    Behavior::GuardFailure,
+                ),
+                None,
+                "{motion:?} GuardRecovery→GuardFailure"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_recovery_bridges_to_guard_stuck_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardRecovery,
+                Behavior::GuardStuck,
+            )
+            .is_some(),
+            "Full GuardRecovery→GuardStuck"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardRecovery, Behavior::GuardStuck).is_some(),
+            "core GuardRecovery→GuardStuck"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::GuardRecovery, Behavior::GuardStuck,),
+                None,
+                "{motion:?} GuardRecovery→GuardStuck"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_recovery_bridges_to_guard_cautious_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardRecovery,
+                Behavior::GuardCautious,
+            )
+            .is_some(),
+            "Full GuardRecovery→GuardCautious"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardRecovery, Behavior::GuardCautious).is_some(),
+            "core GuardRecovery→GuardCautious"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::GuardRecovery,
+                    Behavior::GuardCautious,
+                ),
+                None,
+                "{motion:?} GuardRecovery→GuardCautious"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_recovery_bridges_to_rest_after_push_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardRecovery,
+                Behavior::RestAfterPush,
+            )
+            .is_some(),
+            "Full GuardRecovery→RestAfterPush"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardRecovery, Behavior::RestAfterPush).is_some(),
+            "core GuardRecovery→RestAfterPush"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::GuardRecovery,
+                    Behavior::RestAfterPush,
+                ),
+                None,
+                "{motion:?} GuardRecovery→RestAfterPush"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_recovery_bridges_to_inspect_error_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardRecovery,
+                Behavior::InspectError,
+            )
+            .is_some(),
+            "Full GuardRecovery→InspectError"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardRecovery, Behavior::InspectError).is_some(),
+            "core GuardRecovery→InspectError"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::GuardRecovery,
+                    Behavior::InspectError,
+                ),
+                None,
+                "{motion:?} GuardRecovery→InspectError"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_recovery_bridges_to_sit_near_error_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardRecovery,
+                Behavior::SitNearError,
+            )
+            .is_some(),
+            "Full GuardRecovery→SitNearError"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardRecovery, Behavior::SitNearError).is_some(),
+            "core GuardRecovery→SitNearError"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::GuardRecovery,
+                    Behavior::SitNearError,
+                ),
+                None,
+                "{motion:?} GuardRecovery→SitNearError"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_cautious_bridges_to_guard_failure_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardCautious,
+                Behavior::GuardFailure,
+            )
+            .is_some(),
+            "Full GuardCautious→GuardFailure"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardCautious, Behavior::GuardFailure).is_some(),
+            "core GuardCautious→GuardFailure"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::GuardCautious,
+                    Behavior::GuardFailure,
+                ),
+                None,
+                "{motion:?} GuardCautious→GuardFailure"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_cautious_bridges_to_guard_stuck_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardCautious,
+                Behavior::GuardStuck,
+            )
+            .is_some(),
+            "Full GuardCautious→GuardStuck"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardCautious, Behavior::GuardStuck).is_some(),
+            "core GuardCautious→GuardStuck"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::GuardCautious, Behavior::GuardStuck,),
+                None,
+                "{motion:?} GuardCautious→GuardStuck"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_cautious_bridges_to_guard_recovery_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardCautious,
+                Behavior::GuardRecovery,
+            )
+            .is_some(),
+            "Full GuardCautious→GuardRecovery"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardCautious, Behavior::GuardRecovery).is_some(),
+            "core GuardCautious→GuardRecovery"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::GuardCautious,
+                    Behavior::GuardRecovery,
+                ),
+                None,
+                "{motion:?} GuardCautious→GuardRecovery"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_cautious_bridges_to_rest_after_push_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardCautious,
+                Behavior::RestAfterPush,
+            )
+            .is_some(),
+            "Full GuardCautious→RestAfterPush"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardCautious, Behavior::RestAfterPush).is_some(),
+            "core GuardCautious→RestAfterPush"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::GuardCautious,
+                    Behavior::RestAfterPush,
+                ),
+                None,
+                "{motion:?} GuardCautious→RestAfterPush"
+            );
+        }
+    }
+
+    #[test]
+    fn celebrate_bridges_to_guard_recovery_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::Celebrate,
+                Behavior::GuardRecovery,
+            )
+            .is_some(),
+            "Full Celebrate→GuardRecovery"
+        );
+        assert!(
+            VisualTransition::between(Behavior::Celebrate, Behavior::GuardRecovery).is_some(),
+            "core Celebrate→GuardRecovery"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::GuardRecovery,),
+                None,
+                "{motion:?} Celebrate→GuardRecovery"
+            );
+        }
+    }
+
+    #[test]
+    fn celebrate_bridges_to_guard_cautious_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::Celebrate,
+                Behavior::GuardCautious,
+            )
+            .is_some(),
+            "Full Celebrate→GuardCautious"
+        );
+        assert!(
+            VisualTransition::between(Behavior::Celebrate, Behavior::GuardCautious).is_some(),
+            "core Celebrate→GuardCautious"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::GuardCautious,),
+                None,
+                "{motion:?} Celebrate→GuardCautious"
+            );
+        }
+    }
+
+    #[test]
+    fn celebrate_bridges_to_guard_failure_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::Celebrate,
+                Behavior::GuardFailure,
+            )
+            .is_some(),
+            "Full Celebrate→GuardFailure"
+        );
+        assert!(
+            VisualTransition::between(Behavior::Celebrate, Behavior::GuardFailure).is_some(),
+            "core Celebrate→GuardFailure"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::GuardFailure,),
+                None,
+                "{motion:?} Celebrate→GuardFailure"
+            );
+        }
+    }
+
+    #[test]
+    fn celebrate_bridges_to_guard_stuck_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::Celebrate,
+                Behavior::GuardStuck,
+            )
+            .is_some(),
+            "Full Celebrate→GuardStuck"
+        );
+        assert!(
+            VisualTransition::between(Behavior::Celebrate, Behavior::GuardStuck).is_some(),
+            "core Celebrate→GuardStuck"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::GuardStuck,),
+                None,
+                "{motion:?} Celebrate→GuardStuck"
+            );
+        }
+    }
+
+    #[test]
+    fn celebrate_bridges_to_rest_after_push_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::Celebrate,
+                Behavior::RestAfterPush,
+            )
+            .is_some(),
+            "Full Celebrate→RestAfterPush"
+        );
+        assert!(
+            VisualTransition::between(Behavior::Celebrate, Behavior::RestAfterPush).is_some(),
+            "core Celebrate→RestAfterPush"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::RestAfterPush,),
+                None,
+                "{motion:?} Celebrate→RestAfterPush"
+            );
+        }
+    }
+
+    #[test]
+    fn celebrate_bridges_to_inspect_error_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::Celebrate,
+                Behavior::InspectError,
+            )
+            .is_some(),
+            "Full Celebrate→InspectError"
+        );
+        assert!(
+            VisualTransition::between(Behavior::Celebrate, Behavior::InspectError).is_some(),
+            "core Celebrate→InspectError"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::InspectError,),
+                None,
+                "{motion:?} Celebrate→InspectError"
+            );
+        }
+    }
+
+    #[test]
+    fn celebrate_bridges_to_sit_near_error_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::Celebrate,
+                Behavior::SitNearError,
+            )
+            .is_some(),
+            "Full Celebrate→SitNearError"
+        );
+        assert!(
+            VisualTransition::between(Behavior::Celebrate, Behavior::SitNearError).is_some(),
+            "core Celebrate→SitNearError"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::SitNearError,),
+                None,
+                "{motion:?} Celebrate→SitNearError"
+            );
+        }
+    }
+
+    #[test]
+    fn celebrate_big_bridges_to_guard_recovery_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::CelebrateBig,
+                Behavior::GuardRecovery,
+            )
+            .is_some(),
+            "Full CelebrateBig→GuardRecovery"
+        );
+        assert!(
+            VisualTransition::between(Behavior::CelebrateBig, Behavior::GuardRecovery).is_some(),
+            "core CelebrateBig→GuardRecovery"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::CelebrateBig,
+                    Behavior::GuardRecovery,
+                ),
+                None,
+                "{motion:?} CelebrateBig→GuardRecovery"
+            );
+        }
+    }
+
+    #[test]
+    fn celebrate_big_bridges_to_guard_cautious_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::CelebrateBig,
+                Behavior::GuardCautious,
+            )
+            .is_some(),
+            "Full CelebrateBig→GuardCautious"
+        );
+        assert!(
+            VisualTransition::between(Behavior::CelebrateBig, Behavior::GuardCautious).is_some(),
+            "core CelebrateBig→GuardCautious"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::CelebrateBig,
+                    Behavior::GuardCautious,
+                ),
+                None,
+                "{motion:?} CelebrateBig→GuardCautious"
+            );
+        }
+    }
+
+    #[test]
+    fn celebrate_big_bridges_to_guard_failure_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::CelebrateBig,
+                Behavior::GuardFailure,
+            )
+            .is_some(),
+            "Full CelebrateBig→GuardFailure"
+        );
+        assert!(
+            VisualTransition::between(Behavior::CelebrateBig, Behavior::GuardFailure).is_some(),
+            "core CelebrateBig→GuardFailure"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::CelebrateBig,
+                    Behavior::GuardFailure,
+                ),
+                None,
+                "{motion:?} CelebrateBig→GuardFailure"
+            );
+        }
+    }
+
+    #[test]
+    fn celebrate_big_bridges_to_guard_stuck_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::CelebrateBig,
+                Behavior::GuardStuck,
+            )
+            .is_some(),
+            "Full CelebrateBig→GuardStuck"
+        );
+        assert!(
+            VisualTransition::between(Behavior::CelebrateBig, Behavior::GuardStuck).is_some(),
+            "core CelebrateBig→GuardStuck"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::CelebrateBig, Behavior::GuardStuck,),
+                None,
+                "{motion:?} CelebrateBig→GuardStuck"
+            );
+        }
+    }
+
+    #[test]
+    fn celebrate_big_bridges_to_rest_after_push_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::CelebrateBig,
+                Behavior::RestAfterPush,
+            )
+            .is_some(),
+            "Full CelebrateBig→RestAfterPush"
+        );
+        assert!(
+            VisualTransition::between(Behavior::CelebrateBig, Behavior::RestAfterPush).is_some(),
+            "core CelebrateBig→RestAfterPush"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::CelebrateBig,
+                    Behavior::RestAfterPush,
+                ),
+                None,
+                "{motion:?} CelebrateBig→RestAfterPush"
+            );
+        }
+    }
+
+    #[test]
+    fn celebrate_big_bridges_to_inspect_error_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::CelebrateBig,
+                Behavior::InspectError,
+            )
+            .is_some(),
+            "Full CelebrateBig→InspectError"
+        );
+        assert!(
+            VisualTransition::between(Behavior::CelebrateBig, Behavior::InspectError).is_some(),
+            "core CelebrateBig→InspectError"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::CelebrateBig,
+                    Behavior::InspectError,
+                ),
+                None,
+                "{motion:?} CelebrateBig→InspectError"
+            );
+        }
+    }
+
+    #[test]
+    fn celebrate_big_bridges_to_sit_near_error_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::CelebrateBig,
+                Behavior::SitNearError,
+            )
+            .is_some(),
+            "Full CelebrateBig→SitNearError"
+        );
+        assert!(
+            VisualTransition::between(Behavior::CelebrateBig, Behavior::SitNearError).is_some(),
+            "core CelebrateBig→SitNearError"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::CelebrateBig,
+                    Behavior::SitNearError,
+                ),
+                None,
+                "{motion:?} CelebrateBig→SitNearError"
+            );
+        }
+    }
+
+    #[test]
+    fn rest_after_push_bridges_to_inspect_error_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::RestAfterPush,
+                Behavior::InspectError,
+            )
+            .is_some(),
+            "Full RestAfterPush→InspectError"
+        );
+        assert!(
+            VisualTransition::between(Behavior::RestAfterPush, Behavior::InspectError).is_some(),
+            "core RestAfterPush→InspectError"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::RestAfterPush,
+                    Behavior::InspectError,
+                ),
+                None,
+                "{motion:?} RestAfterPush→InspectError"
+            );
+        }
+    }
+
+    #[test]
+    fn rest_after_push_bridges_to_sit_near_error_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::RestAfterPush,
+                Behavior::SitNearError,
+            )
+            .is_some(),
+            "Full RestAfterPush→SitNearError"
+        );
+        assert!(
+            VisualTransition::between(Behavior::RestAfterPush, Behavior::SitNearError).is_some(),
+            "core RestAfterPush→SitNearError"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::RestAfterPush,
+                    Behavior::SitNearError,
+                ),
+                None,
+                "{motion:?} RestAfterPush→SitNearError"
+            );
+        }
+    }
+
+    #[test]
+    fn rest_after_push_bridges_to_celebrate_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::RestAfterPush,
+                Behavior::Celebrate,
+            )
+            .is_some(),
+            "Full RestAfterPush→Celebrate"
+        );
+        assert!(
+            VisualTransition::between(Behavior::RestAfterPush, Behavior::Celebrate).is_some(),
+            "core RestAfterPush→Celebrate"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::RestAfterPush, Behavior::Celebrate,),
+                None,
+                "{motion:?} RestAfterPush→Celebrate"
+            );
+        }
+    }
+
+    #[test]
+    fn rest_after_push_bridges_to_celebrate_big_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::RestAfterPush,
+                Behavior::CelebrateBig,
+            )
+            .is_some(),
+            "Full RestAfterPush→CelebrateBig"
+        );
+        assert!(
+            VisualTransition::between(Behavior::RestAfterPush, Behavior::CelebrateBig).is_some(),
+            "core RestAfterPush→CelebrateBig"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::RestAfterPush,
+                    Behavior::CelebrateBig,
+                ),
+                None,
+                "{motion:?} RestAfterPush→CelebrateBig"
+            );
+        }
+    }
+
+    #[test]
+    fn rest_after_push_bridges_to_unknown_outcome_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::RestAfterPush,
+                Behavior::UnknownOutcome,
+            )
+            .is_some(),
+            "Full RestAfterPush→UnknownOutcome"
+        );
+        assert!(
+            VisualTransition::between(Behavior::RestAfterPush, Behavior::UnknownOutcome).is_some(),
+            "core RestAfterPush→UnknownOutcome"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::RestAfterPush,
+                    Behavior::UnknownOutcome,
+                ),
+                None,
+                "{motion:?} RestAfterPush→UnknownOutcome"
+            );
+        }
+    }
+
+    #[test]
+    fn celebrate_bridges_to_unknown_outcome_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::Celebrate,
+                Behavior::UnknownOutcome,
+            )
+            .is_some(),
+            "Full Celebrate→UnknownOutcome"
+        );
+        assert!(
+            VisualTransition::between(Behavior::Celebrate, Behavior::UnknownOutcome).is_some(),
+            "core Celebrate→UnknownOutcome"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::UnknownOutcome,),
+                None,
+                "{motion:?} Celebrate→UnknownOutcome"
+            );
+        }
+    }
+
+    #[test]
+    fn celebrate_big_bridges_to_unknown_outcome_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::CelebrateBig,
+                Behavior::UnknownOutcome,
+            )
+            .is_some(),
+            "Full CelebrateBig→UnknownOutcome"
+        );
+        assert!(
+            VisualTransition::between(Behavior::CelebrateBig, Behavior::UnknownOutcome).is_some(),
+            "core CelebrateBig→UnknownOutcome"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::CelebrateBig,
+                    Behavior::UnknownOutcome,
+                ),
+                None,
+                "{motion:?} CelebrateBig→UnknownOutcome"
+            );
+        }
+    }
+
+    #[test]
+    fn ambient_and_typing_surfaces_skip_visual_transition_arcs() {
+        // Ambient utility poses (Explore/Sleep/Approach/Idle) display through
+        // AmbientBehavior → Behavior::display, but disposition exchanges do
+        // not invent VisualTransition bridges (pairs core ambient N/A pin and
+        // forge/anvil upgrade Ambient VisualTransition N/A probes).
+        for (from, to) in [
+            (Behavior::Idle, Behavior::Explore),
+            (Behavior::Explore, Behavior::Sleep),
+            (Behavior::Sleep, Behavior::Approach),
+            (Behavior::Approach, Behavior::Idle),
+            (Behavior::Explore, Behavior::Idle),
+            (Behavior::Sleep, Behavior::Idle),
+            // Complete ambient disposition exchange table (pairs core
+            // `ambient_disposition_exchanges_have_no_visual_transition`).
+            (Behavior::Idle, Behavior::Sleep),
+            (Behavior::Idle, Behavior::Approach),
+            (Behavior::Explore, Behavior::Approach),
+            (Behavior::Approach, Behavior::Explore),
+            (Behavior::Approach, Behavior::Sleep),
+            (Behavior::Sleep, Behavior::Explore),
+        ] {
+            assert_eq!(
+                visual_transition_for_motion(OrganismMotion::Full, from, to),
+                None,
+                "Full ambient {from:?}→{to:?}"
+            );
+            assert_eq!(VisualTransition::between(from, to), None);
+        }
+        // Typing is SurfaceMode → WatchCommand; entering from an ambient pose
+        // snaps without a Typing-named VisualTransition variant. WatchAgent /
+        // WatchSettled entries from ambient poses stay None the same way —
+        // Watch*→Idle animates, but Idle/ambient→Watch* never invents a bridge.
+        for from in [
+            Behavior::Idle,
+            Behavior::Explore,
+            Behavior::Sleep,
+            Behavior::Approach,
+        ] {
+            for to in [
+                Behavior::WatchCommand,
+                Behavior::WatchAgent,
+                Behavior::WatchSettled,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?} (ambient→Watch*)"
+                );
+                assert_eq!(VisualTransition::between(from, to), None);
+            }
+        }
+        // Ambient utility poses also never bridge into repo vigil or Celebrate
+        // holds under Full motion (open vigil / success finish land via Watch*
+        // or Idle snap). Idle/Rest→Guard* is pinned in semantic_bridges; pin
+        // Explore/Sleep/Approach the same way.
+        for from in [Behavior::Explore, Behavior::Sleep, Behavior::Approach] {
+            for to in [
+                Behavior::GuardFailure,
+                Behavior::GuardStuck,
+                Behavior::GuardRecovery,
+                Behavior::GuardCautious,
+                Behavior::Celebrate,
+                Behavior::CelebrateBig,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?} (ambient→vigil/celebrate)"
+                );
+                assert_eq!(VisualTransition::between(from, to), None);
+            }
+        }
+        // Ambient→Inspect/Sit/Unknown/Rest stays None under Full motion too
+        // (holds/rest arrive from finish/push reducers). between() stays 93.
+        for from in [Behavior::Explore, Behavior::Sleep, Behavior::Approach] {
+            for to in [
+                Behavior::InspectError,
+                Behavior::SitNearError,
+                Behavior::UnknownOutcome,
+                Behavior::RestAfterPush,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?} (ambient→hold/rest)"
+                );
+                assert_eq!(VisualTransition::between(from, to), None);
+            }
+        }
+        // Idle→hold/cele/rest stays None: live finishes arrive through Watch*
+        // (which already animate). A finish applied from Idle without Watch
+        // snaps; pin beside ambient utility hold/rest Nones (pairs core).
+        for to in [
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::UnknownOutcome,
+            Behavior::Celebrate,
+            Behavior::CelebrateBig,
+            Behavior::RestAfterPush,
+        ] {
+            assert_eq!(
+                visual_transition_for_motion(OrganismMotion::Full, Behavior::Idle, to),
+                None,
+                "Full Idle→{to:?} (finish without Watch snaps)"
+            );
+            assert_eq!(VisualTransition::between(Behavior::Idle, to), None);
+        }
+    }
+
+    #[test]
+    fn agent_driven_passes_stay_on_celebrate_not_celebrate_big() {
+        // Mirrors core `agent_commands_get_quiet_nods_and_the_big_celebrations_stay_human`
+        // at the UI contract layer: agent recovery is Celebrate, never CelebrateBig.
+        let mut organism = NativeOrganism::default();
+        organism.set_agent_command(true);
+        let started = organism.command_started(CommandKind::BuildOrTest);
+        assert_eq!(started.behavior, Behavior::WatchAgent);
+        organism.restore_repo_context(3, false, 0, 3);
+        organism.set_agent_command(true);
+        let recovery = organism.command_finished(CommandKind::BuildOrTest, Some(0), None);
+        assert_eq!(recovery.behavior, Behavior::Celebrate);
+        assert_ne!(recovery.behavior, Behavior::CelebrateBig);
+        assert_eq!(
+            VisualTransition::between(Behavior::WatchAgent, Behavior::CelebrateBig),
+            None
+        );
     }
 
     #[test]
@@ -4476,9 +11529,89 @@ mod tests {
     }
 
     #[test]
+    fn agent_signal_disabled_phases_are_consumed_without_life_rewards() {
+        let life = Rc::new(Cell::new(LifeState::default()));
+        let config = Rc::new(RefCell::new(crate::config::Config::safe_defaults()));
+        config.borrow_mut().ascii_organism_enabled = false;
+        let signal = OrganismAgentSignal::new(life.clone(), config.clone());
+        let before = format!("{:?}", life.get());
+        for pulse in [
+            AgentPulse::Working,
+            AgentPulse::AskingReview,
+            AgentPulse::Finished,
+            AgentPulse::Gone,
+        ] {
+            signal.note_phase(pulse);
+        }
+        assert_eq!(format!("{:?}", life.get()), before);
+        config.borrow_mut().ascii_organism_enabled = true;
+        signal.note_phase(AgentPulse::Gone);
+        assert_eq!(format!("{:?}", life.get()), before);
+        signal.note_phase(AgentPulse::Working);
+        assert!(life.get().social_need > LifeState::default().social_need);
+        let after = format!("{:?}", life.get());
+        signal.note_phase(AgentPulse::Working);
+        assert_eq!(format!("{:?}", life.get()), after);
+    }
+
+    #[test]
+    fn agent_signal_busy_config_borrow_consumes_phase_without_panicking_or_replaying() {
+        let life = Rc::new(Cell::new(LifeState::default()));
+        let config = Rc::new(RefCell::new(crate::config::Config::safe_defaults()));
+        config.borrow_mut().ascii_organism_enabled = true;
+        let signal = OrganismAgentSignal::new(life.clone(), config.clone());
+        let before = format!("{:?}", life.get());
+        let updating = config.borrow_mut();
+        signal.note_phase(AgentPulse::Finished);
+        assert_eq!(format!("{:?}", life.get()), before);
+        drop(updating);
+        signal.note_phase(AgentPulse::Finished);
+        assert_eq!(format!("{:?}", life.get()), before);
+        signal.note_phase(AgentPulse::Working);
+        assert!(life.get().social_need > LifeState::default().social_need);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn agent_signal_uses_window_setting_when_one_native_pane_is_disabled() {
+        libadwaita::init().expect("GTK/libadwaita display");
+        let view = crate::block_view::organism_settings_test_view();
+        let presence = OrganismPresence::new();
+        presence.remember_view(&view);
+        let token = presence.reserve();
+        let life = Rc::new(Cell::new(LifeState::default()));
+        let runtime = OrganismRuntime::new(
+            life.clone(),
+            OrganismActivity::new(None, GrowthProgress::default()),
+            presence.clone(),
+            token,
+            OrganismMotion::Static,
+            false,
+        );
+        presence.bind(token, &view, &runtime);
+        let config = Rc::new(RefCell::new(crate::config::Config::safe_defaults()));
+        config.borrow_mut().ascii_organism_enabled = true;
+        let signal = OrganismAgentSignal::new(life.clone(), config.clone());
+        OrganismRuntime::apply_settings(&runtime, &view, false, OrganismMotion::Static);
+        assert!(!runtime.enabled.get());
+        assert!(runtime.surface_timer.borrow().is_none());
+        signal.note_phase(AgentPulse::Finished);
+        assert!(life.get().social_need > LifeState::default().social_need);
+        let before_disabled = format!("{:?}", life.get());
+        config.borrow_mut().ascii_organism_enabled = false;
+        signal.note_phase(AgentPulse::Gone);
+        assert_eq!(format!("{:?}", life.get()), before_disabled);
+        config.borrow_mut().ascii_organism_enabled = true;
+        signal.note_phase(AgentPulse::Gone);
+        assert_eq!(format!("{:?}", life.get()), before_disabled);
+    }
+
+    #[test]
     fn agent_signal_deduplicates_repeated_phase_renders() {
         let life = Rc::new(Cell::new(LifeState::default()));
-        let signal = OrganismAgentSignal::new(life.clone());
+        let mut config = crate::config::Config::safe_defaults();
+        config.ascii_organism_enabled = true;
+        let signal = OrganismAgentSignal::new(life.clone(), Rc::new(RefCell::new(config)));
         let before = life.get().social_need;
         signal.note_phase(AgentPulse::Working);
         let after_first = life.get().social_need;
@@ -4500,17 +11633,182 @@ mod tests {
         assert_eq!(signal.dismiss_streak.get(), 0);
     }
 
+    fn assert_physiology_close(actual: LifeState, expected: LifeState) {
+        for (actual, expected) in [
+            (actual.energy, expected.energy),
+            (actual.mood, expected.mood),
+            (actual.curiosity, expected.curiosity),
+            (actual.boredom, expected.boredom),
+            (actual.stress, expected.stress),
+            (actual.social_need, expected.social_need),
+            (actual.attachment, expected.attachment),
+            (actual.confidence, expected.confidence),
+        ] {
+            assert!(
+                (actual - expected).abs() < 0.000001,
+                "{actual} != {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn physiology_rest_counts_only_time_after_the_quiet_threshold() {
+        for (begin_ms, end_ms, awake, rest) in [
+            (59_000, 60_000, 1.0, 0.0),
+            (59_500, 60_500, 0.5, 0.5),
+            (60_000, 61_000, 0.0, 1.0),
+        ] {
+            let activity = OrganismActivity::new(None, GrowthProgress::default());
+            let start = activity.session_started;
+            activity.active_at.set(Some(start));
+            let mut actual = LifeState::default();
+            let mut expected = actual;
+            let phase = CircadianPhase::Unlearned;
+            assert_eq!(
+                activity.advance_life(&mut actual, start + Duration::from_millis(begin_ms), phase),
+                0.0
+            );
+            assert_eq!(
+                activity.advance_life(&mut actual, start + Duration::from_millis(end_ms), phase),
+                1.0
+            );
+            if awake > 0.0 {
+                expected.tick(awake, false, false, phase);
+            }
+            if rest > 0.0 {
+                expected.tick(rest, false, true, phase);
+            }
+            assert_physiology_close(actual, expected);
+        }
+    }
+
+    #[test]
+    fn physiology_running_gates_quiet_and_visible_sleep_but_keeps_exhaustion_rest() {
+        let activity = OrganismActivity::new(None, GrowthProgress::default());
+        let start = activity.session_started;
+        activity.command_started(start);
+        activity.body_started_sleeping();
+        let phase = CircadianPhase::Unlearned;
+        let mut actual = LifeState::default();
+        let mut expected = actual;
+        activity.advance_life(&mut actual, start + Duration::from_secs(60), phase);
+        activity.advance_life(&mut actual, start + Duration::from_secs(61), phase);
+        expected.tick(1.0, false, false, phase);
+        assert_physiology_close(actual, expected);
+
+        activity.command_finished(start + Duration::from_secs(61));
+        activity.advance_life(&mut actual, start + Duration::from_millis(61_500), phase);
+        expected.tick(0.5, false, true, phase);
+        assert_physiology_close(actual, expected);
+
+        activity.command_started(start + Duration::from_millis(61_500));
+        actual.energy = 0.05;
+        expected = actual;
+        activity.advance_life(&mut actual, start + Duration::from_millis(62_000), phase);
+        expected.tick(0.5, false, false, phase);
+        assert_physiology_close(actual, expected);
+        assert!(
+            actual.energy > 0.05,
+            "core exhaustion rest remains available during a command"
+        );
+    }
+
+    #[test]
+    fn physiology_preserves_shared_state_and_chronological_input_without_double_ticks() {
+        let activity = OrganismActivity::new(None, GrowthProgress::default());
+        let start = activity.session_started;
+        let phase = CircadianPhase::Unlearned;
+        let mut actual = LifeState::default();
+        activity.advance_life(&mut actual, start, phase);
+        activity.note_input(start + Duration::from_millis(900));
+        // A lifecycle event may mutate the shared state after the last frame.
+        actual.confidence = 0.9;
+        let mut expected = actual;
+        expected.tick(0.9, false, false, phase);
+        expected.tick(0.1, true, false, phase);
+        activity.advance_life(&mut actual, start + Duration::from_secs(1), phase);
+        assert_physiology_close(actual, expected);
+        assert_eq!(
+            activity.advance_life(&mut actual, start + Duration::from_secs(1), phase),
+            0.0
+        );
+        assert_eq!(activity.advance_life(&mut actual, start, phase), 0.0);
+        assert_physiology_close(actual, expected);
+        activity.body_enabled();
+        activity.body_disabled();
+        activity.body_enabled();
+        assert_eq!(
+            activity.advance_life(&mut actual, start + Duration::from_secs(10), phase),
+            0.0
+        );
+        assert_physiology_close(actual, expected);
+    }
+
+    #[test]
+    fn last_enabled_body_pauses_clock_and_retires_input_until_resume() {
+        let activity = OrganismActivity::new(None, GrowthProgress::default());
+        let start = activity.session_started;
+        activity.body_enabled();
+        activity.tick_slice(start);
+        activity.note_input(start);
+        activity.body_disabled();
+        assert!(activity.ticked_at.get().is_none());
+        activity.body_enabled();
+        // Even a quick reenable cannot revive the pre-disable input window.
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_millis(100)),
+            (0.0, 0.0)
+        );
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_millis(200)),
+            (0.0, 0.1)
+        );
+        activity.body_disabled();
+        activity.body_enabled();
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_secs(3600)),
+            (0.0, 0.0)
+        );
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_millis(3_600_100)),
+            (0.0, 0.1)
+        );
+    }
+
+    #[test]
+    fn disabling_one_of_several_enabled_bodies_preserves_clock_and_input() {
+        let activity = OrganismActivity::new(None, GrowthProgress::default());
+        let start = activity.session_started;
+        activity.body_enabled();
+        activity.body_enabled();
+        activity.tick_slice(start);
+        activity.note_input(start);
+        activity.body_disabled();
+        assert_eq!(activity.enabled_bodies.get(), 1);
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_millis(200)),
+            (0.2, 0.0)
+        );
+        activity.body_enabled();
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_millis(300)),
+            (0.1, 0.0)
+        );
+        activity.body_disabled();
+        assert_eq!(activity.enabled_bodies.get(), 1);
+    }
+
     #[test]
     fn shared_activity_clock_hands_out_each_slice_exactly_once() {
         let activity = OrganismActivity::new(None, GrowthProgress::default());
         let start = Instant::now();
-        assert_eq!(activity.tick_slice(start), 0.0);
+        assert_eq!(activity.tick_slice(start), (0.0, 0.0));
         let later = start + Duration::from_millis(250);
         let slice = activity.tick_slice(later);
-        assert!((slice - 0.25).abs() < 0.005);
+        assert_eq!(slice, (0.0, 0.25));
         // A second body asking at the same instant gets nothing: the mind
         // never lives the same moment twice.
-        assert_eq!(activity.tick_slice(later), 0.0);
+        assert_eq!(activity.tick_slice(later), (0.0, 0.0));
     }
 
     #[test]
@@ -4651,7 +11949,15 @@ mod tests {
 
     #[test]
     fn reactions_and_presence_cues_start_on_their_canonical_frame() {
-        let global = 57;
+        // Weighted sprite cadence can revisit the canonical pose at any
+        // particular global tick. Choose a real alternate frame so the
+        // regression keeps proving that a new event resets that live epoch.
+        let global = (1..240)
+            .find(|&frame| {
+                sprite_frame(Behavior::Celebrate, BodyLanguage::default(), false, frame)
+                    != Behavior::Celebrate.sprite()
+            })
+            .expect("Celebrate must expose an alternate live frame in the sampled cycle");
         let (baseline, live) = animation_frames(global, global, 0, SurfaceMode::Reacting, None);
         assert_eq!((baseline, live), (0, 0));
         assert_eq!(
@@ -4935,15 +12241,104 @@ mod tests {
     }
 
     #[test]
-    fn typing_window_marks_the_user_active_briefly() {
+    fn input_windows_count_expired_overlap_and_just_arrived_input() {
         let activity = OrganismActivity::new(None, GrowthProgress::default());
-        let now = Instant::now();
-        assert!(!activity.user_active(now));
-        activity.note_input(now);
-        assert!(activity.user_active(now + Duration::from_millis(500)));
-        assert!(!activity.user_active(now + Duration::from_millis(1000)));
-        activity.note_output(now + Duration::from_secs(5));
-        assert!(!activity.resting(now + REST_ONSET));
+        let start = activity.session_started;
+        activity.tick_slice(start);
+        activity.note_input(start);
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_millis(900)),
+            (0.9, 0.0)
+        );
+
+        let overlap = OrganismActivity::new(None, GrowthProgress::default());
+        let start = overlap.session_started;
+        overlap.tick_slice(start);
+        overlap.note_input(start);
+        overlap.note_input(start + Duration::from_millis(800));
+        assert_eq!(
+            overlap.tick_slice(start + Duration::from_millis(900)),
+            (0.9, 0.0)
+        );
+
+        let arriving = OrganismActivity::new(None, GrowthProgress::default());
+        let start = arriving.session_started;
+        arriving.tick_slice(start);
+        arriving.note_input(start + Duration::from_millis(900));
+        assert_eq!(
+            arriving.tick_slice(start + Duration::from_secs(1)),
+            (0.1, 0.9)
+        );
+        arriving.note_output(start + Duration::from_secs(5));
+        assert!(!arriving.resting(start + REST_ONSET));
+    }
+
+    #[test]
+    fn out_of_order_input_does_not_rewind_activity_or_extend_its_union() {
+        let activity = OrganismActivity::new(None, GrowthProgress::default());
+        let start = activity.session_started;
+        activity.tick_slice(start);
+        activity.note_input(start + Duration::from_millis(800));
+        activity.note_input(start + Duration::from_millis(500));
+        assert_eq!(
+            activity.active_at.get(),
+            Some(start + Duration::from_millis(800))
+        );
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_secs(1)),
+            (0.2, 0.8)
+        );
+    }
+
+    #[test]
+    fn pending_input_survives_same_time_and_stale_tick_claims() {
+        let activity = OrganismActivity::new(None, GrowthProgress::default());
+        let start = activity.session_started;
+        activity.tick_slice(start);
+        activity.note_input(start + Duration::from_millis(500));
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_millis(400)),
+            (0.0, 0.4)
+        );
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_millis(400)),
+            (0.0, 0.0)
+        );
+        assert_eq!(activity.tick_slice(start), (0.0, 0.0));
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_millis(600)),
+            (0.1, 0.1)
+        );
+        activity.note_input(start + Duration::from_millis(600));
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_millis(600)),
+            (0.0, 0.0)
+        );
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_millis(700)),
+            (0.1, 0.0)
+        );
+    }
+
+    #[test]
+    fn delayed_activity_tick_only_consumes_final_second_and_never_rewinds() {
+        let activity = OrganismActivity::new(None, GrowthProgress::default());
+        let start = activity.session_started;
+        activity.tick_slice(start);
+        activity.note_input(start);
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_secs(5)),
+            (0.0, 1.0)
+        );
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_secs(4)),
+            (0.0, 0.0)
+        );
+        activity.note_input(start + Duration::from_secs(4));
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_millis(5250)),
+            (0.0, 0.25)
+        );
     }
 
     #[test]
@@ -5100,6 +12495,48 @@ mod tests {
     }
 
     #[test]
+    fn sustained_completion_reuses_protected_quiet_pose_without_motion_escalation() {
+        let mut organism = NativeOrganism::default();
+        organism.command_started(CommandKind::Other);
+        let reaction = organism.command_finished(CommandKind::Other, Some(0), Some(60_000));
+        assert_eq!(reaction.behavior, Behavior::Celebrate);
+        assert_eq!(reaction.tone, Tone::Quiet);
+        assert_eq!(reaction.speech, None);
+        assert_eq!(reaction.hold_duration(), Duration::from_millis(1800));
+        assert_eq!(
+            surface_mode(reaction.behavior, false, None),
+            SurfaceMode::Reacting
+        );
+        assert_eq!(
+            surface_mode(reaction.behavior, true, None),
+            SurfaceMode::Watching
+        );
+        assert_eq!(
+            surface_mode(reaction.behavior, false, Some(Duration::ZERO)),
+            SurfaceMode::Typing
+        );
+        assert_eq!(presence_signal_for_exit(Some(0)), None);
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::WatchSettled, reaction.behavior),
+                None
+            );
+            assert_eq!(
+                surface_frame_delay(motion, true, false, false),
+                DORMANT_FRAME_INTERVAL
+            );
+        }
+        let context = RenderContext::new(reaction.behavior, BodyLanguage::default(), false);
+        assert!(!GentleInteraction::default().request(Duration::ZERO, context));
+        let next = organism.command_started(CommandKind::Other);
+        assert_eq!(next.behavior, Behavior::WatchCommand);
+        assert_eq!(
+            surface_mode(next.behavior, true, None),
+            SurfaceMode::Watching
+        );
+    }
+
+    #[test]
     fn reaction_holds_follow_semantic_weight_instead_of_one_fixed_timeout() {
         let reaction = |behavior, tone| Reaction {
             behavior,
@@ -5113,11 +12550,663 @@ mod tests {
         let repeated_error = reaction(Behavior::SitNearError, Tone::Error);
         let big_recovery = reaction(Behavior::CelebrateBig, Tone::Success);
 
-        assert!(reaction_hold(&quiet_pass) < reaction_hold(&ordinary_pass));
-        assert!(reaction_hold(&ordinary_pass) < reaction_hold(&first_error));
-        assert!(reaction_hold(&first_error) < reaction_hold(&big_recovery));
-        assert!(reaction_hold(&big_recovery) < reaction_hold(&repeated_error));
-        assert_eq!(reaction_hold(&repeated_error), Duration::from_secs(10));
+        assert!(quiet_pass.hold_duration() < ordinary_pass.hold_duration());
+        assert!(ordinary_pass.hold_duration() < first_error.hold_duration());
+        assert!(first_error.hold_duration() < big_recovery.hold_duration());
+        assert!(big_recovery.hold_duration() < repeated_error.hold_duration());
+        assert_eq!(repeated_error.hold_duration(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn state_explanation_follows_the_presented_greeting_and_restores_inline_pose() {
+        let inline = Behavior::Idle;
+        let context = RenderContext::new(inline, BodyLanguage::default(), false);
+        let mut interaction = GentleInteraction::default();
+        assert!(interaction.request(Duration::ZERO, context));
+        let displayed = interaction.apply(Duration::from_millis(1), context);
+        assert_eq!(displayed.behavior, Behavior::Approach);
+        assert_eq!(
+            state_explanation(inline, Some(displayed.behavior), true),
+            behavior_explanation(Behavior::Approach)
+        );
+        assert_eq!(
+            state_explanation(inline, Some(displayed.behavior), false),
+            behavior_explanation(inline)
+        );
+        interaction.cancel();
+        assert_eq!(
+            interaction.apply(Duration::from_millis(2), context),
+            context
+        );
+        assert_eq!(
+            state_explanation(inline, None, true),
+            behavior_explanation(inline)
+        );
+    }
+
+    #[test]
+    fn card_tooltip_proxy_is_weak_pane_local_and_read_only() {
+        let source = include_str!("organism.rs");
+        let install = source
+            .split_once("    fn install_card_tooltip(")
+            .unwrap()
+            .1
+            .split_once("    fn set_presented_surface(")
+            .unwrap()
+            .0;
+        assert!(install.contains("Rc::downgrade(runtime)"));
+        assert!(install.contains("Rc::downgrade(view)"));
+        assert!(install.contains("root.downgrade()"));
+        assert_eq!(install.matches("connect_query_tooltip").count(), 1);
+        assert_eq!(install.matches("connect_unmap").count(), 1);
+        assert!(install.contains("root.trigger_tooltip_query()"));
+        assert!(!install.contains("timeout_add"));
+        assert!(!install.contains("add_controller"));
+        assert!(!install.contains("grab_focus"));
+        let query = source
+            .split_once("    fn card_tooltip_at(")
+            .unwrap()
+            .1
+            .split_once("    fn install_card_tooltip(")
+            .unwrap()
+            .0;
+        assert!(query.contains("pointer_button_state(root, buttons) != Some(false)"));
+        let pointer = source
+            .split_once("fn pointer_button_state(")
+            .unwrap()
+            .1
+            .split_once("fn surface_frame_delay(")
+            .unwrap()
+            .0;
+        assert!(pointer.contains("surface.device_position(&pointer)?"));
+        assert!(pointer.contains("pointer_button_state(&view.widget(), buttons) == Some(true)"));
+        assert!(!pointer.contains("BUTTON4_MASK"));
+        assert!(query.contains("BUTTON5_MASK"));
+        assert!(!pointer.contains("pointer.modifier_state()"));
+        for guard in [
+            "!self.enabled.get()",
+            "view.widget() != *root",
+            "!self.card.is_mapped()",
+            "!self.card.is_ancestor(root)",
+            "root.compute_point",
+            "top.pick",
+            "PickFlags::NON_TARGETABLE",
+            "label.tooltip_text()",
+        ] {
+            assert!(query.contains(guard), "missing query guard: {guard}");
+        }
+        assert!(
+            !query.contains("presence.is_owner"),
+            "card semantics remain pane-local"
+        );
+        let attach = source
+            .split_once("    pub(crate) fn attach_ascii_organism_to_view(")
+            .unwrap()
+            .1
+            .split_once("        // The transient card")
+            .unwrap()
+            .0;
+        assert_eq!(
+            attach
+                .matches("OrganismRuntime::install_card_tooltip(&runtime, view)")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn watch_explanation_uses_only_the_visible_final_observation() {
+        for behavior in [
+            Behavior::WatchCommand,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+        ] {
+            for (rhythm, observation) in [
+                (
+                    WatchRhythm::Busy,
+                    "Following an active stream of command output.",
+                ),
+                (
+                    WatchRhythm::Waiting,
+                    "Keeping watch while output is quiet; the command has not finished.",
+                ),
+                (
+                    WatchRhythm::Resumed,
+                    "Perking up as command output resumes.",
+                ),
+            ] {
+                assert_eq!(
+                    state_explanation_with_rhythm(
+                        Behavior::Idle,
+                        Some((behavior, rhythm)),
+                        true,
+                        LifeState::default()
+                    ),
+                    observation
+                );
+                assert_eq!(
+                    state_explanation_with_rhythm(
+                        Behavior::Idle,
+                        Some((behavior, rhythm)),
+                        false,
+                        LifeState::default()
+                    ),
+                    behavior_explanation(Behavior::Idle)
+                );
+            }
+        }
+        for behavior in [
+            Behavior::Idle,
+            Behavior::Approach,
+            Behavior::Celebrate,
+            Behavior::InspectError,
+        ] {
+            assert_eq!(
+                state_explanation_with_rhythm(
+                    Behavior::Idle,
+                    Some((behavior, WatchRhythm::Busy)),
+                    true,
+                    LifeState::default()
+                ),
+                behavior_explanation(behavior)
+            );
+        }
+        assert_eq!(
+            state_explanation_with_rhythm(Behavior::Idle, None, true, LifeState::default()),
+            behavior_explanation(Behavior::Idle)
+        );
+        assert_eq!(
+            state_explanation_with_rhythm(
+                Behavior::Idle,
+                Some((Behavior::WatchCommand, WatchRhythm::Steady)),
+                true,
+                LifeState::default()
+            ),
+            behavior_explanation(Behavior::WatchCommand)
+        );
+    }
+
+    #[test]
+    fn rhythm_description_uses_placed_context_and_preserves_authoritative_status() {
+        let source = include_str!("organism.rs");
+        let setter = source
+            .split_once("    fn set_presented_surface(")
+            .unwrap()
+            .1
+            .split_once("    fn hide_live_body(")
+            .unwrap()
+            .0;
+        assert!(setter.contains("self.refresh_state(self.shared_life.get())"));
+        let refresh = source
+            .split_once("    fn refresh_state(")
+            .unwrap()
+            .1
+            .split_once("    fn human_input_age(")
+            .unwrap()
+            .0;
+        assert!(refresh.contains("state_explanation_with_rhythm("));
+        assert!(refresh.contains("self.presented_surface.get()"));
+        assert!(refresh.contains("self.live_body.is_mapped()"));
+        assert!(!refresh.contains("self.status."));
+        assert!(!refresh.contains("output_rhythm"));
+        assert!(!refresh.contains("offered_watch_rhythm"));
+        assert!(!refresh.contains("timeout"));
+        let hide = source
+            .split_once("    fn hide_live_body(")
+            .unwrap()
+            .1
+            .split_once("    fn bump_generation(")
+            .unwrap()
+            .0;
+        assert!(hide.contains("self.set_presented_surface(None)"));
+    }
+
+    #[test]
+    fn description_tracks_final_context_and_retires_previous_reaction() {
+        let source = include_str!("organism.rs");
+        let render = source
+            .split_once("fn render(&self, reaction: &Reaction) {")
+            .unwrap()
+            .1
+            .split_once("fn refresh_growth_badge")
+            .unwrap()
+            .0;
+        assert!(
+            render.find("self.presented_surface.set(None);").unwrap()
+                < render.find("self.refresh_state(").unwrap()
+        );
+        let surface = source
+            .split_once("fn refresh_surface(&self, view: &TermView, now: Instant) {")
+            .unwrap()
+            .1
+            .split_once("fn apply_settings(")
+            .unwrap()
+            .0;
+        let interaction = surface
+            .find("snapshot.map_or(context, |snapshot| snapshot.presentation)")
+            .unwrap();
+        let shown = surface
+            .find("view.set_live_organism_visible(true);")
+            .unwrap();
+        let explanation = surface
+            .find("self.set_presented_surface(Some((context.behavior, context.watch_rhythm)));")
+            .unwrap();
+        assert!(interaction < shown && shown < explanation);
+    }
+
+    #[test]
+    fn hidden_typing_placeholders_do_not_describe_unstarted_work() {
+        assert_eq!(
+            state_explanation(Behavior::Idle, Some(Behavior::WatchCommand), false),
+            behavior_explanation(Behavior::Idle)
+        );
+        assert_ne!(
+            state_explanation(Behavior::UnknownOutcome, None, false),
+            state_explanation(Behavior::GlanceAside, None, false)
+        );
+        assert_eq!(
+            state_explanation(Behavior::CelebrateBig, None, false),
+            behavior_explanation(Behavior::CelebrateBig)
+        );
+    }
+
+    #[test]
+    fn accepted_input_hides_sticky_form_before_waiting_for_a_frame() {
+        let source = include_str!("organism.rs");
+        let callback = source
+            .split_once("view.connect_human_input(move |_kind| {")
+            .unwrap()
+            .1
+            .split_once("view.connect_alt_screen_transition")
+            .unwrap()
+            .0;
+        let retreat = callback.split_once("if entering_retreat {").unwrap().1;
+        let sticky_hide = retreat
+            .find("runtime.sticky_avatar.set_visible(false);")
+            .unwrap();
+        let view_upgrade = retreat.find("view_weak.upgrade()").unwrap();
+        assert!(sticky_hide < view_upgrade);
+        assert!(retreat.contains("view.set_live_organism_visible(false);"));
+        assert!(!callback.contains("timeout_add"));
+    }
+
+    #[test]
+    fn alternate_screen_changes_hide_sticky_form_until_surface_refresh() {
+        let source = include_str!("organism.rs");
+        let callback = source
+            .split_once("view.connect_alt_screen_transition(move |transition| {")
+            .unwrap()
+            .1
+            .split_once("view.connect_activity(move || {")
+            .unwrap()
+            .0;
+        let sticky_hide = callback
+            .find("runtime.sticky_avatar.set_visible(false);")
+            .unwrap();
+        assert!(sticky_hide < callback.find("view_weak.upgrade()").unwrap());
+        assert!(callback.contains("view.set_live_organism_visible(false);"));
+        assert!(!callback.contains("timeout_add"));
+
+        let refresh = source
+            .split_once("fn refresh_surface(&self, view: &TermView, now: Instant) {")
+            .unwrap()
+            .1
+            .split_once("fn apply_settings(")
+            .unwrap()
+            .0;
+        let alt_gate = refresh.split_once("if metrics.alt_screen {").unwrap().1;
+        let hidden = alt_gate
+            .find("self.sticky_avatar.set_visible(false);")
+            .unwrap();
+        let early_return = alt_gate.find("return;").unwrap();
+        let restore = alt_gate
+            .find(".set_visible(seat == CompanionSurface::Compact)")
+            .unwrap();
+        assert!(hidden < early_return && early_return < restore);
+    }
+
+    #[test]
+    fn visible_full_greetings_keep_animation_and_the_original_hold_deadline() {
+        for motion in [
+            OrganismMotion::Full,
+            OrganismMotion::Calm,
+            OrganismMotion::Static,
+        ] {
+            for owner in [false, true] {
+                for alt in [false, true] {
+                    for mapped in [false, true] {
+                        let result = greeting_frame_delay(
+                            motion,
+                            owner,
+                            alt,
+                            mapped,
+                            Some(GentleInteraction::HOLD),
+                        );
+                        assert_eq!(
+                            result,
+                            (motion == OrganismMotion::Full && owner && !alt && mapped)
+                                .then_some(SURFACE_FRAME_INTERVAL)
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            greeting_frame_delay(OrganismMotion::Full, true, false, true, None),
+            None
+        );
+        assert_eq!(
+            greeting_frame_delay(
+                OrganismMotion::Full,
+                true,
+                false,
+                true,
+                Some(Duration::ZERO)
+            ),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(
+            greeting_frame_delay(
+                OrganismMotion::Full,
+                true,
+                false,
+                true,
+                Some(Duration::from_millis(17))
+            ),
+            Some(Duration::from_millis(17))
+        );
+        assert_eq!(
+            interaction_frame_delay(
+                DORMANT_FRAME_INTERVAL,
+                None,
+                false,
+                Some(SURFACE_FRAME_INTERVAL)
+            ),
+            SURFACE_FRAME_INTERVAL
+        );
+        assert_eq!(
+            greeting_frame_delay(
+                OrganismMotion::Full,
+                true,
+                false,
+                true,
+                Some(Duration::from_nanos(1))
+            ),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(
+            interaction_frame_delay(DORMANT_FRAME_INTERVAL, None, false, None),
+            DORMANT_FRAME_INTERVAL
+        );
+    }
+
+    #[test]
+    fn hidden_typing_defers_frames_without_moving_the_absolute_retreat() {
+        for age_ms in [0, 1, 100, 450, 899] {
+            let delay = interaction_frame_delay(
+                SURFACE_FRAME_INTERVAL,
+                Some(Duration::from_millis(age_ms)),
+                true,
+                None,
+            );
+            assert_eq!(delay, Duration::from_millis(900 - age_ms));
+        }
+        assert_eq!(
+            interaction_frame_delay(SURFACE_FRAME_INTERVAL, None, true, None),
+            SURFACE_FRAME_INTERVAL
+        );
+        assert_eq!(
+            interaction_frame_delay(SURFACE_FRAME_INTERVAL, Some(Duration::ZERO), false, None),
+            SURFACE_FRAME_INTERVAL,
+            "another visible animated surface retains its normal cadence"
+        );
+        for age in [
+            HUMAN_INPUT_RETREAT - Duration::from_nanos(1),
+            HUMAN_INPUT_RETREAT,
+            HUMAN_INPUT_RETREAT + Duration::from_nanos(1),
+        ] {
+            assert_eq!(
+                interaction_frame_delay(SURFACE_FRAME_INTERVAL, Some(age), true, None),
+                Duration::from_millis(1)
+            );
+            assert_eq!(
+                interaction_frame_delay(DORMANT_FRAME_INTERVAL, Some(age), false, None),
+                DORMANT_FRAME_INTERVAL,
+                "an idle no-room frame is not an expired typing frame"
+            );
+        }
+        // The existing source observes newer input at its next wake. That
+        // input changes the absolute deadline; it never starts a new timer.
+        let first_wake =
+            interaction_frame_delay(SURFACE_FRAME_INTERVAL, Some(Duration::ZERO), true, None);
+        let newer_input = Duration::from_millis(800);
+        let next = interaction_frame_delay(
+            SURFACE_FRAME_INTERVAL,
+            Some(first_wake - newer_input),
+            true,
+            None,
+        );
+        assert_eq!(first_wake + next, newer_input + HUMAN_INPUT_RETREAT);
+    }
+
+    #[test]
+    fn retained_greeting_cleans_up_once_when_the_frame_tail_crosses_expiry() {
+        let base = RenderContext::new(Behavior::Idle, BodyLanguage::default(), false);
+        let input = LiveAttentionInput {
+            base_context: base,
+            activity: jterm_core::organism_live::LiveActivityKnowledge::KnownIdle,
+            hard_eligible: true,
+            hover_available: true,
+            pointer_inside: true,
+        };
+        let mut attention = LiveAttention::default();
+        attention.set_owner(Some(1u64));
+        let accepted = attention
+            .advance(Duration::ZERO, &1, input, LiveAttentionEvent::Explicit)
+            .unwrap();
+        let deadline = accepted.active.unwrap().deadline;
+        let painted = attention
+            .advance(
+                deadline - Duration::from_nanos(1),
+                &1,
+                input,
+                LiveAttentionEvent::Reconcile,
+            )
+            .unwrap();
+        assert_eq!(painted.presentation.behavior, Behavior::Approach);
+        for after in [
+            Duration::ZERO,
+            Duration::from_nanos(1),
+            Duration::from_millis(5),
+        ] {
+            let tail = deadline + after;
+            let remaining = painted
+                .active
+                .map(|active| active.deadline.saturating_sub(tail));
+            assert_eq!(painted.wake_after(tail), Some(Duration::ZERO));
+            let cleanup = greeting_frame_delay(OrganismMotion::Full, true, false, true, remaining);
+            assert_eq!(cleanup, Some(Duration::from_millis(1)));
+            assert_eq!(
+                greeting_frame_delay(OrganismMotion::Calm, true, false, true, remaining),
+                None
+            );
+            assert_eq!(
+                greeting_frame_delay(OrganismMotion::Full, false, false, true, remaining),
+                None
+            );
+            assert_eq!(
+                greeting_frame_delay(OrganismMotion::Full, true, true, true, remaining),
+                None
+            );
+            assert_eq!(
+                greeting_frame_delay(OrganismMotion::Full, true, false, false, remaining),
+                None
+            );
+            let retired = attention
+                .advance(
+                    tail + cleanup.unwrap(),
+                    &1,
+                    input,
+                    LiveAttentionEvent::Reconcile,
+                )
+                .unwrap();
+            assert_eq!(retired.active, None);
+            assert_eq!(retired.presentation, base);
+            assert_eq!(retired.next_deadline(), None);
+            assert_eq!(
+                interaction_frame_delay(
+                    DORMANT_FRAME_INTERVAL,
+                    None,
+                    false,
+                    greeting_frame_delay(OrganismMotion::Full, true, false, true, None)
+                ),
+                DORMANT_FRAME_INTERVAL,
+                "retired snapshot cannot create a 1ms loop"
+            );
+        }
+    }
+
+    #[test]
+    fn greeting_tail_keeps_retained_source_but_refresh_owns_retirement() {
+        let source = include_str!("organism.rs");
+        let tail = source
+            .split_once("    fn greeting_frame_delay(&self,")
+            .unwrap()
+            .1
+            .split_once("    fn next_surface_frame_delay(")
+            .unwrap()
+            .0;
+        assert!(tail.contains("self.attention_snapshot.get()"));
+        assert!(tail.contains("snapshot.active.map"));
+        assert!(tail.contains("active.deadline.saturating_sub"));
+        assert!(!tail.contains(".advance("));
+        let refresh = source
+            .split_once("    fn refresh_surface_observing(")
+            .unwrap()
+            .1
+            .split_once("    fn apply_settings(")
+            .unwrap()
+            .0;
+        assert!(refresh.contains("self.advance_attention(view, LiveAttentionEvent::Reconcile)"));
+        assert!(refresh.contains("snapshot.map_or(context, |snapshot| snapshot.presentation)"));
+    }
+
+    #[test]
+    fn greeting_only_replaces_a_later_pending_deadline() {
+        let now = Instant::now();
+        assert!(!greeting_tightens_deadline(
+            None,
+            now,
+            SURFACE_FRAME_INTERVAL
+        ));
+        assert!(!greeting_tightens_deadline(
+            Some(now + Duration::from_millis(10)),
+            now,
+            SURFACE_FRAME_INTERVAL
+        ));
+        assert!(!greeting_tightens_deadline(
+            Some(now + SURFACE_FRAME_INTERVAL),
+            now,
+            SURFACE_FRAME_INTERVAL
+        ));
+        assert!(greeting_tightens_deadline(
+            Some(now + DORMANT_FRAME_INTERVAL),
+            now,
+            SURFACE_FRAME_INTERVAL
+        ));
+        assert!(greeting_tightens_deadline(
+            Some(now + Duration::from_millis(50)),
+            now,
+            Duration::from_millis(17)
+        ));
+    }
+
+    #[test]
+    fn interaction_cadence_keeps_single_source_ownership_and_current_mapping() {
+        let source = include_str!("organism.rs");
+        let admission = source
+            .split_once("    fn request_greeting(")
+            .unwrap()
+            .1
+            .split_once("    fn install_pointer_observer(")
+            .unwrap()
+            .0;
+        assert!(
+            admission
+                .find("self.refresh_surface_observing(view, now, false);")
+                .unwrap()
+                < admission
+                    .find("Self::rearm_surface_tick_for_greeting(self, view, Instant::now());")
+                    .unwrap()
+        );
+        let rearm = source
+            .split_once("    fn rearm_surface_tick_for_greeting(")
+            .unwrap()
+            .1
+            .split_once("    fn rearm_surface_tick_for_focus(")
+            .unwrap()
+            .0;
+        assert!(rearm.contains("runtime.surface_timer.borrow_mut().take()"));
+        assert!(
+            rearm.find("greeting_tightens_deadline(").unwrap()
+                < rearm
+                    .find("runtime.surface_timer.borrow_mut().take()")
+                    .unwrap()
+        );
+        assert!(rearm.contains("runtime.surface_deadline.set(None)"));
+        assert!(
+            rearm.find("let Some(source) = source else").unwrap()
+                < rearm.find("source.remove()").unwrap()
+        );
+        assert!(
+            rearm.find("source.remove()").unwrap()
+                < rearm.find("Self::schedule_surface_frame").unwrap()
+        );
+        let refresh = source
+            .split_once("    fn refresh_surface(")
+            .unwrap()
+            .1
+            .split_once("    fn apply_settings(")
+            .unwrap()
+            .0;
+        assert!(
+            refresh.find("self.hidden_for_typing.set(false)").unwrap()
+                < refresh
+                    .find("if self.awaiting_unobserved_work.get()")
+                    .unwrap()
+        );
+        let typing = refresh
+            .split_once("if suppress_live_body_for_focus(mode)")
+            .unwrap()
+            .1;
+        assert!(
+            typing.find("self.hidden_for_typing.set(true)").unwrap()
+                < typing.find("return;").unwrap()
+        );
+        let cadence = source
+            .split_once("    fn next_surface_frame_delay(")
+            .unwrap()
+            .1
+            .split_once("    fn rearm_surface_tick_for_greeting(")
+            .unwrap()
+            .0;
+        for gate in [
+            "OrganismMotion::Full",
+            "is_owner",
+            "alt_screen",
+            "!self.live_body.is_mapped()",
+            "!self.sticky_avatar.is_mapped()",
+            "self.human_input_age(now)",
+            "self.hidden_for_typing.get()",
+        ] {
+            assert!(
+                cadence.contains(gate),
+                "missing current cadence gate: {gate}"
+            );
+        }
+        assert!(
+            source.contains("let next = runtime.next_surface_frame_delay(&view, Instant::now());")
+        );
     }
 
     #[test]
@@ -5146,6 +13235,412 @@ mod tests {
         assert_eq!(
             surface_frame_delay(OrganismMotion::Static, true, false, false),
             DORMANT_FRAME_INTERVAL
+        );
+    }
+
+    #[test]
+    fn explicit_source_expires_at_the_shared_hold_without_renewal() {
+        let base = RenderContext::new(Behavior::Idle, BodyLanguage::default(), false);
+        let input = LiveAttentionInput {
+            base_context: base,
+            activity: jterm_core::organism_live::LiveActivityKnowledge::KnownIdle,
+            hard_eligible: true,
+            hover_available: false,
+            pointer_inside: false,
+        };
+        let mut attention = LiveAttention::default();
+        attention.set_owner(Some(1u64));
+        let first = attention
+            .advance(Duration::ZERO, &1, input, LiveAttentionEvent::Explicit)
+            .unwrap();
+        assert_eq!(first.active.unwrap().source, LiveAttentionSource::Explicit);
+        let deadline = first.active.unwrap().deadline;
+        assert_eq!(
+            attention
+                .advance(
+                    deadline - Duration::from_millis(1),
+                    &1,
+                    input,
+                    LiveAttentionEvent::Reconcile
+                )
+                .unwrap()
+                .presentation
+                .behavior,
+            Behavior::Approach
+        );
+        assert_eq!(
+            attention
+                .advance(deadline, &1, input, LiveAttentionEvent::Reconcile)
+                .unwrap()
+                .active,
+            None
+        );
+        assert!(matches!(
+            attention
+                .advance(deadline, &1, input, LiveAttentionEvent::Explicit)
+                .unwrap()
+                .outcome,
+            LiveAttentionOutcome::Rejected(_)
+        ));
+        attention.set_owner(Some(2));
+        assert!(matches!(
+            attention
+                .advance(deadline, &2, input, LiveAttentionEvent::Explicit)
+                .unwrap()
+                .outcome,
+            LiveAttentionOutcome::Rejected(_)
+        ));
+        assert!(matches!(
+            attention
+                .advance(
+                    GentleInteraction::COOLDOWN,
+                    &2,
+                    input,
+                    LiveAttentionEvent::Explicit
+                )
+                .unwrap()
+                .outcome,
+            LiveAttentionOutcome::Accepted(_)
+        ));
+    }
+
+    #[test]
+    fn pointer_motion_compares_retained_coordinates_with_one_current_allocation() {
+        let source = include_str!("organism.rs");
+        let motion = source
+            .split_once(concat!("    fn observe_", "pointer("))
+            .unwrap()
+            .1
+            .split_once("    fn arm_pointer_candidate")
+            .unwrap()
+            .0;
+        assert_eq!(
+            motion.matches("runtime.pointer_body_bounds(view)").count(),
+            1
+        );
+        assert!(motion.contains(
+            "let was_inside = Self::pointer_within_body(bounds, runtime.pointer_position.get())"
+        ));
+        assert!(
+            motion.find("let was_inside").unwrap() < motion.find("pointer_position.set").unwrap()
+        );
+        assert!(motion.contains("let entered = !was_inside"));
+        assert!(motion.contains("runtime.attention_input_with_bounds(view, bounds)"));
+        assert!(motion.contains("runtime.pointer_left_body(view, bounds)"));
+        assert!(!motion.contains("runtime.pointer_left(view)"));
+        let body_exit = source
+            .split_once(concat!("    fn pointer_left_", "body("))
+            .unwrap()
+            .1
+            .split_once("    fn sync_attention_snapshot")
+            .unwrap()
+            .0;
+        assert!(!body_exit.contains("pointer_position.set"));
+        assert!(body_exit.contains("LiveAttentionEvent::PointerLeft { ticket }"));
+        let sync = source
+            .split_once(concat!("    fn sync_pointer_", "geometry("))
+            .unwrap()
+            .1
+            .split_once("    fn observe_pointer")
+            .unwrap()
+            .0;
+        assert!(!sync.contains("LiveAttentionEvent"));
+        assert!(!sync.contains("pointer_position.set"));
+    }
+
+    #[test]
+    fn pointer_bounds_preserve_finite_radius_and_reject_missing_positions() {
+        let bounds = Some((100.0, 100.0, 200.0, 140.0));
+        assert!(OrganismRuntime::pointer_within_body(
+            bounds,
+            Some((100.0 - POINTER_GREETING_RADIUS, 110.0))
+        ));
+        assert!(!OrganismRuntime::pointer_within_body(
+            bounds,
+            Some((99.0 - POINTER_GREETING_RADIUS, 110.0))
+        ));
+        assert!(!OrganismRuntime::pointer_within_body(
+            None,
+            Some((150.0, 110.0))
+        ));
+        assert!(!OrganismRuntime::pointer_within_body(bounds, None));
+        for point in [(f64::NAN, 110.0), (150.0, f64::INFINITY)] {
+            assert!(!OrganismRuntime::pointer_within_body(bounds, Some(point)));
+        }
+    }
+
+    #[test]
+    fn explicit_hello_exempts_only_pointer_proximity_and_keeps_hard_cancellation() {
+        let source = include_str!("organism.rs");
+        let eligible = source
+            .split_once(concat!("    fn greeting_is_", "eligible("))
+            .unwrap()
+            .1
+            .split_once("    fn pointer_within_body")
+            .unwrap()
+            .0;
+        for gate in [
+            "enabled",
+            "OrganismMotion::Static",
+            "is_owner",
+            "is_mapped",
+            "command_running",
+            "organism_activity_settled",
+            "pointer_buttons_down",
+            "HUMAN_INPUT_RETREAT",
+            "alt_screen",
+        ] {
+            assert!(eligible.contains(gate), "missing native gate: {gate}");
+        }
+        let hard = source
+            .split_once(concat!("    fn cancel_pointer_", "greeting("))
+            .unwrap()
+            .1
+            .split_once("    fn pointer_left")
+            .unwrap()
+            .0;
+        assert!(hard.contains(".cancel(&self.presence_token)"));
+        assert!(!hard.contains("pointer_inside.set(false)"));
+        let request = source
+            .split_once(concat!("    fn request_", "greeting("))
+            .unwrap()
+            .1
+            .split_once("    fn install_pointer_observer")
+            .unwrap()
+            .0;
+        assert!(
+            request
+                .find("refresh_surface_observing(view, now, false)")
+                .unwrap()
+                < request.find("LiveAttentionEvent::Explicit").unwrap()
+        );
+        assert!(request.contains("LiveAttentionOutcome::Accepted"));
+        assert!(!request.contains("timeout_add"));
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        assert!(!production.contains("last_greeting"));
+        assert!(!production.contains("interaction_epoch"));
+        assert!(!production.contains("RefCell<GentleInteraction>"));
+    }
+
+    #[test]
+    fn pointer_candidate_cue_tracks_only_the_existing_dwell_and_changes_paint_only() {
+        let source = include_str!("organism.rs");
+        let cancel = source
+            .split_once(concat!("    fn cancel_pointer_", "greeting(&self) {"))
+            .unwrap()
+            .1
+            .split_once("    fn pointer_within_body")
+            .unwrap()
+            .0;
+        assert!(cancel.contains("self.retire_pointer_candidate()"));
+        let retire = source
+            .split_once(concat!("    fn retire_pointer_", "candidate(&self) {"))
+            .unwrap()
+            .1
+            .split_once("    fn cancel_pointer_greeting")
+            .unwrap()
+            .0;
+        assert!(retire.find("remove_css_class").unwrap() < retire.find("pointer_timer").unwrap());
+        let observe = source
+            .split_once(concat!("    fn observe_", "pointer("))
+            .unwrap()
+            .1
+            .split_once("    fn install_pointer_observer")
+            .unwrap()
+            .0;
+        assert!(
+            observe.find(".advance(").unwrap() < observe.find("timeout_add_local_once").unwrap()
+        );
+        assert!(
+            observe.find("source.ticket == ticket").unwrap()
+                < observe.find("pointer_timer.borrow_mut().take()").unwrap()
+        );
+        assert!(observe.contains("LiveAttentionEvent::CandidateDue { ticket }"));
+        assert!(observe.contains("PointerCandidateSource { ticket, source }"));
+        assert_eq!(observe.matches("timeout_add_local_once").count(), 1);
+        let css = include_str!("../block_view/css.rs");
+        let candidate = css
+            .split_once(".organism-live-body.organism-hover-candidate {{")
+            .unwrap()
+            .1
+            .split_once("}}")
+            .unwrap()
+            .0;
+        assert!(candidate.contains("border-color: rgba({fg_r},{fg_g},{fg_b},0.45)"));
+        assert!(candidate.contains("transition: none"));
+        assert_eq!(
+            candidate.matches(';').count(),
+            2,
+            "candidate changes paint only"
+        );
+    }
+
+    #[test]
+    fn measured_no_room_slows_only_without_an_animated_sticky_surface() {
+        for sticky in [false, true] {
+            assert_eq!(
+                super::surface_frame_delay_after_placement(
+                    OrganismMotion::Full,
+                    true,
+                    false,
+                    false,
+                    false,
+                    sticky
+                ),
+                SURFACE_FRAME_INTERVAL,
+                "unknown or recovered placement retains Full cadence"
+            );
+            assert_eq!(
+                super::surface_frame_delay_after_placement(
+                    OrganismMotion::Full,
+                    true,
+                    false,
+                    false,
+                    true,
+                    sticky
+                ),
+                if sticky {
+                    SURFACE_FRAME_INTERVAL
+                } else {
+                    DORMANT_FRAME_INTERVAL
+                }
+            );
+        }
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            for blocked in [false, true] {
+                assert_eq!(
+                    super::surface_frame_delay_after_placement(
+                        motion, true, false, false, blocked, true
+                    ),
+                    DORMANT_FRAME_INTERVAL
+                );
+            }
+        }
+        assert_eq!(
+            super::surface_frame_delay_after_placement(
+                OrganismMotion::Full,
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
+            DORMANT_FRAME_INTERVAL
+        );
+        assert_eq!(
+            super::surface_frame_delay_after_placement(
+                OrganismMotion::Full,
+                true,
+                true,
+                false,
+                false,
+                true
+            ),
+            DORMANT_FRAME_INTERVAL
+        );
+        assert_eq!(
+            super::surface_frame_delay_after_placement(
+                OrganismMotion::Full,
+                true,
+                false,
+                true,
+                false,
+                true
+            ),
+            DORMANT_FRAME_INTERVAL
+        );
+    }
+
+    #[test]
+    fn zero_or_unknown_measurements_do_not_claim_no_room() {
+        let surface = SurfaceBox {
+            width: 20,
+            height: 20,
+            right_gutter: 0,
+            cell_width: 8,
+            cell_height: 16,
+            body_width: 88,
+            body_height: 48,
+            cursor_row: 0,
+        };
+        assert!(super::measured_placement_blocked(surface, false));
+        assert!(!super::measured_placement_blocked(surface, true));
+        for unknown in [
+            SurfaceBox {
+                width: 0,
+                ..surface
+            },
+            SurfaceBox {
+                height: 0,
+                ..surface
+            },
+            SurfaceBox {
+                body_width: 0,
+                ..surface
+            },
+            SurfaceBox {
+                body_height: 0,
+                ..surface
+            },
+            SurfaceBox {
+                cell_width: 0,
+                ..surface
+            },
+            SurfaceBox {
+                cell_height: 0,
+                ..surface
+            },
+        ] {
+            assert!(!super::measured_placement_blocked(unknown, false));
+        }
+    }
+
+    #[test]
+    fn no_room_cadence_uses_fresh_geometry_and_actual_sticky_mapping() {
+        let source = include_str!("organism.rs");
+        let refresh = source
+            .split("    fn refresh_surface(")
+            .nth(1)
+            .unwrap()
+            .split("    fn apply_settings(")
+            .next()
+            .unwrap();
+        assert!(
+            refresh
+                .find("self.measured_no_safe_placement.set(false)")
+                .unwrap()
+                < refresh.find("if !self.enabled.get()").unwrap()
+        );
+        assert!(
+            refresh.find("surface_point_for_territory(").unwrap()
+                < refresh
+                    .find("measured_placement_blocked(surface, point.is_some())")
+                    .unwrap()
+        );
+        assert!(refresh.contains("view.widget().is_mapped() && measured_placement_blocked"));
+        let scheduler = source
+            .split_once("    fn next_surface_frame_delay(")
+            .unwrap()
+            .1
+            .split_once("    fn rearm_surface_tick_for_greeting(")
+            .unwrap()
+            .0;
+        assert!(scheduler.contains("surface_frame_delay_after_placement("));
+        assert!(scheduler.contains("self.measured_no_safe_placement.get()"));
+        assert!(scheduler.contains("self.sticky_avatar.is_mapped()"));
+        assert!(
+            source.contains("let next = runtime.next_surface_frame_delay(&view, Instant::now());")
+        );
+        let inline = source
+            .split("    fn refresh_inline_sprite(")
+            .nth(1)
+            .unwrap()
+            .split("    fn refresh_state(")
+            .next()
+            .unwrap();
+        assert!(
+            inline.contains("            0,"),
+            "inline card poses do not require animated frames"
         );
     }
 
@@ -5449,5 +13944,31 @@ mod tests {
         assert!(idle_right.x > idle_left.x);
         assert_eq!(typing.x, idle_right.x);
         assert!(typing.y < idle_left.y);
+    }
+
+    #[test]
+    fn classify_command_peels_daemonize_setlock_and_s6_setuidgid() {
+        // Pane finish path uses classify_command on the raw argv; STAGE 67
+        // wrappers must not hide cargo/git from the work loop.
+        for command in [
+            "daemonize cargo test",
+            "daemonize -a -v cargo check",
+            "daemonize -c /tmp -u nobody cargo nextest run",
+            "setlock /tmp/x.lock cargo test",
+            "setlock -n /var/lock/x -- cargo check",
+            "s6-setuidgid nobody cargo test",
+            "s6-setuidgid -- nobody cargo check",
+            "daemonize setlock /tmp/x.lock s6-setuidgid nobody cargo test",
+        ] {
+            assert_eq!(
+                classify_command(command),
+                CommandKind::BuildOrTest,
+                "{command}"
+            );
+        }
+        assert_eq!(
+            classify_command("daemonize -p /run/x.pid setlock /tmp/x.lock rm -rf /"),
+            CommandKind::Other
+        );
     }
 }

@@ -39,6 +39,11 @@ pub(crate) enum Action {
     OpacityDecrease,
     ToggleSearch,
     ToggleCommandPalette,
+    OpenVim9Ide,
+    GreetAsciiOrganism,
+    InspectAsciiOrganism,
+    ExpandVteCompanion,
+    CollapseVteCompanion,
     ToggleSettings,
     ReloadConfig,
     ToggleSidebar,
@@ -48,6 +53,15 @@ pub(crate) enum Action {
     NextTab,
     ScrollUp,
     ScrollDown,
+    /// Unified command navigation is explicit and has no default shell chord.
+    PreviousCommand,
+    NextCommand,
+    ReturnToLive,
+    CopyCurrentCommand,
+    /// Read-only comparison and exports over explicitly selected records.
+    CompareSelectedOutputs,
+    ExportSelectedMarkdown,
+    ExportSelectedJson,
     CyclePaneFocusForward,
     CyclePaneFocusBackward,
     QuickSwitchTab(u8),
@@ -94,6 +108,9 @@ pub(crate) enum Action {
     CollapseAllBlocks,
     /// Unfold every finished block's output.
     ExpandAllBlocks,
+    /// Fold or unfold only the explicit selection; palette-only by default.
+    CollapseSelectedBlocks,
+    ExpandSelectedBlocks,
     /// Fold or unfold the selected block (or the newest one).
     ToggleBlockCollapsed,
     /// Put selected commands back into the live editor in terminal order.
@@ -118,6 +135,8 @@ pub(crate) enum Action {
     AskAiAboutSelectedBlock,
     /// Open the approval-gated multi-turn shell Agent for the active Block pane.
     OpenAgent,
+    /// Browse and resume provider-owned Codex and Claude conversations.
+    OpenAgentSessions,
     /// Show or hide the native Codex agent Tasks panel (isolated-worktree
     /// tasks). Ctrl+Alt+Shift+T by default; requires `agent_tasks_enabled`.
     ToggleTasksPanel,
@@ -152,6 +171,11 @@ impl Action {
             Action::OpacityDecrease => "Opacity decrease",
             Action::ToggleSearch => "Toggle search",
             Action::ToggleCommandPalette => "Command palette",
+            Action::OpenVim9Ide => "Open Vim9 IDE workbench",
+            Action::GreetAsciiOrganism => "Say hello to ASCII companion",
+            Action::InspectAsciiOrganism => "Inspect ASCII companion",
+            Action::ExpandVteCompanion => "Expand VTE neutral companion",
+            Action::CollapseVteCompanion => "Collapse VTE neutral companion",
             Action::ToggleSettings => "Toggle settings panel",
             Action::ReloadConfig => "Reload configuration",
             Action::ToggleSidebar => "Toggle sidebar",
@@ -161,6 +185,13 @@ impl Action {
             Action::NextTab => "Next tab",
             Action::ScrollUp => "Scroll up",
             Action::ScrollDown => "Scroll down",
+            Action::PreviousCommand => "Previous command",
+            Action::NextCommand => "Next command",
+            Action::ReturnToLive => "Return to live",
+            Action::CopyCurrentCommand => "Copy current command",
+            Action::CompareSelectedOutputs => "Review and compare command output",
+            Action::ExportSelectedMarkdown => "Export selected command records as Markdown",
+            Action::ExportSelectedJson => "Export selected command records as JSON",
             Action::CyclePaneFocusForward => "Cycle pane focus forward",
             Action::CyclePaneFocusBackward => "Cycle pane focus backward",
             Action::QuickSwitchTab(n) => match n {
@@ -216,6 +247,8 @@ impl Action {
             Action::UndoClearBlocks => "Undo removing blocks",
             Action::CollapseAllBlocks => "Collapse all blocks",
             Action::ExpandAllBlocks => "Expand all blocks",
+            Action::CollapseSelectedBlocks => "Collapse selected output",
+            Action::ExpandSelectedBlocks => "Expand selected output",
             Action::ToggleBlockCollapsed => "Collapse or expand block",
             Action::ReinputSelectedCommands => "Reinput selected commands",
             Action::JumpToPrevPinned => "Jump to previous bookmarked block",
@@ -228,6 +261,7 @@ impl Action {
             Action::ToggleAiPanel => "Toggle AI panel",
             Action::OpenAiPanel => "Open AI panel",
             Action::AskAiAboutSelectedBlock => "Ask AI about selected block",
+            Action::OpenAgentSessions => "Agent Sessions: browse and resume Codex / Claude",
             Action::OpenAgent => "Open shell Agent",
             Action::ToggleTasksPanel => "Toggle agent Tasks panel",
             Action::HistoryPalette => "Command history palette",
@@ -252,6 +286,10 @@ impl Action {
             Action::OpacityDecrease => Some("opacity_decrease"),
             Action::ToggleSearch => Some("toggle_search"),
             Action::ToggleCommandPalette => Some("toggle_command_palette"),
+            Action::OpenVim9Ide => Some("open_vim9_ide"),
+            Action::GreetAsciiOrganism => Some("greet_ascii_organism"),
+            Action::InspectAsciiOrganism => Some("inspect_ascii_organism"),
+            Action::ExpandVteCompanion | Action::CollapseVteCompanion => None,
             Action::ToggleSettings => Some("toggle_settings"),
             Action::ReloadConfig => Some("reload_config"),
             Action::ToggleSidebar => Some("toggle_sidebar"),
@@ -261,6 +299,13 @@ impl Action {
             Action::NextTab => Some("next_tab"),
             Action::ScrollUp => Some("scroll_up"),
             Action::ScrollDown => Some("scroll_down"),
+            Action::PreviousCommand => Some("previous_command"),
+            Action::NextCommand => Some("next_command"),
+            Action::ReturnToLive => Some("return_to_live"),
+            Action::CopyCurrentCommand => Some("copy_current_command"),
+            Action::CompareSelectedOutputs => Some("compare_selected_outputs"),
+            Action::ExportSelectedMarkdown => Some("export_selected_markdown"),
+            Action::ExportSelectedJson => Some("export_selected_json"),
             Action::CyclePaneFocusForward => Some("cycle_pane_focus_forward"),
             Action::CyclePaneFocusBackward => Some("cycle_pane_focus_backward"),
             Action::QuickSwitchTab(_) => None,
@@ -306,6 +351,8 @@ impl Action {
             Action::UndoClearBlocks => Some("undo_clear_blocks"),
             Action::CollapseAllBlocks => Some("collapse_all_blocks"),
             Action::ExpandAllBlocks => Some("expand_all_blocks"),
+            Action::CollapseSelectedBlocks => Some("collapse_selected_blocks"),
+            Action::ExpandSelectedBlocks => Some("expand_selected_blocks"),
             Action::ToggleBlockCollapsed => Some("toggle_block_collapsed"),
             Action::ReinputSelectedCommands => Some("reinput_selected_commands"),
             Action::JumpToPrevPinned => Some("jump_to_prev_pinned"),
@@ -318,6 +365,7 @@ impl Action {
             Action::ToggleAiPanel => Some("toggle_ai_panel"),
             Action::OpenAiPanel => None,
             Action::AskAiAboutSelectedBlock => Some("ask_ai_about_selected_block"),
+            Action::OpenAgentSessions => Some("open_agent_sessions"),
             Action::OpenAgent => Some("open_agent"),
             Action::ToggleTasksPanel => Some("toggle_tasks_panel"),
             Action::HistoryPalette => Some("history_palette"),
@@ -343,6 +391,11 @@ impl Action {
             Action::OpacityDecrease,
             Action::ToggleSearch,
             Action::ToggleCommandPalette,
+            Action::OpenVim9Ide,
+            Action::GreetAsciiOrganism,
+            Action::InspectAsciiOrganism,
+            Action::ExpandVteCompanion,
+            Action::CollapseVteCompanion,
             Action::ToggleSettings,
             Action::ReloadConfig,
             Action::ToggleSidebar,
@@ -352,6 +405,13 @@ impl Action {
             Action::NextTab,
             Action::ScrollUp,
             Action::ScrollDown,
+            Action::PreviousCommand,
+            Action::NextCommand,
+            Action::ReturnToLive,
+            Action::CopyCurrentCommand,
+            Action::CompareSelectedOutputs,
+            Action::ExportSelectedMarkdown,
+            Action::ExportSelectedJson,
             Action::CyclePaneFocusForward,
             Action::CyclePaneFocusBackward,
             Action::ConnectRemote(0),
@@ -393,6 +453,8 @@ impl Action {
             Action::UndoClearBlocks,
             Action::CollapseAllBlocks,
             Action::ExpandAllBlocks,
+            Action::CollapseSelectedBlocks,
+            Action::ExpandSelectedBlocks,
             Action::ToggleBlockCollapsed,
             Action::ReinputSelectedCommands,
             Action::JumpToPrevPinned,
@@ -405,6 +467,7 @@ impl Action {
             Action::ToggleAiPanel,
             Action::AskAiAboutSelectedBlock,
             Action::OpenAgent,
+            Action::OpenAgentSessions,
             Action::ToggleTasksPanel,
             Action::HistoryPalette,
             Action::CrossBlockSearch,
@@ -418,7 +481,12 @@ impl Action {
     /// used by sibling jterm frontends. Canonical keys remain the values
     /// returned by [`Self::config_key`].
     pub(crate) fn from_config_key(key: &str) -> Option<Action> {
+        if key == "agent:sessions" {
+            return Some(Action::OpenAgentSessions);
+        }
         let alias = match key {
+            "block:collapse_selected" => Some(Action::CollapseSelectedBlocks),
+            "block:expand_selected" => Some(Action::ExpandSelectedBlocks),
             "open_ai_panel" => Some(Action::OpenAiPanel),
             "open_history_palette" => Some(Action::HistoryPalette),
             "open_workflows" => Some(Action::WorkflowsPalette),
@@ -433,13 +501,7 @@ impl Action {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Direction {
-    Left,
-    Right,
-    Up,
-    Down,
-}
+pub(crate) use jterm_core::pane_layout::PaneDirection as Direction;
 
 #[derive(Clone)]
 pub(crate) struct KeybindingMap {
@@ -469,6 +531,7 @@ impl KeybindingMap {
         bind("Ctrl+Alt+minus", Action::OpacityDecrease);
         bind("Ctrl+Shift+F", Action::ToggleSearch);
         bind("Ctrl+Shift+P", Action::ToggleCommandPalette);
+        bind("Ctrl+Alt+I", Action::OpenVim9Ide);
         bind("Ctrl+Shift+O", Action::ToggleSettings);
         bind("Ctrl+Shift+R", Action::ReloadConfig);
         bind("Ctrl+backslash", Action::ToggleSidebar);
@@ -523,6 +586,7 @@ impl KeybindingMap {
         bind("Ctrl+Alt+Shift+A", Action::ToggleAiPanel);
         bind("Ctrl+Shift+Q", Action::AskAiAboutSelectedBlock);
         bind("Ctrl+Alt+G", Action::OpenAgent);
+        bind("Ctrl+Alt+Shift+G", Action::OpenAgentSessions);
         bind("Ctrl+Alt+Shift+T", Action::ToggleTasksPanel);
         // Ctrl+R is consumed by bash readline in the live VTE, so the chord
         // for our block-history palette is Ctrl+Shift+H ("history").
@@ -699,6 +763,30 @@ impl KeybindingMap {
         chords.join(", ")
     }
 
+    /// Compact menu hints reflect only the current map, never default fallbacks.
+    pub(crate) fn menu_binding_display(&self, action: &Action) -> String {
+        let mut chords: Vec<_> = self
+            .bindings
+            .iter()
+            .filter(|(_, bound)| *bound == action)
+            .map(|(chord, _)| chord.display())
+            .collect();
+        chords.sort();
+        chords.dedup();
+        let more = chords.len() > 3;
+        chords.truncate(3);
+        let mut label = chords.join(" / ");
+        if more {
+            label.push_str(" / …");
+        }
+        let mut chars = label.chars();
+        let mut bounded: String = chars.by_ref().take(96).collect();
+        if chars.next().is_some() {
+            bounded.push('…');
+        }
+        bounded
+    }
+
     pub(crate) fn all_bound_actions(&self) -> Vec<(Action, String)> {
         let mut result = Vec::new();
         for action in Action::all_actions() {
@@ -728,6 +816,103 @@ mod tests {
     //! it) — that needs a GTK event loop and is tracked separately.
     use super::*;
 
+    #[test]
+    fn inspection_is_discoverable_bindable_and_has_no_default_chord() {
+        let action = Action::InspectAsciiOrganism;
+        let defaults = KeybindingMap::from_defaults();
+        assert!(Action::all_actions().contains(&action));
+        assert!(defaults
+            .all_bound_actions()
+            .iter()
+            .any(|(candidate, _)| *candidate == action));
+        assert!(defaults.binding_display(&action).is_empty());
+        assert_eq!(
+            Action::from_config_key("inspect_ascii_organism"),
+            Some(action)
+        );
+        let overrides = "inspect_ascii_organism = 'F10'"
+            .parse::<toml::Table>()
+            .unwrap();
+        let customized = KeybindingMap::from_user_overrides(&overrides).unwrap();
+        assert_eq!(
+            customized.lookup(&jterm_core::keybindings::parse("F10").unwrap()),
+            Some(action)
+        );
+    }
+
+    #[test]
+    fn selected_output_actions_are_discoverable_bindable_and_do_not_reserve_keys() {
+        let defaults = KeybindingMap::from_defaults();
+        for (action, key, alias) in [
+            (
+                Action::CollapseSelectedBlocks,
+                "collapse_selected_blocks",
+                "block:collapse_selected",
+            ),
+            (
+                Action::ExpandSelectedBlocks,
+                "expand_selected_blocks",
+                "block:expand_selected",
+            ),
+        ] {
+            assert_eq!(Action::from_config_key(key), Some(action));
+            assert_eq!(Action::from_config_key(alias), Some(action));
+            assert!(Action::all_actions().contains(&action));
+            assert!(defaults.binding_display(&action).is_empty());
+            for name in [key, alias] {
+                let table = format!("'{name}' = 'F8'").parse::<toml::Table>().unwrap();
+                let customized = KeybindingMap::from_user_overrides(&table).unwrap();
+                assert_eq!(customized.lookup(&parse("F8").unwrap()), Some(action));
+            }
+        }
+    }
+
+    #[test]
+    fn hello_is_discoverable_without_a_default_shortcut() {
+        let map = KeybindingMap::from_defaults();
+        assert!(map
+            .all_bound_actions()
+            .iter()
+            .any(|(action, _)| *action == Action::GreetAsciiOrganism));
+        assert!(map.binding_display(&Action::GreetAsciiOrganism).is_empty());
+        assert_eq!(
+            Action::from_config_key("greet_ascii_organism"),
+            Some(Action::GreetAsciiOrganism)
+        );
+    }
+
+    #[test]
+    fn unified_navigation_is_discoverable_bindable_and_preserves_shell_keys() {
+        let defaults = KeybindingMap::from_defaults();
+        for (action, key) in [
+            (Action::PreviousCommand, "previous_command"),
+            (Action::NextCommand, "next_command"),
+            (Action::ReturnToLive, "return_to_live"),
+            (Action::CopyCurrentCommand, "copy_current_command"),
+            (Action::CompareSelectedOutputs, "compare_selected_outputs"),
+            (Action::ExportSelectedMarkdown, "export_selected_markdown"),
+            (Action::ExportSelectedJson, "export_selected_json"),
+        ] {
+            assert_eq!(Action::from_config_key(key), Some(action));
+            assert!(defaults
+                .all_bound_actions()
+                .iter()
+                .any(|(candidate, _)| *candidate == action));
+            assert!(defaults.binding_display(&action).is_empty());
+            let table = format!("'{key}' = 'F8'").parse::<toml::Table>().unwrap();
+            let customized = KeybindingMap::from_user_overrides(&table).unwrap();
+            assert_eq!(customized.lookup(&parse("F8").unwrap()), Some(action));
+        }
+        assert_eq!(
+            defaults.lookup(&parse("Ctrl+Up").unwrap()),
+            Some(Action::ScrollUp)
+        );
+        assert_eq!(
+            defaults.lookup(&parse("Ctrl+Down").unwrap()),
+            Some(Action::ScrollDown)
+        );
+    }
+
     /// Every action advertised by `all_actions()` either has a default
     /// binding or is on the explicit "palette / TOML-only" allowlist
     /// below. The allowlist exists so a newly-added Action without a
@@ -739,6 +924,10 @@ mod tests {
         // and/or user TOML overrides — they have no default chord on
         // purpose (chord exhaustion + low frequency of use).
         let palette_only: &[Action] = &[
+            Action::GreetAsciiOrganism,
+            Action::InspectAsciiOrganism,
+            Action::ExpandVteCompanion,
+            Action::CollapseVteCompanion,
             Action::CloseTab,
             Action::CyclePaneFocusForward,
             Action::CyclePaneFocusBackward,
@@ -765,10 +954,19 @@ mod tests {
             Action::UndoClearBlocks,
             Action::JumpToPrevFailed,
             Action::JumpToNextFailed,
+            Action::PreviousCommand,
+            Action::NextCommand,
+            Action::ReturnToLive,
+            Action::CopyCurrentCommand,
+            Action::CompareSelectedOutputs,
+            Action::ExportSelectedMarkdown,
+            Action::ExportSelectedJson,
             // Folding is a triage gesture, not a hot key: reachable from the
             // palette and bindable in TOML, like the rest of this list.
             Action::CollapseAllBlocks,
             Action::ExpandAllBlocks,
+            Action::CollapseSelectedBlocks,
+            Action::ExpandSelectedBlocks,
             Action::ToggleBlockCollapsed,
             // anvil leaves session export chordless too; both GTK terminals
             // reach it from the command palette only.
@@ -953,6 +1151,7 @@ mod tests {
             // Block-discovery surface.
             ("Ctrl+Shift+F", Action::ToggleSearch),
             ("Ctrl+Shift+P", Action::ToggleCommandPalette),
+            ("Ctrl+Alt+I", Action::OpenVim9Ide),
             ("Ctrl+Shift+R", Action::ReloadConfig),
             ("Ctrl+Shift+S", Action::ShowRemotePicker),
             // Selection copy out of finished blocks.
@@ -972,6 +1171,7 @@ mod tests {
             ("Ctrl+Alt+Shift+A", Action::ToggleAiPanel),
             ("Ctrl+Shift+Q", Action::AskAiAboutSelectedBlock),
             ("Ctrl+Alt+G", Action::OpenAgent),
+            ("Ctrl+Alt+Shift+G", Action::OpenAgentSessions),
             ("Ctrl+Alt+Shift+T", Action::ToggleTasksPanel),
             // Block-history palette (Ctrl+R is bash readline, so we use Ctrl+Shift+H).
             ("Ctrl+Shift+H", Action::HistoryPalette),
@@ -1012,6 +1212,7 @@ mod tests {
             ("Ctrl+Shift+V", Action::Paste),
             ("Ctrl+Shift+F", Action::ToggleSearch),
             ("Ctrl+Shift+P", Action::ToggleCommandPalette),
+            ("Ctrl+Alt+I", Action::OpenVim9Ide),
             ("Ctrl+Shift+O", Action::ToggleSettings),
             ("Ctrl+backslash", Action::ToggleSidebar),
             ("Ctrl+Shift+E", Action::SplitHorizontal),
@@ -1523,5 +1724,28 @@ font_increase = "Ctrl+Shift+T"
             let chord = parse(binding).expect("valid built-in binding");
             assert_eq!(map.lookup(&chord), Some(expected), "{binding}");
         }
+    }
+}
+
+#[cfg(test)]
+mod menu_hint_tests {
+    use super::*;
+
+    #[test]
+    fn menu_bindings_are_current_sorted_bounded_and_optional() {
+        let mut map = KeybindingMap::from_defaults();
+        let mut overrides = toml::Table::new();
+        overrides.insert("paste".into(), toml::Value::String("none".into()));
+        map.apply_user_overrides(&overrides).unwrap();
+        assert_eq!(map.menu_binding_display(&Action::Paste), "");
+        for key in ["F9", "F6", "F8", "F7"] {
+            map.bindings.insert(parse(key).unwrap(), Action::Paste);
+        }
+        assert_eq!(map.menu_binding_display(&Action::Paste), "F6 / F7 / F8 / …");
+        overrides.insert("paste".into(), toml::Value::String("F10".into()));
+        map.apply_user_overrides(&overrides).unwrap();
+        assert_eq!(map.menu_binding_display(&Action::Paste), "F10");
+        assert_eq!(map.lookup(&parse("F10").unwrap()), Some(Action::Paste));
+        assert_eq!(map.lookup(&parse("F6").unwrap()), None);
     }
 }

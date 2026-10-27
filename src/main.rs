@@ -246,48 +246,121 @@ impl UiState {
         page_num: u32,
     ) {
         let generation = self.invalidate_tab_focus_requests();
-        let notebook_for_focus = self.notebook.clone();
         let ui_for_focus = self.clone();
-        let focus_generation = self.tab_focus_generation.clone();
-        let frame_count = Cell::new(0u8);
-        let stable_frames = Cell::new(0u8);
-        self.notebook.add_tick_callback(move |_, _| {
-            if !tab_focus_request_is_current(
-                focus_generation.get(),
-                generation,
-                notebook_for_focus.current_page(),
-                page_num,
-            ) {
-                return glib::ControlFlow::Break;
-            }
-
-            if ui_for_focus.search_bar.is_search_mode() {
+        queue_tab_terminal_focus(
+            &self.notebook,
+            self.tab_focus_generation.clone(),
+            generation,
+            target_terminal,
+            page_num,
+            self.search_bar.clone(),
+            move || {
                 ui_for_focus.search_apply();
                 ui_for_focus.search_entry.grab_focus();
-                return glib::ControlFlow::Break;
-            }
-
-            frame_count.set(frame_count.get() + 1);
-            let focus_frame = next_tab_focus_frame(
-                target_terminal.is_mapped(),
-                target_terminal.has_focus(),
-                stable_frames.get(),
-            );
-            stable_frames.set(focus_frame.stable_frames);
-            if focus_frame.should_grab {
-                target_terminal.grab_focus();
-            }
-            if focus_frame.complete {
-                return glib::ControlFlow::Break;
-            }
-
-            if frame_count.get() >= TAB_SWITCH_FOCUS_MAX_FRAMES {
-                glib::ControlFlow::Break
-            } else {
-                glib::ControlFlow::Continue
-            }
-        });
+            },
+        );
     }
+}
+
+/// GTK's RUN_LAST default handler maps the destination after ordinary signal
+/// handlers. Reconcile search synchronously after that mapping, so the live
+/// VTE's map handler cannot overwrite it. No queued search grab survives the
+/// switch to steal a newer user focus change. Normal terminal target selection
+/// and its generation invalidation stay in the original pre-default handler.
+pub(crate) fn connect_tab_search_focus_after_switch(
+    notebook: &Notebook,
+    search_bar: &SearchBar,
+    search_entry: &SearchEntry,
+) {
+    let search_bar = search_bar.clone();
+    let search_entry = search_entry.clone();
+    notebook.connect_closure(
+        "switch-page",
+        true,
+        glib::closure_local!(
+            move |notebook: Notebook, page: gtk4::Widget, page_num: u32| {
+                // A reentrant switch or topology mutation may supersede this
+                // emission before the after-handler is reached.
+                if notebook.current_page() == Some(page_num)
+                    && notebook.nth_page(Some(page_num)).as_ref() == Some(&page)
+                    && search_bar.is_search_mode()
+                {
+                    search_entry.grab_focus();
+                }
+            }
+        ),
+    );
+}
+
+/// The switch-page focus decision, shared with native mapping regressions.
+/// Search is applied to the explicit destination before GTK commits it.
+pub(crate) fn focus_switched_page(
+    search_bar: &SearchBar,
+    search_entry: &SearchEntry,
+    invalidate: impl FnOnce(),
+    apply_search: impl FnOnce(),
+    terminal: impl FnOnce() -> Option<vte4::Terminal>,
+    focus_terminal: impl FnOnce(vte4::Terminal),
+) {
+    if search_bar.is_search_mode() {
+        invalidate();
+        apply_search();
+        search_entry.grab_focus();
+    } else if let Some(terminal) = terminal() {
+        focus_terminal(terminal);
+    } else {
+        invalidate();
+    }
+}
+
+/// Schedule the exact production mapped-terminal focus reconciliation.
+pub(crate) fn queue_tab_terminal_focus(
+    notebook: &Notebook,
+    focus_generation: Rc<Cell<u64>>,
+    generation: u64,
+    target_terminal: vte4::Terminal,
+    page_num: u32,
+    search_bar: SearchBar,
+    focus_search: impl Fn() + 'static,
+) {
+    let notebook_for_focus = notebook.clone();
+    let frame_count = Cell::new(0u8);
+    let stable_frames = Cell::new(0u8);
+    notebook.add_tick_callback(move |_, _| {
+        if !tab_focus_request_is_current(
+            focus_generation.get(),
+            generation,
+            notebook_for_focus.current_page(),
+            page_num,
+        ) {
+            return glib::ControlFlow::Break;
+        }
+
+        if search_bar.is_search_mode() {
+            focus_search();
+            return glib::ControlFlow::Break;
+        }
+
+        frame_count.set(frame_count.get() + 1);
+        let focus_frame = next_tab_focus_frame(
+            target_terminal.is_mapped(),
+            target_terminal.has_focus(),
+            stable_frames.get(),
+        );
+        stable_frames.set(focus_frame.stable_frames);
+        if focus_frame.should_grab {
+            target_terminal.grab_focus();
+        }
+        if focus_frame.complete {
+            return glib::ControlFlow::Break;
+        }
+
+        if frame_count.get() >= TAB_SWITCH_FOCUS_MAX_FRAMES {
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
 }
 
 fn env_is_unset(k: &str) -> bool {
@@ -471,6 +544,33 @@ pub fn run() -> glib::ExitCode {
     // by the compiler. Registration is first-call-wins, so it must precede the
     // first `OrganismMemory::load`.
     jterm_core::organism_memory::init_scheduler(Box::new(OrganismLane));
+    if let Some(result) =
+        jterm_core::vim9::forward_shell_vim(&std::env::args_os().skip(1).collect::<Vec<_>>())
+    {
+        let status = result.unwrap_or_else(|error| {
+            eprintln!("forge: {error}");
+            1
+        });
+        return glib::ExitCode::from(status.clamp(0, 255) as u8);
+    }
+    let shell_request =
+        match jterm_core::vim9::shell_vim_request(&std::env::args_os().skip(1).collect::<Vec<_>>())
+        {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!("forge: {error}");
+                return glib::ExitCode::from(2u8);
+            }
+        };
+    if let Some(request) = shell_request {
+        if let Some(path) = std::env::var_os("JTERM_VIM9_CONFIG") {
+            std::env::set_var("FORGE_CONFIG", path);
+        }
+        init_logging();
+        init_input_method_env();
+        let status = crate::vim9_ide::run_shell(request, crate::host::APP_ID);
+        return glib::ExitCode::from(status.clamp(0, 255) as u8);
+    }
     if let Some(code) = crate::cli::handle_early_args() {
         return code;
     }
@@ -485,8 +585,24 @@ pub fn run() -> glib::ExitCode {
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
 
+    let ide_entry = std::cell::RefCell::new(launch_options.ide.then(|| {
+        let root = launch_options
+            .working_directory
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("/"));
+        jterm_core::vim9::Vim9EntryRequest::command_line(root)
+    }));
     app.connect_activate(move |app| {
         let launch = launch_options.clone();
+        if launch.ide {
+            if let Some(request) = ide_entry.borrow_mut().take() {
+                crate::vim9_ide::open(app.upcast_ref(), None, request);
+            } else if let Some(window) = app.active_window() {
+                window.present();
+            }
+            return;
+        }
         let (config, themes, keybinding_map) = if launch.safe_mode {
             load_safe_config()
         } else {
@@ -513,6 +629,7 @@ pub fn run() -> glib::ExitCode {
             .resizable(true)
             .opacity(window_opacity.get())
             .build();
+        window.add_css_class("forge-window");
 
         // Create notebook for tabs (tabs hidden — custom tab bar is used instead)
         let notebook = Notebook::builder()
@@ -549,6 +666,9 @@ pub fn run() -> glib::ExitCode {
         search_next_btn.set_focus_on_click(false);
         search_next_btn
             .update_property(&[gtk4::accessible::Property::Label("Next search match")]);
+        let search_preview_btn = gtk4::Button::with_label("Preview");
+        search_preview_btn.set_tooltip_text(Some("Search a frozen copy of retained completed-record text"));
+
         let search_close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
         search_close_btn.set_tooltip_text(Some("Close search (Escape)"));
         search_close_btn.set_focus_on_click(false);
@@ -559,6 +679,7 @@ pub fn run() -> glib::ExitCode {
         search_box.append(&search_status);
         search_box.append(&search_prev_btn);
         search_box.append(&search_next_btn);
+        search_box.append(&search_preview_btn);
         search_box.append(&search_close_btn);
         search_box.set_margin_start(4);
         search_box.set_margin_end(4);
@@ -632,6 +753,15 @@ pub fn run() -> glib::ExitCode {
         ]);
         command_palette_btn.add_css_class("flat");
 
+        let vim9_ide_btn = gtk4::Button::from_icon_name("text-editor-symbolic");
+        vim9_ide_btn.set_focus_on_click(false);
+        vim9_ide_btn.set_tooltip_text(Some("Open Vim9 IDE (Ctrl+Alt+I)"));
+        vim9_ide_btn.update_property(&[
+            gtk4::accessible::Property::Label("Open Vim9 IDE"),
+            gtk4::accessible::Property::KeyShortcuts("Control+Alt+I"),
+        ]);
+        vim9_ide_btn.add_css_class("flat");
+
         let toggle_sidebar_btn = gtk4::Button::from_icon_name("sidebar-show-symbolic");
         toggle_sidebar_btn.set_focus_on_click(false);
         toggle_sidebar_btn.set_focusable(true);
@@ -667,7 +797,9 @@ pub fn run() -> glib::ExitCode {
         let top_tab_scroll = ScrolledWindow::new();
         top_tab_scroll.set_hexpand(true);
         top_tab_scroll.set_vexpand(false);
-        top_tab_scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Never);
+        // Never propagates the sum of tab minimum widths into the window.
+        // External keeps native horizontal scrolling without a visible scrollbar.
+        top_tab_scroll.set_policy(gtk4::PolicyType::External, gtk4::PolicyType::Never);
         top_tab_scroll.set_overflow(gtk4::Overflow::Hidden);
         top_tab_scroll.set_width_request(0);
         top_tab_scroll.set_min_content_width(0);
@@ -675,7 +807,7 @@ pub fn run() -> glib::ExitCode {
         top_tab_scroll.set_propagate_natural_width(false);
         top_tab_scroll.add_css_class("top-tab-scroll");
         top_tab_scroll.set_visible(false);
-        top_tab_scroll.set_margin_start(128);
+        top_tab_scroll.set_margin_start(164);
         top_tab_scroll.set_margin_end(104);
 
         // Overlay the leading controls, tab strip, and trailing actions so tab
@@ -693,8 +825,12 @@ pub fn run() -> glib::ExitCode {
         leading_actions.append(&command_palette_btn);
         leading_actions.append(&toggle_sidebar_btn);
         leading_actions.append(&toggle_placement_btn);
+        leading_actions.append(&vim9_ide_btn);
         top_bar.add_overlay(&leading_actions);
         top_bar.add_overlay(&top_tab_scroll);
+        // Font zoom can exceed the compact minimum. Include tab text in the
+        // bar's height while the scroller still clamps its minimum width.
+        top_bar.set_measure_overlay(&top_tab_scroll, true);
 
         // A compact, stateful counterpart to Ctrl+Alt+G. Its checked state
         // follows the lifetime of the approval-gated Shell Agent session;
@@ -751,6 +887,30 @@ pub fn run() -> glib::ExitCode {
         close_window_button
             .update_property(&[gtk4::accessible::Property::Label("Close window")]);
 
+        let sessions_button = gtk4::Button::from_icon_name("view-grid-symbolic");
+        sessions_button.set_tooltip_text(Some("Agent Sessions: resume Codex / Claude (Ctrl+Alt+Shift+G)"));
+        sessions_button.update_property(&[gtk4::accessible::Property::Label("Agent Sessions")]);
+        sessions_button.add_css_class("flat");
+        // Tasks with an attention count, shown only where tasks can be used.
+        let tasks_button = gtk4::Button::new();
+        tasks_button.set_visible(false);
+        tasks_button.set_focus_on_click(false);
+        tasks_button.add_css_class("flat");
+        tasks_button.set_tooltip_text(Some(ui::TASKS_BUTTON_TOOLTIP));
+        tasks_button.update_property(&[
+            gtk4::accessible::Property::Label(ui::TASKS_BUTTON_LABEL),
+            gtk4::accessible::Property::KeyShortcuts("Control+Alt+Shift+T"),
+        ]);
+        let tasks_content = gtk4::Box::new(Orientation::Horizontal, 4);
+        tasks_content.append(&gtk4::Image::from_icon_name("view-list-bullet-symbolic"));
+        let tasks_badge = gtk4::Label::new(None);
+        tasks_badge.set_visible(false);
+        tasks_badge.add_css_class("caption-heading");
+        tasks_badge.add_css_class("accent");
+        tasks_content.append(&tasks_badge);
+        tasks_button.set_child(Some(&tasks_content));
+        trailing_actions.append(&sessions_button);
+        trailing_actions.append(&tasks_button);
         trailing_actions.append(&agent_toggle);
         trailing_actions.append(&add_tab_button);
         trailing_actions.append(&minimize_window_button);
@@ -760,6 +920,8 @@ pub fn run() -> glib::ExitCode {
 
         let top_bar_handle = gtk4::WindowHandle::new();
         top_bar_handle.set_child(Some(&top_bar));
+        top_bar_handle.add_css_class("forge-font-chrome");
+        ui::install_top_tab_geometry_reveal(&top_tab_scroll);
 
         {
             let window = window.clone();
@@ -799,6 +961,7 @@ pub fn run() -> glib::ExitCode {
 
         let sidebar = gtk4::Box::new(Orientation::Vertical, 0);
         sidebar.add_css_class("sidebar-box");
+        sidebar.add_css_class("forge-font-chrome");
 
         // Tab search entry for filtering. It always lives in the sidebar's Tabs
         // view, in both tab placements: the top bar is reserved for the tabs
@@ -1030,6 +1193,7 @@ pub fn run() -> glib::ExitCode {
         // AI Chats, and Tasks rides the same chrome without its own config.
         let tasks_panel_widget = ui::TasksPanel::build();
         let side_stack = gtk4::Stack::new();
+        side_stack.add_css_class("forge-font-chrome");
         side_stack.add_named(&ai_panel_widget.root, Some("chats"));
         side_stack.add_named(&tasks_panel_widget.root, Some("tasks"));
         side_stack.set_visible_child_name("chats");
@@ -1063,6 +1227,7 @@ pub fn run() -> glib::ExitCode {
         // Main layout: draggable top bar + content box (vertical), with the
         // status bar spanning the full window width underneath both.
         let (bottom_bar, bottom_bar_left, bottom_bar_right) = ui::build_bottom_bar();
+        bottom_bar.add_css_class("forge-font-chrome");
         let main_box = gtk4::Box::new(Orientation::Vertical, 0);
         main_box.append(&top_bar_handle);
         main_box.append(&content_box);
@@ -1075,9 +1240,15 @@ pub fn run() -> glib::ExitCode {
         // config reload followed by a new Block pane can then opt in without
         // silently falling back to volatile state. This is a bounded read and
         // never creates the file.
-        let organism_memory = match jterm_core::organism_memory::OrganismMemory::load(
-            crate::config::default_ascii_organism_memory_path(),
-        ) {
+        let organism_memory = match crate::config::default_ascii_organism_memory_path()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "no absolute state or home directory",
+                )
+            })
+            .and_then(jterm_core::organism_memory::OrganismMemory::load)
+        {
             Ok(memory) => Some(memory),
             Err(error) => {
                 // Fail closed: a corrupt/future/unsafe memory file must not be
@@ -1106,15 +1277,19 @@ pub fn run() -> glib::ExitCode {
         toast_overlay.set_child(Some(&main_box));
 
         let ui = Rc::new(UiState {
+            unified_navigation_owner: Rc::new(RefCell::new(std::rc::Weak::new())),
             window: window.clone(),
             toast_overlay: toast_overlay.clone(),
             opacity_toast: Rc::new(RefCell::new(None)),
             notebook: notebook.clone(),
+            agent_session_tabs: RefCell::new(HashMap::new()),
+            agent_session_library: Rc::new(RefCell::new(jterm_core::agent_sessions::SessionLibraryStore::new())),
             tab_counter: tab_counter.clone(),
             font_scale: font_scale.clone(),
             config_persist_generation: Rc::new(Cell::new(0)),
             font_persist_generation: Rc::new(Cell::new(0)),
             pending_font_scale: Rc::new(Cell::new(None)),
+            pending_chrome_font_scale: Rc::new(Cell::new(None)),
             window_opacity: window_opacity.clone(),
             shell_argv: shell_argv.clone(),
             config: config.clone(),
@@ -1124,6 +1299,7 @@ pub fn run() -> glib::ExitCode {
             search_status: search_status.clone(),
             search_debounce_source: Rc::new(RefCell::new(None)),
             search_generation: Rc::new(Cell::new(0)),
+            search_owner: Rc::new(RefCell::new(None)),
             tab_strip: tab_strip.clone(),
             sidebar: sidebar.clone(),
             tab_strip_scroll: tab_strip_scroll.clone(),
@@ -1166,8 +1342,10 @@ pub fn run() -> glib::ExitCode {
             cross_block_search_dialog: Rc::new(RefCell::new(None)),
             cross_block_search_toggle_latch: Rc::new(RefCell::new(Default::default())),
             cross_block_search_memory: Rc::new(RefCell::new(Default::default())),
+            workflow_library: jterm_core::workflows::BackgroundRefresh::new(Vec::new()),
             workflows_palette_dialog: Rc::new(RefCell::new(None)),
             settings_dialog: Rc::new(RefCell::new(None)),
+            organism_settings_controls: Rc::new(RefCell::new(None)),
             debug_dashboard_dialog: Rc::new(RefCell::new(None)),
             agent_session: Rc::new(RefCell::new(None)),
             agent_ui_lifetime: Rc::new(Default::default()),
@@ -1176,9 +1354,12 @@ pub fn run() -> glib::ExitCode {
             organism_correction: ui::OrganismCorrectionSignal::new(organism_life.clone()),
             organism_activity: ui::OrganismActivity::new(organism_circadian, organism_growth),
             organism_presence: ui::OrganismPresence::new(),
-            organism_agent: ui::OrganismAgentSignal::new(organism_life.clone()),
+            organism_agent: ui::OrganismAgentSignal::new(organism_life.clone(), config.clone()),
             organism_life,
             agent_toggle: agent_toggle.clone(),
+            tasks_button: tasks_button.clone(),
+            tasks_badge: tasks_badge.clone(),
+            task_badge_state: RefCell::new(None),
             config_save_error_visible: Rc::new(Cell::new(false)),
             safe_mode_config_notice_visible: Rc::new(Cell::new(false)),
             config_reload_conflict_visible: Rc::new(Cell::new(false)),
@@ -1198,6 +1379,9 @@ pub fn run() -> glib::ExitCode {
             ai_panel_visible: Rc::new(Cell::new(ai_initially_visible)),
             ai_panel_width_restoring: Rc::new(Cell::new(false)),
         });
+
+        *ui.unified_navigation_owner.borrow_mut() = Rc::downgrade(&ui);
+        ui.observe_ascii_organism_motion();
 
         // A configuration that could not be read leaves every setting at its
         // default, which looks exactly like a config file that does nothing.
@@ -1219,6 +1403,8 @@ pub fn run() -> glib::ExitCode {
                 }
             });
         }
+
+        crate::vim9_ide::install_shell_host(&window);
 
         // Background persistence failures arrive from a Send-only worker.
         // Polling a bounded queue keeps GTK objects on the main thread and
@@ -1272,6 +1458,7 @@ pub fn run() -> glib::ExitCode {
         );
         ui.apply_dynamic_css();
         ui.sync_agent_toggle();
+        ui.sync_task_badge();
         ui.sync_bottom_bar_visibility();
 
         // jterm prefers jsh as its shell, so it is worth noticing when the
@@ -1326,6 +1513,10 @@ pub fn run() -> glib::ExitCode {
         command_palette_btn.connect_clicked(move |_| {
             ui_for_palette.execute_action(crate::keybindings::Action::ToggleCommandPalette);
         });
+        let ui_for_ide = ui.clone();
+        vim9_ide_btn.connect_clicked(move |_| {
+            ui_for_ide.execute_action(crate::keybindings::Action::OpenVim9Ide);
+        });
 
         // Wire toggle sidebar button
         let ui_for_toggle = ui.clone();
@@ -1337,6 +1528,15 @@ pub fn run() -> glib::ExitCode {
         let ui_for_placement = ui.clone();
         toggle_placement_btn.connect_clicked(move |_| {
             ui_for_placement.toggle_tab_placement();
+        });
+
+        let ui_for_sessions = ui.clone();
+        sessions_button.connect_clicked(move |_| {
+            ui_for_sessions.execute_action(crate::keybindings::Action::OpenAgentSessions);
+        });
+        let ui_for_tasks = ui.clone();
+        tasks_button.connect_clicked(move |_| {
+            ui_for_tasks.execute_action(crate::keybindings::Action::ToggleTasksPanel);
         });
 
         // Wire the visible Shell Agent state toggle.
@@ -1467,8 +1667,15 @@ pub fn run() -> glib::ExitCode {
                 );
             }
         } else {
+            let mut incomplete_restore = false;
             for (name, layout) in saved_tabs {
-                ui.restore_pane_layout(layout, name);
+                incomplete_restore |= ui.restore_pane_layout(layout, name).is_incomplete();
+            }
+            // UI construction can omit siblings even when parsing succeeded.
+            // Preserve the claimed source before installing any autosave hooks
+            // or writing the initial (possibly partial) live workspace.
+            if incomplete_restore {
+                crate::state::preserve_incomplete_tabs_restore();
             }
 
             if let Some(page) = saved_current {
@@ -1541,8 +1748,10 @@ pub fn run() -> glib::ExitCode {
 
         // Setup key controller on window level with Capture phase
         // This allows us to intercept shortcuts before the terminal processes them
+        crate::enter_ownership::watch_window(&window);
         let key_controller = EventControllerKey::new();
         key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        crate::enter_ownership::install_controller(&key_controller);
 
         let ui_clone = ui.clone();
         let pending_focus_shortcut: Rc<RefCell<Option<DeferredFocusShortcut>>> =
@@ -1550,6 +1759,14 @@ pub fn run() -> glib::ExitCode {
         let pending_for_press = pending_focus_shortcut.clone();
 
         key_controller.connect_key_pressed(move |_controller, keyval, keycode, state| {
+            // Embedded Vim owns Quick Open before the shell's global
+            // command-palette binding can consume this capture event.
+            if crate::vim9_ide::native_dialog_owns_keyboard(&ui_clone.window)
+                    || crate::vim9_ide::embedded_owns_quick_open_key(&ui_clone.window, keyval, state)
+                    || crate::vim9_ide::embedded_owns_font_key(&ui_clone.window, keyval, state)
+                {
+                return glib::Propagation::Proceed;
+            }
             // Composer Enter semantics must win over optional user-defined
             // global bindings. The focused TextView controller also gives IME
             // candidate confirmation first refusal.
@@ -1726,6 +1943,11 @@ pub fn run() -> glib::ExitCode {
             ui_for_search_prev.search_prev();
         });
 
+        let ui_for_search_preview = ui.clone();
+        search_preview_btn.connect_clicked(move |_| {
+            ui_for_search_preview.show_exact_search_preview();
+        });
+
         let ui_for_search_close = ui.clone();
         search_close_btn.connect_clicked(move |_| {
             ui_for_search_close.toggle_search();
@@ -1773,23 +1995,21 @@ pub fn run() -> glib::ExitCode {
             // Headers are only maintained for the visible tab, so the newly
             // selected one has to catch up before it is drawn.
             ui_for_switch.refresh_pane_headers_for(widget);
-            if ui_for_switch.search_bar.is_search_mode() {
-                ui_for_switch.invalidate_tab_focus_requests();
-                ui_for_switch.search_apply();
-                ui_for_switch.search_entry.grab_focus();
-            } else if let Some(target_terminal) = ui_for_switch.terminal_in_page(widget) {
-                if let Some(term_view) = ui_for_switch.term_view_in_page(widget) {
-                    term_view.reveal_live_input();
-                }
-
-                // `switch-page` can run before the selected child has completed
-                // its map/focus reconciliation. The shared request generation
-                // also lets topology DnD replace this target if it moves another
-                // live pane into the still-selected page before the next frame.
-                ui_for_switch.request_tab_terminal_focus(target_terminal, page_num);
-            } else {
-                ui_for_switch.invalidate_tab_focus_requests();
-            }
+            focus_switched_page(
+                &ui_for_switch.search_bar,
+                &ui_for_switch.search_entry,
+                || { ui_for_switch.invalidate_tab_focus_requests(); },
+                || ui_for_switch.search_apply_in_page(widget),
+                || ui_for_switch.terminal_in_page(widget),
+                |target_terminal| {
+                    if let Some(term_view) = ui_for_switch.term_view_in_page(widget) {
+                        term_view.reveal_live_input();
+                    }
+                    // GTK may not have mapped the selected child yet. DnD can
+                    // supersede this target through the shared generation.
+                    ui_for_switch.request_tab_terminal_focus(target_terminal, page_num);
+                },
+            );
             // Clear activity/bell indicators for the tab being switched to
             let tab_name = widget.widget_name();
             ui_for_switch.clear_tab_indicators(tab_name.as_str());
@@ -1804,30 +2024,50 @@ pub fn run() -> glib::ExitCode {
             });
         });
 
+        connect_tab_search_focus_after_switch(&notebook, &search_bar, &search_entry);
+
         window.add_controller(key_controller);
 
-        // Ctrl+scroll to zoom font
-        let scroll_controller = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
-        scroll_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
-        let ui_for_scroll = ui.clone();
-        scroll_controller.connect_scroll(move |controller, _dx, dy| {
-            let state = controller.current_event_state();
-            // Touchpads emit fractional deltas; a zero step would still claim
-            // the event, so let those through untouched.
-            if state.contains(ModifierType::CONTROL_MASK) && dy != 0.0 {
-                let font_step = 0.025;
-                let current = ui_for_scroll.font_scale.get();
-                let new_scale = if dy < 0.0 {
-                    (current + font_step).min(10.0)
+        // Each capture controller owns a disjoint widget subtree. GTK routes
+        // scrolls through the pointer target's ancestors, never keyboard focus.
+        // Window-level overlays and separate dialogs have no region controller;
+        // only inter-region split handles lack a group. Internal terminal
+        // split handles remain in the Content subtree.
+        use crate::font_zoom::FontGroup;
+        for (root, group) in [
+            (top_bar_handle.clone().upcast::<gtk4::Widget>(), FontGroup::Chrome),
+            (sidebar.clone().upcast::<gtk4::Widget>(), FontGroup::Chrome),
+            (right_col.clone().upcast::<gtk4::Widget>(), FontGroup::Content),
+            (side_stack.clone().upcast::<gtk4::Widget>(), FontGroup::Chrome),
+            (bottom_bar.clone().upcast::<gtk4::Widget>(), FontGroup::Chrome),
+        ] {
+            let controller = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
+            controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            let ui = ui.clone();
+            controller.connect_scroll(move |controller, _dx, dy| {
+                let control = controller.current_event_state().contains(ModifierType::CONTROL_MASK);
+                if crate::vim9_zoom::owns_wheel(control, controller.widget().is_some_and(|root| crate::vim9_ide::embedded_owns_font_scroll(&root))) {
+                    return glib::Propagation::Proceed;
+                }
+                let steps = if controller.unit() == gtk4::gdk::ScrollUnit::Surface {
+                    dy / jterm_core::wheel::SURFACE_UNITS_PER_STEP
                 } else {
-                    (current - font_step).max(0.1)
+                    dy
                 };
-                ui_for_scroll.apply_font_scale(new_scale);
-                return true.into();
-            }
-            false.into()
-        });
-        window.add_controller(scroll_controller);
+                let current = match group {
+                    FontGroup::Content => ui.font_scale.get(),
+                    FontGroup::Chrome => ui.config.borrow().chrome_font_scale,
+                };
+                if let Some(scale) = crate::font_zoom::wheel_scale(current, control, steps) {
+                    ui.apply_font_group_scale(group, scale);
+                    // Stop before any Block/VTE scroll handler or ancestor can
+                    // process this same gesture, including at a clamp boundary.
+                    return true.into();
+                }
+                false.into()
+            });
+            root.add_controller(controller);
+        }
 
         // Save state *before* GTK starts destroying widgets.
         let notebook_for_close_request = notebook.clone();
@@ -1847,6 +2087,7 @@ pub fn run() -> glib::ExitCode {
         let close_allowed = Rc::new(Cell::new(false));
         let close_confirmation_open = Rc::new(Cell::new(false));
         window.connect_close_request(move |window| {
+            if crate::vim9_ide::request_embedded_close(window) { return glib::Propagation::Stop; }
             if !close_allowed.get() {
                 // A zoomed split keeps the sibling tree outside the Notebook.
                 // Restore it before scanning/saving so no hidden pane escapes
@@ -2021,7 +2262,13 @@ pub fn run() -> glib::ExitCode {
 
         // Safe mode deliberately ignores later config-file changes.
         if !launch.safe_mode {
-            let config_path = config_file_path();
+            let config_path = match config_file_path() {
+                Ok(path) => path,
+                Err(error) => {
+                    log::warn!("Configuration watcher unavailable: {error}");
+                    return;
+                }
+            };
             if let Some(parent_dir) = config_path.parent() {
                 let _ = fs::create_dir_all(parent_dir);
             }
@@ -2200,7 +2447,7 @@ mod tests {
                 .find("identity::init(")
                 .expect("run() initialises the shared identity");
             let load_at = run_body
-                .find("OrganismMemory::load(")
+                .find(".and_then(jterm_core::organism_memory::OrganismMemory::load)")
                 .expect("run() opens the organism memory file");
 
             assert!(

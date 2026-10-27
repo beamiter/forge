@@ -31,6 +31,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Materialize bundled shared core
+        shell: bash
+        run: |
+          if [[ -f "scripts/materialize-shared-core.sh" ]]; then
+            bash "scripts/materialize-shared-core.sh"
+          fi
       - name: Reject known personal identifiers
         run: ./scripts/privacy-check.sh
 
@@ -46,6 +52,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Materialize bundled shared core
+        shell: bash
+        run: |
+          if [[ -f "scripts/materialize-shared-core.sh" ]]; then
+            bash "scripts/materialize-shared-core.sh"
+          fi
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # stable
 
@@ -67,10 +79,31 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Materialize bundled shared core
+        shell: bash
+        run: |
+          if [[ -f "scripts/materialize-shared-core.sh" ]]; then
+            bash "scripts/materialize-shared-core.sh"
+          fi
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # stable
         with:
           components: rustfmt
+
+      - name: Check Files follow callback races
+        run: python3 scripts/test-files-follow.py
+
+      - name: Check search callback lifecycle
+        run: python3 scripts/test-search-lifecycle.py
+
+      - name: Check pane focus and zoom lifecycle
+        run: python3 scripts/test-pane-lifecycle.py
+
+      - name: Check bidirectional tab selection
+        run: python3 scripts/test-tab-selection.py
+
+      - name: Check PTY resize errors against native Linux PTYs
+        run: python3 scripts/test-pty-resize.py
 
       - name: Check formatting
         id: fmt
@@ -101,10 +134,25 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Materialize bundled shared core
+        shell: bash
+        run: |
+          if [[ -f "scripts/materialize-shared-core.sh" ]]; then
+            bash "scripts/materialize-shared-core.sh"
+          fi
       - name: Install ShellCheck
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y shellcheck
+
+      - name: Check Bash integration locale and native readline
+        run: python3 scripts/test-bash-integration-locale.py
+
+      - name: Check Bash OSC transport and redirected bytes
+        run: python3 scripts/test-bash-osc-transport.py
+
+      - name: Check bounded Bash command metadata
+        run: python3 scripts/test-bash-command-metadata.py
 
       - name: Check tracked shell scripts
         run: |
@@ -125,6 +173,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Materialize bundled shared core
+        shell: bash
+        run: |
+          if [[ -f "scripts/materialize-shared-core.sh" ]]; then
+            bash "scripts/materialize-shared-core.sh"
+          fi
       - name: Install GTK display test dependencies
         run: |
           sudo apt-get update
@@ -133,10 +187,23 @@ jobs:
             libgtk-4-dev \
             libadwaita-1-dev \
             libvte-2.91-gtk4-dev \
+            vim \
+            ripgrep \
             libpcre2-dev \
             xvfb \
+            xdotool \
             xauth \
-            dbus-x11
+            libxtst6 \
+            python3 \
+            gdb \
+            dbus-x11 \
+            sway \
+            wtype \
+            grim \
+            fonts-dejavu-core \
+            fonts-liberation \
+            fonts-noto-cjk \
+            fonts-noto-color-emoji
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # stable
@@ -146,8 +213,178 @@ jobs:
         with:
           shared-key: gtk-display
 
+      - name: Check PTY input rejection and native delivery
+        run: |
+          cargo fetch --locked
+          python3 scripts/test-pty-input.py
+
+      - name: Check font sizing against native Pango
+        run: python3 scripts/test-font-sync.py
+
+      - name: Check native Vim9 editing and navigation
+        timeout-minutes: 10
+        env:
+          GDK_BACKEND: x11
+          GSK_RENDERER: cairo
+          GTK_A11Y: none
+        run: |
+          set -Eeuo pipefail
+          vim_bin="$(command -v "${JTERM_VIM9_BIN:-${VIM9_TEST_VIM:-vim}}")"
+          export JTERM_VIM9_BIN="$vim_bin" VIM9_TEST_VIM="$vim_bin"
+          "$vim_bin" --version
+          cargo_test=(cargo test --lib --all-features --locked)
+          listed_tests="$("${cargo_test[@]}" vim9_ide -- --include-ignored --list)"
+          mapfile -t tests < <(printf '%s\n' "$listed_tests" | sed -n 's/: test$//p')
+          if ((${#tests[@]} == 0)); then
+            printf 'No Vim9 IDE tests were discovered.\n' >&2
+            exit 1
+          fi
+          # GTK initialization belongs to one OS thread for the whole process.
+          # Rust uses a new thread per test even with --test-threads=1.
+          failed=0
+          for test_name in "${tests[@]}"; do
+            if ! dbus-run-session -- xvfb-run --auto-servernum \
+              "${cargo_test[@]}" "$test_name" -- --exact --include-ignored --test-threads=1; then
+              failed=1
+            fi
+          done
+          exit "$failed"
+
+      - name: Check F13 native fractional-scale Chat rendering
+        run: |
+          python3 scripts/test-chat-render-oracles.py
+          python3 scripts/test-chat-render-matrix.py
+
+      - name: Check F13 real Bash keyboard and clipboard smoke
+        run: |
+          python3 scripts/test-chat-shell-oracles.py
+          python3 scripts/test-chat-shell-smoke.py
+
+      - name: Check F13 history-enabled same-execution metadata
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/test-chat-metadata-oracles.py
+          python3 scripts/test-chat-shell-smoke.py --metadata --output gtk-paint-diagnostics/f13-metadata
+
+      - name: Check historical command provenance labels
+        if: ${{ !cancelled() }}
+        run: |
+          set -Eeuo pipefail
+          test_name=block_view::blocks::command_reuse_labels_tests::recall_header_describes_insert_only_action
+          listed_tests="$(cargo test --lib --all-features --locked -- --ignored --list)"
+          grep -Fqx -- "${test_name}: test" <<<"${listed_tests}"
+          test_xdg_root="$(mktemp -d)"
+          trap 'rm -rf -- "$test_xdg_root"' EXIT
+          mkdir -p "$test_xdg_root"/{config,data,state,cache,runtime}
+          chmod 700 "$test_xdg_root/runtime"
+          export XDG_CONFIG_HOME="$test_xdg_root/config"
+          export XDG_DATA_HOME="$test_xdg_root/data"
+          export XDG_STATE_HOME="$test_xdg_root/state"
+          export XDG_CACHE_HOME="$test_xdg_root/cache"
+          export XDG_RUNTIME_DIR="$test_xdg_root/runtime"
+          export RUST_TEST_THREADS=1 GDK_BACKEND=x11 GSK_RENDERER=cairo
+          export LIBGL_ALWAYS_SOFTWARE=1 NO_AT_BRIDGE=1 GTK_A11Y=none
+          dbus-run-session -- \
+            xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
+            cargo test --lib --all-features --locked "$test_name" -- \
+            --ignored --exact --nocapture
+
+      - name: Check independent native font groups
+        if: ${{ !cancelled() }}
+        run: |
+          set -Eeuo pipefail
+          test_name=block_view::font_sync_tests::font_groups_stay_independent_across_native_panes_and_late_rows
+          listed_tests="$(cargo test --lib --all-features --locked -- --ignored --list)"
+          grep -Fqx -- "${test_name}: test" <<<"${listed_tests}"
+          test_xdg_root="$(mktemp -d)"
+          trap 'rm -rf -- "$test_xdg_root"' EXIT
+          mkdir -p "$test_xdg_root"/{config,data,state,cache,runtime}
+          chmod 700 "$test_xdg_root/runtime"
+          export XDG_CONFIG_HOME="$test_xdg_root/config"
+          export XDG_DATA_HOME="$test_xdg_root/data"
+          export XDG_STATE_HOME="$test_xdg_root/state"
+          export XDG_CACHE_HOME="$test_xdg_root/cache"
+          export XDG_RUNTIME_DIR="$test_xdg_root/runtime"
+          export RUST_TEST_THREADS=1 GDK_BACKEND=x11 GSK_RENDERER=cairo
+          export LIBGL_ALWAYS_SOFTWARE=1 NO_AT_BRIDGE=1 GTK_A11Y=none
+          dbus-run-session -- \
+            xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
+            cargo test --lib --all-features --locked "$test_name" -- \
+            --ignored --exact --nocapture
+
+      - name: Check production top-tab geometry extremes
+        if: ${{ !cancelled() }}
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/check-tab-geometry-shape.py
+          mkdir -p gtk-paint-diagnostics
+          test_name=ui::tab_geometry_tests::production_top_tabs_bound_viewport_minimum_across_font_extremes
+          listed_tests="$(cargo test --lib --all-features --locked -- --ignored --list)"
+          grep -Fqx -- "${test_name}: test" <<<"${listed_tests}"
+          test_xdg_root="$(mktemp -d)"
+          trap 'rm -rf -- "$test_xdg_root"' EXIT
+          mkdir -p "$test_xdg_root"/{config,data,state,cache,runtime}
+          chmod 700 "$test_xdg_root/runtime"
+          export XDG_CONFIG_HOME="$test_xdg_root/config"
+          export XDG_DATA_HOME="$test_xdg_root/data"
+          export XDG_STATE_HOME="$test_xdg_root/state"
+          export XDG_CACHE_HOME="$test_xdg_root/cache"
+          export XDG_RUNTIME_DIR="$test_xdg_root/runtime"
+          export RUST_TEST_THREADS=1 GDK_BACKEND=x11 GSK_RENDERER=cairo
+          export LIBGL_ALWAYS_SOFTWARE=1 NO_AT_BRIDGE=1 GTK_A11Y=none
+          dbus-run-session -- \
+            xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
+            cargo test --lib --all-features --locked "$test_name" -- \
+            --ignored --exact --nocapture 2>&1 | tee gtk-paint-diagnostics/top-tab-geometry.log
+
+      - name: Check exact retained-text search preview
+        if: ${{ !cancelled() }}
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/check-search-preview-shape.py
+          mkdir -p gtk-paint-diagnostics
+          model_tests="$(cargo test --lib --all-features --locked -- --list)"
+          grep -Fqx -- 'block_view::search_preview::tests::failed_snapshot_construction_cannot_publish_a_partial_total: test' <<<"$model_tests"
+          cargo test --lib --all-features --locked block_view::search_preview::tests:: -- \
+            --nocapture 2>&1 | tee gtk-paint-diagnostics/exact-search-preview-model.log
+          test_name=ui::search_preview::tests::exact_preview_tags_follow_unicode_ranges_without_native_selection
+          listed_tests="$(cargo test --lib --all-features --locked -- --ignored --list)"
+          grep -Fqx -- "${test_name}: test" <<<"${listed_tests}"
+          test_xdg_root="$(mktemp -d)"
+          trap 'rm -rf -- "$test_xdg_root"' EXIT
+          mkdir -p "$test_xdg_root"/{config,data,state,cache,runtime}
+          chmod 700 "$test_xdg_root/runtime"
+          export XDG_CONFIG_HOME="$test_xdg_root/config"
+          export XDG_DATA_HOME="$test_xdg_root/data"
+          export XDG_STATE_HOME="$test_xdg_root/state"
+          export XDG_CACHE_HOME="$test_xdg_root/cache"
+          export XDG_RUNTIME_DIR="$test_xdg_root/runtime"
+          export RUST_TEST_THREADS=1 GDK_BACKEND=x11 GSK_RENDERER=cairo
+          export LIBGL_ALWAYS_SOFTWARE=1 NO_AT_BRIDGE=1 GTK_A11Y=none
+          dbus-run-session -- \
+            xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
+            cargo test --lib --all-features --locked "$test_name" -- \
+            --ignored --exact --nocapture 2>&1 | tee gtk-paint-diagnostics/exact-search-preview.log
+
+          test_name=ui::search_preview::dialog_tests::production_dialog_is_frozen_stale_safe_and_primary_neutral
+          grep -Fqx -- "${test_name}: test" <<<"${listed_tests}"
+          dbus-run-session -- \
+            xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
+            cargo test --lib --all-features --locked "$test_name" -- \
+            --ignored --exact --nocapture 2>&1 | tee gtk-paint-diagnostics/exact-search-preview-dialog.log
+
       - name: Run display-backed GTK/VTE regressions
-        run: bash scripts/test-gtk-display.sh
+        run: FORGE_NATIVE_CRASH_DIAGNOSTICS=1 GTK_PAINT_DIAGNOSTICS_DIR="$PWD/gtk-paint-diagnostics" FORGE_XTEST_DRIVER="$PWD/scripts/qa-cross-selection-pointer.py" bash scripts/test-gtk-display.sh
+
+      - name: Upload synthetic GTK paint diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: gtk-paint-diagnostics
+          path: gtk-paint-diagnostics/
+          if-no-files-found: ignore
+          retention-days: 7
+
 
   clippy:
     name: Clippy
@@ -159,6 +396,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Materialize bundled shared core
+        shell: bash
+        run: |
+          if [[ -f "scripts/materialize-shared-core.sh" ]]; then
+            bash "scripts/materialize-shared-core.sh"
+          fi
       - name: Install GTK build dependencies
         run: |
           sudo apt-get update
@@ -204,6 +447,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Materialize bundled shared core
+        shell: bash
+        run: |
+          if [[ -f "scripts/materialize-shared-core.sh" ]]; then
+            bash "scripts/materialize-shared-core.sh"
+          fi
       - name: Install GTK build dependencies
         run: |
           sudo apt-get update
@@ -237,6 +486,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Materialize bundled shared core
+        shell: bash
+        run: |
+          if [[ -f "scripts/materialize-shared-core.sh" ]]; then
+            bash "scripts/materialize-shared-core.sh"
+          fi
       - name: Install GTK build dependencies
         run: |
           sudo apt-get update
@@ -271,6 +526,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Materialize bundled shared core
+        shell: bash
+        run: |
+          if [[ -f "scripts/materialize-shared-core.sh" ]]; then
+            bash "scripts/materialize-shared-core.sh"
+          fi
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # stable
         with:
@@ -301,6 +562,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Materialize bundled shared core
+        shell: bash
+        run: |
+          if [[ -f "scripts/materialize-shared-core.sh" ]]; then
+            bash "scripts/materialize-shared-core.sh"
+          fi
       - name: Install GTK build dependencies
         run: |
           sudo apt-get update
@@ -345,6 +612,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Materialize bundled shared core
+        shell: bash
+        run: |
+          if [[ -f "scripts/materialize-shared-core.sh" ]]; then
+            bash "scripts/materialize-shared-core.sh"
+          fi
       - name: Install Nix
         uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24  # v31
         with:

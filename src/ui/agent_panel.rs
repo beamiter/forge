@@ -236,7 +236,13 @@ impl AgentHandle {
     /// when there is nothing to save). Called on window close, before
     /// shutdown cancels the session.
     pub(crate) fn persist(&self) {
-        let path = agent_snapshot_path();
+        let path = match agent_snapshot_path() {
+            Ok(path) => path,
+            Err(error) => {
+                log::warn!("agent: session storage unavailable: {error}");
+                return;
+            }
+        };
         if let Some(snapshot) = self.runtime.session.borrow().snapshot() {
             if let Err(error) = write_agent_snapshot_file(&path, &snapshot) {
                 log::warn!("agent: could not persist session: {error}");
@@ -248,10 +254,10 @@ impl AgentHandle {
     }
 }
 
-fn agent_snapshot_path() -> std::path::PathBuf {
-    let mut path = crate::config::config_file_path();
+fn agent_snapshot_path() -> std::io::Result<std::path::PathBuf> {
+    let mut path = crate::config::config_file_path()?;
     path.set_file_name("agent_session.json");
-    path
+    Ok(path)
 }
 
 fn write_agent_snapshot_file(
@@ -345,8 +351,48 @@ fn load_agent_snapshot(path: &std::path::Path) -> Option<AgentSession> {
     }
 }
 
+fn restored_history_notice(session: &jterm_core::agent::AgentSession) -> Option<&'static str> {
+    session
+        .snapshot()
+        .is_some_and(|snapshot| snapshot.transcript_truncated())
+        .then_some("Earlier activity was omitted to keep the saved session within its size limit")
+}
+
+// Cross-restart history has no terminal/cwd provenance. Keep it readable,
+// but retire its proposals and model request before binding a new pane.
+fn seal_restored_session(mut session: AgentSession) -> AgentSession {
+    session.cancel();
+    session
+}
+
+/// Stop wins over a provider result already queued for the UI poll. Checking
+/// only in the worker leaves a race between enqueueing a successful reply and
+/// the next main-loop tick. Preserve Empty/Disconnected until the worker ends.
+fn poll_model_reply(
+    receiver: &std::sync::mpsc::Receiver<Result<String, crate::ai::AiError>>,
+    cancellation: Option<&crate::ai::AiCancellationToken>,
+) -> Result<Result<String, crate::ai::AiError>, std::sync::mpsc::TryRecvError> {
+    receiver.try_recv().map(|reply| {
+        if cancellation.is_some_and(crate::ai::AiCancellationToken::is_cancelled) {
+            Err(crate::ai::AiError::Cancelled)
+        } else {
+            reply
+        }
+    })
+}
+
+fn start_fresh_task(session: &mut AgentSession) -> Result<(), crate::agent::SessionError> {
+    if session.state() == AgentState::Cancelled {
+        *session = AgentSession::new(session.max_turns());
+        Ok(())
+    } else {
+        session.start_new_task()
+    }
+}
+
 struct AgentRuntime {
     session: RefCell<AgentSession>,
+    history_notice: Label,
     target: Rc<TermView>,
     ui_lifetime: Rc<AgentUiLifetime>,
     config: Rc<RefCell<crate::config::Config>>,
@@ -465,7 +511,7 @@ impl AgentRuntime {
             && !self.busy.get()
             && matches!(
                 session.state(),
-                AgentState::Completed | AgentState::TurnLimitReached
+                AgentState::Completed | AgentState::Cancelled | AgentState::TurnLimitReached
             )
             && !can_follow_up;
         self.session_action
@@ -517,12 +563,13 @@ impl AgentRuntime {
             if session.can_continue_after_completion() {
                 session.continue_after_completion().map(|()| false)
             } else {
-                session.start_new_task().map(|()| true)
+                start_fresh_task(&mut session).map(|()| true)
             }
         };
         match result {
             Ok(started_new) => {
                 if started_new {
+                    runtime.history_notice.set_visible(false);
                     runtime.task_epoch.set(runtime.task_epoch.get() + 1);
                     runtime.clear_proposal();
                     runtime.pending_command.borrow_mut().take();
@@ -537,6 +584,9 @@ impl AgentRuntime {
                         "Completed task reopened for a follow-up instruction",
                     ));
                 }
+                // This is an explicit Follow up / New task action. Background
+                // model replies only render state and must not choose focus.
+                runtime.input.grab_focus();
             }
             Err(error) => runtime.render_session_state(Some(&error.to_string())),
         }
@@ -553,22 +603,7 @@ impl AgentRuntime {
             return;
         }
         let state = self.session.borrow().state();
-        let pulse = match state {
-            // An idle session awaiting instruction is not "working"; staying
-            // silent here also keeps panel open/close toggles from pumping
-            // alternating phases past the dedup.
-            AgentState::Ready => None,
-            AgentState::AwaitingModel | AgentState::AwaitingObservation { .. } => {
-                Some(jterm_core::organism::AgentPulse::Working)
-            }
-            AgentState::AwaitingApproval { .. } => {
-                Some(jterm_core::organism::AgentPulse::AskingReview)
-            }
-            AgentState::Completed | AgentState::TurnLimitReached => {
-                Some(jterm_core::organism::AgentPulse::Finished)
-            }
-            AgentState::Cancelled => Some(jterm_core::organism::AgentPulse::Gone),
-        };
+        let pulse = jterm_core::organism::agent_state_pulse(state, false);
         if let Some(pulse) = pulse {
             self.organism_agent.note_phase(pulse);
         }
@@ -578,7 +613,6 @@ impl AgentRuntime {
                     ready_status.unwrap_or("Ready for the next instruction"),
                     false,
                 );
-                self.input.grab_focus();
             }
             AgentState::AwaitingApproval { proposal_id } => self.set_status(
                 &format!("Proposal #{} is waiting for review", proposal_id.get()),
@@ -737,7 +771,7 @@ impl AgentRuntime {
         );
 
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
+        if let Err(error) = crate::ai::spawn_request_worker("forge-agent-request", move || {
             if session_cancellation.is_cancelled() {
                 return;
             }
@@ -770,14 +804,20 @@ impl AgentRuntime {
             if !session_cancellation.is_cancelled() {
                 let _ = tx.send(result);
             }
-        });
+        }) {
+            log::warn!("forge-agent-request could not start: {error}");
+        }
 
         let rx = RefCell::new(rx);
         gtk4::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
             if !runtime.alive.get() {
                 return gtk4::glib::ControlFlow::Break;
             }
-            match rx.borrow().try_recv() {
+            // Finish the RefCell borrows before handling the result: terminal
+            // branches clear the same cancellation slot.
+            let result =
+                poll_model_reply(&rx.borrow(), runtime.request_cancellation.borrow().as_ref());
+            match result {
                 Ok(Ok(reply)) => {
                     runtime.request_cancellation.borrow_mut().take();
                     runtime.busy.set(false);
@@ -878,7 +918,9 @@ impl AgentRuntime {
         });
         runtime.proposal_box.append(&review.root);
         runtime.render_session_state(None);
-        review.focus();
+        // A provider reply may arrive after the user has moved to another
+        // pane, Find, or history. Keep review keyboard-accessible through the
+        // normal focus chain; rendering a proposal does not authorize focus.
 
         let weak = Rc::downgrade(runtime);
         let entry_for_approve = review.entry.clone();
@@ -1868,12 +1910,30 @@ impl UiState {
 
         let card: gtk4::Widget = outer.clone().upcast();
         // A snapshot persisted by the previous run is atomically claimed,
-        // consumed once, and rebound to the pane the user opened the Agent on.
+        // consumed once, and retained for review without new pane authority.
         // Pending approval state must never be restorable by two processes.
-        let restored_session = load_agent_snapshot(&agent_snapshot_path());
+        let restored_session = match agent_snapshot_path() {
+            Ok(path) => load_agent_snapshot(&path),
+            Err(error) => {
+                log::warn!("agent: session restore unavailable: {error}");
+                None
+            }
+        };
         let was_restored = restored_session.is_some();
+        let notice = restored_session.as_ref().and_then(restored_history_notice);
+        let history_notice = Label::new(notice);
+        history_notice.set_xalign(0.0);
+        history_notice.set_wrap(true);
+        history_notice.add_css_class("dim-label");
+        history_notice.set_visible(notice.is_some());
+        body.prepend(&history_notice);
         let runtime = Rc::new(AgentRuntime {
-            session: RefCell::new(restored_session.unwrap_or_else(|| AgentSession::new(max_turns))),
+            history_notice,
+            session: RefCell::new(
+                restored_session
+                    .map(seal_restored_session)
+                    .unwrap_or_else(|| AgentSession::new(max_turns)),
+            ),
             target: target.clone(),
             ui_lifetime: self.agent_ui_lifetime.clone(),
             config: self.config.clone(),
@@ -1912,7 +1972,7 @@ impl UiState {
         if was_restored {
             runtime.append(
                 "Agent",
-                "Restored the previous agent session from your last run.",
+                "Restored the previous Agent transcript for review only. Start a new task to bind this pane.",
             );
             let transcript: Vec<Turn> = runtime.session.borrow().transcript().to_vec();
             for turn in &transcript {
@@ -1944,27 +2004,8 @@ impl UiState {
                     Turn::ProtocolError(message) => runtime.append("Error", message),
                 }
             }
-            // Resume what the snapshot left in flight: a pending proposal is
-            // re-rendered as a manual review card (never auto-approved), and
-            // a lost model turn is simply re-requested.
-            let state = runtime.session.borrow().state();
-            match state {
-                AgentState::AwaitingApproval { proposal_id } => {
-                    let pending = transcript.iter().rev().find_map(|turn| match turn {
-                        Turn::AssistantProposed {
-                            id,
-                            command,
-                            status: ProposalStatus::Pending,
-                        } if *id == proposal_id => Some(command.clone()),
-                        _ => None,
-                    });
-                    if let Some(command) = pending {
-                        AgentRuntime::render_proposal_card(&runtime, proposal_id, command);
-                    }
-                }
-                AgentState::AwaitingModel => AgentRuntime::request_model(runtime.clone()),
-                _ => {}
-            }
+            // Restored history is sealed above. Do not recreate actionable
+            // approval cards or re-request a model turn in this new pane.
         }
         runtime.render_session_state(None);
 
@@ -2078,6 +2119,134 @@ impl UiState {
 
 #[cfg(test)]
 mod tests {
+    fn legacy_omitted_history_session() -> jterm_core::agent::AgentSession {
+        use jterm_core::agent::{AgentSession, AgentSessionSnapshot};
+        let mut session = AgentSession::new(10);
+        session.submit_user("retained task").unwrap();
+        let mut snapshot: serde_json::Value =
+            serde_json::from_str(&session.snapshot().unwrap().to_json().unwrap()).unwrap();
+        snapshot["transcript_truncated"] = serde_json::json!(true);
+        AgentSession::restore(AgentSessionSnapshot::from_json(&snapshot.to_string()).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn stop_discards_success_already_queued_for_the_ui() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let cancellation = crate::ai::AiCancellationToken::new();
+        sender.send(Ok("queued proposal".to_string())).unwrap();
+        cancellation.cancel();
+        assert!(matches!(
+            super::poll_model_reply(&receiver, Some(&cancellation)),
+            Ok(Err(crate::ai::AiError::Cancelled))
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn model_reply_poll_keeps_live_results_and_channel_lifecycle() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let cancellation = crate::ai::AiCancellationToken::new();
+        assert!(matches!(
+            super::poll_model_reply(&receiver, Some(&cancellation)),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        sender.send(Ok("current reply".to_string())).unwrap();
+        assert!(matches!(
+            super::poll_model_reply(&receiver, Some(&cancellation)),
+            Ok(Ok(reply)) if reply == "current reply"
+        ));
+        cancellation.cancel();
+        drop(sender);
+        assert!(matches!(
+            super::poll_model_reply(&receiver, Some(&cancellation)),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let retry = crate::ai::AiCancellationToken::new();
+        sender.send(Ok("retry reply".to_string())).unwrap();
+        assert!(matches!(
+            super::poll_model_reply(&receiver, Some(&retry)),
+            Ok(Ok(reply)) if reply == "retry reply"
+        ));
+    }
+
+    #[test]
+    fn restored_history_notice_accepts_legacy_omission_and_rejects_complete_history() {
+        let omitted = legacy_omitted_history_session();
+        assert!(super::restored_history_notice(&omitted)
+            .unwrap()
+            .contains("Earlier activity was omitted"));
+        let mut complete = jterm_core::agent::AgentSession::new(10);
+        complete.submit_user("complete task").unwrap();
+        assert!(super::restored_history_notice(&complete).is_none());
+    }
+
+    #[test]
+    fn restored_proposal_is_read_only_and_new_task_has_a_fresh_epoch() {
+        use crate::agent::{AgentSession, AgentState, ModelOutcome};
+        let mut old = AgentSession::new(10);
+        old.submit_user("old task").unwrap();
+        let id = match old
+            .accept_model_reply(r#"{"action":"run","command":"pwd"}"#)
+            .unwrap()
+        {
+            ModelOutcome::Proposal { id, .. } => id,
+            other => panic!("expected proposal: {other:?}"),
+        };
+        let mut session = super::seal_restored_session(old);
+        assert_eq!(session.state(), AgentState::Cancelled);
+        assert!(!session.transcript().is_empty());
+        assert!(session.approve(id).is_err());
+        let old_epoch = session.epoch();
+        super::start_fresh_task(&mut session).unwrap();
+        assert_ne!(session.epoch(), old_epoch);
+        assert_eq!(session.state(), AgentState::Ready);
+        assert!(session.transcript().is_empty());
+        session.submit_user("new task").unwrap();
+        let id = match session
+            .accept_model_reply(r#"{"action":"run","command":"pwd"}"#)
+            .unwrap()
+        {
+            ModelOutcome::Proposal { id, .. } => id,
+            other => panic!("expected proposal: {other:?}"),
+        };
+        // The runtime increments its task epoch after this successful reset;
+        // an old card must fail even if the fresh core reuses a numeric id.
+        assert!(!super::proposal_callback_is_current(
+            true,
+            1,
+            0,
+            session.state(),
+            id
+        ));
+        assert!(session.approve(id).is_ok());
+    }
+
+    #[test]
+    fn restored_model_request_is_never_resumed() {
+        use crate::agent::{AgentSession, AgentState};
+        let mut old = AgentSession::new(10);
+        old.submit_user("old task").unwrap();
+        let session = super::seal_restored_session(old);
+        assert_eq!(session.state(), AgentState::Cancelled);
+        assert!(!session.can_continue_after_completion());
+    }
+
+    #[test]
+    fn restored_history_notice_has_a_fixed_card_outside_the_activity_budget() {
+        let source = include_str!("agent_panel.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(source.contains("body.prepend(&history_notice)"));
+        assert!(source.contains("history_notice.set_visible(notice.is_some())"));
+        assert!(source.contains("runtime.history_notice.set_visible(false)"));
+    }
+
     use super::{
         agent_message_display_bytes, agent_message_display_text, bounded_agent_input,
         claim_weak_target, load_agent_snapshot, proposal_callback_is_current,
@@ -2724,3 +2893,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "agent_panel_focus_tests.rs"]
+mod focus_tests;

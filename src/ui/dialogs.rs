@@ -19,6 +19,1733 @@ use crate::block_view::RecordNavigationResult;
 use crate::keybindings::Action;
 use crate::terminal::open_uri;
 
+/// Weak controls for the currently open settings dialog. External reloads
+/// update presentation without turning GTK notifications into new user edits.
+pub(crate) struct OrganismSettingsControls {
+    enabled: glib::WeakRef<adw::SwitchRow>,
+    motion: glib::WeakRef<adw::ComboRow>,
+    syncing: Cell<bool>,
+    retired: Cell<bool>,
+    safe_mode: bool,
+}
+
+struct OrganismSettingsSyncGuard<'a>(&'a Cell<bool>);
+
+impl Drop for OrganismSettingsSyncGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
+impl OrganismSettingsControls {
+    fn new(enabled: &adw::SwitchRow, motion: &adw::ComboRow, safe_mode: bool) -> Rc<Self> {
+        Rc::new(Self {
+            enabled: enabled.downgrade(),
+            motion: motion.downgrade(),
+            syncing: Cell::new(false),
+            retired: Cell::new(false),
+            safe_mode,
+        })
+    }
+
+    fn accepts_user_change(&self) -> bool {
+        !self.retired.get() && !self.syncing.get()
+    }
+
+    fn retire(&self) {
+        self.retired.set(true);
+    }
+
+    fn sync(&self, enabled: bool, motion: Option<crate::config::OrganismMotion>) {
+        if self.retired.get() || self.syncing.get() {
+            return;
+        }
+        let (Some(enabled_row), Some(motion_row)) = (self.enabled.upgrade(), self.motion.upgrade())
+        else {
+            return;
+        };
+        self.syncing.set(true);
+        let _guard = OrganismSettingsSyncGuard(&self.syncing);
+        enabled_row.set_active(enabled);
+        enabled_row.set_subtitle(organism_enabled_description(self.safe_mode, enabled));
+        motion_row.set_selected(organism_motion_selection(motion));
+        motion_row.set_sensitive(!self.safe_mode && enabled);
+    }
+}
+
+fn organism_enabled_description(safe_mode: bool, enabled: bool) -> &'static str {
+    if safe_mode {
+        "Unavailable in safe mode; offline preview is still available."
+    } else if enabled {
+        "Local, no-LLM companion for Block, Unified and traditional VTE panes"
+    } else {
+        "Off. Offline preview is still available below."
+    }
+}
+
+fn organism_motion_selection(motion: Option<crate::config::OrganismMotion>) -> u32 {
+    match motion {
+        None => 0,
+        Some(crate::config::OrganismMotion::Full) => 1,
+        Some(crate::config::OrganismMotion::Calm) => 2,
+        Some(crate::config::OrganismMotion::Static) => 3,
+    }
+}
+
+/// A settings-only gallery: no terminal, reducer, repository memory, or config
+/// writes. All sources use weak references and are removed on hide or close.
+mod organism_preview {
+    use super::adw;
+    use adw::prelude::*;
+    use gtk::glib;
+    use gtk4 as gtk;
+    use jterm_core::organism::sprite_frame_with_context;
+    use jterm_core::organism_daily::{GentleInteraction, PreviewPose};
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
+
+    use crate::config::OrganismMotion;
+
+    pub(super) const INTERACTION_HINT: &str = concat!(
+        "Traditional VTE shows a neutral companion only; live greetings are unavailable because command and alternate-screen state cannot be verified. Use this offline preview to explore greetings.\n\n",
+        "Changes apply to open panes.\n",
+        "In Full or Calm, keep the pointer near an idle companion for 600 ms ",
+        "for a brief hello (about 2 seconds). Greetings are at least 8 seconds apart; ",
+        "move away and return to try again.\n",
+        "Typing, running commands and alternate-screen apps take priority. ",
+        "Static uses inline cards only, without live hover greetings. ",
+        "Clicks and selection stay with your terminal."
+    );
+
+    const FRAME_INTERVAL: Duration = Duration::from_millis(100);
+
+    fn motion_for_selection(selected: u32, animations: bool) -> OrganismMotion {
+        match selected {
+            1 => OrganismMotion::Full,
+            2 => OrganismMotion::Calm,
+            3 => OrganismMotion::Static,
+            _ if animations => OrganismMotion::Full,
+            _ => OrganismMotion::Calm,
+        }
+    }
+
+    fn motion_description(selected: u32, animations: Option<bool>) -> &'static str {
+        match selected {
+            1 => "Full: animated movement and quiet hover greetings.",
+            2 => "Calm: still poses and quiet hover greetings.",
+            3 => "Static: inline cards only; no live hover greetings.",
+            _ => match animations {
+                Some(true) => "Automatic (Full): follows desktop animations.",
+                Some(false) => "Automatic (Calm): desktop animations are disabled.",
+                None => "Automatic (Full): desktop preference unavailable.",
+            },
+        }
+    }
+
+    fn presentation_active(visible: bool, mapped: bool, host_active: Option<bool>) -> bool {
+        visible && mapped && host_active == Some(true)
+    }
+
+    const DEMO_POSES: [PreviewPose; 5] = [
+        PreviewPose::Calm,
+        PreviewPose::Working,
+        PreviewPose::Concerned,
+        PreviewPose::Success,
+        PreviewPose::Sleeping,
+    ];
+    const DEMO_STEP: Duration = Duration::from_secs(2);
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct DemoFrame {
+        pose: PreviewPose,
+        index: usize,
+        next_wake: Duration,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum DemoAction {
+        Play,
+        Pause,
+        Resume,
+        Stop,
+    }
+
+    struct PreviewSequence {
+        started: Option<Duration>,
+        paused_at: Option<Duration>,
+        paused_total: Duration,
+        revision: Option<u64>,
+    }
+
+    impl Default for PreviewSequence {
+        fn default() -> Self {
+            Self {
+                started: None,
+                paused_at: None,
+                paused_total: Duration::ZERO,
+                revision: Some(0),
+            }
+        }
+    }
+
+    impl PreviewSequence {
+        fn retire_controls(&mut self) {
+            self.revision = self.revision.and_then(|revision| revision.checked_add(1));
+        }
+
+        fn start(&mut self, now: Duration) {
+            self.started = Some(now);
+            self.paused_at = None;
+            self.paused_total = Duration::ZERO;
+            self.retire_controls();
+        }
+
+        fn stop(&mut self) {
+            self.started = None;
+            self.retire_controls();
+            self.paused_at = None;
+            self.paused_total = Duration::ZERO;
+        }
+
+        fn is_running(&self) -> bool {
+            self.started.is_some()
+        }
+
+        fn is_paused(&self) -> bool {
+            self.paused_at.is_some()
+        }
+
+        fn animation_time(&self, now: Duration) -> Duration {
+            self.paused_at
+                .unwrap_or(now)
+                .saturating_sub(self.paused_total)
+        }
+
+        /// Controls carry the state revision at which their native widget was
+        /// created. An old press cannot toggle a new demo or a different action.
+        fn act(&mut self, revision: Option<u64>, action: DemoAction, now: Duration) -> bool {
+            // Expiration wins even if the scheduled presentation wake is late.
+            self.sample(now);
+            if revision.is_none() || self.revision != revision {
+                return false;
+            }
+            match action {
+                DemoAction::Play if !self.is_running() => self.start(now),
+                DemoAction::Pause if self.is_running() && !self.is_paused() => {
+                    self.paused_at = Some(now);
+                    self.retire_controls();
+                }
+                DemoAction::Resume if self.is_paused() => {
+                    let pause = now.saturating_sub(self.paused_at.take().unwrap());
+                    self.started = self.started.map(|start| start.saturating_add(pause));
+                    self.paused_total = self.paused_total.saturating_add(pause);
+                    self.retire_controls();
+                }
+                DemoAction::Stop if self.is_running() => self.stop(),
+                _ => return false,
+            }
+            true
+        }
+
+        fn sample(&mut self, now: Duration) -> Option<DemoFrame> {
+            let elapsed = self.paused_at.unwrap_or(now).saturating_sub(self.started?);
+            if elapsed >= DEMO_STEP * DEMO_POSES.len() as u32 {
+                self.stop();
+                return None;
+            }
+            let index = (elapsed.as_secs() / DEMO_STEP.as_secs()) as usize;
+            Some(DemoFrame {
+                pose: DEMO_POSES[index],
+                index,
+                next_wake: DEMO_STEP * (index as u32 + 1) - elapsed,
+            })
+        }
+    }
+
+    fn preview_explanation(pose: PreviewPose, greeting: bool) -> &'static str {
+        if greeting {
+            PreviewPose::Greeting.explanation()
+        } else {
+            pose.explanation()
+        }
+    }
+
+    fn selected_pose(index: u32) -> PreviewPose {
+        PreviewPose::ALL
+            .get(index as usize)
+            .copied()
+            .unwrap_or(PreviewPose::Calm)
+    }
+
+    fn can_greet(pose: PreviewPose) -> bool {
+        matches!(
+            pose,
+            PreviewPose::Calm
+                | PreviewPose::Curious
+                | PreviewPose::Sleeping
+                | PreviewPose::Greeting
+        )
+    }
+
+    fn frame_index(motion: OrganismMotion, elapsed: Duration) -> u64 {
+        if motion == OrganismMotion::Full {
+            (elapsed.as_millis() / FRAME_INTERVAL.as_millis()) as u64
+        } else {
+            0
+        }
+    }
+
+    /// Base preview wakes cover animation and requested greeting deadlines.
+    /// Explicit demo boundaries are merged by refresh into the same source.
+    /// Visibility is a hard gate, including during the dialog close animation.
+    fn next_wake(
+        visible: bool,
+        motion: OrganismMotion,
+        now: Duration,
+        greeting: Option<Duration>,
+        last_hello: Option<Duration>,
+    ) -> Option<Duration> {
+        if !visible {
+            return None;
+        }
+        let animation = (motion == OrganismMotion::Full).then_some(FRAME_INTERVAL);
+        let expiry = greeting.and_then(|start| {
+            start
+                .saturating_add(GentleInteraction::HOLD)
+                .checked_sub(now)
+        });
+        let cooldown = last_hello.and_then(|start| {
+            start
+                .saturating_add(GentleInteraction::COOLDOWN)
+                .checked_sub(now)
+        });
+        [animation, expiry, cooldown]
+            .into_iter()
+            .flatten()
+            .filter(|delay| !delay.is_zero())
+            .min()
+            // GLib rounds down to milliseconds; never spin on a sub-ms expiry.
+            .map(|delay| delay.max(Duration::from_millis(1)))
+    }
+
+    struct Preview {
+        group: glib::WeakRef<adw::PreferencesGroup>,
+        pose: glib::WeakRef<adw::ComboRow>,
+        motion: glib::WeakRef<adw::ComboRow>,
+        sample: glib::WeakRef<adw::ActionRow>,
+        sprite: glib::WeakRef<gtk::Label>,
+        hello: RefCell<glib::WeakRef<gtk::Button>>,
+        controls: glib::WeakRef<gtk::Box>,
+        demo: RefCell<glib::WeakRef<gtk::Button>>,
+        pause: RefCell<glib::WeakRef<gtk::Button>>,
+        controls_revision: Cell<Option<Option<u64>>>,
+        sequence: RefCell<PreviewSequence>,
+        desktop: Option<gtk::Settings>,
+        desktop_handler: RefCell<Option<glib::SignalHandlerId>>,
+        host_handler: RefCell<Option<(glib::WeakRef<gtk::Window>, glib::SignalHandlerId)>>,
+        source: RefCell<Option<glib::SourceId>>,
+        visible: Cell<bool>,
+        epoch: Instant,
+        greeting: Cell<Option<Duration>>,
+        last_hello: Cell<Option<Duration>>,
+        interaction: RefCell<GentleInteraction>,
+    }
+
+    impl Preview {
+        fn stop_source(&self) {
+            if let Some(source) = self.source.borrow_mut().take() {
+                source.remove();
+            }
+        }
+
+        fn cancel_greeting(&self) {
+            self.interaction.borrow_mut().cancel();
+            self.greeting.set(None);
+        }
+
+        fn cancel_transients(&self) {
+            self.cancel_greeting();
+            self.sequence.borrow_mut().stop();
+        }
+
+        fn disconnect_host(&self) {
+            let observer = self.host_handler.borrow_mut().take();
+            if let Some((host, handler)) = observer {
+                if let Some(host) = host.upgrade() {
+                    host.disconnect(handler);
+                }
+            }
+        }
+
+        fn bind_host(self: &Rc<Self>, group: &adw::PreferencesGroup) {
+            let host = (self.visible.get() && group.is_mapped())
+                .then(|| group.root().and_downcast::<gtk::Window>())
+                .flatten();
+            let previous = self
+                .host_handler
+                .borrow()
+                .as_ref()
+                .and_then(|(host, _)| host.upgrade());
+            if host.is_some() && previous == host {
+                return;
+            }
+            self.disconnect_host();
+            self.cancel_transients();
+            if let Some(host) = host {
+                let weak = Rc::downgrade(self);
+                let handler = host.connect_is_active_notify(move |_| {
+                    if let Some(preview) = weak.upgrade() {
+                        preview.refresh();
+                    }
+                });
+                *self.host_handler.borrow_mut() = Some((host.downgrade(), handler));
+            }
+        }
+
+        fn is_active(&self) -> bool {
+            self.group.upgrade().is_some_and(|group| {
+                presentation_active(
+                    self.visible.get(),
+                    group.is_mapped(),
+                    group
+                        .root()
+                        .and_downcast::<gtk::Window>()
+                        .map(|host| host.is_active()),
+                )
+            })
+        }
+
+        fn hide(&self) {
+            self.visible.set(false);
+            self.stop_source();
+            self.cancel_transients();
+            self.disconnect_host();
+        }
+
+        fn pose(&self) -> PreviewPose {
+            selected_pose(self.pose.upgrade().map_or(0, |row| row.selected()))
+        }
+
+        fn sync_demo_controls(self: &Rc<Self>, active: bool) -> Option<gtk::Button> {
+            let controls = self.controls.upgrade()?;
+            let (revision, running, paused) = {
+                let sequence = self.sequence.borrow();
+                (
+                    sequence.revision,
+                    sequence.is_running(),
+                    sequence.is_paused(),
+                )
+            };
+            let mut focused_slot = None;
+            if self.controls_revision.get() != Some(revision) {
+                for (index, slot) in [&self.hello, &self.demo, &self.pause]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let old = slot.borrow_mut().upgrade();
+                    if let Some(old) = old {
+                        if active && old.has_focus() {
+                            focused_slot = Some(
+                                if index == 1
+                                    && old.label().as_deref() == Some("Play demo")
+                                    && running
+                                {
+                                    2
+                                } else {
+                                    index
+                                },
+                            );
+                        }
+                        old.set_sensitive(false);
+                        controls.remove(&old);
+                    }
+                    *slot.borrow_mut() = glib::WeakRef::new();
+                }
+                let hello = gtk::Button::builder()
+                    .label("Say hello")
+                    .valign(gtk::Align::Center)
+                    .build();
+                hello.set_visible(!running);
+                hello.set_tooltip_text(Some(
+                    "A brief preview-only greeting. Does not send terminal input.",
+                ));
+                let weak = Rc::downgrade(self);
+                hello.connect_clicked(move |_| {
+                    let Some(preview) = weak.upgrade() else {
+                        return;
+                    };
+                    if !preview.is_active() || {
+                        let sequence = preview.sequence.borrow();
+                        revision.is_none() || sequence.revision != revision || sequence.is_running()
+                    } {
+                        return;
+                    }
+                    let now = preview.epoch.elapsed();
+                    if preview
+                        .interaction
+                        .borrow_mut()
+                        .request(now, preview.pose().context())
+                    {
+                        preview.sequence.borrow_mut().retire_controls();
+                        preview.greeting.set(Some(now));
+                        preview.last_hello.set(Some(now));
+                    }
+                    preview.refresh();
+                });
+                controls.append(&hello);
+                *self.hello.borrow_mut() = hello.downgrade();
+                let actions = if running {
+                    vec![
+                        (
+                            if paused {
+                                DemoAction::Resume
+                            } else {
+                                DemoAction::Pause
+                            },
+                            if paused { "Resume demo" } else { "Pause demo" },
+                        ),
+                        (DemoAction::Stop, "Stop demo"),
+                    ]
+                } else {
+                    vec![(DemoAction::Play, "Play demo")]
+                };
+                for (action, label) in actions {
+                    let button = gtk::Button::builder()
+                        .label(label)
+                        .valign(gtk::Align::Center)
+                        .build();
+                    button.set_tooltip_text(Some(
+                        "Offline examples only. Pause freezes the example; leaving cancels it. No commands run.",
+                    ));
+                    let weak = Rc::downgrade(self);
+                    button.connect_clicked(move |_| {
+                        if let Some(preview) = weak.upgrade() {
+                            if !preview.is_active() {
+                                return;
+                            }
+                            let accepted = preview.sequence.borrow_mut().act(
+                                revision,
+                                action,
+                                preview.epoch.elapsed(),
+                            );
+                            if accepted && action == DemoAction::Play {
+                                preview.cancel_greeting();
+                            }
+                            preview.refresh();
+                        }
+                    });
+                    controls.append(&button);
+                    let slot = if matches!(action, DemoAction::Pause | DemoAction::Resume) {
+                        &self.pause
+                    } else {
+                        &self.demo
+                    };
+                    *slot.borrow_mut() = button.downgrade();
+                }
+                self.controls_revision.set(Some(revision));
+            }
+            for slot in [&self.demo, &self.pause] {
+                if let Some(button) = slot.borrow().upgrade() {
+                    button.set_sensitive(active && revision.is_some());
+                }
+            }
+            focused_slot.and_then(|slot| match slot {
+                0 => self.hello.borrow().upgrade(),
+                2 => self
+                    .pause
+                    .borrow()
+                    .upgrade()
+                    .or_else(|| self.demo.borrow().upgrade()),
+                _ => self.demo.borrow().upgrade(),
+            })
+        }
+
+        fn refresh(self: &Rc<Self>) {
+            self.stop_source();
+            let (Some(group), Some(pose_row), Some(motion_row), Some(sample), Some(sprite)) = (
+                self.group.upgrade(),
+                self.pose.upgrade(),
+                self.motion.upgrade(),
+                self.sample.upgrade(),
+                self.sprite.upgrade(),
+            ) else {
+                return;
+            };
+            self.bind_host(&group);
+            let active = self.is_active();
+            if !active {
+                // Keep the absolute cooldown, but never replay a greeting when
+                // the actual settings host returns to the foreground.
+                self.cancel_transients();
+            }
+            let now = self.epoch.elapsed();
+            let manual_pose = self.pose();
+            let (demo, paused, animation_time) = {
+                let mut sequence = self.sequence.borrow_mut();
+                let demo = sequence.sample(now);
+                (demo, sequence.is_paused(), sequence.animation_time(now))
+            };
+            let pose = demo.map_or(manual_pose, |frame| frame.pose);
+            let animations = self
+                .desktop
+                .as_ref()
+                .map(|settings| settings.is_gtk_enable_animations());
+            let motion = motion_for_selection(motion_row.selected(), animations.unwrap_or(true));
+            let description = motion_description(motion_row.selected(), animations);
+            if motion_row.subtitle().as_deref() != Some(description) {
+                motion_row.set_subtitle(description);
+            }
+            let context = self.interaction.borrow_mut().apply(now, pose.context());
+            let frame = sprite_frame_with_context(context, frame_index(motion, animation_time));
+            if sprite.text().as_str() != frame.as_ref() {
+                sprite.set_text(frame.as_ref());
+            }
+            if pose_row.subtitle().as_deref() != Some(manual_pose.explanation()) {
+                pose_row.set_subtitle(manual_pose.explanation());
+            }
+            let greeting = self
+                .greeting
+                .get()
+                .filter(|start| now.saturating_sub(*start) < GentleInteraction::HOLD);
+            self.greeting.set(greeting);
+            let cooling_down = self
+                .last_hello
+                .get()
+                .is_some_and(|start| now.saturating_sub(start) < GentleInteraction::COOLDOWN);
+            let restore_focus = self.sync_demo_controls(active);
+            if let Some(hello) = self.hello.borrow().upgrade() {
+                hello.set_sensitive(
+                    active
+                        && can_greet(pose)
+                        && !cooling_down
+                        && demo.is_none()
+                        && self.sequence.borrow().revision.is_some(),
+                );
+            }
+            if let Some(button) =
+                restore_focus.filter(|button| button.is_visible() && button.is_sensitive())
+            {
+                // Only preserve focus already owned by a retired preview control.
+                button.grab_focus();
+            }
+            let motion_note = match motion {
+                OrganismMotion::Full => "Full motion: animated example.",
+                OrganismMotion::Calm => "Calm: still poses, with no frame animation.",
+                OrganismMotion::Static => {
+                    "Static: still example; the live companion uses inline cards only."
+                }
+            };
+            let interaction_note = if demo.is_some() {
+                "Offline demo examples only. No commands run and no live state changes."
+            } else if greeting.is_some() {
+                "Hello! Returning to your chosen pose in a moment."
+            } else if !can_greet(pose) {
+                "Choose a quiet pose to try a greeting."
+            } else if cooling_down {
+                "A little rest before another hello."
+            } else {
+                "Say hello for a brief, local response."
+            };
+            let motion_title = match motion {
+                OrganismMotion::Full => "Full motion",
+                OrganismMotion::Calm => "Calm motion",
+                OrganismMotion::Static => "Static motion",
+            };
+            let short_status = if let Some(frame) = demo {
+                format!(
+                    "Demo {}/5: {} · example{}",
+                    frame.index + 1,
+                    pose.label(),
+                    if paused { " · paused" } else { "" }
+                )
+            } else if greeting.is_some() {
+                "Hello!".to_owned()
+            } else if !can_greet(pose) {
+                "Let it settle".to_owned()
+            } else if cooling_down {
+                "Resting…".to_owned()
+            } else {
+                "Local preview".to_owned()
+            };
+            let explanation = preview_explanation(pose, greeting.is_some());
+            let short_status = format!("{short_status} — Example: {explanation}");
+            if sample.title().as_str() != motion_title
+                || sample.subtitle().as_deref() != Some(short_status.as_str())
+            {
+                sample.set_title(motion_title);
+                sample.set_subtitle(&short_status);
+                sample.set_tooltip_text(Some(&format!(
+                    "Example: {explanation}\n{motion_note}\n{interaction_note}"
+                )));
+            }
+            let delay = next_wake(
+                active && !paused,
+                motion,
+                now,
+                greeting,
+                (demo.is_none() && can_greet(pose))
+                    .then(|| self.last_hello.get())
+                    .flatten(),
+            )
+            .into_iter()
+            .chain(demo.filter(|_| !paused).map(|frame| frame.next_wake))
+            .min();
+            if let Some(delay) = delay {
+                let weak = Rc::downgrade(self);
+                let source = glib::timeout_add_local_once(delay, move || {
+                    if let Some(preview) = weak.upgrade() {
+                        // The one-shot has fired; never remove a stale source id.
+                        preview.source.borrow_mut().take();
+                        preview.refresh();
+                    }
+                });
+                *self.source.borrow_mut() = Some(source);
+            }
+        }
+    }
+
+    impl Drop for Preview {
+        fn drop(&mut self) {
+            self.stop_source();
+            self.disconnect_host();
+            if let (Some(desktop), Some(handler)) =
+                (&self.desktop, self.desktop_handler.borrow_mut().take())
+            {
+                desktop.disconnect(handler);
+            }
+        }
+    }
+
+    pub(super) fn install(
+        group: &adw::PreferencesGroup,
+        motion: &adw::ComboRow,
+        dialog: &adw::PreferencesDialog,
+    ) {
+        build(group, motion, dialog);
+    }
+
+    fn build(
+        group: &adw::PreferencesGroup,
+        motion: &adw::ComboRow,
+        dialog: &adw::PreferencesDialog,
+    ) -> Rc<Preview> {
+        group.set_title("Organism Preview");
+        group.set_description(Some("Preview eight offline moods, even when your companion is off. This never runs commands or changes its memory."));
+        let labels: Vec<_> = PreviewPose::ALL.iter().map(|pose| pose.label()).collect();
+        let pose = adw::ComboRow::builder()
+            .title("Pose")
+            .model(&gtk::StringList::new(&labels))
+            .selected(0)
+            .build();
+        let sprite = gtk::Label::builder()
+            .width_chars(10)
+            .height_request(76)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .can_target(false)
+            .focusable(false)
+            .build();
+        sprite.add_css_class("monospace");
+        sprite.update_property(&[gtk::accessible::Property::Label(
+            "ASCII organism pose preview",
+        )]);
+        let sample = adw::ActionRow::builder().title("Try a greeting").build();
+        sample.add_prefix(&sprite);
+        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        sample.add_suffix(&controls);
+        group.add(&pose);
+        group.add(&sample);
+        let preview = Rc::new(Preview {
+            group: group.downgrade(),
+            pose: pose.downgrade(),
+            motion: motion.downgrade(),
+            sample: sample.downgrade(),
+            sprite: sprite.downgrade(),
+            hello: RefCell::new(glib::WeakRef::new()),
+            controls: controls.downgrade(),
+            demo: RefCell::new(glib::WeakRef::new()),
+            pause: RefCell::new(glib::WeakRef::new()),
+            controls_revision: Cell::new(None),
+            sequence: RefCell::new(PreviewSequence::default()),
+            desktop: gtk::Settings::default(),
+            desktop_handler: RefCell::new(None),
+            host_handler: RefCell::new(None),
+            source: RefCell::new(None),
+            visible: Cell::new(false),
+            epoch: Instant::now(),
+            greeting: Cell::new(None),
+            last_hello: Cell::new(None),
+            interaction: RefCell::new(GentleInteraction::default()),
+        });
+        pose.connect_selected_notify({
+            let preview = preview.clone();
+            move |_| {
+                preview.cancel_transients();
+                preview.refresh();
+            }
+        });
+        group.connect_map({
+            let preview = preview.clone();
+            move |_| {
+                preview.visible.set(true);
+                preview.refresh();
+            }
+        });
+        group.connect_root_notify({
+            let weak = Rc::downgrade(&preview);
+            move |_| {
+                if let Some(preview) = weak.upgrade() {
+                    preview.refresh();
+                }
+            }
+        });
+        group.connect_unmap({
+            let preview = preview.clone();
+            move |_| preview.hide()
+        });
+        dialog.connect_closed({
+            let preview = preview.clone();
+            move |_| preview.hide()
+        });
+        motion.connect_selected_notify({
+            let weak = Rc::downgrade(&preview);
+            move |_| {
+                if let Some(preview) = weak.upgrade() {
+                    preview.refresh();
+                }
+            }
+        });
+        if let Some(desktop) = &preview.desktop {
+            let weak = Rc::downgrade(&preview);
+            let handler = desktop.connect_gtk_enable_animations_notify(move |_| {
+                if let Some(preview) = weak.upgrade() {
+                    preview.refresh();
+                }
+            });
+            *preview.desktop_handler.borrow_mut() = Some(handler);
+        }
+        preview.refresh();
+        preview
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        #[ignore = "requires DISPLAY"]
+        fn preview_lifecycle_keeps_motion_local_and_stops_hidden_sources() {
+            gtk::init().expect("GTK display");
+            adw::init().expect("Adwaita initialization");
+            let desktop = gtk::Settings::default().expect("desktop settings");
+            let original_animations = desktop.is_gtk_enable_animations();
+            desktop.set_gtk_enable_animations(false);
+            let entry = gtk::Entry::new();
+            entry.set_text("untouched terminal draft");
+            let view = crate::block_view::organism_settings_test_view();
+            let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            content.append(&entry);
+            content.append(&view.widget());
+            // Use the same dialog-capable Adwaita host as the application.
+            // A plain GtkWindow exercises AdwDialog's separate-window fallback.
+            let window = adw::ApplicationWindow::builder()
+                .default_width(800)
+                .default_height(600)
+                .content(&content)
+                .build();
+            window.present();
+            let dialog = adw::PreferencesDialog::new();
+            dialog.set_title("Settings");
+            let page = adw::PreferencesPage::new();
+            let group = adw::PreferencesGroup::new();
+            // Disabled live controls simulate companion-off or safe mode. The
+            // gallery has no enable/config callback and remains usable.
+            let motion = adw::ComboRow::builder()
+                .model(&gtk::StringList::new(&[
+                    "Automatic",
+                    "Full",
+                    "Calm",
+                    "Static",
+                ]))
+                .selected(1)
+                .sensitive(false)
+                .build();
+            let preview = build(&group, &motion, &dialog);
+            page.add(&group);
+            dialog.add(&page);
+            dialog.present(Some(&window));
+            let main = glib::MainContext::default();
+            let spin_until = |condition: &dyn Fn() -> bool| {
+                let deadline = Instant::now() + Duration::from_secs(4);
+                while !condition() && Instant::now() < deadline {
+                    while main.pending() {
+                        main.iteration(false);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(condition(), "GTK condition did not settle");
+            };
+            spin_until(&|| group.is_mapped() && preview.is_active());
+            // Discard fixture initialization bytes; the following interactions
+            // must never write into this nonexecuting terminal's PTY.
+            crate::block_view::organism_settings_test_pty_bytes(&view);
+            assert!(group.is_sensitive());
+            assert!(preview.source.borrow().is_some());
+            // Optional native screenshot capture window; ordinary CI never waits.
+            if let Some(pause) = std::env::var("ORGANISM_PREVIEW_SCREENSHOT_PAUSE_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                eprintln!("ORGANISM_PREVIEW_READY");
+                let until = Instant::now() + Duration::from_millis(pause.min(30_000));
+                while Instant::now() < until {
+                    while main.pending() {
+                        main.iteration(false);
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            let pose = preview.pose.upgrade().unwrap();
+            let sprite = preview.sprite.upgrade().unwrap();
+            let hello = preview.hello.borrow().upgrade().unwrap();
+            assert!(!sprite.can_target());
+            assert!(!sprite.is_focusable());
+
+            // External reload notifications refresh both real controls and
+            // the existing preview, without becoming persistence requests.
+            let enabled = adw::SwitchRow::new();
+            let controls = super::super::OrganismSettingsControls::new(&enabled, &motion, false);
+            let user_edits = Rc::new(Cell::new(0));
+            let controls_for_enabled = controls.clone();
+            let enabled_edits = user_edits.clone();
+            enabled.connect_active_notify(move |_| {
+                if controls_for_enabled.accepts_user_change() {
+                    enabled_edits.set(enabled_edits.get() + 1);
+                }
+            });
+            let controls_for_motion = controls.clone();
+            let motion_edits = user_edits.clone();
+            motion.connect_selected_notify(move |_| {
+                if controls_for_motion.accepts_user_change() {
+                    motion_edits.set(motion_edits.get() + 1);
+                }
+            });
+            controls.sync(true, Some(OrganismMotion::Calm));
+            assert_eq!(
+                enabled.subtitle().as_deref(),
+                Some(super::super::organism_enabled_description(false, true))
+            );
+            assert!(enabled.is_active());
+            assert_eq!(motion.selected(), 2);
+            assert!(motion.is_sensitive());
+            assert_eq!(
+                motion.subtitle().as_deref(),
+                Some(motion_description(2, Some(false)))
+            );
+            assert_eq!(user_edits.get(), 0);
+            controls.sync(false, None);
+            assert_eq!(
+                enabled.subtitle().as_deref(),
+                Some(super::super::organism_enabled_description(false, false))
+            );
+            assert!(!enabled.is_active());
+            assert_eq!(motion.selected(), 0);
+            assert!(!motion.is_sensitive());
+            assert_eq!(
+                motion.subtitle().as_deref(),
+                Some(motion_description(0, Some(false)))
+            );
+            assert_eq!(user_edits.get(), 0);
+            enabled.set_active(true);
+            motion.set_selected(1);
+            assert_eq!(user_edits.get(), 2, "later user changes are not suppressed");
+            controls.retire();
+            controls.sync(false, Some(OrganismMotion::Static));
+            assert!(
+                enabled.is_active(),
+                "retired dialog controls cannot be changed"
+            );
+            assert_eq!(motion.selected(), 1);
+            let safe_controls =
+                super::super::OrganismSettingsControls::new(&enabled, &motion, true);
+            safe_controls.sync(false, Some(OrganismMotion::Static));
+            assert_eq!(
+                enabled.subtitle().as_deref(),
+                Some(super::super::organism_enabled_description(true, false))
+            );
+            assert!(!motion.is_sensitive());
+            safe_controls.retire();
+
+            // The following real pose/Hello/Demo controls remain usable even
+            // when accepted live-companion controls reflect safe mode/off.
+            motion.set_selected(3);
+            assert!(preview.source.borrow().is_none());
+            for (index, example) in PreviewPose::ALL.into_iter().enumerate() {
+                pose.set_selected(index as u32);
+                assert_eq!(pose.subtitle().as_deref(), Some(example.explanation()));
+                assert_eq!(
+                    sprite.text().as_str(),
+                    sprite_frame_with_context(example.context(), 0).as_ref()
+                );
+            }
+            pose.set_selected(0);
+            pose.grab_focus();
+            let focus_before = gtk::prelude::GtkWindowExt::focus(&window);
+            assert!(
+                focus_before.is_some(),
+                "the settings control owns keyboard focus"
+            );
+            {
+                let button = preview.hello.borrow().upgrade().unwrap();
+                button.emit_clicked();
+            }
+            let accepted = preview.greeting.get();
+            assert!(accepted.is_some());
+            assert!(!preview.hello.borrow().upgrade().unwrap().is_sensitive());
+            {
+                let button = preview.hello.borrow().upgrade().unwrap();
+                button.emit_clicked();
+            } // Even a repeated/programmatic click is bounded.
+            assert_eq!(preview.greeting.get(), accepted);
+            assert_eq!(gtk::prelude::GtkWindowExt::focus(&window), focus_before);
+            assert_eq!(
+                sprite.text().as_str(),
+                sprite_frame_with_context(PreviewPose::Greeting.context(), 0).as_ref()
+            );
+            spin_until(&|| preview.greeting.get().is_none());
+            assert_eq!(
+                sprite.text().as_str(),
+                sprite_frame_with_context(PreviewPose::Calm.context(), 0).as_ref()
+            );
+            assert!(
+                preview.source.borrow().is_some(),
+                "one cooldown wake remains"
+            );
+            pose.set_selected(2);
+            assert!(preview.greeting.get().is_none());
+            assert!(!preview.hello.borrow().upgrade().unwrap().is_sensitive());
+            assert!(
+                preview.source.borrow().is_none(),
+                "busy still poses do not poll a cooldown"
+            );
+            {
+                let button = preview.hello.borrow().upgrade().unwrap();
+                button.emit_clicked();
+            }
+            assert!(preview.greeting.get().is_none());
+
+            motion.set_selected(0);
+            assert!(
+                preview.source.borrow().is_none(),
+                "automatic follows reduced motion"
+            );
+            desktop.set_gtk_enable_animations(true);
+            assert!(
+                preview.source.borrow().is_some(),
+                "desktop preference updates live"
+            );
+            desktop.set_gtk_enable_animations(false);
+            assert!(preview.source.borrow().is_none());
+            motion.set_selected(3);
+            let cooldown_before_interruptions = preview.last_hello.get();
+            {
+                let button = preview.demo.borrow().upgrade().unwrap();
+                button.emit_clicked();
+            }
+            assert!(preview.sequence.borrow().is_running());
+            pose.set_selected(1);
+            assert!(!preview.sequence.borrow().is_running());
+            assert_eq!(
+                preview.demo.borrow().upgrade().unwrap().label().as_deref(),
+                Some("Play demo")
+            );
+            assert_eq!(
+                sprite.text().as_str(),
+                sprite_frame_with_context(PreviewPose::Curious.context(), 0).as_ref()
+            );
+            {
+                let button = preview.demo.borrow().upgrade().unwrap();
+                button.emit_clicked();
+            }
+            assert!(preview.sequence.borrow().is_running());
+            assert!(preview.source.borrow().is_some());
+            group.set_visible(false);
+            assert!(preview.source.borrow().is_none());
+            assert!(!preview.sequence.borrow().is_running());
+            group.set_visible(true);
+            spin_until(&|| group.is_mapped() && preview.is_active());
+            assert!(
+                !preview.sequence.borrow().is_running(),
+                "show must not replay demo"
+            );
+            assert_eq!(
+                preview.demo.borrow().upgrade().unwrap().label().as_deref(),
+                Some("Play demo")
+            );
+            assert_eq!(pose.selected(), 1);
+            assert_eq!(
+                sprite.text().as_str(),
+                sprite_frame_with_context(PreviewPose::Curious.context(), 0).as_ref()
+            );
+            assert_eq!(preview.last_hello.get(), cooldown_before_interruptions);
+            motion.set_selected(1);
+            assert!(preview.source.borrow().is_some());
+            dialog.force_close();
+            spin_until(&|| !group.is_mapped());
+            assert!(preview.source.borrow().is_none());
+            // Reopening the same dialog starts exactly one mapped source.
+            dialog.present(Some(&window));
+            spin_until(&|| group.is_mapped() && preview.is_active());
+            assert!(preview.source.borrow().is_some());
+            // Drive the real preview controls once in a still mode. This is
+            // the existing offline settings fixture, never a terminal event.
+            motion.set_selected(3);
+            pose.set_selected(1);
+            let sample = preview.sample.upgrade().unwrap();
+            let cooldown_before_demo = preview.last_hello.get();
+            {
+                let button = preview.demo.borrow().upgrade().unwrap();
+                button.emit_clicked();
+            }
+            assert!(preview.sequence.borrow().is_running());
+            assert_eq!(
+                preview.demo.borrow().upgrade().unwrap().label().as_deref(),
+                Some("Stop demo")
+            );
+            assert!(!preview.hello.borrow().upgrade().unwrap().is_sensitive());
+            spin_until(&|| {
+                sample
+                    .subtitle()
+                    .is_some_and(|text| text.starts_with("Demo 2/5: Working · example"))
+            });
+            assert_eq!(pose.selected(), 1, "demo preserves the manual pose");
+            assert_eq!(
+                sprite.text().as_str(),
+                sprite_frame_with_context(PreviewPose::Working.context(), 0).as_ref()
+            );
+            let old_stop = preview.demo.borrow().upgrade().unwrap();
+            let old_pause = preview.pause.borrow().upgrade().unwrap();
+            motion.set_selected(1);
+            old_pause.grab_focus();
+            assert!(old_pause.has_focus());
+            old_pause.emit_clicked();
+            assert!(preview.pause.borrow().upgrade().unwrap().has_focus());
+            assert!(preview.sequence.borrow().is_paused());
+            assert!(preview.source.borrow().is_none());
+            let frozen_sprite = sprite.text();
+            preview.refresh();
+            assert_eq!(sprite.text(), frozen_sprite);
+            assert!(sample.subtitle().unwrap().contains("paused"));
+            assert!(sample
+                .subtitle()
+                .unwrap()
+                .contains(PreviewPose::Working.explanation()));
+            motion.set_selected(3);
+            assert_eq!(
+                sprite.text().as_str(),
+                sprite_frame_with_context(PreviewPose::Working.context(), 0).as_ref()
+            );
+            motion.set_selected(1);
+            assert_eq!(sprite.text(), frozen_sprite);
+            assert!(preview.source.borrow().is_none());
+            old_stop.emit_clicked();
+            old_pause.emit_clicked();
+            assert!(
+                preview.sequence.borrow().is_paused(),
+                "old action widgets are retired"
+            );
+            let resume = preview.pause.borrow().upgrade().unwrap();
+            resume.emit_clicked();
+            assert!(preview.pause.borrow().upgrade().unwrap().has_focus());
+            assert!(!preview.sequence.borrow().is_paused());
+            resume.emit_clicked();
+            assert!(preview.sequence.borrow().is_running());
+            assert!(preview.source.borrow().is_some());
+            assert_eq!(preview.last_hello.get(), cooldown_before_demo);
+            motion.set_selected(3);
+            {
+                let button = preview.demo.borrow().upgrade().unwrap();
+                button.emit_clicked();
+            }
+            assert!(!preview.sequence.borrow().is_running());
+            assert_eq!(
+                preview.demo.borrow().upgrade().unwrap().label().as_deref(),
+                Some("Play demo")
+            );
+            assert_eq!(preview.last_hello.get(), cooldown_before_demo);
+            hello.emit_clicked();
+            assert!(
+                preview.greeting.get().is_none(),
+                "retired Hello cannot act after demo"
+            );
+            assert_eq!(preview.last_hello.get(), cooldown_before_demo);
+            assert_eq!(
+                sprite.text().as_str(),
+                sprite_frame_with_context(PreviewPose::Curious.context(), 0).as_ref()
+            );
+            motion.set_selected(1);
+            dialog.force_close();
+            spin_until(&|| !group.is_mapped());
+            assert!(preview.source.borrow().is_none());
+            assert_eq!(entry.text().as_str(), "untouched terminal draft");
+            assert!(
+                crate::block_view::organism_settings_test_pty_bytes(&view).is_empty(),
+                "pose preview and greeting must not send terminal input"
+            );
+            assert_eq!(
+                motion.selected(),
+                1,
+                "preview never edits the motion control"
+            );
+            desktop.set_gtk_enable_animations(original_animations);
+            assert!(
+                preview.source.borrow().is_none(),
+                "hidden settings callbacks cannot restart a timer"
+            );
+            window.close();
+        }
+
+        #[test]
+        fn reload_controls_use_exact_motion_selection_and_scoped_suppression() {
+            use super::super::{organism_motion_selection, OrganismSettingsSyncGuard};
+            for (motion, selected) in [
+                (None, 0),
+                (Some(OrganismMotion::Full), 1),
+                (Some(OrganismMotion::Calm), 2),
+                (Some(OrganismMotion::Static), 3),
+            ] {
+                assert_eq!(organism_motion_selection(motion), selected);
+            }
+            let syncing = Cell::new(true);
+            {
+                let _guard = OrganismSettingsSyncGuard(&syncing);
+                assert!(syncing.get());
+            }
+            assert!(!syncing.get());
+        }
+
+        #[test]
+        fn reload_controls_are_weak_guarded_and_updated_only_after_config_acceptance() {
+            let source = include_str!("dialogs.rs");
+            let binding = source.split_once("/// A settings-only gallery:").unwrap().0;
+            assert!(binding.contains("glib::WeakRef<adw::SwitchRow>"));
+            assert!(binding.contains("glib::WeakRef<adw::ComboRow>"));
+            assert!(binding.contains("let _guard = OrganismSettingsSyncGuard(&self.syncing);"));
+            let settings = source
+                .rsplit_once("pub(crate) fn toggle_settings_panel(&self)")
+                .unwrap()
+                .1;
+            for callback in [
+                "ascii_organism_row.connect_active_notify",
+                "ascii_organism_motion_row.connect_selected_notify",
+            ] {
+                let callback = settings
+                    .split_once(callback)
+                    .unwrap()
+                    .1
+                    .split_once("});")
+                    .unwrap()
+                    .0;
+                assert!(
+                    callback.find("accepts_user_change()").unwrap()
+                        < callback.find("ui.config.borrow_mut()").unwrap()
+                );
+                assert!(callback.contains("ui.persist_config();"));
+            }
+            assert!(settings.contains("Rc::ptr_eq(controls, &controls_for_close)"));
+            assert!(settings.contains("dialog_ref.borrow().as_ref() == Some(closed)"));
+            let reload = include_str!("config_apply.rs");
+            let accepted = reload
+                .split_once("*self.config.borrow_mut() = new_config;")
+                .unwrap()
+                .1;
+            assert!(accepted.contains("self.sync_organism_settings_controls();"));
+            assert!(!reload
+                .split_once("*self.config.borrow_mut() = new_config;")
+                .unwrap()
+                .0
+                .contains("self.sync_organism_settings_controls();"));
+        }
+
+        #[test]
+        fn demo_sequence_has_five_bounded_phases_and_never_catches_up() {
+            let start = Duration::from_secs(7);
+            let mut sequence = PreviewSequence::default();
+            assert_eq!(sequence.sample(start), None);
+            sequence.start(start);
+            for (millis, pose, index, remaining) in [
+                (0, PreviewPose::Calm, 0, 2000),
+                (1999, PreviewPose::Calm, 0, 1),
+                (2000, PreviewPose::Working, 1, 2000),
+                (4000, PreviewPose::Concerned, 2, 2000),
+                (6000, PreviewPose::Success, 3, 2000),
+                (8000, PreviewPose::Sleeping, 4, 2000),
+                (9999, PreviewPose::Sleeping, 4, 1),
+            ] {
+                assert_eq!(
+                    sequence.sample(start + Duration::from_millis(millis)),
+                    Some(DemoFrame {
+                        pose,
+                        index,
+                        next_wake: Duration::from_millis(remaining),
+                    })
+                );
+            }
+            assert_eq!(sequence.sample(start + Duration::from_secs(10)), None);
+            assert!(!sequence.is_running());
+            assert_eq!(sequence.sample(start), None, "no implicit replay");
+            sequence.start(start);
+            assert_eq!(sequence.sample(start + Duration::from_secs(60)), None);
+            assert!(
+                !sequence.is_running(),
+                "a delayed frame skips the expired demo"
+            );
+        }
+
+        #[test]
+        fn paused_demo_freezes_phase_frame_and_exact_remaining_time() {
+            let mut sequence = PreviewSequence::default();
+            let start = Duration::from_secs(7);
+            sequence.start(start);
+            let pause = start + Duration::from_millis(2750);
+            assert!(sequence.act(sequence.revision, DemoAction::Pause, pause));
+            let frozen = sequence.sample(pause).unwrap();
+            assert_eq!(frozen.pose, PreviewPose::Working);
+            assert_eq!(frozen.next_wake, Duration::from_millis(1250));
+            let frame = sequence.animation_time(pause);
+            let resume = pause + Duration::from_secs(3600);
+            assert_eq!(sequence.sample(resume), Some(frozen));
+            assert_eq!(sequence.animation_time(resume), frame);
+            for motion in [
+                OrganismMotion::Full,
+                OrganismMotion::Calm,
+                OrganismMotion::Static,
+            ] {
+                assert_eq!(
+                    next_wake(!sequence.is_paused(), motion, resume, None, None),
+                    None
+                );
+                assert_eq!(
+                    frame_index(motion, sequence.animation_time(resume)),
+                    if motion == OrganismMotion::Full {
+                        frame_index(motion, frame)
+                    } else {
+                        0
+                    }
+                );
+            }
+            assert!(sequence.act(sequence.revision, DemoAction::Resume, resume));
+            assert_eq!(sequence.animation_time(resume), frame);
+            assert_eq!(sequence.sample(resume), Some(frozen));
+            assert_eq!(
+                sequence
+                    .sample(resume + Duration::from_millis(1249))
+                    .unwrap()
+                    .pose,
+                PreviewPose::Working
+            );
+            assert_eq!(
+                sequence
+                    .sample(resume + Duration::from_millis(1250))
+                    .unwrap()
+                    .pose,
+                PreviewPose::Concerned
+            );
+            assert_eq!(sequence.sample(resume + Duration::from_millis(7250)), None);
+        }
+
+        #[test]
+        fn demo_controls_reject_expired_repeated_and_replaced_intents() {
+            let mut sequence = PreviewSequence::default();
+            let play = sequence.revision;
+            assert!(sequence.act(play, DemoAction::Play, Duration::ZERO));
+            assert!(!sequence.act(play, DemoAction::Play, Duration::ZERO));
+            let running = sequence.revision;
+            assert!(sequence.act(running, DemoAction::Pause, Duration::from_secs(1)));
+            assert!(!sequence.act(running, DemoAction::Stop, Duration::from_secs(1)));
+            let paused = sequence.revision;
+            assert!(sequence.act(paused, DemoAction::Resume, Duration::from_secs(30)));
+            assert!(!sequence.act(paused, DemoAction::Resume, Duration::from_secs(31)));
+            let active = sequence.revision;
+            assert!(!sequence.act(active, DemoAction::Pause, Duration::from_secs(39)));
+            assert!(!sequence.is_running());
+            assert!(!sequence.act(active, DemoAction::Resume, Duration::from_secs(40)));
+            assert!(sequence.act(sequence.revision, DemoAction::Play, Duration::from_secs(40)));
+            let previous = sequence.revision;
+            sequence.stop();
+            assert!(sequence.act(sequence.revision, DemoAction::Play, Duration::from_secs(41)));
+            assert!(!sequence.act(previous, DemoAction::Stop, Duration::from_secs(41)));
+            assert!(sequence.is_running());
+            sequence.revision = Some(u64::MAX);
+            sequence.stop();
+            assert_eq!(sequence.revision, None);
+            assert!(!sequence.act(None, DemoAction::Play, Duration::from_secs(42)));
+            assert!(!sequence.act(Some(0), DemoAction::Play, Duration::from_secs(42)));
+        }
+
+        #[test]
+        fn preview_explanation_tracks_displayed_greeting_and_demo_pose() {
+            assert_eq!(
+                preview_explanation(PreviewPose::Curious, true),
+                PreviewPose::Greeting.explanation()
+            );
+            assert_eq!(
+                preview_explanation(PreviewPose::Curious, false),
+                PreviewPose::Curious.explanation()
+            );
+            for pose in DEMO_POSES {
+                assert_eq!(preview_explanation(pose, false), pose.explanation());
+            }
+        }
+
+        #[test]
+        fn preview_buttons_capture_revision_and_keep_paused_scheduler_quiet() {
+            let source = include_str!("dialogs.rs");
+            let runtime = source
+                .split_once("    #[cfg(test)]\n    mod tests")
+                .unwrap()
+                .0;
+            let controls = runtime
+                .split_once("fn sync_demo_controls")
+                .unwrap()
+                .1
+                .split_once("fn refresh")
+                .unwrap()
+                .0;
+            assert!(controls.contains("controls.remove(&old)"));
+            assert!(controls.contains("old.set_sensitive(false)"));
+            assert!(controls.contains(
+                "revision.is_none() || sequence.revision != revision || sequence.is_running()"
+            ));
+            assert!(controls.contains("let weak = Rc::downgrade(self)"));
+            assert!(runtime.contains("active && !paused"));
+            assert!(runtime.contains("demo.filter(|_| !paused).map(|frame| frame.next_wake)"));
+            assert!(runtime.contains("frame_index(motion, animation_time)"));
+            assert!(runtime.contains("preview_explanation(pose, greeting.is_some())"));
+            assert!(runtime.contains("Example: {explanation}"));
+        }
+
+        #[test]
+        fn cancelling_demo_restores_manual_pose_without_spending_hello_cooldown() {
+            let manual = PreviewPose::Curious;
+            let mut sequence = PreviewSequence::default();
+            let mut interaction = GentleInteraction::default();
+            assert!(interaction.request(Duration::ZERO, manual.context()));
+            interaction.cancel();
+            sequence.start(Duration::from_secs(1));
+            assert_eq!(
+                sequence.sample(Duration::from_secs(3)).unwrap().pose,
+                PreviewPose::Working
+            );
+            sequence.stop();
+            let restored = sequence
+                .sample(Duration::from_secs(3))
+                .map_or(manual, |frame| frame.pose);
+            assert_eq!(restored, manual);
+            assert_eq!(sequence.sample(Duration::from_secs(4)), None);
+            assert!(!interaction.request(Duration::from_secs(7), manual.context()));
+            assert!(interaction.request(Duration::from_secs(8), manual.context()));
+        }
+
+        #[test]
+        fn demo_deadlines_share_the_existing_wake_and_end_in_still_modes() {
+            for motion in [
+                OrganismMotion::Full,
+                OrganismMotion::Calm,
+                OrganismMotion::Static,
+            ] {
+                let mut sequence = PreviewSequence::default();
+                sequence.start(Duration::ZERO);
+                let demo = sequence.sample(Duration::ZERO);
+                let wake = next_wake(true, motion, Duration::ZERO, None, None)
+                    .into_iter()
+                    .chain(demo.map(|frame| frame.next_wake))
+                    .min();
+                assert_eq!(
+                    wake,
+                    Some(if motion == OrganismMotion::Full {
+                        FRAME_INTERVAL
+                    } else {
+                        DEMO_STEP
+                    })
+                );
+                assert_eq!(sequence.sample(Duration::from_secs(10)), None);
+                if motion != OrganismMotion::Full {
+                    assert_eq!(
+                        next_wake(true, motion, Duration::from_secs(10), None, None),
+                        None
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn demo_controls_are_preview_only_and_cancel_at_presentation_boundaries() {
+            let source = include_str!("dialogs.rs");
+            let production = source.split_once("#[cfg(test)]").unwrap().0;
+            let click = production
+                .split_once("button.connect_clicked(move |_| {")
+                .unwrap()
+                .1
+                .split_once("controls.append(&button)")
+                .unwrap()
+                .0;
+            assert!(click.contains("if !preview.is_active()"));
+            assert!(!click.contains(".request("));
+            assert!(!click.contains("last_hello.set"));
+            assert!(
+                click.contains("revision,")
+                    && click.contains("action,")
+                    && click.contains("preview.epoch.elapsed()")
+            );
+            assert!(production.contains(
+                "revision.is_none() || sequence.revision != revision || sequence.is_running()"
+            ));
+            assert!(production.contains("let manual_pose = self.pose();"));
+            assert!(production.contains("Demo {}/5: {} · example{}"));
+            assert!(production.contains("demo.filter(|_| !paused).map(|frame| frame.next_wake)"));
+            assert!(production.contains("self.sequence.borrow_mut().stop();"));
+            assert!(!production.contains("pose_row.set_selected"));
+        }
+
+        #[test]
+        fn interaction_help_matches_live_timing_and_settings_binding() {
+            assert_eq!(GentleInteraction::HOLD, Duration::from_secs(2));
+            assert_eq!(GentleInteraction::COOLDOWN, Duration::from_secs(8));
+            let runtime = include_str!("organism.rs");
+            assert_eq!(
+                jterm_core::organism_live::LiveAttention::<u64>::DWELL,
+                Duration::from_millis(600)
+            );
+            let arm = runtime
+                .split_once("    fn arm_pointer_candidate(")
+                .unwrap()
+                .1
+                .split_once("    fn pointer_candidate_fired(")
+                .unwrap()
+                .0;
+            let compact: String = arm.chars().filter(|ch| !ch.is_whitespace()).collect();
+            assert!(compact.contains(
+                "candidate.deadline.saturating_sub(runtime.presence.attention_epoch.elapsed())"
+            ));
+            assert!(compact.contains(".max(Duration::from_millis(1))"));
+            assert!(compact.contains("timeout_add_local_once(delay,"));
+            assert!(runtime.contains("LiveAttentionEvent::CandidateDue { ticket }"));
+            assert!(INTERACTION_HINT.contains("600 ms"));
+            assert!(INTERACTION_HINT.contains("about 2 seconds"));
+            assert!(INTERACTION_HINT.contains("at least 8 seconds"));
+            assert!(INTERACTION_HINT.contains("without live hover greetings"));
+            let source = include_str!("dialogs.rs");
+            let row = source
+                .rsplit_once("let ascii_organism_row =")
+                .unwrap()
+                .1
+                .split_once(".build();")
+                .unwrap()
+                .0;
+            assert!(row.contains(".tooltip_text(organism_preview::INTERACTION_HINT)"));
+        }
+
+        #[test]
+        fn inactive_preview_has_no_wakes_and_cannot_replay_a_greeting() {
+            for visible in [false, true] {
+                for mapped in [false, true] {
+                    for host in [None, Some(false), Some(true)] {
+                        let active = presentation_active(visible, mapped, host);
+                        assert_eq!(active, visible && mapped && host == Some(true));
+                        if !active {
+                            for motion in [
+                                OrganismMotion::Full,
+                                OrganismMotion::Calm,
+                                OrganismMotion::Static,
+                            ] {
+                                assert_eq!(
+                                    next_wake(
+                                        active,
+                                        motion,
+                                        Duration::ZERO,
+                                        Some(Duration::ZERO),
+                                        Some(Duration::ZERO),
+                                    ),
+                                    None
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            let mut interaction = GentleInteraction::default();
+            let context = PreviewPose::Calm.context();
+            assert!(interaction.request(Duration::ZERO, context));
+            interaction.cancel();
+            assert_eq!(interaction.apply(Duration::from_secs(1), context), context);
+            assert!(!interaction.request(Duration::from_secs(1), context));
+            assert!(interaction.request(GentleInteraction::COOLDOWN, context));
+        }
+
+        #[test]
+        fn preview_focus_gates_existing_wakes_and_retires_host_handlers() {
+            let source = include_str!("dialogs.rs");
+            let runtime = source
+                .split_once("impl Preview {")
+                .unwrap()
+                .1
+                .split_once("#[cfg(test)]")
+                .unwrap()
+                .0;
+            assert!(runtime.contains("group.root().and_downcast::<gtk::Window>()"));
+            assert!(runtime.contains("host.connect_is_active_notify"));
+            assert!(runtime.contains("group.connect_root_notify"));
+            assert!(runtime.contains("if !preview.is_active()"));
+            assert!(runtime
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains("active && can_greet(pose)"));
+            assert!(runtime.contains("let active = self.is_active();"));
+            let drop = runtime.split_once("impl Drop for Preview").unwrap().1;
+            assert!(drop.contains("self.disconnect_host();"));
+            assert!(runtime.contains("host.disconnect(handler);"));
+        }
+
+        #[test]
+        fn motion_description_matches_automatic_and_explicit_resolution() {
+            assert_eq!(
+                motion_description(0, Some(true)),
+                "Automatic (Full): follows desktop animations."
+            );
+            assert_eq!(
+                motion_description(0, Some(false)),
+                "Automatic (Calm): desktop animations are disabled."
+            );
+            assert_eq!(
+                motion_description(0, None),
+                "Automatic (Full): desktop preference unavailable."
+            );
+            for selected in 1..=3 {
+                assert_eq!(
+                    motion_description(selected, Some(true)),
+                    motion_description(selected, Some(false))
+                );
+                assert_eq!(
+                    motion_description(selected, None),
+                    motion_description(selected, Some(true))
+                );
+            }
+            assert_eq!(
+                motion_description(3, Some(true)),
+                "Static: inline cards only; no live hover greetings."
+            );
+            assert_eq!(
+                motion_description(u32::MAX, Some(false)),
+                motion_description(0, Some(false))
+            );
+        }
+
+        #[test]
+        fn existing_preview_refresh_updates_the_motion_description() {
+            let source = include_str!("dialogs.rs");
+            let refresh = source
+                .split_once("fn refresh(self: &Rc<Self>) {")
+                .unwrap()
+                .1
+                .split_once("impl Drop for Preview")
+                .unwrap()
+                .0;
+            assert!(refresh.contains(
+                "motion_for_selection(motion_row.selected(), animations.unwrap_or(true))"
+            ));
+            assert!(refresh.contains("motion_description(motion_row.selected(), animations)"));
+            assert!(refresh.contains("motion_row.set_subtitle(description)"));
+        }
+
+        #[test]
+        fn automatic_respects_reduced_motion_and_explicit_choices_win() {
+            assert_eq!(motion_for_selection(0, false), OrganismMotion::Calm);
+            assert_eq!(motion_for_selection(0, true), OrganismMotion::Full);
+            assert_eq!(motion_for_selection(1, false), OrganismMotion::Full);
+            assert_eq!(motion_for_selection(2, true), OrganismMotion::Calm);
+            assert_eq!(motion_for_selection(3, true), OrganismMotion::Static);
+        }
+
+        #[test]
+        fn still_modes_never_advance_frames_or_keep_an_idle_timer() {
+            for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+                assert_eq!(frame_index(motion, Duration::from_secs(9)), 0);
+                assert_eq!(next_wake(true, motion, Duration::ZERO, None, None), None);
+            }
+            assert_eq!(
+                frame_index(OrganismMotion::Full, Duration::from_secs(1)),
+                10
+            );
+        }
+
+        #[test]
+        fn greeting_expiry_and_cooldown_are_bounded_even_in_static_mode() {
+            let start = Duration::ZERO;
+            let motion = OrganismMotion::Static;
+            assert_eq!(
+                next_wake(true, motion, start, Some(start), Some(start)),
+                Some(GentleInteraction::HOLD)
+            );
+            assert_eq!(
+                next_wake(
+                    true,
+                    motion,
+                    GentleInteraction::HOLD,
+                    Some(start),
+                    Some(start)
+                ),
+                Some(GentleInteraction::COOLDOWN - GentleInteraction::HOLD)
+            );
+            assert_eq!(
+                next_wake(
+                    true,
+                    motion,
+                    GentleInteraction::COOLDOWN,
+                    Some(start),
+                    Some(start)
+                ),
+                None
+            );
+        }
+
+        #[test]
+        fn hiding_cancels_every_kind_of_preview_wake() {
+            for motion in [
+                OrganismMotion::Full,
+                OrganismMotion::Calm,
+                OrganismMotion::Static,
+            ] {
+                assert_eq!(
+                    next_wake(
+                        false,
+                        motion,
+                        Duration::ZERO,
+                        Some(Duration::ZERO),
+                        Some(Duration::ZERO)
+                    ),
+                    None
+                );
+            }
+        }
+
+        #[test]
+        fn work_previews_do_not_offer_a_greeting_and_invalid_selection_is_safe() {
+            assert_eq!(selected_pose(u32::MAX), PreviewPose::Calm);
+            for (index, pose) in PreviewPose::ALL.into_iter().enumerate() {
+                assert_eq!(selected_pose(index as u32), pose);
+                let mut interaction = GentleInteraction::default();
+                assert_eq!(
+                    can_greet(pose),
+                    interaction.request(Duration::ZERO, pose.context())
+                );
+            }
+        }
+    }
+}
+
 /// Rebuilds the Remote Hosts rows from the config after it changes. Held in a
 /// cell because the handlers that need to call it (delete confirmations, the
 /// add/edit dialog) are created by the closure that does the rebuilding.
@@ -31,6 +1758,45 @@ type CrossBlockScheduleRebuildSlot = Rc<RefCell<Option<std::rc::Weak<dyn Fn(bool
 /// act on — the file can be reloaded behind an open dialog, and writing back to
 /// a stale index would silently edit a different host.
 type RemoteHostEditTarget = (usize, String);
+
+const REMOTE_HOSTS_CHANGED: &str = "Remote hosts changed; close and reopen this dialog.";
+
+/// Commit only against the host list the dialog displayed. A stale edit must
+/// neither overwrite a replacement profile nor resurrect a removed profile.
+fn apply_remote_host_edit<T: PartialEq>(
+    hosts: &mut Vec<T>,
+    expected: &[T],
+    target: Option<usize>,
+    new_host: T,
+) -> Result<(), &'static str> {
+    if hosts.as_slice() != expected {
+        return Err(REMOTE_HOSTS_CHANGED);
+    }
+    match target {
+        Some(index) => {
+            *hosts.get_mut(index).ok_or(REMOTE_HOSTS_CHANGED)? = new_host;
+        }
+        None => hosts.push(new_host),
+    }
+    Ok(())
+}
+
+/// A destructive confirmation belongs to one complete profile snapshot, not
+/// its old index or display name. Reordering is safe; ambiguity is not.
+fn remove_remote_host_snapshot<T: PartialEq>(hosts: &mut Vec<T>, expected: &T) -> bool {
+    let mut matches = hosts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, host)| (host == expected).then_some(index));
+    let Some(index) = matches.next() else {
+        return false;
+    };
+    if matches.next().is_some() {
+        return false;
+    }
+    hosts.remove(index);
+    true
+}
 
 const CROSS_BLOCK_SEARCH_LIMIT: usize = 500;
 const CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES: usize = 8 * 1024;
@@ -52,6 +1818,29 @@ const WORKFLOW_PALETTE_POLICY: crate::workflows::PickerPolicy =
 const WORKFLOW_PALETTE_LABEL_BYTES: usize = 256;
 const WORKFLOW_PALETTE_PREVIEW_BYTES: usize = 4 * 1024;
 
+fn replace_workflow_picker_library(
+    picker: &mut crate::workflows::WorkflowPicker,
+    workflows: &[crate::workflows::Workflow],
+    query: &str,
+    selected: Option<usize>,
+) -> usize {
+    let path = selected
+        .and_then(|index| picker.workflow_at_filtered(index))
+        .and_then(|workflow| workflow.source_path.clone());
+    let mut next =
+        crate::workflows::WorkflowPicker::new(workflows.to_vec(), WORKFLOW_PALETTE_POLICY);
+    next.set_query(query);
+    let selected = path
+        .and_then(|path| {
+            next.filtered()
+                .iter()
+                .position(|workflow| workflow.source_path.as_ref() == Some(&path))
+        })
+        .unwrap_or(0);
+    *picker = next;
+    selected
+}
+
 fn render_workflow_palette_rows(list: &ListBox, workflows: &[crate::workflows::Workflow]) {
     while let Some(row) = list.row_at_index(0) {
         list.remove(&row);
@@ -71,6 +1860,7 @@ fn render_workflow_palette_rows(list: &ListBox, workflows: &[crate::workflows::W
         let row = adw::ActionRow::builder()
             .title(&title)
             .subtitle(&subtitle)
+            .use_markup(false)
             .activatable(true)
             .build();
         list.append(&row);
@@ -102,7 +1892,7 @@ fn cross_block_search_dialog_title() -> &'static str {
 }
 
 fn cross_block_search_idle_status() -> &'static str {
-    "Type to search. F5 refreshes; Ctrl+Shift+B bookmarks; Shift+Enter jumps and advances."
+    "Browse blocks or type to search. F5 refreshes; Ctrl+Shift+B bookmarks; Shift+Enter jumps and advances."
 }
 
 fn cross_block_search_pending_status() -> &'static str {
@@ -189,6 +1979,153 @@ fn update_cross_block_bookmark_buttons(
     for (_, button) in buttons.iter().filter(|(id, _)| *id == record_id) {
         update_cross_block_bookmark_button(button, active);
     }
+}
+
+/// CSS class for [`hit_outcome_label`]: an interrupt or a stop is neutral, as
+/// on its card, and only a real failure is painted bad.
+fn hit_outcome_class(exit_code: Option<i32>) -> &'static str {
+    match exit_code {
+        Some(code)
+            if matches!(
+                crate::block_view::BlockOutcome::classify_foreground(Some(code)),
+                crate::block_view::BlockOutcome::Interrupted(_)
+            ) =>
+        {
+            "block-status-interrupted"
+        }
+        Some(code) if code != 0 => "block-status-bad",
+        _ => "block-status-ok",
+    }
+}
+
+/// `exit:1 · 2.4s · …/forge` for one hit, or `None` when the record carried
+/// none of the three. Uses the same badge text Block cards paint.
+fn hit_outcome_label(hit: &crate::block_view::CrossBlockHit) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    match hit.exit_code {
+        Some(0) => {}
+        Some(code) => parts.push(crate::block_view::record_exit_badge_text(code)),
+        None => {}
+    }
+    if let Some(duration) = hit.duration_ms {
+        parts.push(crate::block_view::format_block_duration(duration));
+    }
+    if let Some(cwd) = hit.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
+        parts.push(crate::block_view::shorten_path(cwd));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// Palette widgets and bookmark state shared by the initial and continued rows.
+struct CrossBlockHitRowContext<'a> {
+    list_box: &'a gtk4::ListBox,
+    term_view: &'a Rc<crate::block_view::TermView>,
+    row_bookmark_buttons: &'a Rc<RefCell<Vec<(u64, gtk4::ToggleButton)>>>,
+    status_label: &'a gtk4::Label,
+    filter_entry: &'a SearchEntry,
+    observed_version: &'a Rc<Cell<crate::block_view::CrossBlockSearchVersion>>,
+    schedule_rebuild_slot: &'a CrossBlockScheduleRebuildSlot,
+    bookmarked_toggle: &'a gtk4::ToggleButton,
+}
+
+/// Append one palette hit row, including the bookmark suffix. Shared by the
+/// initial rebuild and `pending_scan_continue` idle slices so continued hits
+/// stay bookmarkable (parity with anvil's append_hit_row).
+fn append_cross_block_hit_row(
+    context: &CrossBlockHitRowContext<'_>,
+    hit: &crate::block_view::CrossBlockHit,
+    jumpable: &std::collections::HashSet<(u64, bool)>,
+) {
+    let list_box = context.list_box;
+    let term_view = context.term_view;
+    let row_bookmark_buttons = context.row_bookmark_buttons;
+    let status_label = context.status_label;
+    let filter_entry = context.filter_entry;
+    let observed_version = context.observed_version;
+    let schedule_rebuild_slot = context.schedule_rebuild_slot;
+    let bookmarked_toggle = context.bookmarked_toggle;
+    let can_jump = jumpable.contains(&(hit.block_id, hit.is_output));
+    let surface = if hit.is_output { "out" } else { "cmd" };
+    let mut subtitle = format!(
+        "{surface} L{}: {}",
+        hit.line_no,
+        glib::markup_escape_text(&hit.line_text)
+    );
+    if !can_jump {
+        subtitle.push_str(" — location unavailable");
+    }
+    let row = adw::ActionRow::builder()
+        .title(glib::markup_escape_text(&hit.cmd_preview).as_str())
+        .subtitle(&subtitle)
+        .activatable(can_jump)
+        .build();
+    let bookmark_button = gtk4::ToggleButton::new();
+    bookmark_button.add_css_class("flat");
+    bookmark_button.set_valign(gtk4::Align::Center);
+    update_cross_block_bookmark_button(
+        &bookmark_button,
+        term_view.is_record_bookmarked(hit.block_id),
+    );
+    row_bookmark_buttons
+        .borrow_mut()
+        .push((hit.block_id, bookmark_button.clone()));
+    {
+        let term_view = term_view.clone();
+        let filter_entry = filter_entry.clone();
+        let status_label = status_label.clone();
+        let observed_version = observed_version.clone();
+        let schedule_rebuild_slot = schedule_rebuild_slot.clone();
+        let row_bookmark_buttons = row_bookmark_buttons.clone();
+        let bookmarked_toggle = bookmarked_toggle.clone();
+        let record_id = hit.block_id;
+        bookmark_button.connect_clicked(move |button| {
+            if let Some(active) = term_view.toggle_record_bookmark(record_id) {
+                update_cross_block_bookmark_buttons(
+                    &row_bookmark_buttons.borrow(),
+                    record_id,
+                    active,
+                );
+                observed_version.set(term_view.cross_block_search_version());
+                if bookmarked_toggle.is_active() {
+                    if let Some(schedule) = schedule_rebuild_slot
+                        .borrow()
+                        .as_ref()
+                        .and_then(std::rc::Weak::upgrade)
+                    {
+                        schedule(true);
+                    }
+                }
+                status_label.announce(
+                    cross_block_bookmark_confirmation(active),
+                    gtk4::AccessibleAnnouncementPriority::Medium,
+                );
+            } else {
+                let active = term_view.is_record_bookmarked(record_id);
+                update_cross_block_bookmark_buttons(
+                    &row_bookmark_buttons.borrow(),
+                    record_id,
+                    active,
+                );
+                // Keep the clicked widget authoritative even if a
+                // defensive stale row was not present in the index.
+                update_cross_block_bookmark_button(button, active);
+                let message = cross_block_bookmark_unavailable_status();
+                status_label.set_text(message);
+                status_label.announce(message, gtk4::AccessibleAnnouncementPriority::Medium);
+            }
+            filter_entry.grab_focus();
+        });
+    }
+    row.add_suffix(&bookmark_button);
+    // Outcome at a glance: telling the failing `cargo build` from the passing
+    // ones should not require visiting each (parity with anvil).
+    if let Some(outcome) = hit_outcome_label(hit) {
+        let label = gtk4::Label::new(Some(&outcome));
+        label.add_css_class(hit_outcome_class(hit.exit_code));
+        label.set_valign(gtk4::Align::Center);
+        row.add_suffix(&label);
+    }
+    list_box.append(&row);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -359,16 +2296,6 @@ fn cross_block_search_query_error(query: &str) -> Option<&'static str> {
         .then_some("Query is too long (maximum 8 KiB).")
 }
 
-fn cross_block_search_has_intent(
-    query: &str,
-    failed_only: bool,
-    slow_only: bool,
-    background_only: bool,
-    bookmarked_only: bool,
-) -> bool {
-    !query.is_empty() || failed_only || slow_only || background_only || bookmarked_only
-}
-
 fn cross_block_search_compact_layout(
     matching_row: &gtk4::Box,
     filter_row: &gtk4::Box,
@@ -417,6 +2344,42 @@ fn clear_cross_block_search_dialog_claim<T: PartialEq>(
         true
     } else {
         false
+    }
+}
+
+/// History filtering is case-insensitive; delayed notifications for the same
+/// effective text must not reset the user's selected visible row.
+fn changed_history_query(previous: &str, text: &str) -> Option<String> {
+    let query = text.to_lowercase();
+    (query != previous).then_some(query)
+}
+
+/// Synchronize the effective query without resetting a still-valid selection
+/// when SearchEntry later emits its delayed notification for the same text.
+fn refresh_workflow_picker_query(
+    picker: &mut crate::workflows::WorkflowPicker,
+    query: &str,
+) -> bool {
+    let previous_query = picker.query().to_string();
+    let previous_selection = picker.selected();
+    picker.set_query(query);
+    if picker.query() == previous_query {
+        picker.select(previous_selection);
+        false
+    } else {
+        true
+    }
+}
+
+/// Retire the argument form only after the original target accepts the text.
+/// Acceptance may only enqueue PTY input; it does not acknowledge later I/O.
+fn workflow_dialog_if_open(dialog: &glib::WeakRef<adw::Dialog>) -> Option<adw::Dialog> {
+    dialog.upgrade().filter(|dialog| dialog.parent().is_some())
+}
+
+fn finish_workflow_insertion(insert: impl FnOnce() -> bool, finish: impl FnOnce()) {
+    if insert() {
+        finish();
     }
 }
 
@@ -471,21 +2434,127 @@ fn cross_block_search_memory(
     }
 }
 
-fn cross_block_search_status(total: usize, selected: Option<usize>) -> String {
+fn cross_block_search_status(
+    total: usize,
+    selected: Option<usize>,
+    scan_incomplete: bool,
+) -> String {
     if total == 0 {
-        "No matches.".to_string()
+        if scan_incomplete {
+            "No matches in the scanned prefix — history scan budget reached; narrow the scope or refine the query.".to_string()
+        } else {
+            "No matches.".to_string()
+        }
     } else {
-        let noun = if total == 1 { "match" } else { "matches" };
+        let noun = if total == 1 {
+            "matching line"
+        } else {
+            "matching lines"
+        };
         let position = selected
             .filter(|index| *index < total)
             .map(|index| format!("{} of ", index + 1))
             .unwrap_or_default();
         if total == CROSS_BLOCK_SEARCH_LIMIT {
             format!("{position}{total} {noun} (capped) — refine your query.")
+        } else if scan_incomplete {
+            format!("{position}{total} {noun} (scan budget reached — later blocks not examined)")
         } else {
             format!("{position}{total} {noun}")
         }
     }
+}
+
+fn cross_block_search_status_for_query(
+    total: usize,
+    selected: Option<usize>,
+    scan_incomplete: bool,
+    query: &str,
+) -> String {
+    let status = cross_block_search_status(total, selected, scan_incomplete);
+    if query.is_empty() {
+        status.replace("matching line", "matching record")
+    } else {
+        status
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrossBlockHighlightPlan {
+    NativeHighlightAttempt,
+    NavigatedWithoutHighlight,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrossBlockHighlightOutcome {
+    Highlighted,
+    NavigatedWithoutHighlight,
+    Unavailable,
+}
+
+fn cross_block_results_are_current(
+    expected_query: Option<&(String, crate::block_view::CrossBlockSearchOptions)>,
+    expected_lease: Option<(u64, crate::block_view::CrossBlockSearchVersion)>,
+    query: &str,
+    options: crate::block_view::CrossBlockSearchOptions,
+    generation: u64,
+    version: crate::block_view::CrossBlockSearchVersion,
+) -> bool {
+    expected_query.is_some_and(|(text, flags)| text == query && *flags == options)
+        && expected_lease == Some((generation, version))
+}
+
+fn cross_block_highlight_plan(
+    kind: crate::block_view::CrossBlockRecordKind,
+) -> CrossBlockHighlightPlan {
+    match kind {
+        crate::block_view::CrossBlockRecordKind::NativeRecord => {
+            CrossBlockHighlightPlan::NativeHighlightAttempt
+        }
+        crate::block_view::CrossBlockRecordKind::MetadataRecord => {
+            CrossBlockHighlightPlan::NavigatedWithoutHighlight
+        }
+        crate::block_view::CrossBlockRecordKind::Missing => CrossBlockHighlightPlan::Unavailable,
+    }
+}
+
+/// A stale lease must not invoke native highlighting, which changes PRIMARY.
+fn cross_block_try_highlight(
+    plan: CrossBlockHighlightPlan,
+    current: bool,
+    highlight: impl FnOnce() -> bool,
+) -> CrossBlockHighlightOutcome {
+    if !current {
+        return CrossBlockHighlightOutcome::Unavailable;
+    }
+    match plan {
+        CrossBlockHighlightPlan::NativeHighlightAttempt if highlight() => {
+            CrossBlockHighlightOutcome::Highlighted
+        }
+        CrossBlockHighlightPlan::NavigatedWithoutHighlight => {
+            CrossBlockHighlightOutcome::NavigatedWithoutHighlight
+        }
+        _ => CrossBlockHighlightOutcome::Unavailable,
+    }
+}
+
+/// Continue slices share the first rebuild's bookmarked-empty copy so a
+/// Bookmarked scan that finishes empty after idle resume does not drop to
+/// generic "No matches."
+fn overlay_scan_status(
+    total: usize,
+    selected: Option<usize>,
+    scan_incomplete: bool,
+    bookmarked_empty: Option<&'static str>,
+    query: &str,
+) -> String {
+    if total == 0 && !scan_incomplete {
+        if let Some(message) = bookmarked_empty {
+            return message.to_string();
+        }
+    }
+    cross_block_search_status_for_query(total, selected, scan_incomplete, query)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -579,7 +2648,8 @@ fn cross_block_search_jump_unavailable_status() -> &'static str {
 /// What the cross-block palette does with one activated hit. Every arm of
 /// [`RecordNavigationResult`] resolves to exactly one of these: a record the
 /// view could reach, or could only show a snapshot of, always closes the
-/// palette; only a record it can do neither for keeps it open with a status.
+/// palette after activation validation; unavailable navigation or highlighting
+/// keeps it open with a status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CrossBlockJumpOutcome {
     Close,
@@ -599,7 +2669,43 @@ fn cross_block_jump_outcome(result: RecordNavigationResult) -> CrossBlockJumpOut
     }
 }
 
-/// Continuous review is possible only after an exact live terminal jump.
+fn activate_cross_block_palette_hit(
+    current: bool,
+    plan: CrossBlockHighlightPlan,
+    has_pattern: bool,
+    status: &Label,
+    entry: &SearchEntry,
+    navigate: impl FnOnce() -> RecordNavigationResult,
+    highlight: impl FnOnce() -> bool,
+) -> CrossBlockJumpOutcome {
+    if !current || plan == CrossBlockHighlightPlan::Unavailable {
+        status.set_text("Results changed. Refresh the search before opening this result.");
+        entry.grab_focus();
+        return CrossBlockJumpOutcome::KeepOpen;
+    }
+    let outcome = cross_block_jump_outcome(navigate());
+    match outcome {
+        CrossBlockJumpOutcome::Close if has_pattern => {
+            if cross_block_try_highlight(plan, true, highlight)
+                == CrossBlockHighlightOutcome::Unavailable
+            {
+                // Native false conflates no-match, unsupported and runtime errors.
+                status.set_text("Highlight unavailable. Refresh the search or refine the query.");
+                entry.grab_focus();
+                return CrossBlockJumpOutcome::KeepOpen;
+            }
+        }
+        CrossBlockJumpOutcome::KeepOpen => {
+            status.set_text(cross_block_search_jump_unavailable_status());
+            entry.grab_focus();
+        }
+        _ => {}
+    }
+    outcome
+}
+
+/// Continuous review follows a successful native navigation/highlight attempt.
+/// Native success is not proof of an exact regex occurrence.
 /// Snapshot-only results still open their snapshot dialog, and unavailable
 /// results stay selected with their error status instead of silently moving.
 fn cross_block_should_step(outcome: CrossBlockJumpOutcome, requested: bool) -> bool {
@@ -963,6 +3069,7 @@ impl UiState {
             let row = adw::ActionRow::builder()
                 .title(name.as_str())
                 .subtitle(target.as_str())
+                .use_markup(false)
                 .activatable(true)
                 .build();
             list_box.append(&row);
@@ -1233,6 +3340,7 @@ impl UiState {
             let first_line = cmd.lines().next().unwrap_or(cmd);
             let row = adw::ActionRow::builder()
                 .title(first_line)
+                .use_markup(false)
                 .activatable(true)
                 .build();
             list_box.append(&row);
@@ -1264,8 +3372,12 @@ impl UiState {
         let list_box_for_filter = list_box.clone();
         let haystacks_for_filter = haystacks.clone();
         let status_for_filter = status_label.clone();
-        filter_entry.connect_search_changed(move |entry| {
-            let query = entry.text().to_string().to_lowercase();
+        let rendered_query = RefCell::new(String::new());
+        let refresh_query = Rc::new(move |text: &str| {
+            let Some(query) = changed_history_query(&rendered_query.borrow(), text) else {
+                return;
+            };
+            *rendered_query.borrow_mut() = query.clone();
             let mut first_visible: Option<gtk4::ListBoxRow> = None;
             let mut visible_count = 0usize;
             for (idx, hay) in haystacks_for_filter.iter().enumerate() {
@@ -1314,6 +3426,11 @@ impl UiState {
             }
         });
 
+        {
+            let refresh_query = refresh_query.clone();
+            filter_entry.connect_search_changed(move |entry| refresh_query(entry.text().as_str()));
+        }
+
         // Paste the selected command into the live VTE. Does NOT append a
         // trailing newline — user reviews/edits, then presses Enter — which
         // matches how bash's reverse-i-search behaves.
@@ -1342,6 +3459,8 @@ impl UiState {
         let list_box_for_key = list_box.clone();
         let dialog_for_key = dialog.clone();
         let paste_for_key = paste.clone();
+        let filter_for_key = filter_entry.clone();
+        let refresh_query_for_key = refresh_query.clone();
         key_controller.connect_key_pressed(move |_, keyval, _, state| {
             // Escape, or the same chord that opened the palette, closes it.
             if keyval == Key::Escape
@@ -1355,6 +3474,7 @@ impl UiState {
                 return true.into();
             }
             if matches!(keyval, Key::Return | Key::KP_Enter) {
+                refresh_query_for_key(filter_for_key.text().as_str());
                 if let Some(row) = list_box_for_key
                     .selected_row()
                     .filter(|row| row.is_visible())
@@ -1440,6 +3560,11 @@ impl UiState {
             log::debug!("[xsearch] no active block-mode tab");
             return;
         };
+        self.show_cross_block_search_for(term_view);
+    }
+
+    pub(super) fn show_cross_block_search_for(&self, term_view: Rc<crate::block_view::TermView>) {
+        self.close_cross_block_search();
         let remembered = self.cross_block_search_memory.borrow().clone();
 
         let dialog = adw::Dialog::builder()
@@ -1527,7 +3652,7 @@ impl UiState {
         let compact_scroll = cross_block_search_compact_layout(&matching_row, &filter_row);
 
         let filter_entry = SearchEntry::new();
-        filter_entry.set_placeholder_text(Some("Search across blocks…"));
+        filter_entry.set_placeholder_text(Some("Browse blocks or type to search…"));
         filter_entry.set_hexpand(true);
         case_toggle.set_active(remembered.options.case_sensitive);
         regex_toggle.set_active(remembered.options.regex);
@@ -1546,7 +3671,7 @@ impl UiState {
         list_box.set_margin_end(12);
         list_box.set_margin_bottom(12);
 
-        let status_label = Label::new(None);
+        let status_label = Label::new(Some(cross_block_search_idle_status()));
         status_label.add_css_class("dim-label");
         status_label.set_accessible_role(gtk4::AccessibleRole::Status);
         status_label.set_xalign(0.0);
@@ -1580,33 +3705,45 @@ impl UiState {
         // keystroke / regex-toggle change.
         let hits: Rc<RefCell<Vec<crate::block_view::CrossBlockHit>>> =
             Rc::new(RefCell::new(Vec::new()));
+        let scan_incomplete = Rc::new(Cell::new(false));
         let row_bookmark_buttons: Rc<RefCell<Vec<(u64, gtk4::ToggleButton)>>> =
             Rc::new(RefCell::new(Vec::new()));
         let retained_hit: Rc<RefCell<Option<CrossBlockSelectionAnchor>>> =
             Rc::new(RefCell::new(None));
         let pending_rebuild: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        let pending_scan_continue: Rc<RefCell<Option<glib::SourceId>>> =
+            Rc::new(RefCell::new(None));
         let pending_manual_refresh: Rc<RefCell<Option<gtk4::TickCallbackId>>> =
             Rc::new(RefCell::new(None));
         let search_generation = Rc::new(Cell::new(0u64));
         let observed_version = Rc::new(Cell::new(term_view.cross_block_search_version()));
+        let result_lease = Rc::new(Cell::new(None));
+        let result_query = Rc::new(RefCell::new(None));
         let schedule_rebuild_slot: CrossBlockScheduleRebuildSlot = Rc::new(RefCell::new(None));
 
         {
             let hits = hits.clone();
+            let scan_incomplete = scan_incomplete.clone();
+            let filter_entry = filter_entry.clone();
             let status_label = status_label.clone();
             list_box.connect_row_selected(move |_, row| {
                 let total = hits.borrow().len();
-                status_label.set_text(&cross_block_search_status(
+                status_label.set_text(&cross_block_search_status_for_query(
                     total,
                     row.map(|row| row.index() as usize),
+                    scan_incomplete.get(),
+                    filter_entry.text().as_str(),
                 ));
             });
         }
 
         let rebuild = {
+            let result_lease = result_lease.clone();
+            let result_query = result_query.clone();
             let term_view = term_view.clone();
             let list_box = list_box.clone();
             let hits = hits.clone();
+            let scan_incomplete = scan_incomplete.clone();
             let row_bookmark_buttons = row_bookmark_buttons.clone();
             let status_label = status_label.clone();
             let filter_entry = filter_entry.clone();
@@ -1621,7 +3758,15 @@ impl UiState {
             let retained_hit = retained_hit.clone();
             let observed_version = observed_version.clone();
             let schedule_rebuild_slot = schedule_rebuild_slot.clone();
+            let search_generation = search_generation.clone();
+            let pending_scan_continue = pending_scan_continue.clone();
             Rc::new(move || {
+                if let Some(source) = pending_scan_continue.borrow_mut().take() {
+                    source.remove();
+                }
+                let generation = search_generation.get();
+                let version = term_view.cross_block_search_version();
+                result_lease.set(Some((generation, version)));
                 let query = filter_entry.text().to_string();
                 // Navigation remains available while the short refresh
                 // debounce runs. Re-snapshot at execution time so a Down/Up
@@ -1643,6 +3788,7 @@ impl UiState {
                     regex: regex_toggle.is_active(),
                     whole_word: whole_word_toggle.is_active(),
                 };
+                *result_query.borrow_mut() = Some((query.clone(), options));
                 let filters = crate::block_view::BlockFilters {
                     failed_only: failed_toggle.is_active(),
                     slow_only: slow_toggle.is_active(),
@@ -1653,19 +3799,9 @@ impl UiState {
                 };
                 clear_list_box(&list_box);
                 row_bookmark_buttons.borrow_mut().clear();
-                if !cross_block_search_has_intent(
-                    &query,
-                    filters.failed_only,
-                    filters.slow_only,
-                    filters.background_only,
-                    filters.bookmarked_only,
-                ) {
-                    hits.borrow_mut().clear();
-                    status_label.set_text(cross_block_search_idle_status());
-                    return;
-                }
                 if let Some(message) = cross_block_search_query_error(&query) {
                     hits.borrow_mut().clear();
+                    scan_incomplete.set(false);
                     status_label.set_text(message);
                     return;
                 }
@@ -1679,100 +3815,37 @@ impl UiState {
                     CROSS_BLOCK_SEARCH_LIMIT,
                     &filters,
                 ) {
-                    Ok(results) => {
+                    Ok(report) => {
+                        let resume = report.resume.clone();
+                        let results = report.hits;
+                        scan_incomplete.set(report.scan_incomplete);
                         let total = results.len();
-                        let status = if total == 0 {
+                        let status = overlay_scan_status(
+                            total,
+                            None,
+                            report.scan_incomplete,
                             term_view
                                 .bookmarked_search_empty_reason(&query, scope, &filters)
-                                .map(cross_block_bookmarked_empty_status)
-                                .map(str::to_string)
-                                .unwrap_or_else(|| cross_block_search_status(total, None))
-                        } else {
-                            cross_block_search_status(total, None)
-                        };
+                                .map(cross_block_bookmarked_empty_status),
+                            &query,
+                        );
                         status_label.set_text(&status);
                         let jumpable = term_view.jumpable_search_hits(&results);
                         for hit in results.iter() {
-                            let can_jump = jumpable.contains(&(hit.block_id, hit.is_output));
-                            let surface = if hit.is_output { "out" } else { "cmd" };
-                            let mut subtitle = format!(
-                                "{surface} L{}: {}",
-                                hit.line_no,
-                                glib::markup_escape_text(&hit.line_text)
+                            append_cross_block_hit_row(
+                                &CrossBlockHitRowContext {
+                                    list_box: &list_box,
+                                    term_view: &term_view,
+                                    row_bookmark_buttons: &row_bookmark_buttons,
+                                    status_label: &status_label,
+                                    filter_entry: &filter_entry,
+                                    observed_version: &observed_version,
+                                    schedule_rebuild_slot: &schedule_rebuild_slot,
+                                    bookmarked_toggle: &bookmarked_toggle,
+                                },
+                                hit,
+                                &jumpable,
                             );
-                            if !can_jump {
-                                subtitle.push_str(" — location unavailable");
-                            }
-                            let row = adw::ActionRow::builder()
-                                .title(glib::markup_escape_text(&hit.cmd_preview).as_str())
-                                .subtitle(&subtitle)
-                                .activatable(can_jump)
-                                .build();
-                            let bookmark_button = gtk4::ToggleButton::new();
-                            bookmark_button.add_css_class("flat");
-                            bookmark_button.set_valign(gtk4::Align::Center);
-                            update_cross_block_bookmark_button(
-                                &bookmark_button,
-                                term_view.is_record_bookmarked(hit.block_id),
-                            );
-                            row_bookmark_buttons
-                                .borrow_mut()
-                                .push((hit.block_id, bookmark_button.clone()));
-                            {
-                                let term_view = term_view.clone();
-                                let filter_entry = filter_entry.clone();
-                                let status_label = status_label.clone();
-                                let observed_version = observed_version.clone();
-                                let schedule_rebuild_slot = schedule_rebuild_slot.clone();
-                                let row_bookmark_buttons = row_bookmark_buttons.clone();
-                                let bookmarked_toggle = bookmarked_toggle.clone();
-                                let record_id = hit.block_id;
-                                bookmark_button.connect_clicked(move |button| {
-                                    if let Some(active) =
-                                        term_view.toggle_record_bookmark(record_id)
-                                    {
-                                        update_cross_block_bookmark_buttons(
-                                            &row_bookmark_buttons.borrow(),
-                                            record_id,
-                                            active,
-                                        );
-                                        observed_version
-                                            .set(term_view.cross_block_search_version());
-                                        if bookmarked_toggle.is_active() {
-                                            if let Some(schedule) = schedule_rebuild_slot
-                                                .borrow()
-                                                .as_ref()
-                                                .and_then(std::rc::Weak::upgrade)
-                                            {
-                                                schedule(true);
-                                            }
-                                        }
-                                        status_label.announce(
-                                            cross_block_bookmark_confirmation(active),
-                                            gtk4::AccessibleAnnouncementPriority::Medium,
-                                        );
-                                    } else {
-                                        let active = term_view.is_record_bookmarked(record_id);
-                                        update_cross_block_bookmark_buttons(
-                                            &row_bookmark_buttons.borrow(),
-                                            record_id,
-                                            active,
-                                        );
-                                        // Keep the clicked widget authoritative even if a
-                                        // defensive stale row was not present in the index.
-                                        update_cross_block_bookmark_button(button, active);
-                                        let message = cross_block_bookmark_unavailable_status();
-                                        status_label.set_text(message);
-                                        status_label.announce(
-                                            message,
-                                            gtk4::AccessibleAnnouncementPriority::Medium,
-                                        );
-                                    }
-                                    filter_entry.grab_focus();
-                                });
-                            }
-                            row.add_suffix(&bookmark_button);
-                            list_box.append(&row);
                         }
                         let selected =
                             cross_block_refresh_selection_index(&results, retained_hit.as_ref());
@@ -1780,9 +3853,113 @@ impl UiState {
                         if let Some(row) = list_box.row_at_index(selected as i32) {
                             list_box.select_row(Some(&row));
                         }
+
+                        if let Some(initial_resume) = resume {
+                            let cursor = Rc::new(RefCell::new(Some(initial_resume)));
+                            let term_view = term_view.clone();
+                            let list_box = list_box.clone();
+                            let hits = hits.clone();
+                            let scan_incomplete = scan_incomplete.clone();
+                            let status_label = status_label.clone();
+                            let search_generation = search_generation.clone();
+                            let pending_scan_continue = pending_scan_continue.clone();
+                            let pending_scan_continue_idle = pending_scan_continue.clone();
+                            let row_bookmark_buttons = row_bookmark_buttons.clone();
+                            let filter_entry = filter_entry.clone();
+                            let observed_version = observed_version.clone();
+                            let schedule_rebuild_slot = schedule_rebuild_slot.clone();
+                            let bookmarked_toggle = bookmarked_toggle.clone();
+                            let query = query.clone();
+                            let source = glib::idle_add_local(move || {
+                                if !crate::block_view::cross_block_search_continue_is_current(
+                                    generation,
+                                    search_generation.get(),
+                                    cursor.borrow().is_some(),
+                                ) {
+                                    pending_scan_continue_idle.borrow_mut().take();
+                                    return glib::ControlFlow::Break;
+                                }
+                                if term_view.cross_block_search_version() != version {
+                                    pending_scan_continue_idle.borrow_mut().take();
+                                    return glib::ControlFlow::Break;
+                                }
+                                let Some(resume) = cursor.borrow().clone() else {
+                                    pending_scan_continue_idle.borrow_mut().take();
+                                    return glib::ControlFlow::Break;
+                                };
+                                let already = hits.borrow().len();
+                                if already >= CROSS_BLOCK_SEARCH_LIMIT {
+                                    scan_incomplete.set(false);
+                                    status_label.set_text(&cross_block_search_status_for_query(
+                                        already,
+                                        list_box.selected_row().map(|row| row.index() as usize),
+                                        false,
+                                        &query,
+                                    ));
+                                    pending_scan_continue_idle.borrow_mut().take();
+                                    return glib::ControlFlow::Break;
+                                }
+                                let remaining = CROSS_BLOCK_SEARCH_LIMIT - already;
+                                match term_view.cross_block_search_in_scope_from(
+                                    &query,
+                                    options,
+                                    scope,
+                                    remaining,
+                                    &filters,
+                                    Some(&resume),
+                                ) {
+                                    Ok(more) => {
+                                        let jumpable = term_view.jumpable_search_hits(&more.hits);
+                                        for hit in more.hits.iter() {
+                                            append_cross_block_hit_row(
+                                                &CrossBlockHitRowContext {
+                                                    list_box: &list_box,
+                                                    term_view: &term_view,
+                                                    row_bookmark_buttons: &row_bookmark_buttons,
+                                                    status_label: &status_label,
+                                                    filter_entry: &filter_entry,
+                                                    observed_version: &observed_version,
+                                                    schedule_rebuild_slot: &schedule_rebuild_slot,
+                                                    bookmarked_toggle: &bookmarked_toggle,
+                                                },
+                                                hit,
+                                                &jumpable,
+                                            );
+                                        }
+                                        hits.borrow_mut().extend(more.hits.iter().cloned());
+                                        let total = hits.borrow().len();
+                                        scan_incomplete.set(more.scan_incomplete);
+                                        status_label.set_text(&overlay_scan_status(
+                                            total,
+                                            list_box.selected_row().map(|row| row.index() as usize),
+                                            more.scan_incomplete,
+                                            term_view
+                                                .bookmarked_search_empty_reason(
+                                                    &query, scope, &filters,
+                                                )
+                                                .map(cross_block_bookmarked_empty_status),
+                                            &query,
+                                        ));
+                                        *cursor.borrow_mut() = more.resume;
+                                        if cursor.borrow().is_some() {
+                                            glib::ControlFlow::Continue
+                                        } else {
+                                            pending_scan_continue_idle.borrow_mut().take();
+                                            glib::ControlFlow::Break
+                                        }
+                                    }
+                                    Err(_) => {
+                                        pending_scan_continue_idle.borrow_mut().take();
+                                        glib::ControlFlow::Break
+                                    }
+                                }
+                            });
+                            *pending_scan_continue.borrow_mut() = Some(source);
+                        }
                     }
                     Err(e) => {
                         hits.borrow_mut().clear();
+                        scan_incomplete.set(false);
                         clear_list_box(&list_box);
                         status_label.set_text(&format!("Bad regex: {e}"));
                     }
@@ -1792,6 +3969,7 @@ impl UiState {
 
         let schedule_rebuild: CrossBlockScheduleRebuild = {
             let pending_rebuild = pending_rebuild.clone();
+            let pending_scan_continue = pending_scan_continue.clone();
             let pending_manual_refresh = pending_manual_refresh.clone();
             let search_generation = search_generation.clone();
             let rebuild = rebuild.clone();
@@ -1800,14 +3978,13 @@ impl UiState {
             let status_label = status_label.clone();
             let filter_entry = filter_entry.clone();
             let retained_hit = retained_hit.clone();
-            let failed_toggle = failed_toggle.clone();
-            let slow_toggle = slow_toggle.clone();
-            let background_toggle = background_toggle.clone();
-            let bookmarked_toggle = bookmarked_toggle.clone();
             Rc::new(move |preserve_selection: bool| {
                 let generation = search_generation.get().wrapping_add(1);
                 search_generation.set(generation);
                 if let Some(source) = pending_rebuild.borrow_mut().take() {
+                    source.remove();
+                }
+                if let Some(source) = pending_scan_continue.borrow_mut().take() {
                     source.remove();
                 }
                 if let Some(tick) = pending_manual_refresh.borrow_mut().take() {
@@ -1825,18 +4002,6 @@ impl UiState {
                 } else {
                     None
                 };
-                if !cross_block_search_has_intent(
-                    filter_entry.text().as_str(),
-                    failed_toggle.is_active(),
-                    slow_toggle.is_active(),
-                    background_toggle.is_active(),
-                    bookmarked_toggle.is_active(),
-                ) {
-                    clear_list_box(&list_box);
-                    hits.borrow_mut().clear();
-                    status_label.set_text(cross_block_search_idle_status());
-                    return;
-                }
                 if let Some(message) = cross_block_search_query_error(filter_entry.text().as_str())
                 {
                     clear_list_box(&list_box);
@@ -1960,6 +4125,7 @@ impl UiState {
             let term_view = term_view.clone();
             let observed_version = observed_version.clone();
             let pending_rebuild = pending_rebuild.clone();
+            let pending_scan_continue = pending_scan_continue.clone();
             let pending_manual_refresh = pending_manual_refresh.clone();
             let search_generation = search_generation.clone();
             let retained_hit = retained_hit.clone();
@@ -1976,6 +4142,9 @@ impl UiState {
                 observed_version.set(term_view.cross_block_search_version());
                 search_generation.set(search_generation.get().wrapping_add(1));
                 if let Some(source) = pending_rebuild.borrow_mut().take() {
+                    source.remove();
+                }
+                if let Some(source) = pending_scan_continue.borrow_mut().take() {
                     source.remove();
                 }
                 if let Some(tick) = pending_manual_refresh.borrow_mut().take() {
@@ -2038,6 +4207,9 @@ impl UiState {
         // turn on its per-VTE search highlight at the matching hit. Plain
         // activation closes; Shift+Enter can keep a successful live jump open.
         let jump = {
+            let result_lease = result_lease.clone();
+            let result_query = result_query.clone();
+            let search_generation = search_generation.clone();
             let term_view = term_view.clone();
             let hits = hits.clone();
             let filter_entry = filter_entry.clone();
@@ -2056,30 +4228,31 @@ impl UiState {
                     Some(h) => h.clone(),
                     None => return CrossBlockJumpOutcome::KeepOpen,
                 };
-                let outcome = cross_block_jump_outcome(
-                    term_view.navigate_to_record_id(hit.block_id, hit.is_output),
+                let current = cross_block_results_are_current(
+                    result_query.borrow().as_ref(),
+                    result_lease.get(),
+                    &pattern,
+                    options,
+                    search_generation.get(),
+                    term_view.cross_block_search_version(),
                 );
-                match outcome {
-                    CrossBlockJumpOutcome::Close => {
-                        // The surface has already scrolled and taken focus. A
-                        // highlight that cannot be set is not a reason to
-                        // strand this modal over it.
-                        if !pattern.is_empty() {
-                            term_view.focus_match_in_block(
-                                hit.block_id,
-                                &pattern,
-                                options,
-                                hit.is_output,
-                                hit.occurrence,
-                            );
-                        }
-                    }
-                    CrossBlockJumpOutcome::KeepOpen => {
-                        status_label.set_text(cross_block_search_jump_unavailable_status());
-                    }
-                    CrossBlockJumpOutcome::ShowSnapshot(_) => {}
-                }
-                outcome
+                activate_cross_block_palette_hit(
+                    current,
+                    cross_block_highlight_plan(term_view.cross_block_record_kind(hit.block_id)),
+                    !pattern.is_empty(),
+                    &status_label,
+                    &filter_entry,
+                    || term_view.navigate_to_record_id(hit.block_id, hit.is_output),
+                    || {
+                        term_view.focus_match_in_block(
+                            hit.block_id,
+                            &pattern,
+                            options,
+                            hit.is_output,
+                            hit.occurrence,
+                        )
+                    },
+                )
             }
         };
 
@@ -2088,11 +4261,12 @@ impl UiState {
         let apply_jump_outcome = {
             let ui = self.clone();
             let dialog = dialog.clone();
+            let term_view = term_view.clone();
             Rc::new(move |outcome: CrossBlockJumpOutcome| match outcome {
                 CrossBlockJumpOutcome::Close => dialog.force_close(),
                 CrossBlockJumpOutcome::ShowSnapshot(record_id) => {
                     dialog.force_close();
-                    ui.show_record_snapshot_dialog(record_id);
+                    ui.show_record_snapshot_dialog_for(&term_view, record_id);
                 }
                 CrossBlockJumpOutcome::KeepOpen => {}
             })
@@ -2329,8 +4503,10 @@ impl UiState {
 
         let dialog_ref = self.cross_block_search_dialog.clone();
         let pending_rebuild_for_close = pending_rebuild.clone();
+        let pending_scan_continue_for_close = pending_scan_continue.clone();
         let pending_manual_refresh_for_close = pending_manual_refresh.clone();
         let refresh_source_for_close = refresh_source.clone();
+        let search_generation_for_close = search_generation.clone();
         let memory_for_close = self.cross_block_search_memory.clone();
         let filter_entry_for_close = filter_entry.clone();
         let case_toggle_for_close = case_toggle.clone();
@@ -2342,10 +4518,14 @@ impl UiState {
         let background_toggle_for_close = background_toggle.clone();
         let bookmarked_toggle_for_close = bookmarked_toggle.clone();
         dialog.connect_closed(move |closed_dialog| {
+            search_generation_for_close.set(search_generation_for_close.get().wrapping_add(1));
             if let Some(source) = refresh_source_for_close.borrow_mut().take() {
                 source.remove();
             }
             if let Some(source) = pending_rebuild_for_close.borrow_mut().take() {
+                source.remove();
+            }
+            if let Some(source) = pending_scan_continue_for_close.borrow_mut().take() {
                 source.remove();
             }
             if let Some(tick) = pending_manual_refresh_for_close.borrow_mut().take() {
@@ -2375,15 +4555,7 @@ impl UiState {
 
         *self.cross_block_search_dialog.borrow_mut() = Some(dialog.clone());
         dialog.present(Some(&self.window));
-        if cross_block_search_has_intent(
-            &remembered.query,
-            remembered.failed_only,
-            remembered.slow_only,
-            remembered.background_only,
-            remembered.bookmarked_only,
-        ) {
-            schedule_rebuild(false);
-        }
+        schedule_rebuild(false);
         filter_entry.grab_focus();
     }
 
@@ -2580,6 +4752,17 @@ impl UiState {
         dialog.present(Some(&self.window));
     }
 
+    pub(crate) fn sync_organism_settings_controls(&self) {
+        let controls = self.organism_settings_controls.borrow().clone();
+        let values = {
+            let config = self.config.borrow();
+            (config.ascii_organism_enabled, config.ascii_organism_motion)
+        };
+        if let Some(controls) = controls {
+            controls.sync(values.0, values.1);
+        }
+    }
+
     pub(crate) fn toggle_settings_panel(&self) {
         let dialog_to_close = self.settings_dialog.borrow_mut().take();
         if let Some(dialog) = dialog_to_close {
@@ -2647,16 +4830,38 @@ impl UiState {
 
         // --- Font Size ---
         let current_size = current_font_desc.size() as f64 / gtk4::pango::SCALE as f64;
-        let font_size_adj = Adjustment::new(current_size, 6.0, 72.0, 1.0, 4.0, 0.0);
-        let font_size_row = adw::SpinRow::new(Some(&font_size_adj), 1.0, 0);
-        font_size_row.set_title("Font Size");
+        let font_size_adj = Adjustment::new(current_size, 6.0, 72.0, 0.25, 4.0, 0.0);
+        let font_size_row = adw::SpinRow::new(Some(&font_size_adj), 0.25, 2);
+        font_size_row.set_title("Main Content Font Size");
+        font_size_row.set_subtitle(if current_font_desc.is_size_absolute() {
+            "Pixels"
+        } else {
+            "Points"
+        });
         group.add(&font_size_row);
 
         // --- Font Scale ---
         let font_scale_adj = Adjustment::new(self.font_scale.get(), 0.1, 10.0, 0.025, 0.1, 0.0);
         let font_scale_row = adw::SpinRow::new(Some(&font_scale_adj), 0.025, 3);
-        font_scale_row.set_title("Font Scale");
+        font_scale_row.set_title("Main Content Font Scale");
         group.add(&font_scale_row);
+
+        let chrome_desc = FontDescription::from_string(&config.chrome_font_size);
+        let chrome_size = f64::from(chrome_desc.size()) / f64::from(gtk4::pango::SCALE);
+        let chrome_size_adj = Adjustment::new(chrome_size, 6.0, 72.0, 0.25, 4.0, 0.0);
+        let chrome_size_row = adw::SpinRow::new(Some(&chrome_size_adj), 0.25, 2);
+        chrome_size_row.set_title("Sidebar & Top Bar Font Size");
+        chrome_size_row.set_subtitle(if chrome_desc.is_size_absolute() {
+            "Pixels"
+        } else {
+            "Points"
+        });
+        group.add(&chrome_size_row);
+        let chrome_scale_adj =
+            Adjustment::new(config.chrome_font_scale, 0.1, 10.0, 0.025, 0.1, 0.0);
+        let chrome_scale_row = adw::SpinRow::new(Some(&chrome_scale_adj), 0.025, 3);
+        chrome_scale_row.set_title("Sidebar & Top Bar Font Scale");
+        group.add(&chrome_scale_row);
 
         // --- Opacity ---
         let opacity_row = adw::ActionRow::builder().title("Opacity").build();
@@ -2684,8 +4889,12 @@ impl UiState {
 
         let terminal_group = adw::PreferencesGroup::new();
         terminal_group.set_title(preferences_group_title("Terminal & Blocks").as_str());
-        let terminal_mode_model =
-            gtk4::StringList::new(&["Block", "VTE compatibility", "Unified (experimental)"]);
+        let terminal_mode_model = gtk4::StringList::new(&[
+            "Block",
+            "VTE compatibility",
+            "Unified (experimental)",
+            "Chat",
+        ]);
         let terminal_mode_row = adw::ComboRow::builder()
             .title("Terminal Backend")
             .subtitle("Applies to new and restored local panes")
@@ -2694,6 +4903,7 @@ impl UiState {
                 crate::config::TerminalMode::Block => 0,
                 crate::config::TerminalMode::Vte => 1,
                 crate::config::TerminalMode::Unified => 2,
+                crate::config::TerminalMode::Chat => 3,
             })
             .build();
         let safe_mode = std::env::var_os("FORGE_SAFE_MODE").is_some();
@@ -2718,7 +4928,11 @@ impl UiState {
 
         let ascii_organism_row = adw::SwitchRow::builder()
             .title("ASCII Organism")
-            .subtitle("Show the local, no-LLM organism in new Block panes")
+            .subtitle(organism_enabled_description(
+                safe_mode,
+                config.ascii_organism_enabled,
+            ))
+            .tooltip_text(organism_preview::INTERACTION_HINT)
             .active(config.ascii_organism_enabled)
             .build();
         ascii_organism_row.set_sensitive(!safe_mode);
@@ -2730,15 +4944,18 @@ impl UiState {
             .title("Organism Motion")
             .subtitle("Automatic follows the desktop animation preference")
             .model(&ascii_organism_motion_model)
-            .selected(match config.ascii_organism_motion {
-                None => 0,
-                Some(crate::config::OrganismMotion::Full) => 1,
-                Some(crate::config::OrganismMotion::Calm) => 2,
-                Some(crate::config::OrganismMotion::Static) => 3,
-            })
+            .selected(organism_motion_selection(config.ascii_organism_motion))
             .build();
         ascii_organism_motion_row.set_sensitive(!safe_mode && config.ascii_organism_enabled);
         terminal_group.add(&ascii_organism_motion_row);
+        let organism_controls = OrganismSettingsControls::new(
+            &ascii_organism_row,
+            &ascii_organism_motion_row,
+            safe_mode,
+        );
+
+        let organism_preview_group = adw::PreferencesGroup::new();
+        organism_preview::install(&organism_preview_group, &ascii_organism_motion_row, &dialog);
 
         let privacy_group = adw::PreferencesGroup::new();
         privacy_group.set_title(preferences_group_title("Features & Privacy").as_str());
@@ -2895,6 +5112,7 @@ impl UiState {
 
         page.add(&group);
         page.add(&terminal_group);
+        page.add(&organism_preview_group);
         page.add(&privacy_group);
         page.add(&ai_group);
         page.add(&remote_group);
@@ -2916,12 +5134,13 @@ impl UiState {
         // --- Signal: Font ---
         let ui = self.clone();
         let mono_fonts_clone = mono_fonts.clone();
-        let font_size_row_clone = font_size_row.clone();
         font_row.connect_notify_local(Some("selected"), move |row, _| {
             let idx = row.selected() as usize;
             if let Some(family) = mono_fonts_clone.get(idx) {
-                let size = font_size_row_clone.value() as i32;
-                let new_desc = format!("{} {}", family, size);
+                let new_desc = crate::font::font_description_with_family(
+                    &ui.config.borrow().font_desc,
+                    family,
+                );
                 ui.config.borrow_mut().font_desc = new_desc;
                 ui.apply_font_all();
                 ui.persist_config();
@@ -2930,16 +5149,9 @@ impl UiState {
 
         // --- Signal: Font Size ---
         let ui = self.clone();
-        let mono_fonts_clone2 = mono_fonts;
-        let font_row_clone = font_row.clone();
         font_size_row.connect_notify_local(Some("value"), move |row, _| {
-            let idx = font_row_clone.selected() as usize;
-            let family = mono_fonts_clone2
-                .get(idx)
-                .map(|s| s.as_str())
-                .unwrap_or("Monospace");
-            let size = row.value() as i32;
-            let new_desc = format!("{} {}", family, size);
+            let new_desc =
+                crate::font::font_description_with_size(&ui.config.borrow().font_desc, row.value());
             ui.config.borrow_mut().font_desc = new_desc;
             ui.apply_font_all();
             ui.persist_config();
@@ -2949,6 +5161,20 @@ impl UiState {
         let ui = self.clone();
         font_scale_row.connect_notify_local(Some("value"), move |row, _| {
             ui.apply_font_scale(row.value());
+        });
+
+        let ui = self.clone();
+        // Chrome size has its own fixed base, independent of the main font description.
+        let chrome_absolute = chrome_desc.is_size_absolute();
+        chrome_size_row.connect_notify_local(Some("value"), move |row, _| {
+            let unit = if chrome_absolute { "px" } else { "" };
+            ui.config.borrow_mut().chrome_font_size = format!("{}{unit}", row.value());
+            ui.apply_dynamic_css();
+            ui.persist_config();
+        });
+        let ui = self.clone();
+        chrome_scale_row.connect_notify_local(Some("value"), move |row, _| {
+            ui.apply_font_group_scale(crate::font_zoom::FontGroup::Chrome, row.value());
         });
 
         // --- Signal: Opacity ---
@@ -2982,6 +5208,7 @@ impl UiState {
             ui.config.borrow_mut().terminal_mode = match row.selected() {
                 0 => crate::config::TerminalMode::Block,
                 2 => crate::config::TerminalMode::Unified,
+                3 => crate::config::TerminalMode::Chat,
                 _ => crate::config::TerminalMode::Vte,
             };
             ui.persist_config();
@@ -2993,7 +5220,7 @@ impl UiState {
             let mut config = ui.config.borrow_mut();
             config.command_history_enabled = enabled;
             if enabled && config.command_history_path.is_none() {
-                config.command_history_path = Some(crate::config::default_command_history_path());
+                config.command_history_path = crate::config::default_command_history_path();
             }
             drop(config);
             ui.sync_block_configs();
@@ -3002,21 +5229,35 @@ impl UiState {
 
         let motion_for_enabled = ascii_organism_motion_row.clone();
         let ui = self.clone();
+        let controls_for_enabled = organism_controls.clone();
         ascii_organism_row.connect_active_notify(move |row| {
+            if !controls_for_enabled.accepts_user_change() {
+                return;
+            }
             let enabled = row.is_active();
+            row.set_subtitle(organism_enabled_description(
+                controls_for_enabled.safe_mode,
+                enabled,
+            ));
             ui.config.borrow_mut().ascii_organism_enabled = enabled;
             motion_for_enabled.set_sensitive(enabled);
+            ui.sync_ascii_organism_settings();
             ui.persist_config();
         });
 
         let ui = self.clone();
+        let controls_for_motion = organism_controls.clone();
         ascii_organism_motion_row.connect_selected_notify(move |row| {
+            if !controls_for_motion.accepts_user_change() {
+                return;
+            }
             ui.config.borrow_mut().ascii_organism_motion = match row.selected() {
                 1 => Some(crate::config::OrganismMotion::Full),
                 2 => Some(crate::config::OrganismMotion::Calm),
                 3 => Some(crate::config::OrganismMotion::Static),
                 _ => None,
             };
+            ui.sync_ascii_organism_settings();
             ui.persist_config();
         });
 
@@ -3157,7 +5398,14 @@ impl UiState {
                 .borrow()
                 .ai_api_key_file_configured
                 .clone()
-                .unwrap_or_else(crate::config::default_ai_api_key_path);
+                .or_else(crate::config::default_ai_api_key_path);
+            let Some(path) = path else {
+                ui.show_config_error(
+                    "API Key was not saved",
+                    "No usable default API key path; configure an absolute UTF-8 key file path.",
+                );
+                return;
+            };
             if let Err(error) = crate::ai::write_api_key_file(&path, row.text().as_str()) {
                 ui.show_config_error("API Key was not saved", &error.to_string());
                 return;
@@ -3273,9 +5521,9 @@ impl UiState {
 
                 let ui = ui_for_hosts.clone();
                 let populate_ref = populate_for_delete.clone();
-                let name = host.name.clone();
+                let expected_host = host.clone();
                 delete_btn.connect_clicked(move |_| {
-                    let display = jterm_core::review_input::safe_inline_display(&name, 1024);
+                    let display = jterm_core::review_input::safe_inline_display(&expected_host.name, 1024);
                     let dialog = adw::AlertDialog::new(
                         Some("Remove this host?"),
                         Some(&format!(
@@ -3288,7 +5536,7 @@ impl UiState {
                     dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
                     let ui_for_response = ui.clone();
                     let populate_ref = populate_ref.clone();
-                    let name = name.clone();
+                    let expected_host = expected_host.clone();
                     dialog.connect_response(None, move |_, response| {
                         if response != "remove" {
                             return;
@@ -3296,18 +5544,17 @@ impl UiState {
                         let previous_hosts = {
                             let mut config = ui_for_response.config.borrow_mut();
                             let previous_hosts = config.remote_hosts.clone();
-                            // The index can go stale if the file was reloaded
-                            // behind the panel; fall back to matching the name.
-                            match config.remote_hosts.get(index) {
-                                Some(host) if host.name == name => {
-                                    config.remote_hosts.remove(index);
-                                }
-                                _ => config.remote_hosts.retain(|h| h.name != name),
-                            }
-                            previous_hosts
+                            remove_remote_host_snapshot(&mut config.remote_hosts, &expected_host)
+                                .then_some(previous_hosts)
                         };
-                        ui_for_response.reconcile_file_tree_remote_hosts(&previous_hosts);
-                        ui_for_response.persist_config();
+                        if let Some(previous_hosts) = previous_hosts {
+                            ui_for_response.reconcile_file_tree_remote_hosts(&previous_hosts);
+                            ui_for_response.persist_config();
+                        } else {
+                            ui_for_response.toast_overlay.add_toast(adw::Toast::new(
+                                "Remote host changed, disappeared or is duplicated. Nothing was removed; review the refreshed list.",
+                            ));
+                        }
                         let populate = populate_ref.borrow().clone();
                         if let Some(populate) = populate {
                             populate();
@@ -3347,10 +5594,24 @@ impl UiState {
         dialog.add_controller(key_controller);
 
         let dialog_ref = self.settings_dialog.clone();
-        dialog.connect_closed(move |_| {
-            *dialog_ref.borrow_mut() = None;
+        let controls_slot = self.organism_settings_controls.clone();
+        let controls_for_close = organism_controls.clone();
+        dialog.connect_closed(move |closed| {
+            controls_for_close.retire();
+            let is_current = controls_slot
+                .borrow()
+                .as_ref()
+                .is_some_and(|controls| Rc::ptr_eq(controls, &controls_for_close));
+            if is_current {
+                controls_slot.borrow_mut().take();
+            }
+            let is_current = dialog_ref.borrow().as_ref() == Some(closed);
+            if is_current {
+                dialog_ref.borrow_mut().take();
+            }
         });
 
+        *self.organism_settings_controls.borrow_mut() = Some(organism_controls);
         *self.settings_dialog.borrow_mut() = Some(dialog.clone());
         dialog.present(Some(&self.window));
     }
@@ -3370,15 +5631,15 @@ impl UiState {
         // back untouched. Rebuilding an entry from the visible rows alone would
         // drop a `-p 2222` or a pinned session the moment someone corrected a
         // typo in the name, and nothing on screen would show it happened.
+        let expected_hosts = self.config.borrow().remote_hosts.clone();
         let existing = editing.as_ref().and_then(|(index, name)| {
-            let config = self.config.borrow();
-            let resolved = match config.remote_hosts.get(*index) {
+            let resolved = match expected_hosts.get(*index) {
                 Some(host) if &host.name == name => Some(*index),
                 // The file can be reloaded behind an open panel; fall back to
-                // matching the name, exactly as the delete path does.
-                _ => config.remote_hosts.iter().position(|h| &h.name == name),
+                // matching the name before displaying the current edit form.
+                _ => expected_hosts.iter().position(|h| &h.name == name),
             };
-            resolved.map(|index| (index, config.remote_hosts[index].clone()))
+            resolved.map(|index| (index, expected_hosts[index].clone()))
         });
 
         let dialog = adw::Dialog::builder()
@@ -3505,6 +5766,9 @@ impl UiState {
             // Mirrors parse_remote_hosts so a host accepted here always
             // survives a reload of the saved file.
             let result: Result<(Option<usize>, crate::config::RemoteHost), &'static str> = (|| {
+                if ui.config.borrow().remote_hosts != expected_hosts {
+                    return Err(REMOTE_HOSTS_CHANGED);
+                }
                 if was_editing && existing.is_none() {
                     return Err("This host is no longer in the configuration.");
                 }
@@ -3586,19 +5850,24 @@ impl UiState {
                     error_label.set_visible(true);
                 }
                 Ok((target, new_host)) => {
-                    let previous_hosts = {
+                    let committed = {
                         let mut config = ui.config.borrow_mut();
                         let previous_hosts = config.remote_hosts.clone();
-                        match target {
-                            // Replaced in place so the host keeps its position
-                            // in the picker; remove-then-push would move it to
-                            // the end on every edit.
-                            Some(index) if index < config.remote_hosts.len() => {
-                                config.remote_hosts[index] = new_host;
-                            }
-                            _ => config.remote_hosts.push(new_host),
+                        apply_remote_host_edit(
+                            &mut config.remote_hosts,
+                            &expected_hosts,
+                            target,
+                            new_host,
+                        )
+                        .map(|()| previous_hosts)
+                    };
+                    let previous_hosts = match committed {
+                        Ok(previous) => previous,
+                        Err(message) => {
+                            error_label.set_text(message);
+                            error_label.set_visible(true);
+                            return;
                         }
-                        previous_hosts
                     };
                     ui.reconcile_file_tree_remote_hosts(&previous_hosts);
                     ui.persist_config();
@@ -3671,6 +5940,11 @@ impl UiState {
             // Paste
             {
                 let item = make_item("Paste");
+                crate::block_view::shortcut_hints::decorate_with_map(
+                    &item,
+                    &ui.keybinding_map.borrow(),
+                    Action::Paste,
+                );
                 let popover_c = popover.clone();
                 let ui_paste = ui.clone();
                 let term_paste_target = term.clone();
@@ -3690,6 +5964,11 @@ impl UiState {
             // Split Right
             {
                 let item = make_item("Split Right");
+                crate::block_view::shortcut_hints::decorate_with_map(
+                    &item,
+                    &ui.keybinding_map.borrow(),
+                    Action::SplitHorizontal,
+                );
                 let popover_c = popover.clone();
                 let ui_split_h = ui.clone();
                 item.connect_clicked(move |_| {
@@ -3702,6 +5981,11 @@ impl UiState {
             // Split Down
             {
                 let item = make_item("Split Down");
+                crate::block_view::shortcut_hints::decorate_with_map(
+                    &item,
+                    &ui.keybinding_map.borrow(),
+                    Action::SplitVertical,
+                );
                 let popover_c = popover.clone();
                 let ui_split_v = ui.clone();
                 item.connect_clicked(move |_| {
@@ -3714,6 +5998,11 @@ impl UiState {
             // New Tab
             {
                 let item = make_item("New Tab");
+                crate::block_view::shortcut_hints::decorate_with_map(
+                    &item,
+                    &ui.keybinding_map.borrow(),
+                    Action::NewTab,
+                );
                 let popover_c = popover.clone();
                 let ui_new_tab = ui.clone();
                 item.connect_clicked(move |_| {
@@ -3726,6 +6015,11 @@ impl UiState {
             // Close Pane
             {
                 let item = make_item("Close Pane");
+                crate::block_view::shortcut_hints::decorate_with_map(
+                    &item,
+                    &ui.keybinding_map.borrow(),
+                    Action::ClosePaneOrTab,
+                );
                 let popover_c = popover.clone();
                 let ui_close = ui.clone();
                 item.connect_clicked(move |_| {
@@ -3789,30 +6083,8 @@ impl UiState {
             return;
         };
 
-        let workflows = crate::workflows::load_all();
-        if workflows.is_empty() {
-            // `None` when no absolute user config directory resolves, which is
-            // also when the loader skips that tier: the hint must never name a
-            // directory the loader would not read.
-            let user_dir = crate::workflows::user_workflow_dir();
-            let target = user_dir
-                .as_ref()
-                .map(|dir| dir.display().to_string())
-                .unwrap_or_else(|| "your user configuration directory".to_string());
-            log::debug!("[workflows] no workflows in {target}");
-            // Toast-like hint via a one-shot message dialog. Otherwise the
-            // user gets no feedback at all and concludes the chord is dead.
-            let dialog = adw::MessageDialog::builder()
-                .heading("No workflows yet")
-                .body(format!(
-                    "Add `*.toml`, `*.yaml`, or `*.yml` workflow files to:\n\n{target}"
-                ))
-                .build();
-            dialog.add_response("ok", "OK");
-            dialog.set_transient_for(Some(&self.window));
-            dialog.present();
-            return;
-        }
+        let library = self.workflow_library.snapshot().value;
+        self.refresh_workflow_library();
 
         let dialog = adw::Dialog::builder()
             .title("Workflows")
@@ -3833,7 +6105,7 @@ impl UiState {
         list_box.set_margin_bottom(12);
 
         let picker = Rc::new(RefCell::new(crate::workflows::WorkflowPicker::new(
-            workflows,
+            library.as_ref().clone(),
             WORKFLOW_PALETTE_POLICY,
         )));
         let visible: Vec<_> = picker.borrow().filtered().into_iter().cloned().collect();
@@ -3851,6 +6123,10 @@ impl UiState {
         filter_entry.set_margin_top(8);
         filter_entry.set_margin_bottom(8);
         search_box.append(&filter_entry);
+        let load_status = Label::new(Some("Refreshing workflows…"));
+        load_status.set_wrap(true);
+        load_status.add_css_class("dim-label");
+        search_box.append(&load_status);
         search_box.append(&scrolled);
 
         let toolbar_view = adw::ToolbarView::new();
@@ -3858,28 +6134,35 @@ impl UiState {
         toolbar_view.set_content(Some(&search_box));
         dialog.set_child(Some(&toolbar_view));
 
-        let list_box_for_filter = list_box.clone();
-        let picker_for_filter = picker.clone();
-        filter_entry.connect_search_changed(move |entry| {
-            let normalized = {
-                let mut picker = picker_for_filter.borrow_mut();
-                picker.set_query(entry.text().to_string());
-                picker.query().to_string()
-            };
-            if entry.text().as_str() != normalized {
-                // `set_text` emits this signal again; the normalized second
-                // pass reaches the rendering branch and terminates.
-                entry.set_text(&normalized);
-                return;
-            }
-            let visible: Vec<_> = picker_for_filter
-                .borrow()
-                .filtered()
-                .into_iter()
-                .cloned()
-                .collect();
-            render_workflow_palette_rows(&list_box_for_filter, &visible);
-        });
+        let refresh_query = {
+            let list_box = list_box.clone();
+            let picker = picker.clone();
+            let entry = filter_entry.downgrade();
+            Rc::new(move || {
+                let Some(entry) = entry.upgrade() else {
+                    return;
+                };
+                let (normalized, visible) = {
+                    let mut picker = picker.borrow_mut();
+                    let changed = refresh_workflow_picker_query(&mut picker, entry.text().as_str());
+                    let visible =
+                        changed.then(|| picker.filtered().into_iter().cloned().collect::<Vec<_>>());
+                    (picker.query().to_string(), visible)
+                };
+                // Complete the refresh in this call: normalization must not
+                // depend on a second delayed search-changed signal.
+                if entry.text().as_str() != normalized {
+                    entry.set_text(&normalized);
+                }
+                if let Some(visible) = visible {
+                    render_workflow_palette_rows(&list_box, &visible);
+                }
+            })
+        };
+        {
+            let refresh_query = refresh_query.clone();
+            filter_entry.connect_search_changed(move |_| refresh_query());
+        }
 
         // Pick is the only verb here: either write the command directly
         // (no args) or hand off to the args dialog. The row index resolves
@@ -3904,10 +6187,15 @@ impl UiState {
 
         let pick_for_activate = pick.clone();
         let dialog_for_activate = dialog.clone();
-        list_box.connect_row_activated(move |_, row| {
-            let idx = row.index() as usize;
+        list_box.connect_row_activated(move |list, row| {
+            let index = row.index();
+            // A queued activation from a removed row belongs to the previous
+            // library/query, never to the workflow now occupying that index.
+            if index < 0 || list.row_at_index(index).as_ref() != Some(row) {
+                return;
+            }
             dialog_for_activate.force_close();
-            pick_for_activate(idx);
+            pick_for_activate(index as usize);
         });
 
         let key_controller = EventControllerKey::new();
@@ -3917,6 +6205,7 @@ impl UiState {
         let dialog_for_key = dialog.clone();
         let pick_for_key = pick.clone();
         let picker_for_key = picker.clone();
+        let refresh_query_for_key = refresh_query.clone();
         key_controller.connect_key_pressed(move |_, keyval, _, state| {
             if keyval == Key::Escape
                 || (matches!(keyval, Key::M | Key::m)
@@ -3929,6 +6218,8 @@ impl UiState {
                 return true.into();
             }
             if matches!(keyval, Key::Return | Key::KP_Enter) {
+                // Accept the query visible now, before the debounced signal.
+                refresh_query_for_key();
                 if let Some(row) = list_box_for_key.selected_row() {
                     let idx = row.index() as usize;
                     dialog_for_key.force_close();
@@ -3965,6 +6256,29 @@ impl UiState {
             *dialog_ref.borrow_mut() = None;
         });
 
+        {
+            let picker = picker.clone();
+            let list = list_box.downgrade();
+            let filter = filter_entry.downgrade();
+            self.watch_workflow_library(&dialog, &load_status, library, move |workflows| {
+                let (Some(list), Some(filter)) = (list.upgrade(), filter.upgrade()) else {
+                    return;
+                };
+                let selected = list.selected_row().map(|row| row.index() as usize);
+                let mut picker = picker.borrow_mut();
+                let selected = replace_workflow_picker_library(
+                    &mut picker,
+                    workflows,
+                    filter.text().as_str(),
+                    selected,
+                );
+                let visible: Vec<_> = picker.filtered().into_iter().cloned().collect();
+                render_workflow_palette_rows(&list, &visible);
+                if let Some(row) = list.row_at_index(selected as i32) {
+                    list.select_row(Some(&row));
+                }
+            });
+        }
         *self.workflows_palette_dialog.borrow_mut() = Some(dialog.clone());
         dialog.present(Some(&self.window));
         filter_entry.grab_focus();
@@ -4083,10 +6397,17 @@ impl UiState {
                 "Clear this value and mark it as required"
             }));
             let form_for_reset = form.clone();
-            let row_for_reset = row.clone();
+            let row_for_reset = row.downgrade();
+            let dialog_for_reset = dialog.downgrade();
             let refresh_for_reset = refresh_outstanding.clone();
             let sync_for_reset = programmatic_sync.clone();
             reset.connect_clicked(move |_| {
+                if workflow_dialog_if_open(&dialog_for_reset).is_none() {
+                    return;
+                }
+                let Some(row_for_reset) = row_for_reset.upgrade() else {
+                    return;
+                };
                 // Drop the mutable borrow before `set_text`: changing the row
                 // emits `changed`, whose callback borrows the same form.
                 let value = {
@@ -4113,10 +6434,19 @@ impl UiState {
         dialog.set_child(Some(&toolbar_view));
 
         let form_for_run = form.clone();
-        let pane_for_run = pane.clone();
+        let pane_for_run = Some(pane.root_widget().downgrade());
         let ui_for_run = self.clone();
-        let dialog_for_run = dialog.clone();
+        let dialog_for_run = dialog.downgrade();
         run_btn.connect_clicked(move |_| {
+            let Some(dialog_for_run) = workflow_dialog_if_open(&dialog_for_run) else {
+                return;
+            };
+            let Some(pane_for_run) = ui_for_run.palette_input_target(&pane_for_run) else {
+                ui_for_run.toast_overlay.add_toast(adw::Toast::new(
+                    "Nothing was inserted: the workflow's original pane is no longer active.",
+                ));
+                return;
+            };
             // `ArgsForm::render` re-validates the workflow, bounds and checks
             // every value, and puts the finished text back across
             // `review_input::validate`. The old path called `substitute`,
@@ -4129,8 +6459,13 @@ impl UiState {
             let rendered = form_for_run.borrow().render();
             match rendered {
                 Ok(resolved) => {
-                    dialog_for_run.force_close();
-                    ui_for_run.insert_review_text(&pane_for_run, &resolved);
+                    finish_workflow_insertion(
+                        || ui_for_run.insert_review_text(&pane_for_run, &resolved),
+                        || {
+                            dialog_for_run.force_close();
+                            pane_for_run.grab_focus();
+                        },
+                    );
                 }
                 Err(error) => {
                     log::warn!("refusing unsafe or incomplete workflow render: {error}");
@@ -4147,9 +6482,12 @@ impl UiState {
         // keyboard-only operation. It deliberately never sends Enter to PTY.
         let key_controller = EventControllerKey::new();
         key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
-        let dialog_for_key = dialog.clone();
-        let run_btn_for_key = run_btn.clone();
+        let dialog_for_key = dialog.downgrade();
+        let run_btn_for_key = run_btn.downgrade();
         key_controller.connect_key_pressed(move |_, keyval, _, state| {
+            let Some(dialog_for_key) = workflow_dialog_if_open(&dialog_for_key) else {
+                return false.into();
+            };
             if keyval == Key::Escape {
                 dialog_for_key.force_close();
                 return true.into();
@@ -4157,7 +6495,9 @@ impl UiState {
             if matches!(keyval, Key::Return | Key::KP_Enter)
                 && state.contains(ModifierType::CONTROL_MASK)
             {
-                run_btn_for_key.emit_clicked();
+                if let Some(run_btn_for_key) = run_btn_for_key.upgrade() {
+                    run_btn_for_key.emit_clicked();
+                }
                 return true.into();
             }
             false.into()
@@ -4175,6 +6515,16 @@ impl UiState {
         let Some(term_view) = self.current_term_view() else {
             return;
         };
+        self.show_record_snapshot_dialog_for(&term_view, record_id);
+    }
+
+    /// A search result belongs to its captured pane even if that pane exits
+    /// while the dialog is open. Never look up its record in the current pane.
+    pub(super) fn show_record_snapshot_dialog_for(
+        &self,
+        term_view: &crate::block_view::TermView,
+        record_id: u64,
+    ) {
         let Some(view) = term_view.record_snapshot_view(record_id) else {
             // The budget can evict a snapshot between navigation and
             // presentation; answer with the honest message, not an empty pane.
@@ -4256,6 +6606,116 @@ impl UiState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plain_text_picker_rows_disable_implicit_pango_markup() {
+        let source = include_str!("dialogs.rs");
+        for (start, end) in [
+            (
+                "fn render_workflow_palette_rows(",
+                "fn preferences_group_title(",
+            ),
+            (
+                "pub(crate) fn show_remote_picker(",
+                "pub(crate) fn show_history_palette(",
+            ),
+            (
+                "pub(crate) fn show_history_palette(",
+                "pub(crate) fn close_cross_block_search(",
+            ),
+        ] {
+            let section = source
+                .split(start)
+                .nth(1)
+                .unwrap()
+                .split(end)
+                .next()
+                .unwrap();
+            let builder = section
+                .split("let row = adw::ActionRow::builder()")
+                .nth(1)
+                .unwrap()
+                .split(".build()")
+                .next()
+                .unwrap();
+            assert!(
+                builder.contains(".use_markup(false)"),
+                "plain text row: {start}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_host_delete_uses_one_complete_snapshot_after_reorder() {
+        let expected = ("same name", "host-a", "port22");
+        let unrelated = ("other", "host-b", "port22");
+        let same_name_other = ("same name", "host-c", "port2222");
+        let mut hosts = vec![unrelated, same_name_other, expected];
+        assert!(super::remove_remote_host_snapshot(&mut hosts, &expected));
+        assert_eq!(hosts, [unrelated, same_name_other]);
+    }
+
+    #[test]
+    fn remote_host_delete_refuses_removed_edited_and_ambiguous_profiles() {
+        let expected = ("same name", "host-a", "port22");
+        for mut hosts in [
+            vec![],
+            vec![("same name", "replacement", "port22")],
+            vec![("same name", "host-a", "port2222")],
+            vec![expected, expected],
+        ] {
+            let unchanged = hosts.clone();
+            assert!(!super::remove_remote_host_snapshot(&mut hosts, &expected));
+            assert_eq!(hosts, unchanged);
+        }
+    }
+
+    #[test]
+    fn remote_host_delete_confirmation_captures_profile_and_has_no_name_fallback() {
+        let source = include_str!("dialogs.rs");
+        let delete = source
+            .split_once("let expected_host = host.clone();")
+            .unwrap()
+            .1
+            .split_once("group_for_hosts.add(&row);")
+            .unwrap()
+            .0;
+        assert!(delete.contains("let expected_host = expected_host.clone();"));
+        assert!(delete
+            .contains("remove_remote_host_snapshot(&mut config.remote_hosts, &expected_host)"));
+        assert!(!delete.contains("get(index)"));
+        assert!(!delete.contains("retain("));
+        assert!(
+            delete.find("if let Some(previous_hosts)").unwrap()
+                < delete.find("ui_for_response.persist_config()").unwrap()
+        );
+    }
+
+    #[test]
+    fn remote_host_edit_refuses_every_stale_list_without_mutation() {
+        let expected = vec![1, 2];
+        for mut current in [vec![3, 2], vec![2], vec![], vec![2, 1], vec![1, 2, 3]] {
+            let unchanged = current.clone();
+            for target in [Some(0), None] {
+                assert_eq!(
+                    super::apply_remote_host_edit(&mut current, &expected, target, 4),
+                    Err(super::REMOTE_HOSTS_CHANGED)
+                );
+                assert_eq!(current, unchanged);
+            }
+        }
+    }
+
+    #[test]
+    fn remote_host_edit_never_appends_for_a_missing_edit_target() {
+        let mut current = vec![1];
+        assert!(super::apply_remote_host_edit(&mut current, &[1], Some(1), 2).is_err());
+        assert_eq!(current, [1]);
+        super::apply_remote_host_edit(&mut current, &[1], Some(0), 2).unwrap();
+        assert_eq!(current, [2]);
+        super::apply_remote_host_edit(&mut current, &[2], None, 3).unwrap();
+        assert_eq!(current, [2, 3]);
+    }
+
     use super::{
         clear_cross_block_search_dialog_claim, cross_block_bookmark_confirmation,
         cross_block_bookmark_copy, cross_block_bookmark_unavailable_status,
@@ -4263,18 +6723,19 @@ mod tests {
         cross_block_focus_confirms_result, cross_block_jump_outcome,
         cross_block_refresh_selection_index, cross_block_search_compact_layout,
         cross_block_search_dialog_for_close, cross_block_search_dialog_title,
-        cross_block_search_has_intent, cross_block_search_idle_status,
-        cross_block_search_is_bookmark_shortcut, cross_block_search_is_plain_refresh_key,
-        cross_block_search_jump_unavailable_status, cross_block_search_memory,
-        cross_block_search_pending_status, cross_block_search_query_error,
-        cross_block_search_refresh_status, cross_block_search_status, cross_block_selection_index,
-        cross_block_should_step, preferences_group_title, record_snapshot_dialog_title,
-        record_snapshot_status_line, record_snapshot_unavailable_message,
-        record_workflow_arg_entry_change, remote_picker_guard, CrossBlockBookmarkKeyDecision,
-        CrossBlockBookmarkKeyLatch, CrossBlockEnterKeyRoute, CrossBlockJumpOutcome,
-        CrossBlockRefreshFrameDecision, CrossBlockRefreshFrameGate, CrossBlockRefreshKeyDecision,
-        CrossBlockRefreshKeyLatch, CrossBlockSelectionAnchor, CrossBlockSelectionMove,
-        CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES, WORKFLOW_PALETTE_POLICY,
+        cross_block_search_idle_status, cross_block_search_is_bookmark_shortcut,
+        cross_block_search_is_plain_refresh_key, cross_block_search_jump_unavailable_status,
+        cross_block_search_memory, cross_block_search_pending_status,
+        cross_block_search_query_error, cross_block_search_refresh_status,
+        cross_block_search_status, cross_block_selection_index, cross_block_should_step,
+        finish_workflow_insertion, overlay_scan_status, preferences_group_title,
+        record_snapshot_dialog_title, record_snapshot_status_line,
+        record_snapshot_unavailable_message, record_workflow_arg_entry_change, remote_picker_guard,
+        CrossBlockBookmarkKeyDecision, CrossBlockBookmarkKeyLatch, CrossBlockEnterKeyRoute,
+        CrossBlockJumpOutcome, CrossBlockRefreshFrameDecision, CrossBlockRefreshFrameGate,
+        CrossBlockRefreshKeyDecision, CrossBlockRefreshKeyLatch, CrossBlockSelectionAnchor,
+        CrossBlockSelectionMove, CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
+        WORKFLOW_PALETTE_POLICY,
     };
     use crate::block_view::{
         BookmarkedSearchEmptyReason, CrossBlockHit, CrossBlockSearchOptions, CrossBlockSearchScope,
@@ -4289,8 +6750,87 @@ mod tests {
             line_no: 1,
             line_text: format!("hit {block_id}"),
             cmd_preview: "cargo test".to_string(),
+            exit_code: None,
+            duration_ms: None,
+            cwd: None,
             occurrence: 0,
         }
+    }
+
+    fn outcome_hit(
+        exit_code: Option<i32>,
+        duration_ms: Option<u64>,
+        cwd: Option<&str>,
+    ) -> CrossBlockHit {
+        CrossBlockHit {
+            block_id: 1,
+            is_output: true,
+            line_no: 1,
+            line_text: "error[E0308]".to_string(),
+            cmd_preview: "cargo build".to_string(),
+            exit_code,
+            duration_ms,
+            cwd: cwd.map(str::to_string),
+            occurrence: 0,
+        }
+    }
+
+    /// Optional palette chrome must answer "which of these `cargo build`s
+    /// failed" without visiting each one — success stays badge-free, and an
+    /// empty record wears no suffix.
+    #[test]
+    fn outcome_suffix_reports_only_what_the_record_carried() {
+        assert_eq!(
+            super::hit_outcome_label(&outcome_hit(
+                Some(1),
+                Some(2_400),
+                Some("/srv/ci/work/forge")
+            ))
+            .as_deref(),
+            Some("exit:1 · 2.4s · …/work/forge")
+        );
+        assert_eq!(
+            super::hit_outcome_label(&outcome_hit(Some(0), Some(2_400), None)).as_deref(),
+            Some("2.4s"),
+            "a success is the absence of an exit badge, not `exit:0`"
+        );
+        assert_eq!(
+            super::hit_outcome_label(&outcome_hit(None, None, None)),
+            None,
+            "a record with no outcome gets no suffix rather than an empty one"
+        );
+        assert_eq!(
+            super::hit_outcome_label(&outcome_hit(None, None, Some(""))),
+            None,
+            "an empty cwd is not a directory"
+        );
+        assert_eq!(
+            super::hit_outcome_label(&outcome_hit(Some(137), Some(2_400), None)).as_deref(),
+            Some("exit:137 SIGKILL · 2.4s")
+        );
+        assert_eq!(
+            super::hit_outcome_label(&outcome_hit(Some(130), None, None)).as_deref(),
+            Some("exit:130 · interrupted")
+        );
+        assert_eq!(
+            super::hit_outcome_label(&outcome_hit(Some(148), None, None)).as_deref(),
+            Some("exit:148 · suspended")
+        );
+        assert_eq!(
+            super::hit_outcome_class(Some(148)),
+            "block-status-interrupted"
+        );
+        assert_eq!(
+            super::hit_outcome_class(Some(130)),
+            "block-status-interrupted"
+        );
+        assert_eq!(super::hit_outcome_class(Some(137)), "block-status-bad");
+        assert_eq!(super::hit_outcome_class(Some(0)), "block-status-ok");
+        assert_eq!(
+            super::hit_outcome_class(None),
+            "block-status-ok",
+            "missing exit stays success-class, matching the Block card"
+        );
     }
 
     #[test]
@@ -4304,6 +6844,165 @@ mod tests {
             Err("No remote hosts are configured. Add one in Settings → Remote Hosts.")
         );
         assert!(remote_picker_guard(false, 1).is_ok());
+    }
+
+    #[test]
+    fn workflow_insertion_rejection_preserves_the_form() {
+        let open = std::cell::Cell::new(true);
+        let draft = std::cell::RefCell::new(String::from("keep these arguments"));
+        let calls = std::cell::RefCell::new(Vec::new());
+        finish_workflow_insertion(
+            || {
+                calls.borrow_mut().push("rejected");
+                false
+            },
+            || {
+                calls.borrow_mut().push("closed");
+                open.set(false);
+                draft.borrow_mut().clear();
+            },
+        );
+        assert!(open.get());
+        assert_eq!(*draft.borrow(), "keep these arguments");
+        assert_eq!(*calls.borrow(), ["rejected"]);
+    }
+
+    #[test]
+    fn workflow_insertion_acceptance_precedes_form_close() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        finish_workflow_insertion(
+            || {
+                calls.borrow_mut().push("accepted");
+                true
+            },
+            || calls.borrow_mut().push("closed"),
+        );
+        assert_eq!(*calls.borrow(), ["accepted", "closed"]);
+    }
+
+    #[test]
+    fn workflow_form_callbacks_do_not_keep_dialog_rows_or_pane_alive() {
+        let source = include_str!("dialogs.rs");
+        let form = source
+            .split("    pub(crate) fn show_workflow_args_dialog(")
+            .nth(1)
+            .unwrap()
+            .split("    /// Read-only view of a completed record")
+            .next()
+            .unwrap();
+        for weak in [
+            "let row_for_reset = row.downgrade()",
+            "let dialog_for_run = dialog.downgrade()",
+            "let dialog_for_key = dialog.downgrade()",
+            "let pane_for_run = Some(pane.root_widget().downgrade())",
+        ] {
+            assert!(form.contains(weak), "missing weak callback owner: {weak}");
+        }
+        assert!(!form.contains("let pane_for_run = pane.clone()"));
+        assert!(form.contains("ui_for_run.palette_input_target(&pane_for_run)"));
+        let submit = form
+            .split("run_btn.connect_clicked(move |_|")
+            .nth(1)
+            .unwrap();
+        assert!(
+            submit.find("workflow_dialog_if_open").unwrap() < submit.find(".render()").unwrap()
+        );
+        assert!(submit.find("palette_input_target").unwrap() < submit.find(".render()").unwrap());
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK process and display"]
+    fn workflow_form_weak_callbacks_release_closed_widgets() {
+        use adw::prelude::*;
+        use gtk4::glib;
+        use libadwaita as adw;
+        use std::cell::Cell;
+        use std::rc::Rc;
+        adw::init().expect("GTK/Adwaita display");
+        let pump = || {
+            while glib::MainContext::default().iteration(false) {}
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        let window = adw::Window::new();
+        let dialog = adw::Dialog::new();
+        let body = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let row = adw::EntryRow::new();
+        let reset = gtk4::Button::with_label("Reset");
+        row.add_suffix(&reset);
+        body.append(&row);
+        let insert = gtk4::Button::with_label("Insert");
+        body.append(&insert);
+        dialog.set_child(Some(&body));
+        let weak_dialog = dialog.downgrade();
+        let weak_row = row.downgrade();
+        let calls = Rc::new(Cell::new(0));
+        {
+            let dialog = weak_dialog.clone();
+            let calls = calls.clone();
+            insert.connect_clicked(move |_| {
+                if super::workflow_dialog_if_open(&dialog).is_some() {
+                    calls.set(calls.get() + 1);
+                }
+            });
+        }
+        {
+            let dialog = weak_dialog.clone();
+            let row = weak_row.clone();
+            reset.connect_clicked(move |_| {
+                if super::workflow_dialog_if_open(&dialog).is_some() {
+                    if let Some(row) = row.upgrade() {
+                        row.set_text("reset");
+                    }
+                }
+            });
+        }
+        window.present();
+        dialog.present(Some(&window));
+        pump();
+        insert.emit_clicked();
+        assert_eq!(calls.get(), 1);
+        dialog.force_close();
+        pump();
+        insert.emit_clicked();
+        assert_eq!(calls.get(), 1, "late submit after close must be inert");
+        drop((insert, reset, row, body, dialog));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while weak_dialog.upgrade().is_some() || weak_row.upgrade().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "closed form leaked its widgets"
+            );
+            pump();
+        }
+        window.close();
+    }
+
+    #[test]
+    fn workflow_form_completion_uses_the_captured_target_after_acceptance() {
+        let source = include_str!("dialogs.rs");
+        let form = source
+            .split("pub(crate) fn show_workflow_args_dialog")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn show_record_snapshot_dialog")
+            .next()
+            .unwrap();
+        let success = form
+            .split("Ok(resolved) => {")
+            .nth(1)
+            .unwrap()
+            .split("Err(error) => {")
+            .next()
+            .unwrap();
+        let gate = success.find("finish_workflow_insertion(").unwrap();
+        let insert = success
+            .find("insert_review_text(&pane_for_run, &resolved)")
+            .unwrap();
+        let close = success.find("dialog_for_run.force_close()").unwrap();
+        let focus = success.find("pane_for_run.grab_focus()").unwrap();
+        assert!(gate < insert && insert < close && close < focus);
+        assert!(!success.contains("current_pane"));
+        assert!(!success.contains("write_input"));
     }
 
     #[test]
@@ -4339,6 +7038,208 @@ mod tests {
     }
 
     #[test]
+    fn history_query_refresh_changes_only_effective_filter_text() {
+        assert_eq!(
+            super::changed_history_query("", "ALPHA"),
+            Some("alpha".to_string())
+        );
+        assert_eq!(super::changed_history_query("alpha", "AlPhA"), None);
+        assert_eq!(
+            super::changed_history_query("alpha", "zzzz-unmatched"),
+            Some("zzzz-unmatched".to_string())
+        );
+        assert_eq!(
+            super::changed_history_query("zzzz-unmatched", ""),
+            Some(String::new())
+        );
+        assert_eq!(super::changed_history_query("", ""), None);
+    }
+
+    #[test]
+    fn history_enter_refreshes_before_accepting_visible_row() {
+        let source = include_str!("dialogs.rs");
+        let palette = source
+            .split("pub(crate) fn show_history_palette(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn close_cross_block_search(")
+            .next()
+            .unwrap();
+        let refresh = palette
+            .split("let refresh_query = Rc::new(move |text: &str|")
+            .nth(1)
+            .unwrap()
+            .split("// Paste the selected command")
+            .next()
+            .unwrap();
+        assert!(refresh.contains("changed_history_query(&rendered_query.borrow(), text)"));
+        assert!(refresh.contains("query.is_empty() || hay.contains(&query)"));
+        assert!(refresh.contains("list_box_for_filter.unselect_all()"));
+        assert!(!refresh.contains("filter_entry.clone()"));
+        let enter = palette
+            .split("if matches!(keyval, Key::Return | Key::KP_Enter) {")
+            .nth(1)
+            .unwrap()
+            .split("if keyval == Key::Down")
+            .next()
+            .unwrap();
+        assert!(
+            enter
+                .find("refresh_query_for_key(filter_for_key.text().as_str())")
+                .unwrap()
+                < enter.find("selected_row()").unwrap()
+        );
+        assert!(enter.contains(".filter(|row| row.is_visible())"));
+        assert!(enter.find("if let Some(row)").unwrap() < enter.find("force_close()").unwrap());
+        let paste = palette
+            .split("let paste = {")
+            .nth(1)
+            .unwrap()
+            .split("let paste_for_activate")
+            .next()
+            .unwrap();
+        assert!(paste.contains("let pane = pane.clone();"));
+        assert!(paste.contains("ui.insert_review_text(&pane, cmd)"));
+        let mouse = palette
+            .split("list_box.connect_row_activated")
+            .nth(1)
+            .unwrap()
+            .split("let key_controller")
+            .next()
+            .unwrap();
+        assert!(!mouse.contains("refresh_query"));
+    }
+
+    #[test]
+    fn workflow_background_refresh_preserves_query_and_selected_source_path() {
+        let make = |name: &str| Workflow {
+            name: name.into(),
+            description: String::new(),
+            command: "echo done".into(),
+            tags: Vec::new(),
+            shell: None,
+            args: Vec::new(),
+            source_path: Some(std::path::PathBuf::from(format!("/w/{name}.toml"))),
+        };
+        let mut picker = crate::workflows::WorkflowPicker::new(
+            vec![make("alpha"), make("beta")],
+            WORKFLOW_PALETTE_POLICY,
+        );
+        let selected = super::replace_workflow_picker_library(
+            &mut picker,
+            &[make("new"), make("alpha"), make("beta")],
+            "",
+            Some(1),
+        );
+        assert_eq!(selected, 2);
+        assert_eq!(picker.workflow_at_filtered(selected).unwrap().name, "beta");
+        let selected = super::replace_workflow_picker_library(
+            &mut picker,
+            &[make("alpha"), make("beta")],
+            "beta",
+            Some(selected),
+        );
+        assert_eq!(picker.query(), "beta");
+        assert_eq!(selected, 0);
+        assert_eq!(picker.workflow_at_filtered(selected).unwrap().name, "beta");
+        let selected = super::replace_workflow_picker_library(&mut picker, &[], "beta", Some(0));
+        assert_eq!(selected, 0);
+        assert!(picker.filtered().is_empty());
+    }
+
+    #[test]
+    fn workflow_query_refresh_handles_fast_enter_and_preserves_unchanged_selection() {
+        let entries = ["alpha", "beta"]
+            .into_iter()
+            .map(|name| Workflow {
+                name: name.to_string(),
+                description: String::new(),
+                command: format!("echo {name}"),
+                tags: Vec::new(),
+                shell: None,
+                args: Vec::new(),
+                source_path: None,
+            })
+            .collect();
+        let mut picker = crate::workflows::WorkflowPicker::new(entries, WORKFLOW_PALETTE_POLICY);
+        picker.select(1);
+        assert!(!super::refresh_workflow_picker_query(&mut picker, ""));
+        assert_eq!(picker.selected(), 1);
+        assert!(super::refresh_workflow_picker_query(&mut picker, "alpha\n"));
+        assert_eq!(picker.query(), "alpha");
+        assert_eq!(picker.workflow_at_filtered(0).unwrap().name, "alpha");
+        assert!(!super::refresh_workflow_picker_query(&mut picker, "alpha"));
+        assert!(super::refresh_workflow_picker_query(
+            &mut picker,
+            "zzzz-unmatched"
+        ));
+        assert!(picker.workflow_at_filtered(0).is_none());
+        assert!(super::refresh_workflow_picker_query(&mut picker, ""));
+        picker.select(1);
+        assert!(!super::refresh_workflow_picker_query(&mut picker, "\n"));
+        assert_eq!(picker.query(), "");
+        assert_eq!(
+            picker.selected(),
+            1,
+            "normalization-only notification preserves selection"
+        );
+    }
+
+    #[test]
+    fn workflow_enter_refreshes_visible_query_before_selection_and_close() {
+        let source = include_str!("dialogs.rs");
+        let palette = source
+            .split("pub(crate) fn show_workflows_palette(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn show_workflow_args_dialog(")
+            .next()
+            .unwrap();
+        let refresh = palette
+            .split("let refresh_query = {")
+            .nth(1)
+            .unwrap()
+            .split("// Pick is the only verb here:")
+            .next()
+            .unwrap();
+        assert!(
+            refresh.contains("refresh_workflow_picker_query(&mut picker, entry.text().as_str())")
+        );
+        assert!(refresh.contains("if let Some(visible) = visible"));
+        assert!(refresh.contains("let entry = filter_entry.downgrade();"));
+        let normalization = refresh
+            .split("if entry.text().as_str() != normalized")
+            .nth(1)
+            .unwrap()
+            .split("if let Some(visible)")
+            .next()
+            .unwrap();
+        assert!(
+            !normalization.contains("return;"),
+            "normalization must finish in the same refresh"
+        );
+        let enter = palette
+            .split("if matches!(keyval, Key::Return | Key::KP_Enter) {")
+            .nth(1)
+            .unwrap()
+            .split("if matches!(keyval, Key::Down | Key::Up)")
+            .next()
+            .unwrap();
+        assert!(
+            enter.find("refresh_query_for_key()").unwrap() < enter.find("selected_row()").unwrap()
+        );
+        assert!(enter.find("if let Some(row)").unwrap() < enter.find("force_close()").unwrap());
+        let mouse = palette
+            .split("list_box.connect_row_activated")
+            .nth(1)
+            .unwrap()
+            .split("let key_controller")
+            .next()
+            .unwrap();
+        assert!(!mouse.contains("refresh_query"));
+    }
+
+    #[test]
     fn standalone_workflow_picker_keeps_forge_search_with_a_drawn_row_cap() {
         assert_eq!(WORKFLOW_PALETTE_POLICY.max_results(), 15);
         assert!(WORKFLOW_PALETTE_POLICY.search_command());
@@ -4371,6 +7272,68 @@ mod tests {
         assert_eq!(picker.selected(), 0, "query changes reset selection");
         assert_eq!(picker.filtered().len(), 1);
         assert_eq!(picker.filtered()[0].name, "workflow-19");
+    }
+
+    #[test]
+    fn organism_availability_description_distinguishes_safe_off_and_on() {
+        assert_eq!(
+            super::organism_enabled_description(false, true),
+            "Local, no-LLM companion for Block, Unified and traditional VTE panes"
+        );
+        assert_eq!(
+            super::organism_enabled_description(false, false),
+            "Off. Offline preview is still available below."
+        );
+        for enabled in [false, true] {
+            assert_eq!(
+                super::organism_enabled_description(true, enabled),
+                "Unavailable in safe mode; offline preview is still available."
+            );
+        }
+    }
+
+    #[test]
+    fn organism_availability_description_follows_accepted_controls_and_user_toggle() {
+        let source = include_str!("dialogs.rs");
+        let sync = source
+            .split("    fn sync(&self, enabled: bool,")
+            .nth(1)
+            .unwrap()
+            .split("fn organism_enabled_description(")
+            .next()
+            .unwrap();
+        assert!(sync.contains("organism_enabled_description(self.safe_mode, enabled)"));
+        let settings = source
+            .split(concat!(
+                "    pub(crate) fn ",
+                "toggle_settings_panel(&self) {"
+            ))
+            .nth(1)
+            .unwrap();
+        let row = settings
+            .split(concat!(
+                "let ascii_organism_row",
+                " = adw::SwitchRow::builder()"
+            ))
+            .nth(1)
+            .unwrap()
+            .split("let ascii_organism_motion_model")
+            .next()
+            .unwrap();
+        assert!(row.contains("organism_enabled_description("));
+        assert!(row.contains("config.ascii_organism_enabled"));
+        let toggle = settings
+            .split("ascii_organism_row.connect_active_notify")
+            .nth(1)
+            .unwrap()
+            .split("let controls_for_motion")
+            .next()
+            .unwrap();
+        assert!(
+            toggle.find("accepts_user_change()").unwrap()
+                < toggle.find("organism_enabled_description(").unwrap()
+        );
+        assert!(toggle.contains("controls_for_enabled.safe_mode"));
     }
 
     #[test]
@@ -4423,20 +7386,54 @@ mod tests {
         assert_eq!(cross_block_search_dialog_title(), "Search Blocks");
         assert_eq!(
             cross_block_search_idle_status(),
-            "Type to search. F5 refreshes; Ctrl+Shift+B bookmarks; Shift+Enter jumps and advances."
+            "Browse blocks or type to search. F5 refreshes; Ctrl+Shift+B bookmarks; Shift+Enter jumps and advances."
         );
         assert_eq!(cross_block_search_pending_status(), "Searching blocks…");
         assert_eq!(cross_block_search_refresh_status(), "Refreshing blocks…");
-        assert_eq!(cross_block_search_status(0, None), "No matches.");
+        assert_eq!(cross_block_search_status(0, None, false), "No matches.");
         assert_eq!(
-            cross_block_search_status(CROSS_BLOCK_SEARCH_LIMIT, None),
-            "500 matches (capped) — refine your query."
+            overlay_scan_status(
+                0,
+                None,
+                false,
+                Some("No bookmarked blocks in retained history."),
+                "needle",
+            ),
+            "No bookmarked blocks in retained history."
         );
-        assert_eq!(cross_block_search_status(37, None), "37 matches");
-        assert_eq!(cross_block_search_status(1, Some(0)), "1 of 1 match");
         assert_eq!(
-            cross_block_search_status(CROSS_BLOCK_SEARCH_LIMIT, Some(36)),
-            "37 of 500 matches (capped) — refine your query."
+            overlay_scan_status(
+                0,
+                None,
+                true,
+                Some("No bookmarked blocks in retained history."),
+                "needle",
+            ),
+            cross_block_search_status(0, None, true)
+        );
+        assert_eq!(
+            cross_block_search_status(0, None, true),
+            "No matches in the scanned prefix — history scan budget reached; narrow the scope or refine the query."
+        );
+        assert_eq!(
+            cross_block_search_status(CROSS_BLOCK_SEARCH_LIMIT, None, false),
+            "500 matching lines (capped) — refine your query."
+        );
+        assert_eq!(
+            cross_block_search_status(37, None, false),
+            "37 matching lines"
+        );
+        assert_eq!(
+            cross_block_search_status(37, None, true),
+            "37 matching lines (scan budget reached — later blocks not examined)"
+        );
+        assert_eq!(
+            cross_block_search_status(1, Some(0), false),
+            "1 of 1 matching line"
+        );
+        assert_eq!(
+            cross_block_search_status(CROSS_BLOCK_SEARCH_LIMIT, Some(36), false),
+            "37 of 500 matching lines (capped) — refine your query."
         );
         assert_eq!(
             cross_block_search_jump_unavailable_status(),
@@ -4860,6 +7857,64 @@ mod tests {
         assert_eq!(cross_block_refresh_selection_index(&[], Some(&anchor)), 0);
     }
 
+    #[test]
+    fn search_snapshot_keeps_the_captured_owner_and_never_falls_back() {
+        let source = include_str!("dialogs.rs");
+        let search = source
+            .split("pub(crate) fn show_cross_block_search(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn toggle_debug_dashboard(")
+            .next()
+            .unwrap();
+        let jump = search
+            .split("let jump = {")
+            .nth(1)
+            .unwrap()
+            .split("let apply_jump_outcome = {")
+            .next()
+            .unwrap();
+        assert!(jump.contains("let term_view = term_view.clone();"));
+        assert!(jump.contains("term_view.navigate_to_record_id(hit.block_id, hit.is_output)"));
+        let outcome = search
+            .split("let apply_jump_outcome = {")
+            .nth(1)
+            .unwrap()
+            .split("let jump_for_activate")
+            .next()
+            .unwrap();
+        assert!(outcome.contains("let term_view = term_view.clone();"));
+        assert!(outcome.contains("ui.show_record_snapshot_dialog_for(&term_view, record_id)"));
+        assert!(!outcome.contains("current_term_view"));
+        let explicit = source
+            .split("    pub(super) fn show_record_snapshot_dialog_for(")
+            .nth(1)
+            .unwrap()
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap();
+        assert!(explicit.contains("term_view.record_snapshot_view(record_id)"));
+        assert!(!explicit.contains("current_term_view"));
+        let absent = explicit
+            .split("let Some(view) =")
+            .nth(1)
+            .unwrap()
+            .split("let dialog =")
+            .next()
+            .unwrap();
+        assert!(absent.contains("record_snapshot_unavailable_message()"));
+        assert!(absent.contains("return;"));
+        let wrapper = source
+            .split("pub(crate) fn show_record_snapshot_dialog(")
+            .nth(1)
+            .unwrap()
+            .split("    pub(super) fn show_record_snapshot_dialog_for(")
+            .next()
+            .unwrap();
+        assert!(wrapper.contains("self.current_term_view()"));
+        assert!(wrapper.contains("self.show_record_snapshot_dialog_for(&term_view, record_id)"));
+    }
+
     /// The snapshot dialog's header values come from the completed record;
     /// unknown outcomes stay explicit and background output names itself.
     #[test]
@@ -4913,21 +7968,6 @@ mod tests {
     }
 
     #[test]
-    fn cross_block_search_metadata_filters_are_intent_without_text() {
-        assert!(!cross_block_search_has_intent(
-            "", false, false, false, false
-        ));
-        assert!(cross_block_search_has_intent(
-            "needle", false, false, false, false
-        ));
-        assert!(cross_block_search_has_intent("", true, false, false, false));
-        assert!(cross_block_search_has_intent("", false, true, false, false));
-        assert!(cross_block_search_has_intent("", false, false, true, false));
-        assert!(cross_block_search_has_intent("", false, false, false, true));
-        assert!(cross_block_search_has_intent("", true, true, true, true));
-    }
-
-    #[test]
     fn cross_block_search_memory_is_bounded_and_keeps_matching_intent() {
         let options = CrossBlockSearchOptions {
             case_sensitive: true,
@@ -4969,5 +8009,371 @@ mod tests {
         assert!(!oversized.bookmarked_only);
         assert!(!super::CrossBlockSearchMemory::default().background_only);
         assert!(!super::CrossBlockSearchMemory::default().bookmarked_only);
+    }
+}
+
+#[cfg(test)]
+mod palette_activation_contract_tests {
+    use super::*;
+    #[test]
+    fn stale_activation_never_calls_native_and_false_stays_unsuccessful() {
+        use CrossBlockHighlightOutcome as Outcome;
+        use CrossBlockHighlightPlan as Plan;
+        let called = Cell::new(0);
+        assert_eq!(
+            cross_block_try_highlight(Plan::NativeHighlightAttempt, false, || {
+                called.set(99);
+                true
+            }),
+            Outcome::Unavailable
+        );
+        assert_eq!(
+            cross_block_try_highlight(Plan::NavigatedWithoutHighlight, true, || {
+                called.set(99);
+                false
+            }),
+            Outcome::NavigatedWithoutHighlight
+        );
+        assert_eq!(
+            cross_block_try_highlight(Plan::NavigatedWithoutHighlight, false, || {
+                called.set(99);
+                false
+            }),
+            Outcome::Unavailable
+        );
+        assert_eq!(
+            cross_block_try_highlight(Plan::Unavailable, true, || {
+                called.set(99);
+                true
+            }),
+            Outcome::Unavailable
+        );
+        assert_eq!(called.get(), 0);
+        assert_eq!(
+            cross_block_try_highlight(Plan::NativeHighlightAttempt, true, || {
+                called.set(called.get() + 1);
+                false
+            }),
+            Outcome::Unavailable
+        );
+        assert_eq!(
+            cross_block_try_highlight(Plan::NativeHighlightAttempt, true, || {
+                called.set(called.get() + 1);
+                true
+            }),
+            Outcome::Highlighted
+        );
+        assert_eq!(called.get(), 2);
+    }
+    #[test]
+    fn missing_native_lease_is_not_a_metadata_navigation_lease() {
+        assert_eq!(
+            cross_block_highlight_plan(crate::block_view::CrossBlockRecordKind::Missing),
+            CrossBlockHighlightPlan::Unavailable
+        );
+        assert_eq!(
+            cross_block_highlight_plan(crate::block_view::CrossBlockRecordKind::MetadataRecord),
+            CrossBlockHighlightPlan::NavigatedWithoutHighlight
+        );
+    }
+    #[test]
+    fn result_lease_rejects_query_options_and_generation_changes() {
+        let version = crate::block_view::CrossBlockSearchVersion::default();
+        let options = crate::block_view::CrossBlockSearchOptions {
+            case_sensitive: true,
+            regex: false,
+            whole_word: false,
+        };
+        let query = ("needle".to_owned(), options);
+        assert!(cross_block_results_are_current(
+            Some(&query),
+            Some((3, version)),
+            "needle",
+            options,
+            3,
+            version
+        ));
+        assert!(!cross_block_results_are_current(
+            Some(&query),
+            Some((3, version)),
+            "new",
+            options,
+            3,
+            version
+        ));
+        let changed = crate::block_view::CrossBlockSearchOptions {
+            regex: true,
+            ..options
+        };
+        assert!(!cross_block_results_are_current(
+            Some(&query),
+            Some((3, version)),
+            "needle",
+            changed,
+            3,
+            version
+        ));
+        assert!(!cross_block_results_are_current(
+            Some(&query),
+            Some((3, version)),
+            "needle",
+            options,
+            4,
+            version
+        ));
+    }
+    #[test]
+    fn palette_counts_lines_for_queries_and_records_for_filters() {
+        assert_eq!(
+            cross_block_search_status_for_query(2, None, false, "word"),
+            "2 matching lines"
+        );
+        assert_eq!(
+            cross_block_search_status_for_query(2, None, false, ""),
+            "2 matching records"
+        );
+        assert_eq!(
+            cross_block_search_status_for_query(1, Some(0), false, ""),
+            "1 of 1 matching record"
+        );
+    }
+}
+
+#[cfg(test)]
+mod native_palette_activation_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an isolated GTK process and display"]
+    fn palette_activation_preserves_snapshot_unfold_failure_focus_and_stale_ownership() {
+        gtk4::init().expect("GTK display");
+        let pump = || {
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            while std::time::Instant::now() < until {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        let seed = |view: &crate::block_view::TermView| {
+            crate::block_view::palette_activation_test_feed(
+                view,
+                b"\x1b]133;A\x07$ \x1b]133;B\x07",
+            );
+            pump();
+            crate::block_view::palette_activation_test_feed(view, b"printf needle\r\n\x1b]133;C\x07needle\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+            pump();
+        };
+        let options = crate::block_view::CrossBlockSearchOptions {
+            case_sensitive: true,
+            regex: false,
+            whole_word: false,
+        };
+        let view =
+            crate::block_view::palette_activation_test_view(crate::config::TerminalMode::Block);
+        let window = gtk4::Window::builder()
+            .default_width(700)
+            .default_height(500)
+            .child(&view.widget())
+            .build();
+        window.present();
+        pump();
+        seed(&view);
+        let hits = view
+            .cross_block_search_in_scope(
+                "needle",
+                options,
+                crate::block_view::CrossBlockSearchScope::Output,
+                10,
+                &crate::block_view::BlockFilters::default(),
+            )
+            .unwrap()
+            .hits;
+        let hit = hits
+            .first()
+            .expect("production PTY completion creates output search row")
+            .clone();
+        assert_eq!(
+            view.cross_block_record_kind(hit.block_id),
+            crate::block_view::CrossBlockRecordKind::NativeRecord
+        );
+
+        let entry = SearchEntry::new();
+        entry.set_text("needle");
+        let status = Label::new(None);
+        let list = ListBox::new();
+        list.append(&Label::new(Some("needle")));
+        let body = gtk4::Box::new(Orientation::Vertical, 0);
+        body.append(&entry);
+        body.append(&status);
+        body.append(&list);
+        let dialog = adw::Dialog::new();
+        dialog.set_child(Some(&body));
+        dialog.present(Some(&window));
+        pump();
+        let lease = view.cross_block_search_version();
+        let generation = Rc::new(Cell::new(0));
+        let fail = Rc::new(Cell::new(false));
+        let calls = Rc::new(Cell::new(0));
+        let outcome = Rc::new(Cell::new(CrossBlockJumpOutcome::KeepOpen));
+        {
+            let view = view.clone();
+            let entry = entry.clone();
+            let status = status.clone();
+            let generation = generation.clone();
+            let fail = fail.clone();
+            let calls = calls.clone();
+            let outcome = outcome.clone();
+            list.connect_row_activated(move |_, _| {
+                outcome.set(activate_cross_block_palette_hit(
+                    cross_block_results_are_current(
+                        Some(&("needle".to_owned(), options)),
+                        Some((0, lease)),
+                        entry.text().as_str(),
+                        options,
+                        generation.get(),
+                        view.cross_block_search_version(),
+                    ),
+                    cross_block_highlight_plan(view.cross_block_record_kind(hit.block_id)),
+                    true,
+                    &status,
+                    &entry,
+                    || {
+                        calls.set(calls.get() + 1);
+                        view.navigate_to_record_id(hit.block_id, hit.is_output)
+                    },
+                    || {
+                        calls.set(calls.get() + 1);
+                        view.focus_match_in_block(
+                            hit.block_id,
+                            if fail.get() {
+                                "absent-fixture-word"
+                            } else {
+                                "needle"
+                            },
+                            options,
+                            hit.is_output,
+                            hit.occurrence,
+                        )
+                    },
+                ));
+            });
+        }
+        let activate = || {
+            list.emit_by_name::<()>("row-activated", &[&list.row_at_index(0).unwrap()]);
+            pump();
+        };
+        activate();
+        assert_eq!(
+            outcome.get(),
+            CrossBlockJumpOutcome::Close,
+            "expanded native target succeeds"
+        );
+        assert!(view.set_all_blocks_collapsed(true) > 0);
+        pump();
+        assert_eq!(
+            crate::block_view::palette_activation_test_collapsed(&view, hit.block_id),
+            Some(true),
+            "target is actually collapsed before activation"
+        );
+        activate();
+        assert_eq!(
+            crate::block_view::palette_activation_test_collapsed(&view, hit.block_id),
+            Some(false),
+            "activation actually unfolds the target"
+        );
+        assert_eq!(
+            outcome.get(),
+            CrossBlockJumpOutcome::Close,
+            "one-time unfold preserves successful highlight"
+        );
+        activate();
+        assert_eq!(
+            outcome.get(),
+            CrossBlockJumpOutcome::Close,
+            "repeated expanded activation succeeds"
+        );
+        fail.set(true);
+        activate();
+        assert_eq!(outcome.get(), CrossBlockJumpOutcome::KeepOpen);
+        assert!(dialog.is_visible());
+        assert!(status.text().contains("Highlight unavailable"));
+        // A Dialog presented from GtkWindow has its own native window.
+        // Read the query's actual root, as production keyboard routing does.
+        let query_root = entry.root().expect("presented query has a root");
+        assert_ne!(&query_root, window.upcast_ref::<gtk4::Root>());
+        let query_window = query_root
+            .downcast_ref::<gtk4::Window>()
+            .expect("dialog query root is a native window");
+        assert!(query_window.is_mapped());
+        eprintln!(
+            "F01 palette focus: separate query root; mapped={}; active={}",
+            query_window.is_mapped(),
+            query_window.is_active()
+        );
+        let focused = query_root
+            .focus()
+            .expect("failed highlight restores query focus");
+        let query = entry.upcast_ref::<gtk4::Widget>();
+        assert!(
+            focused == *query || focused.is_ancestor(query),
+            "failed highlight focuses the query entry, not the result list"
+        );
+        let before = calls.get();
+        entry.set_text("new query before debounce");
+        activate();
+        assert_eq!(outcome.get(), CrossBlockJumpOutcome::KeepOpen);
+        assert_eq!(
+            calls.get(),
+            before,
+            "stale activation never navigates or highlights"
+        );
+        assert!(status.text().contains("Results changed"));
+        entry.set_text("needle");
+        generation.set(1);
+        activate();
+        assert_eq!(calls.get(), before, "new UI generation rejects old rows");
+        generation.set(0);
+        assert!(view.clear_blocks() > 0);
+        assert_ne!(lease, view.cross_block_search_version());
+        activate();
+        assert_eq!(
+            calls.get(),
+            before,
+            "retired finalized record rejects old rows"
+        );
+        dialog.force_close();
+        window.close();
+        pump();
+
+        // An unmapped Unified view has retained metadata/snapshot but no
+        // draw-proven zone projection. The actual backend returns SnapshotView.
+        let unified =
+            crate::block_view::palette_activation_test_view(crate::config::TerminalMode::Unified);
+        seed(&unified);
+        let hit = unified
+            .cross_block_search_in_scope(
+                "needle",
+                options,
+                crate::block_view::CrossBlockSearchScope::Output,
+                10,
+                &crate::block_view::BlockFilters::default(),
+            )
+            .unwrap()
+            .hits
+            .into_iter()
+            .next()
+            .unwrap();
+        let plan = cross_block_highlight_plan(unified.cross_block_record_kind(hit.block_id));
+        assert_eq!(plan, CrossBlockHighlightPlan::NavigatedWithoutHighlight);
+        let outcome = activate_cross_block_palette_hit(
+            true,
+            plan,
+            true,
+            &status,
+            &entry,
+            || unified.navigate_to_record_id(hit.block_id, hit.is_output),
+            || panic!("metadata snapshot must not invoke native highlighter"),
+        );
+        assert_eq!(outcome, CrossBlockJumpOutcome::ShowSnapshot(hit.block_id));
     }
 }

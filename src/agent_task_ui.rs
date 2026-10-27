@@ -9,12 +9,69 @@
 //! the pure parts are headless-testable. Ported from ember's `app/tasks.rs`
 //! and frost's `agent_task_ui.rs` via anvil's GTK adaptation.
 
+#[path = "task_composer.rs"]
+pub(crate) mod task_composer;
+pub(crate) use task_composer::TaskProjectRequest;
+
+#[path = "task_follow_up.rs"]
+mod task_follow_up;
+pub(crate) use task_follow_up::{FollowUpReceipts, TaskFollowUpRequest};
+
+/// Resolve the current binding without interpreting its opaque session identity.
+pub(crate) fn task_terminal_binding(
+    task: &crate::agent_task::AgentTask,
+    role: crate::agent_task::TaskTerminalRole,
+) -> Option<&str> {
+    match role {
+        crate::agent_task::TaskTerminalRole::Agent => task.terminal_session_id.as_deref(),
+        crate::agent_task::TaskTerminalRole::Validation => {
+            task.validation.terminal_session_id.as_deref()
+        }
+    }
+}
+
+/// Resolve against live identities, never against an old tab or pane index.
+pub(crate) fn resolve_task_terminal<T>(
+    binding: Option<&str>,
+    terminals: impl IntoIterator<Item = (String, T)>,
+) -> Option<T> {
+    let binding = binding?;
+    terminals
+        .into_iter()
+        .find_map(|(identity, target)| (identity == binding).then_some(target))
+}
+
+pub(crate) fn task_focus_allowed(
+    visible: bool,
+    selected: Option<TaskId>,
+    requested: TaskId,
+) -> bool {
+    visible && selected == Some(requested)
+}
+
+/// A display-only reason, selected from authoritative task/validation details.
+pub(crate) fn task_reason(
+    status: crate::agent_task::TaskStatus,
+    validation: crate::agent_task::TaskValidationStatus,
+    status_detail: Option<&str>,
+    validation_detail: Option<&str>,
+) -> Option<String> {
+    crate::agent_task::TaskGuidance::reason_for(
+        status,
+        validation,
+        status_detail,
+        validation_detail,
+    )
+    .map(|reason| jterm_core::review_input::safe_inline_display(&reason, 1024))
+}
+
 use crate::agent_task::{
     AgentProvider, ManagedWorktree, NativePromptPolicy, SemanticCommandContext, TaskId,
     WorktreeService, CODEX_APP_SERVER_LIVE_TURN_MAX, NATIVE_AGENT_FOLLOW_UP_MAX_BYTES,
 };
 use crate::config::Config;
 use crate::review_text::visible_bounded;
+use libadwaita as adw;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -63,25 +120,77 @@ pub(crate) fn native_follow_up_can_send(text: &str, completed_turns: usize) -> b
 pub(crate) enum TaskPanelAction {
     /// Create a task from the active pane's selected block evidence.
     CreateFromBlock,
-    StartCodex(TaskId),
+    ComposeProject,
+    CreateProject(TaskProjectRequest),
+    StartNative(TaskId),
     StartTerminal(TaskId),
+    FocusTerminal(TaskId),
+    FocusValidation(TaskId),
     StopCodex(TaskId),
-    FollowUp(TaskId, String),
+    FollowUp(TaskFollowUpRequest),
     FinishCodex(TaskId),
     Approve(TaskId, crate::agent_task::ApprovalId),
     Deny(TaskId, crate::agent_task::ApprovalId),
     RunValidation(TaskId),
     Complete(TaskId),
+    AcceptReviewed(TaskId),
     ReviewDiff(TaskId),
     Archive(TaskId),
+    /// Return a hidden task to the state it had when hidden.
+    Restore(TaskId),
     Select(TaskId),
     Close,
+}
+
+/// Read-only details use the shared bounded projection and contain no inferred history.
+pub(crate) fn task_inspector_text(task: &crate::agent_task::AgentTask) -> String {
+    let inspector = crate::agent_task::TaskInspector::from_task(task);
+    let mut text = inspector
+        .fields
+        .into_iter()
+        .map(|field| format!("{}\n{}", field.label, field.value))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if let Some(goal) = inspector.goal {
+        text.push_str("\n\nGoal\n");
+        text.push_str(&goal);
+    }
+    if task.brief.is_some() {
+        text.push_str("\n\nTerminal brief\n");
+        text.push_str(&format!("On Start terminal, read {} inside the task worktree. Sharing consent is required before the brief is written.", crate::agent_task::pty_task_brief_relative()));
+    }
+    text
+}
+
+/// Deliver an authored goal only after the existing explicit sharing gate allows it.
+pub(crate) fn prepare_authored_terminal(
+    task: &crate::agent_task::AgentTask,
+    policy: NativePromptPolicy,
+    launch: crate::agent_task::AgentLaunchSpec,
+) -> Result<crate::agent_task::AgentLaunchSpec, String> {
+    if task.brief.is_none() {
+        return Ok(launch);
+    }
+    let brief =
+        crate::agent_task::write_pty_task_brief(task, policy).map_err(|error| error.to_string())?;
+    if brief.is_none() {
+        return Err(
+            "Enable AI features and command-context sharing before starting this authored task"
+                .into(),
+        );
+    }
+    Ok(launch.with_pty_seed_prompt(&format!(
+        "Read {} and carry out the task goal inside this isolated worktree.",
+        crate::agent_task::pty_task_brief_relative()
+    )))
 }
 
 /// Fully prepared task registration produced by the background worktree
 /// worker. The UI thread only registers it with the task manager.
 pub(crate) struct PreparedTask {
-    pub(crate) context: SemanticCommandContext,
+    pub(crate) project_request: Option<TaskProjectRequest>,
+    pub(crate) context: Option<SemanticCommandContext>,
+    pub(crate) brief: Option<crate::agent_task::TaskBrief>,
     pub(crate) title: String,
     pub(crate) provider: AgentProvider,
     pub(crate) worktree: ManagedWorktree,
@@ -118,10 +227,6 @@ pub(crate) fn begin_worktree_creation(
     context: SemanticCommandContext,
     provider: AgentProvider,
 ) -> Result<PendingTaskCreation, String> {
-    let worktree_root = dirs::data_local_dir()
-        .ok_or_else(|| "cannot locate the per-user data directory".to_string())?
-        .join("forge")
-        .join("agent-tasks");
     let cwd = context
         .cwd
         .as_deref()
@@ -133,16 +238,52 @@ pub(crate) fn begin_worktree_creation(
         "Fix {}",
         visible_bounded(command, MAX_TASK_TITLE_DISPLAY_BYTES)
     );
+    begin_task_worktree_creation(cwd, title, provider, Some(context), None, None)
+}
+
+pub(crate) fn begin_project_worktree_creation(
+    request: TaskProjectRequest,
+) -> Result<PendingTaskCreation, String> {
+    let draft = request.draft.clone();
+    draft.validate()?;
+    if request.cancelled() {
+        return Err("Task creation was cancelled".into());
+    }
+    begin_task_worktree_creation(
+        draft.directory,
+        draft.title,
+        draft.provider,
+        None,
+        Some(draft.brief),
+        Some(request),
+    )
+}
+
+fn begin_task_worktree_creation(
+    cwd: PathBuf,
+    title: String,
+    provider: AgentProvider,
+    context: Option<SemanticCommandContext>,
+    brief: Option<crate::agent_task::TaskBrief>,
+    project_request: Option<TaskProjectRequest>,
+) -> Result<PendingTaskCreation, String> {
+    let worktree_root = dirs::data_local_dir()
+        .ok_or_else(|| "cannot locate the per-user data directory".to_string())?
+        .join("forge")
+        .join("agent-tasks");
     let token = uuid::Uuid::new_v4().simple().to_string();
     let task_name = format!("task-{token}");
     let branch = format!("forge/{task_name}");
     let (sender, receiver) = mpsc::sync_channel(1);
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = project_request
+        .as_ref()
+        .map(TaskProjectRequest::worktree_cancel_flag)
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let worker_cancel = Arc::clone(&cancel);
     let worker = std::thread::Builder::new()
         .name("forge-task-worktree".to_string())
         .spawn(move || {
-            let result = (|| {
+            let result: Result<PreparedTask, String> = (|| {
                 let service = WorktreeService::new(worktree_root)
                     .map_err(|error| error.to_string())?
                     .with_cancel_flag(worker_cancel);
@@ -156,12 +297,17 @@ pub(crate) fn begin_worktree_creation(
                     .create(&request)
                     .map_err(|error| error.to_string())?;
                 Ok(PreparedTask {
+                    project_request: project_request.clone(),
                     context,
+                    brief,
                     title,
                     provider,
                     worktree,
                 })
             })();
+            if let (Some(request), Err(error)) = (&project_request, &result) {
+                request.finish(Err(error.clone()));
+            }
             let _ = sender.send(result);
         })
         .map_err(|error| format!("could not start task worktree worker: {error}"))?;
@@ -265,6 +411,7 @@ pub(crate) struct TaskRowSnapshot {
     pub(crate) validation_attempt: u64,
     pub(crate) needs_attention: bool,
     pub(crate) status_detail: Option<String>,
+    pub(crate) validation_detail: Option<String>,
 }
 
 impl TaskRowSnapshot {
@@ -295,8 +442,14 @@ pub(crate) fn order_task_rows(rows: &mut [TaskRowSnapshot], updated_at_ms: impl 
 
 /// One-line status summary for a row, bounded for display.
 pub(crate) fn row_status_line(row: &TaskRowSnapshot) -> String {
-    let base = if row.native_preparing {
-        "preparing native Codex".to_string()
+    // A pending approval or question outranks background preparation.
+    let base = if row.native_preparing
+        && !matches!(
+            row.status,
+            crate::agent_task::TaskStatus::WaitingForApproval
+                | crate::agent_task::TaskStatus::WaitingForHuman
+        ) {
+        format!("Preparing native {}", row.provider.display_name())
     } else {
         row.status.label().to_string()
     };
@@ -376,13 +529,56 @@ fn phase_label(phase: crate::agent_task::CodexAppServerPhase) -> &'static str {
     }
 }
 
-fn push_bounded(out: &mut String, text: &str) {
-    let remaining = MAX_NATIVE_STREAM_DISPLAY_BYTES.saturating_sub(out.len());
-    if remaining == 0 {
-        return;
+/// Every fragment, including headings and truncation notices, shares one
+/// UTF-8 byte budget. Stream text preserves structural newlines/tabs while
+/// neutralizing the same controls and visual spoofing as other review text.
+#[derive(Default)]
+struct StreamDisplay {
+    text: String,
+    truncated: bool,
+}
+
+impl StreamDisplay {
+    fn push_str(&mut self, text: &str) {
+        if self.truncated || text.is_empty() {
+            return;
+        }
+        let remaining = MAX_NATIVE_STREAM_DISPLAY_BYTES.saturating_sub(self.text.len());
+        // Four look-ahead bytes cover any UTF-8 scalar. Even if the shared
+        // helper adds its ellipsis, overflow still leaves more than `remaining`
+        // bytes, including when a scalar cannot fit the final one or two bytes.
+        let shown = jterm_core::review_input::safe_multiline_display(text, remaining + 4);
+        let mut end = shown.len().min(remaining);
+        self.truncated = shown.len() > remaining;
+        while !shown.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.text.push_str(&shown[..end]);
     }
-    let shown = crate::review_text::visible_bounded(text, remaining);
-    out.push_str(&shown);
+
+    fn push(&mut self, character: char) {
+        self.push_str(character.encode_utf8(&mut [0; 4]));
+    }
+
+    fn finish(mut self) -> String {
+        if self.truncated {
+            const NOTICE: &str = "\n(stream display truncated)";
+            let mut end = self
+                .text
+                .len()
+                .min(MAX_NATIVE_STREAM_DISPLAY_BYTES - NOTICE.len());
+            while !self.text.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.text.truncate(end);
+            self.text.push_str(NOTICE);
+        }
+        self.text
+    }
+}
+
+fn push_bounded(out: &mut StreamDisplay, text: &str) {
+    out.push_str(text);
 }
 
 /// Render one native session snapshot as bounded plain text for the panel's
@@ -392,7 +588,7 @@ fn push_bounded(out: &mut String, text: &str) {
 pub(crate) fn render_stream_text(
     snapshot: &crate::agent_task::CodexAppServerViewSnapshot,
 ) -> String {
-    let mut out = String::new();
+    let mut out = StreamDisplay::default();
     out.push_str(&format!("phase: {}", phase_label(snapshot.phase)));
     if let Some(error) = &snapshot.last_error {
         push_bounded(&mut out, &format!("\nerror: {error}"));
@@ -477,7 +673,7 @@ pub(crate) fn render_stream_text(
                 out.push('\n');
                 push_bounded(
                     &mut out,
-                    &crate::review_text::visible_bounded(
+                    &jterm_core::review_input::safe_multiline_display(
                         &command.output,
                         MAX_NATIVE_ITEM_DISPLAY_BYTES,
                     ),
@@ -502,10 +698,7 @@ pub(crate) fn render_stream_text(
             }
         }
     }
-    if out.len() >= MAX_NATIVE_STREAM_DISPLAY_BYTES {
-        out.push_str("\n(stream display truncated)");
-    }
-    out
+    out.finish()
 }
 
 /// One pending approval rendered for the action area: stable identity plus a
@@ -545,6 +738,166 @@ pub(crate) fn approval_summary(approval: &crate::agent_task::CodexAppServerAppro
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn task_reason_prefers_current_requests_then_validation_and_drops_stale_detail() {
+        use crate::agent_task::{TaskStatus as S, TaskValidationStatus as V};
+        assert_eq!(
+            super::task_reason(
+                S::ReadyForReview,
+                V::Failed,
+                Some("task failed"),
+                Some("tests failed")
+            )
+            .as_deref(),
+            Some("tests failed")
+        );
+        assert_eq!(
+            super::task_reason(
+                S::ReadyForReview,
+                V::Inconclusive,
+                Some("task failed"),
+                Some("no exit status")
+            )
+            .as_deref(),
+            Some("no exit status")
+        );
+        assert_eq!(
+            super::task_reason(S::Failed, V::Failed, Some("task failed"), Some("  ")).as_deref(),
+            Some("task failed")
+        );
+        for status in [S::WaitingForHuman, S::WaitingForApproval] {
+            assert_eq!(
+                super::task_reason(status, V::NotRun, Some("needs a decision"), None).as_deref(),
+                Some("needs a decision")
+            );
+            assert_eq!(
+                super::task_reason(
+                    status,
+                    V::Failed,
+                    Some("approve the current command"),
+                    Some("old validation failure")
+                )
+                .as_deref(),
+                Some("approve the current command")
+            );
+            assert_eq!(
+                super::task_reason(status, V::Failed, None, Some("old validation failure")),
+                None
+            );
+        }
+        assert_eq!(
+            super::task_reason(
+                S::ReadyForReview,
+                V::Cancelled,
+                None,
+                Some("validation interrupted")
+            )
+            .as_deref(),
+            Some("validation interrupted")
+        );
+        assert_eq!(
+            super::task_reason(
+                S::Completed,
+                V::Passed,
+                Some("old failure"),
+                Some("old tests")
+            ),
+            None
+        );
+        assert_eq!(
+            super::task_reason(S::Failed, V::NotRun, Some(" \n\t "), None),
+            None
+        );
+        assert_eq!(super::task_reason(S::Failed, V::NotRun, None, None), None);
+        let unsafe_detail = format!("bad\u{1b}\n\u{202e}{}", "界".repeat(800));
+        let reason = super::task_reason(S::Failed, V::NotRun, Some(&unsafe_detail), None).unwrap();
+        assert!(reason.len() <= 1024);
+        assert!(!reason.chars().any(char::is_control));
+        assert!(!reason.contains('\u{202e}'));
+        assert_eq!(
+            super::task_reason(S::Failed, V::NotRun, Some("updated"), None).as_deref(),
+            Some("updated")
+        );
+    }
+
+    #[test]
+    fn task_terminal_resolution_survives_reorder_and_rejects_replacement() {
+        use crate::agent_task::{AgentProvider, NewTask, TaskManager, TaskTerminalRole};
+        let mut manager = TaskManager::new();
+        let mut ids = Vec::new();
+        for title in ["first", "second"] {
+            ids.push(
+                manager
+                    .create(NewTask {
+                        title: title.into(),
+                        provider: AgentProvider::Codex,
+                        repo_root: "/fixture".into(),
+                        worktree_path: "/fixture/worktree".into(),
+                        branch: "test/focus".into(),
+                        base_commit: "a".repeat(40),
+                        source_context: None,
+                    })
+                    .unwrap(),
+            );
+        }
+        manager
+            .bind_terminal_session(ids[0], "terminal-first".into())
+            .unwrap();
+        manager
+            .bind_terminal_session(ids[1], "terminal-second".into())
+            .unwrap();
+        manager
+            .update_status(ids[1], crate::agent_task::TaskStatus::ReadyForReview, None)
+            .unwrap();
+        manager
+            .bind_validation_session(ids[1], "validation-second".into())
+            .unwrap();
+        manager.handle_terminal_session_exit("validation-second", Some(0));
+        let before = manager.tasks().to_vec();
+        let binding =
+            super::task_terminal_binding(manager.get(ids[1]).unwrap(), TaskTerminalRole::Agent);
+        assert_eq!(
+            super::resolve_task_terminal(
+                binding,
+                [
+                    ("terminal-first".into(), 11),
+                    ("terminal-second".into(), 22)
+                ]
+            ),
+            Some(22)
+        );
+        assert_eq!(
+            super::resolve_task_terminal(
+                binding,
+                [
+                    ("terminal-second".into(), 22),
+                    ("terminal-first".into(), 11)
+                ]
+            ),
+            Some(22)
+        );
+        assert_eq!(
+            super::resolve_task_terminal(
+                binding,
+                [("replacement".into(), 22), ("terminal-first".into(), 11)]
+            ),
+            None
+        );
+        let validation = super::task_terminal_binding(
+            manager.get(ids[1]).unwrap(),
+            TaskTerminalRole::Validation,
+        );
+        assert_eq!(
+            super::resolve_task_terminal(validation, [("validation-second".into(), 33)]),
+            Some(33),
+            "finished validation output stays focusable"
+        );
+        assert!(super::task_focus_allowed(true, Some(ids[1]), ids[1]));
+        assert!(!super::task_focus_allowed(false, Some(ids[1]), ids[1]));
+        assert!(!super::task_focus_allowed(true, Some(ids[0]), ids[1]));
+        assert_eq!(format!("{:?}", manager.tasks()), format!("{before:?}"));
+    }
+
     use super::*;
     use crate::agent_task::{TaskStatus, TaskValidationStatus};
 
@@ -624,6 +977,7 @@ mod tests {
             validation_attempt: 0,
             needs_attention,
             status_detail: None,
+            validation_detail: None,
         }
     }
 
@@ -650,7 +1004,11 @@ mod tests {
             "Ready for review · validation Passed"
         );
         row.native_preparing = true;
-        assert!(row_status_line(&row).starts_with("preparing native Codex"));
+        assert!(row_status_line(&row).starts_with("Preparing native Codex"));
+        row.provider = AgentProvider::Claude;
+        assert!(row_status_line(&row).starts_with("Preparing native Claude"));
+        row.status = TaskStatus::WaitingForApproval;
+        assert!(row_status_line(&row).starts_with("Waiting for approval"));
     }
 
     #[test]
@@ -714,5 +1072,416 @@ mod tests {
         assert!(plan.rebuild_rows);
         assert!(!plan.apply_selection);
         assert_eq!(plan.select_index, None);
+    }
+    fn stream_snapshot() -> crate::agent_task::CodexAppServerViewSnapshot {
+        crate::agent_task::CodexAppServerViewSnapshot::default()
+    }
+
+    fn stream_history(ordinal: usize) -> crate::agent_task::CodexAppServerTurnHistory {
+        crate::agent_task::CodexAppServerTurnHistory {
+            ordinal,
+            local_turn_id: crate::agent_task::AgentTurnId::new(),
+            follow_up_feedback: Some("please\ncontinue".to_string()),
+            agent_text: String::new(),
+            agent_text_truncated: false,
+            commands: Vec::new(),
+            file_changes: Vec::new(),
+            dropped_updates: 0,
+        }
+    }
+
+    #[test]
+    fn stream_render_empty_snapshot_is_just_phase() {
+        assert_eq!(render_stream_text(&stream_snapshot()), "phase: created");
+    }
+
+    #[test]
+    fn stream_render_preserves_structural_lines_and_tabs() {
+        let mut snapshot = stream_snapshot();
+        snapshot.last_error = Some("first\nsecond".to_string());
+        snapshot.agent_text = "hello\n\tworld".to_string();
+        snapshot.displayed_follow_up_feedback = Some("adjust\nthis".to_string());
+        snapshot.turn_history = vec![stream_history(1)].into();
+        snapshot
+            .commands
+            .push(crate::agent_task::CodexAppServerCommandView {
+                item_id: "command".to_string(),
+                command: "echo hello".to_string(),
+                cwd: "/tmp".to_string(),
+                status: "completed".to_string(),
+                output: "one\ntwo\tthree".to_string(),
+                output_truncated: false,
+            });
+        let rendered = render_stream_text(&snapshot);
+        assert!(rendered.contains("\nerror: first\nsecond"), "{rendered:?}");
+        assert!(rendered.contains("\n> please\ncontinue"));
+        assert!(rendered.contains("\n> adjust\nthis"));
+        assert!(rendered.contains("hello\n\tworld"));
+        assert!(rendered.contains("\n$ echo hello [completed]\none\ntwo\tthree"));
+    }
+
+    #[test]
+    fn stream_render_neutralizes_controls_and_visual_spoofing() {
+        let mut snapshot = stream_snapshot();
+        snapshot.agent_text = "left\u{1b}\u{202e}\u{200b}\u{00a0}\rright".to_string();
+        let rendered = render_stream_text(&snapshot);
+        assert!(rendered.contains("left"));
+        assert!(rendered.contains("right"));
+        for unsafe_char in ['\u{1b}', '\u{202e}', '\u{200b}', '\u{00a0}', '\r'] {
+            assert!(!rendered.contains(unsafe_char));
+        }
+        assert!(rendered.len() <= MAX_NATIVE_STREAM_DISPLAY_BYTES);
+    }
+
+    #[test]
+    fn stream_render_bounds_full_error_plus_history_headings_and_suffixes() {
+        let mut snapshot = stream_snapshot();
+        snapshot.last_error = Some("x".repeat(MAX_NATIVE_STREAM_DISPLAY_BYTES));
+        snapshot.turn_history = (1..=8)
+            .map(|ordinal| {
+                let mut turn = stream_history(ordinal);
+                turn.agent_text = "body".to_string();
+                turn.agent_text_truncated = true;
+                turn.dropped_updates = 10;
+                turn
+            })
+            .collect::<Vec<_>>()
+            .into();
+        snapshot.dropped_turns = 2;
+        snapshot.agent_text = "latest".to_string();
+        snapshot.agent_text_truncated = true;
+        let rendered = render_stream_text(&snapshot);
+        assert!(
+            rendered.len() <= MAX_NATIVE_STREAM_DISPLAY_BYTES,
+            "{} bytes",
+            rendered.len()
+        );
+        assert!(rendered.ends_with("\n(stream display truncated)"));
+    }
+
+    #[test]
+    fn stream_render_bounds_unicode_and_expanding_controls_at_every_edge() {
+        for scalar in ['界', '🙂', '\u{1b}', '\u{202e}'] {
+            for edge in 0..=7 {
+                let mut snapshot = stream_snapshot();
+                snapshot.agent_text = format!(
+                    "{}{}",
+                    "x".repeat(MAX_NATIVE_STREAM_DISPLAY_BYTES - 32 + edge),
+                    scalar.to_string().repeat(40)
+                );
+                let rendered = render_stream_text(&snapshot);
+                assert!(
+                    rendered.len() <= MAX_NATIVE_STREAM_DISPLAY_BYTES,
+                    "{scalar:?}/{edge}: {} bytes",
+                    rendered.len()
+                );
+                assert!(rendered.ends_with("\n(stream display truncated)"));
+                assert!(rendered.is_char_boundary(rendered.len()));
+            }
+        }
+    }
+
+    #[test]
+    fn stream_render_item_budget_preserves_multiline_output() {
+        let mut snapshot = stream_snapshot();
+        snapshot
+            .commands
+            .push(crate::agent_task::CodexAppServerCommandView {
+                item_id: "command".to_string(),
+                command: "echo".to_string(),
+                cwd: "/tmp".to_string(),
+                status: "done".to_string(),
+                output: format!("first\n{}", "界".repeat(MAX_NATIVE_ITEM_DISPLAY_BYTES)),
+                output_truncated: true,
+            });
+        let rendered = render_stream_text(&snapshot);
+        assert!(rendered.contains("\nfirst\n"));
+        assert!(rendered.len() < MAX_NATIVE_ITEM_DISPLAY_BYTES + 256);
+        assert!(rendered.ends_with(" …"));
+    }
+}
+
+/// A bounded, redacted title and a stable ID prefix; never use prompt/output text.
+fn feedback_identity(manager: &crate::agent_task::TaskManager, id: TaskId) -> String {
+    let full = id.to_string();
+    let peers: Vec<_> = manager
+        .tasks()
+        .iter()
+        .filter(|task| task.id != id)
+        .map(|task| task.id.to_string())
+        .collect();
+    let length = feedback_id_prefix_length(&full, &peers);
+    let title = manager
+        .get(id)
+        .map(|task| feedback_title(&task.title))
+        .unwrap_or_else(|| "Task no longer available".into());
+    format!("{title} [{}]", &full[..length])
+}
+
+fn feedback_id_prefix_length(full: &str, peers: &[String]) -> usize {
+    let mut length = 8;
+    while length < full.len() && peers.iter().any(|peer| peer.starts_with(&full[..length])) {
+        length = (length + 4).min(full.len());
+    }
+    length
+}
+
+fn feedback_title(title: &str) -> String {
+    // Redact before bounding so a secret cannot evade detection at the cut point.
+    let redacted = jterm_core::redact::redact_secrets(title);
+    visible_bounded(
+        &redacted.split_whitespace().collect::<Vec<_>>().join(" "),
+        64,
+    )
+}
+
+pub(crate) fn task_completion_feedback(
+    manager: &crate::agent_task::TaskManager,
+    completions: impl IntoIterator<Item = (TaskId, crate::agent_task::AgentSessionOutcome)>,
+) -> Option<String> {
+    use crate::agent_task::AgentSessionOutcome;
+    let completions: Vec<_> = completions.into_iter().collect();
+    let (id, outcome) = *completions.first()?;
+    if completions.len() > 1 {
+        let failed = completions
+            .iter()
+            .filter(|(_, outcome)| *outcome == AgentSessionOutcome::Failed)
+            .count();
+        let cancelled = completions
+            .iter()
+            .filter(|(_, outcome)| *outcome == AgentSessionOutcome::Cancelled)
+            .count();
+        return Some(format!("{} agent sessions stopped: {} clean, {cancelled} cancelled, {failed} failed; open Tasks for details", completions.len(), completions.len() - failed - cancelled));
+    }
+    let outcome = match outcome {
+        AgentSessionOutcome::Clean => {
+            "Agent session stopped cleanly; review changes, then validate"
+        }
+        AgentSessionOutcome::Cancelled => "Agent session cancelled and stopped",
+        AgentSessionOutcome::Failed => "Agent session failed; open Tasks for details",
+    };
+    Some(format!("{}: {outcome}", feedback_identity(manager, id)))
+}
+
+pub(crate) fn task_validation_feedback(
+    manager: &crate::agent_task::TaskManager,
+    id: TaskId,
+    session: &str,
+) -> Option<String> {
+    use crate::agent_task::TaskValidationStatus;
+    let task = manager.get(id)?;
+    let validation = &task.validation;
+    if validation.terminal_session_id.as_deref() != Some(session) {
+        return None;
+    }
+    let outcome = match validation.status {
+        TaskValidationStatus::NotRun | TaskValidationStatus::Running => return None,
+        TaskValidationStatus::Passed => "passed".into(),
+        TaskValidationStatus::Failed => validation
+            .exit_code
+            .map(|code| format!("failed (exit {code})"))
+            .unwrap_or_else(|| "failed; open Tasks for details".into()),
+        TaskValidationStatus::Cancelled => "cancelled".into(),
+        TaskValidationStatus::Inconclusive => {
+            "ended without a confirmed result; open Tasks for details".into()
+        }
+    };
+    Some(format!(
+        "{}: Validation #{} {outcome}",
+        feedback_identity(manager, id),
+        validation.attempt
+    ))
+}
+
+/// Passive delivery: does not select a task, activate a pane, or move input focus.
+pub(crate) fn show_task_feedback(overlay: &adw::ToastOverlay, message: &str) {
+    let toast = adw::Toast::new(message);
+    toast.set_use_markup(false);
+    overlay.add_toast(toast);
+}
+
+#[cfg(test)]
+mod feedback_tests {
+    use super::*;
+    use crate::agent_task::{AgentSessionOutcome, NewTask, TaskManager, TaskStatus};
+
+    fn add_task(manager: &mut TaskManager, title: &str) -> TaskId {
+        manager
+            .create(NewTask {
+                title: title.into(),
+                provider: AgentProvider::Codex,
+                repo_root: "/fixture".into(),
+                worktree_path: "/fixture/worktree".into(),
+                branch: "test/feedback".into(),
+                base_commit: "a".repeat(40),
+                source_context: None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn completion_feedback_identifies_same_title_tasks_and_missing_task() {
+        let mut manager = TaskManager::new();
+        let a = add_task(&mut manager, "Same title");
+        let b = add_task(&mut manager, "Same title");
+        let message =
+            |id| task_completion_feedback(&manager, [(id, AgentSessionOutcome::Failed)]).unwrap();
+        assert_ne!(message(a), message(b));
+        assert!(message(a).contains(&a.to_string()[..8]));
+        assert!(message(b).contains(&b.to_string()[..8]));
+        let missing = TaskId::new();
+        assert!(message(missing).contains("Task no longer available"));
+        assert!(message(missing).contains(&missing.to_string()[..8]));
+        assert!(task_completion_feedback(&manager, []).is_none());
+        let batch = task_completion_feedback(
+            &manager,
+            [
+                (a, AgentSessionOutcome::Clean),
+                (b, AgentSessionOutcome::Cancelled),
+                (a, AgentSessionOutcome::Failed),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            batch,
+            "3 agent sessions stopped: 1 clean, 1 cancelled, 1 failed; open Tasks for details"
+        );
+        assert!(!batch.contains("3 tasks"));
+    }
+
+    #[test]
+    fn feedback_id_prefix_extends_for_live_collisions() {
+        let a = "12345678-1111-4111-8111-111111111111";
+        let b = "12345678-2222-4222-8222-222222222222";
+        assert_eq!(feedback_id_prefix_length(a, &[]), 8);
+        let length = feedback_id_prefix_length(a, &[b.into()]);
+        assert_eq!(length, 12);
+        assert_ne!(&a[..length], &b[..length]);
+    }
+
+    #[test]
+    fn feedback_title_is_redacted_single_line_and_utf8_bounded() {
+        let secret = format!("sk-{}", "a".repeat(32));
+        assert!(!feedback_title(&format!("Fix {secret}")).contains(&secret));
+        let hostile = feedback_title("one\n\t\u{202e}two\u{2066}\u{1b}[31m");
+        assert!(!hostile.chars().any(char::is_control));
+        assert!(!hostile.contains('\u{202e}'));
+        assert!(!hostile.contains('\u{2066}'));
+        assert!(hostile.contains("one "));
+        let long = feedback_title(&"界🙂".repeat(80));
+        assert!(long.len() <= 64);
+        assert!(long.is_char_boundary(long.len()));
+        assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn validation_feedback_uses_bound_attempt_and_stored_result() {
+        let mut manager = TaskManager::new();
+        let a = add_task(&mut manager, "Same title");
+        let b = add_task(&mut manager, "Same title");
+        for (id, session) in [(a, "agent-a"), (b, "agent-b")] {
+            manager.bind_terminal_session(id, session.into()).unwrap();
+            manager
+                .update_status(id, TaskStatus::ReadyForReview, None)
+                .unwrap();
+        }
+        manager
+            .bind_validation_session(a, "validation-a".into())
+            .unwrap();
+        manager
+            .bind_validation_session(b, "validation-b".into())
+            .unwrap();
+        assert!(task_validation_feedback(&manager, a, "validation-a").is_none());
+        manager.handle_terminal_session_exit("validation-a", Some(7));
+        assert_eq!(
+            manager.handle_terminal_session_closed("validation-a"),
+            Some(a)
+        );
+        let failed = task_validation_feedback(&manager, a, "validation-a").unwrap();
+        assert!(failed.contains(&a.to_string()[..8]));
+        assert!(failed.ends_with("Validation #1 failed (exit 7)"));
+        assert!(task_validation_feedback(&manager, b, "validation-a").is_none());
+        manager
+            .bind_validation_session(a, "validation-a-retry".into())
+            .unwrap();
+        assert!(manager
+            .handle_terminal_session_exit("validation-a", Some(0))
+            .is_none());
+        assert!(task_validation_feedback(&manager, a, "validation-a").is_none());
+        assert!(task_validation_feedback(&manager, a, "validation-a-retry").is_none());
+        manager.handle_terminal_session_exit("validation-a-retry", Some(0));
+        assert_eq!(
+            manager.handle_terminal_session_closed("validation-a-retry"),
+            Some(a)
+        );
+        assert!(task_validation_feedback(&manager, b, "validation-b").is_none());
+        assert!(task_validation_feedback(&manager, a, "validation-a-retry")
+            .unwrap()
+            .ends_with("Validation #2 passed"));
+        assert!(task_validation_feedback(&TaskManager::new(), a, "validation-a-retry").is_none());
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK process and display"]
+    fn task_feedback_keeps_input_draft_and_focus() {
+        use adw::prelude::*;
+        use gtk4 as gtk;
+        use gtk4::glib;
+        adw::init().expect("GTK display");
+        let overlay = adw::ToastOverlay::new();
+        let input = gtk::Entry::new();
+        input.set_text("unfinished input");
+        overlay.set_child(Some(&input));
+        let window = gtk::Window::new();
+        window.set_default_size(640, 240);
+        window.set_child(Some(&overlay));
+        window.present();
+        let settle = || {
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(150);
+            while std::time::Instant::now() < until {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        settle();
+        assert!(input.grab_focus());
+        let owner = gtk::prelude::GtkWindowExt::focus(&window).expect("input focus owner");
+        let mut manager = TaskManager::new();
+        let a = add_task(&mut manager, "<b>Same title</b>");
+        let b = add_task(&mut manager, "<b>Same title</b>");
+        fn displays(widget: &gtk::Widget, text: &str) -> bool {
+            if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                if label.is_mapped() && label.text() == text {
+                    return true;
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                if displays(&current, text) {
+                    return true;
+                }
+                child = current.next_sibling();
+            }
+            false
+        }
+        for id in [a, b] {
+            let message =
+                task_completion_feedback(&manager, [(id, AgentSessionOutcome::Failed)]).unwrap();
+            show_task_feedback(&overlay, &message);
+            settle();
+            assert_eq!(
+                gtk::prelude::GtkWindowExt::focus(&window),
+                Some(owner.clone())
+            );
+            assert_eq!(input.text(), "unfinished input");
+            if id == a {
+                assert!(
+                    displays(overlay.upcast_ref(), &message),
+                    "the actual toast is rendered"
+                );
+            }
+        }
+        assert!(overlay.is_mapped());
+        window.close();
     }
 }

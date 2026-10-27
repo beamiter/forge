@@ -23,6 +23,8 @@ use crate::keybindings::KeybindingMap;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalMode {
     Block,
+    /// Native conversation layout over the existing PTY and shell editor.
+    Chat,
     Vte,
     /// One long-lived full-size VTE driven by the same OSC 133 lifecycle
     /// engine as Block, with no per-command block chrome: finished commands
@@ -35,6 +37,7 @@ impl TerminalMode {
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
             TerminalMode::Block => "block",
+            TerminalMode::Chat => "chat",
             TerminalMode::Vte => "vte",
             TerminalMode::Unified => "unified",
         }
@@ -45,6 +48,7 @@ impl TerminalMode {
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
             "block" => Some(TerminalMode::Block),
+            "chat" => Some(TerminalMode::Chat),
             "vte" => Some(TerminalMode::Vte),
             "unified" => Some(TerminalMode::Unified),
             _ => None,
@@ -54,7 +58,10 @@ impl TerminalMode {
     /// Whether this mode is rendered by `TermView` (the OSC 133 engine), as
     /// opposed to a conventional VTE pane.
     pub(crate) fn uses_term_view(&self) -> bool {
-        matches!(self, TerminalMode::Block | TerminalMode::Unified)
+        matches!(
+            self,
+            TerminalMode::Block | TerminalMode::Chat | TerminalMode::Unified
+        )
     }
 
     /// Whether a `TermView` in this mode renders through the Unified backend
@@ -362,7 +369,7 @@ fn resolve_setting_text(
         setting_text_is_safe(value, max_bytes).then(|| value.to_string())
     };
     override_value
-        .and_then(&normalize)
+        .and_then(normalize)
         .or_else(|| configured_value.and_then(normalize))
 }
 
@@ -670,7 +677,7 @@ fn wrap_jsh_argv_in_interactive_bash(jsh_path: &str) -> Option<Vec<String>> {
         // shell path therefore travels as `$0`, and a `--session <id>` the
         // caller appends reaches the shell through `$@` instead of being
         // consumed as the wrapper's own operands.
-        "exec \"$0\" \"$@\"".to_string(),
+        jterm_core::vim9::VIM9_SHELL_EXEC.to_string(),
         jsh_path.to_string(),
     ])
 }
@@ -806,6 +813,8 @@ pub(crate) const DEFAULT_FONT_DESC: &str = "JetBrainsMono Nerd Font Mono 14";
 
 #[derive(Clone)]
 pub struct Config {
+    /// Native buffer rendering is independent of optional Vim workbench chrome.
+    pub(crate) vim9: jterm_core::vim9::Vim9UiConfig,
     pub(crate) window_opacity: f64,
     pub(crate) terminal_scrollback_lines: u32,
     pub(crate) font_desc: String,
@@ -814,6 +823,8 @@ pub struct Config {
     /// the glyphs to fontconfig's global sort.
     pub(crate) icon_font: Option<String>,
     pub(crate) default_font_scale: f64,
+    pub(crate) chrome_font_scale: f64,
+    pub(crate) chrome_font_size: String,
     pub(crate) theme_name: String,
     pub(crate) foreground: RGBA,
     pub(crate) background: RGBA,
@@ -876,10 +887,12 @@ pub struct Config {
     /// Disabled by default because finished blocks already own that history;
     /// enabling it deliberately presents both the VTE and structured views.
     pub(crate) preserve_live_scrollback: bool,
-    /// Show the experimental no-LLM ASCII organism in Block panes. The widget
-    /// reacts only to Forge's local command lifecycle events and never runs a
+    /// Show the experimental no-LLM ASCII organism in local Block/Unified panes.
+    /// The widget reacts only to local command lifecycle events and never runs a
     /// command or sends terminal contents elsewhere.
     pub(crate) ascii_organism_enabled: bool,
+    /// Optional gentle breaks; one foreground clock for the whole window.
+    pub(crate) ascii_organism_care_enabled: bool,
     /// Explicit motion level for the organism body; `None` follows the
     /// desktop animation preference.
     pub(crate) ascii_organism_motion: Option<OrganismMotion>,
@@ -981,11 +994,14 @@ impl Config {
         let themes = builtin_themes();
         let theme = &themes[0];
         Self {
+            vim9: jterm_core::vim9::Vim9UiConfig::default(),
             window_opacity: 0.95,
             terminal_scrollback_lines: 5_000,
             font_desc: DEFAULT_FONT_DESC.to_string(),
             icon_font: None,
             default_font_scale: 1.0,
+            chrome_font_scale: 1.0,
+            chrome_font_size: crate::font::unscaled_font_size(DEFAULT_FONT_DESC),
             theme_name: theme.name.clone(),
             foreground: theme.foreground,
             background: theme.background,
@@ -1021,6 +1037,7 @@ impl Config {
             focus_reporting_enabled: true,
             preserve_live_scrollback: false,
             ascii_organism_enabled: false,
+            ascii_organism_care_enabled: false,
             ascii_organism_motion: None,
             ai_enabled: false,
             agent_enabled: false,
@@ -1345,31 +1362,94 @@ fn env_rgba(name: &str) -> Option<RGBA> {
 // File config
 // ---------------------------------------------------------------------------
 
-pub(crate) fn config_file_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("FORGE_CONFIG").filter(|p| !p.is_empty()) {
-        return PathBuf::from(path);
-    }
-    glib::user_config_dir().join("forge").join("config.toml")
+pub(crate) fn config_root_unavailable() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "configuration storage is unavailable: no absolute config or home directory",
+    )
 }
 
-pub(crate) fn default_ai_api_key_path() -> String {
-    glib::user_config_dir()
-        .join("forge")
+fn config_home_from(
+    xdg_config_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+    fallback: &Path,
+) -> Option<PathBuf> {
+    xdg_config_home
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            home.map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map(|home| home.join(".config"))
+        })
+        .or_else(|| fallback.is_absolute().then(|| fallback.to_path_buf()))
+}
+
+pub(crate) fn config_home() -> std::io::Result<PathBuf> {
+    config_home_from(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+        &glib::user_config_dir(),
+    )
+    .ok_or_else(config_root_unavailable)
+}
+
+fn config_file_path_from(
+    explicit: Option<&std::ffi::OsStr>,
+    default_root: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> std::io::Result<PathBuf> {
+    if let Some(path) = explicit.filter(|p| !p.is_empty()) {
+        // An explicitly selected relative path is intentional, unlike an
+        // automatic config root inherited from malformed XDG variables.
+        return Ok(PathBuf::from(path));
+    }
+    default_root().map(|root| root.join("forge").join("config.toml"))
+}
+
+pub(crate) fn config_file_path() -> std::io::Result<PathBuf> {
+    config_file_path_from(std::env::var_os("FORGE_CONFIG").as_deref(), config_home)
+}
+
+pub(crate) fn default_ai_api_key_path() -> Option<String> {
+    config_home()
+        .ok()
+        .and_then(|root| default_ai_api_key_path_in(&root))
+}
+
+fn default_ai_api_key_path_in(root: &Path) -> Option<String> {
+    // The key writer accepts UTF-8 paths only. A lossy conversion could name
+    // a different directory instead of rejecting this destination.
+    root.join("forge")
         .join("ai.key")
-        .to_string_lossy()
-        .into_owned()
+        .into_os_string()
+        .into_string()
+        .ok()
 }
 
 pub(crate) fn ai_api_key_file_env_override() -> Option<String> {
-    env_string("FORGE_AI_API_KEY_FILE").filter(|path| configured_path_is_safe(path, true))
+    selected_ai_api_key_file(std::env::var("FORGE_AI_API_KEY_FILE").ok())
 }
 
-pub(crate) fn default_command_history_path() -> String {
-    xdg_state_home()
+fn selected_ai_api_key_file(value: Option<String>) -> Option<String> {
+    // Keep a nonempty selection exact, even when invalid. The strict key
+    // reader/writer must reject that destination rather than fall back to
+    // another credential file. Only an exactly empty value means unset.
+    value.filter(|path| !path.is_empty())
+}
+
+pub(crate) fn default_command_history_path() -> Option<String> {
+    xdg_state_home().and_then(|state| default_command_history_path_in(&state))
+}
+
+fn default_command_history_path_in(state: &Path) -> Option<String> {
+    // History accepts String paths. Do not turn an unrepresentable state
+    // directory into a different destination by replacing its raw bytes.
+    state
         .join("forge")
         .join("history.jsonl")
-        .to_string_lossy()
-        .into_owned()
+        .into_os_string()
+        .into_string()
+        .ok()
 }
 
 /// Private, local state used by the experimental native ASCII organism.
@@ -1377,41 +1457,50 @@ pub(crate) fn default_command_history_path() -> String {
 /// This is intentionally not configurable: command metadata must never make
 /// an arbitrary user-selected path writable. Tests and isolated launches can
 /// still redirect it through the standard `XDG_STATE_HOME` environment.
-pub(crate) fn default_ascii_organism_memory_path() -> PathBuf {
+pub(crate) fn default_ascii_organism_memory_path() -> Option<PathBuf> {
     // Keep the native schema isolated from the standalone prototype, whose
     // historical `ascii-organism.json` uses an incompatible version-1 shape.
-    xdg_state_home()
-        .join("forge")
-        .join("ascii-organism-native.json")
+    xdg_state_home().map(|state| state.join("forge").join("ascii-organism-native.json"))
 }
 
 /// GLib only exposes `g_get_user_state_dir()` behind a newer API feature than
 /// forge currently requires, so implement the XDG Base Directory rule
-/// directly: an absolute `$XDG_STATE_HOME`, otherwise `$HOME/.local/state`.
-fn xdg_state_home() -> PathBuf {
-    xdg_state_home_from(
+/// directly: an absolute `$XDG_STATE_HOME`, otherwise an absolute home directory
+/// plus `.local/state`. GLib can return relative HOME verbatim, so validate its
+/// fallback too and disable persistence when neither source is safe.
+fn xdg_state_home() -> Option<PathBuf> {
+    let path = xdg_state_home_from(
         std::env::var_os("XDG_STATE_HOME").as_deref(),
         std::env::var_os("HOME").as_deref(),
         &glib::home_dir(),
-    )
+    );
+    if path.is_none() {
+        log::warn!("local state persistence is unavailable: no absolute state or home directory");
+    }
+    path
 }
 
 fn xdg_state_home_from(
     xdg_state_home: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
     fallback_home: &Path,
-) -> PathBuf {
+) -> Option<PathBuf> {
     if let Some(path) = xdg_state_home
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
     {
-        return path;
+        return Some(path);
     }
     home.filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| fallback_home.to_path_buf())
-        .join(".local/state")
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            fallback_home
+                .is_absolute()
+                .then(|| fallback_home.to_path_buf())
+        })
+        .map(|home| home.join(".local/state"))
 }
 
 /// Severity reported by the headless config checker and startup diagnostics.
@@ -1446,10 +1535,13 @@ impl std::fmt::Display for ConfigIssue {
 }
 
 const KNOWN_CONFIG_KEYS: &[&str] = &[
+    "vim9",
     "opacity",
     "scrollback",
     "font",
     "font_scale",
+    "chrome_font_scale",
+    "chrome_font_size",
     "theme",
     "colors",
     "keybindings",
@@ -1481,6 +1573,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "focus_reporting_enabled",
     "preserve_live_scrollback",
     "ascii_organism_enabled",
+    "ascii_organism_care_enabled",
     "ascii_organism_motion",
     "ai_enabled",
     "agent_enabled",
@@ -1583,6 +1676,7 @@ fn validate_remote_host_string(
 fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
     let strings = [
         "font",
+        "chrome_font_size",
         "theme",
         "shell",
         "startup_commands",
@@ -1624,6 +1718,7 @@ fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
         "focus_reporting_enabled",
         "preserve_live_scrollback",
         "ascii_organism_enabled",
+        "ascii_organism_care_enabled",
         "sidebar_visible",
         "ai_enabled",
         "agent_enabled",
@@ -1660,7 +1755,7 @@ fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
             );
         }
     }
-    for key in ["opacity", "font_scale"] {
+    for key in ["opacity", "font_scale", "chrome_font_scale"] {
         if table.get(key).is_some_and(|v| !v.is_float()) {
             config_issue(
                 issues,
@@ -1676,6 +1771,11 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
     use ConfigIssueLevel::{Error, Warning};
 
     let mut issues = Vec::new();
+    if let Some(value) = table.get("vim9") {
+        if let Err(error) = value.clone().try_into::<jterm_core::vim9::Vim9UiConfig>() {
+            config_issue(&mut issues, Error, "vim9", error.to_string());
+        }
+    }
     for key in table.keys() {
         if !KNOWN_CONFIG_KEYS.contains(&key.as_str()) {
             let message = match key.as_str() {
@@ -1722,6 +1822,7 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
     };
     warn_float_range(&mut issues, "opacity", 0.01, 1.0);
     warn_float_range(&mut issues, "font_scale", 0.1, 10.0);
+    warn_float_range(&mut issues, "chrome_font_scale", 0.1, 10.0);
     warn_int_range(&mut issues, "scrollback", 0, 1_000_000);
     warn_int_range(&mut issues, "sidebar_width", 120, 800);
     warn_int_range(
@@ -1775,6 +1876,7 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
 
     for (key, max_bytes) in [
         ("font", MAX_FONT_DESC_BYTES),
+        ("chrome_font_size", MAX_FONT_DESC_BYTES),
         ("shell", MAX_CONFIG_PATH_BYTES),
         ("startup_commands", MAX_STARTUP_COMMANDS_BYTES),
         ("ai_model", MAX_AI_IDENTIFIER_BYTES),
@@ -1814,7 +1916,7 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
                 &mut issues,
                 Error,
                 "terminal_mode",
-                "expected 'block', 'vte' or 'unified'",
+                "expected 'block', 'chat', 'vte' or 'unified'",
             );
         }
     }
@@ -2233,14 +2335,31 @@ pub(crate) fn config_syntax_diagnostic(
     }
 }
 
+/// Missing Vim settings preserve the buffer-first defaults. This section is
+/// file-owned and survives ordinary terminal settings saves unchanged.
+fn parse_vim9_config(table: &toml::Table) -> jterm_core::vim9::Vim9UiConfig {
+    table
+        .get("vim9")
+        .map(|value| {
+            value.clone().try_into().unwrap_or_else(|error| {
+                log::warn!("Invalid [vim9] configuration: {error}");
+                jterm_core::vim9::Vim9UiConfig::default()
+            })
+        })
+        .unwrap_or_default()
+}
+
 /// Parsed TOML config file structure.
 #[derive(Default)]
 struct FileConfig {
+    vim9: jterm_core::vim9::Vim9UiConfig,
     opacity: Option<f64>,
     scrollback: Option<u32>,
     font: Option<String>,
     icon_font: Option<String>,
     font_scale: Option<f64>,
+    chrome_font_scale: Option<f64>,
+    chrome_font_size: Option<String>,
     theme: Option<String>,
     foreground: Option<String>,
     background: Option<String>,
@@ -2277,6 +2396,7 @@ struct FileConfig {
     focus_reporting_enabled: Option<bool>,
     preserve_live_scrollback: Option<bool>,
     ascii_organism_enabled: Option<bool>,
+    ascii_organism_care_enabled: Option<bool>,
     ascii_organism_motion: Option<String>,
     ai_enabled: Option<bool>,
     agent_enabled: Option<bool>,
@@ -2343,7 +2463,14 @@ pub(crate) fn load_error() -> Option<String> {
 
 fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision>) {
     clear_load_error();
-    let path = config_file_path();
+    let path = match config_file_path() {
+        Ok(path) => path,
+        Err(error) => {
+            record_load_error(error.to_string());
+            log::warn!("Failed to resolve config file: {error}");
+            return (FileConfig::default(), None);
+        }
+    };
     let display_path =
         || jterm_core::review_input::safe_inline_display(&path.to_string_lossy(), 2 * 1024);
     let bytes = match crate::config_store::read_config_bytes(&path) {
@@ -2422,6 +2549,7 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
     let remote_hosts = parse_remote_hosts(&table);
 
     let file_config = FileConfig {
+        vim9: parse_vim9_config(&table),
         opacity: table.get("opacity").and_then(|v| v.as_float()),
         scrollback: table_u32(&table, "scrollback"),
         font: table
@@ -2433,6 +2561,11 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         font_scale: table.get("font_scale").and_then(|v| v.as_float()),
+        chrome_font_scale: table.get("chrome_font_scale").and_then(|v| v.as_float()),
+        chrome_font_size: table
+            .get("chrome_font_size")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
         theme: table
             .get("theme")
             .and_then(|v| v.as_str())
@@ -2519,6 +2652,9 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
             .and_then(|v| v.as_bool()),
         ascii_organism_enabled: table
             .get("ascii_organism_enabled")
+            .and_then(|v| v.as_bool()),
+        ascii_organism_care_enabled: table
+            .get("ascii_organism_care_enabled")
             .and_then(|v| v.as_bool()),
         ascii_organism_motion: table
             .get("ascii_organism_motion")
@@ -2773,8 +2909,14 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         0.1,
         10.0,
     );
+    // An old single-scale config keeps exactly the same initial appearance.
+    let chrome_font_scale =
+        crate::font_zoom::initial_chrome_scale(fc.chrome_font_scale, default_font_scale);
     let font_desc = resolve_setting_text(env_string("FORGE_FONT"), fc.font, MAX_FONT_DESC_BYTES)
         .unwrap_or_else(|| DEFAULT_FONT_DESC.to_string());
+    let chrome_font_size = resolve_setting_text(None, fc.chrome_font_size, MAX_FONT_DESC_BYTES)
+        .map(|size| crate::font::unscaled_font_size(&size))
+        .unwrap_or_else(|| crate::font::unscaled_font_size(&font_desc));
     // Left unset so `crate::font` can pick whichever icon font is installed.
     let icon_font = resolve_setting_text(
         env_string("FORGE_ICON_FONT"),
@@ -2832,8 +2974,8 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let command_history_path = if command_history_enabled {
         let requested = env_string("FORGE_COMMAND_HISTORY_PATH")
             .or(fc.command_history_path)
-            .unwrap_or_else(default_command_history_path);
-        normalize_history_path(Some(requested), "command_history_path")
+            .or_else(default_command_history_path);
+        normalize_history_path(requested, "command_history_path")
     } else {
         None
     };
@@ -2907,6 +3049,9 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .unwrap_or(true);
     let ascii_organism_enabled = env_bool("FORGE_ASCII_ORGANISM_ENABLED")
         .or(fc.ascii_organism_enabled)
+        .unwrap_or(true);
+    let ascii_organism_care_enabled = env_bool("FORGE_ASCII_ORGANISM_CARE_ENABLED")
+        .or(fc.ascii_organism_care_enabled)
         .unwrap_or(false);
     let ascii_organism_motion = resolve_setting_text(
         env_string("FORGE_ASCII_ORGANISM_MOTION"),
@@ -2943,18 +3088,19 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         env_string("FORGE_AI_BASE_URL").or(fc.ai_base_url),
         default_ai_base_url,
     );
-    let ai_api_key_file_configured = fc
-        .ai_api_key_file
-        .filter(|path| configured_path_is_safe(path, true));
+    let ai_api_key_file_configured = selected_ai_api_key_file(fc.ai_api_key_file);
     let ai_api_key_file =
         ai_api_key_file_env_override().or_else(|| ai_api_key_file_configured.clone());
 
     let config = Config {
+        vim9: fc.vim9,
         window_opacity,
         terminal_scrollback_lines,
         font_desc,
         icon_font,
         default_font_scale,
+        chrome_font_scale,
+        chrome_font_size,
         theme_name: theme.name.clone(),
         foreground,
         background,
@@ -3000,6 +3146,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         focus_reporting_enabled: fc.focus_reporting_enabled.unwrap_or(true),
         preserve_live_scrollback: fc.preserve_live_scrollback.unwrap_or(false),
         ascii_organism_enabled,
+        ascii_organism_care_enabled,
         ascii_organism_motion,
         ai_enabled,
         agent_enabled,
@@ -3066,11 +3213,9 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
 /// after `load_config`, this cannot block on or inherit a user-selected config
 /// path, and it also resets custom keybindings.
 pub(crate) fn load_safe_config() -> (Config, Vec<Theme>, KeybindingMap) {
-    (
-        Config::safe_defaults(),
-        builtin_themes(),
-        KeybindingMap::from_defaults(),
-    )
+    let mut config = Config::safe_defaults();
+    config.vim9.auto_gui = false;
+    (config, builtin_themes(), KeybindingMap::from_defaults())
 }
 
 // ---------------------------------------------------------------------------
@@ -3196,6 +3341,142 @@ pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vim9_settings_load_independently_from_terminal_and_workbench_defaults() {
+        let empty = toml::Table::new();
+        assert_eq!(
+            parse_vim9_config(&empty),
+            jterm_core::vim9::Vim9UiConfig::default()
+        );
+        let table: toml::Table = "[vim9]\nproject_panel = true\ntool_panel = true\n"
+            .parse()
+            .unwrap();
+        let settings = parse_vim9_config(&table);
+        assert!(settings.native_buffer && settings.project_panel && settings.tool_panel);
+        assert!(!settings.toolbar && !settings.buffer_tabs && !settings.status_bar);
+        let disabled: toml::Table = "[vim9]\nnative_buffer = false\n".parse().unwrap();
+        assert!(!parse_vim9_config(&disabled).native_buffer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_history_path_never_rewrites_non_utf8_root_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let state = PathBuf::from(std::ffi::OsString::from_vec(b"/state/test-\xff".to_vec()));
+        assert!(state.is_absolute());
+        assert_eq!(default_command_history_path_in(&state), None);
+        assert_eq!(
+            default_command_history_path_in(Path::new("/state/test")),
+            Some("/state/test/forge/history.jsonl".to_string()),
+        );
+    }
+
+    #[test]
+    fn credential_file_selection_is_exact_and_never_retargets_invalid_paths() {
+        for raw in [
+            "relative.key",
+            "   ",
+            " /absolute/key ",
+            "/absolute/\nkey",
+            "/absolute/\u{202e}key",
+            "/absolute/key",
+            "~/key",
+        ] {
+            let selected = selected_ai_api_key_file(Some(raw.to_string()));
+            assert_eq!(selected.as_deref(), Some(raw));
+            let effective = selected
+                .clone()
+                .or_else(|| Some("/configured/key".to_string()));
+            assert_eq!(effective.as_deref(), Some(raw));
+            let write_target = selected.or_else(|| Some("/default/key".to_string()));
+            assert_eq!(write_target.as_deref(), Some(raw));
+        }
+        let oversized = format!("/{}", "x".repeat(MAX_CONFIG_PATH_BYTES));
+        assert!(!configured_path_is_safe(&oversized, true));
+        assert_eq!(
+            selected_ai_api_key_file(Some(oversized.clone())),
+            Some(oversized)
+        );
+        assert_eq!(selected_ai_api_key_file(None), None);
+        assert_eq!(selected_ai_api_key_file(Some(String::new())), None);
+        assert_eq!(
+            selected_ai_api_key_file(Some(String::new()))
+                .or_else(|| Some("/configured/key".to_string())),
+            Some("/configured/key".to_string()),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_key_path_never_rewrites_non_utf8_root_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = PathBuf::from(std::ffi::OsString::from_vec(b"/home/test-\xff".to_vec()));
+        assert!(root.is_absolute());
+        assert_eq!(default_ai_api_key_path_in(&root), None);
+        assert_eq!(
+            default_ai_api_key_path_in(Path::new("/home/test/.config")),
+            Some("/home/test/.config/forge/ai.key".to_string()),
+        );
+    }
+
+    #[test]
+    fn automatic_config_root_requires_an_absolute_directory() {
+        use std::ffi::OsStr;
+        let absolute_home = Some(OsStr::new("/home/tester"));
+        assert_eq!(
+            config_home_from(
+                Some(OsStr::new("/xdg")),
+                absolute_home,
+                Path::new("/fallback")
+            ),
+            Some(PathBuf::from("/xdg"))
+        );
+        for invalid in ["", ".", "relative", "../relative"] {
+            assert_eq!(
+                config_home_from(
+                    Some(OsStr::new(invalid)),
+                    absolute_home,
+                    Path::new("/fallback")
+                ),
+                Some(PathBuf::from("/home/tester/.config"))
+            );
+            assert_eq!(
+                config_home_from(
+                    Some(OsStr::new(invalid)),
+                    Some(OsStr::new(invalid)),
+                    Path::new("/fallback")
+                ),
+                Some(PathBuf::from("/fallback"))
+            );
+            assert_eq!(
+                config_home_from(
+                    Some(OsStr::new(invalid)),
+                    Some(OsStr::new(invalid)),
+                    Path::new(invalid)
+                ),
+                None
+            );
+        }
+        assert_eq!(config_home_from(None, None, Path::new("relative")), None);
+    }
+
+    #[test]
+    fn explicit_config_path_does_not_require_automatic_storage() {
+        use std::ffi::OsStr;
+        for explicit in ["relative.toml", "/absolute/config.toml"] {
+            let path = config_file_path_from(Some(OsStr::new(explicit)), || {
+                panic!("an explicit override must not resolve or access automatic storage")
+            })
+            .unwrap();
+            assert_eq!(path, PathBuf::from(explicit));
+        }
+        for explicit in [None, Some(OsStr::new(""))] {
+            let error =
+                config_file_path_from(explicit, || Err(config_root_unavailable())).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
 
     fn host() -> RemoteHost {
         RemoteHost {
@@ -3351,7 +3632,7 @@ mod tests {
         assert_eq!(argv[1], "-ic");
         // The shell travels as `$0` and appended operands as `$@`, so a
         // `--session <id>` the spawn path adds reaches the shell.
-        assert_eq!(argv[2], "exec \"$0\" \"$@\"");
+        assert_eq!(argv[2], jterm_core::vim9::VIM9_SHELL_EXEC);
         assert_eq!(argv[3], "/home/tester/.cargo/bin/jsh");
     }
 
@@ -3366,7 +3647,7 @@ mod tests {
         assert_eq!(
             &argv[2..],
             &[
-                "exec \"$0\" \"$@\"".to_string(),
+                jterm_core::vim9::VIM9_SHELL_EXEC.to_string(),
                 "/home/tester/.cargo/bin/jsh".to_string(),
                 "--session".to_string(),
                 "home-main".to_string(),
@@ -3510,6 +3791,7 @@ unknown_action = "F8"
     fn terminal_mode_parses_and_round_trips_every_backend() {
         for (text, mode) in [
             ("block", TerminalMode::Block),
+            ("chat", TerminalMode::Chat),
             ("vte", TerminalMode::Vte),
             ("unified", TerminalMode::Unified),
         ] {
@@ -3521,12 +3803,24 @@ unknown_action = "F8"
             assert_eq!(mode.as_str(), text);
             assert_eq!(TerminalMode::parse(mode.as_str()).as_ref(), Some(&mode));
         }
-        assert_eq!(TerminalMode::parse("warp"), None);
+        for unsupported in ["warp", "chatbot", "capsule", "ai", " chat "] {
+            assert_eq!(TerminalMode::parse(unsupported), None);
+        }
         // Unified is rendered by TermView, so it takes the Block leaf/pane
         // path everywhere a mode is dispatched on.
         assert!(TerminalMode::Unified.uses_term_view());
         assert!(TerminalMode::Block.uses_term_view());
+        assert!(TerminalMode::Chat.uses_term_view());
+        assert!(!TerminalMode::Chat.is_unified());
         assert!(!TerminalMode::Vte.uses_term_view());
+    }
+
+    #[test]
+    fn config_validator_accepts_chat_without_changing_default() {
+        assert!(validate_config_contents("terminal_mode = 'chat'\n")
+            .unwrap()
+            .is_empty());
+        assert_eq!(Config::safe_defaults().terminal_mode, TerminalMode::Vte);
     }
 
     #[test]
@@ -3657,7 +3951,7 @@ open_palette = "F8"
     }
 
     #[test]
-    fn ascii_organism_is_a_boolean_opt_in_config_key() {
+    fn ascii_organism_is_a_boolean_config_key() {
         let valid = validate_config_contents("ascii_organism_enabled = true\n").unwrap();
         assert!(valid.is_empty(), "unexpected issues: {valid:?}");
 
@@ -4191,7 +4485,7 @@ session = "bad/session"
                 Some(std::ffi::OsStr::new("/home/test")),
                 Path::new("/fallback")
             ),
-            PathBuf::from("/var/state")
+            Some(PathBuf::from("/var/state"))
         );
         assert_eq!(
             xdg_state_home_from(
@@ -4199,7 +4493,51 @@ session = "bad/session"
                 Some(std::ffi::OsStr::new("/home/test")),
                 Path::new("/fallback")
             ),
-            PathBuf::from("/home/test/.local/state")
+            Some(PathBuf::from("/home/test/.local/state"))
+        );
+    }
+
+    #[test]
+    fn state_directory_never_falls_back_to_the_working_directory() {
+        for home in [
+            None,
+            Some(""),
+            Some("."),
+            Some("relative-home"),
+            Some("../home"),
+        ] {
+            for fallback in ["", ".", "relative-home", "../home"] {
+                for state in [None, Some(""), Some("relative-state")] {
+                    assert_eq!(
+                        xdg_state_home_from(
+                            state.map(std::ffi::OsStr::new),
+                            home.map(std::ffi::OsStr::new),
+                            Path::new(fallback)
+                        ),
+                        None
+                    );
+                }
+                assert_eq!(
+                    xdg_state_home_from(
+                        Some(std::ffi::OsStr::new("/var/state")),
+                        home.map(std::ffi::OsStr::new),
+                        Path::new(fallback)
+                    ),
+                    Some(PathBuf::from("/var/state"))
+                );
+            }
+            assert_eq!(
+                xdg_state_home_from(None, home.map(std::ffi::OsStr::new), Path::new("/fallback")),
+                Some(PathBuf::from("/fallback/.local/state"))
+            );
+        }
+        assert_eq!(
+            xdg_state_home_from(
+                None,
+                Some(std::ffi::OsStr::new("/home/test")),
+                Path::new("relative-fallback")
+            ),
+            Some(PathBuf::from("/home/test/.local/state"))
         );
     }
 
@@ -4401,8 +4739,10 @@ session = "bad/session"
         assert_eq!(finite_clamp_f64(Some(4.0), 0.95, 0.01, 1.0), 1.0);
         assert_eq!(finite_clamp_f64(Some(0.7), 0.95, 0.01, 1.0), 0.7);
 
-        let issues = validate_config_contents("opacity = nan\nfont_scale = inf\n").unwrap();
-        for key in ["opacity", "font_scale"] {
+        let issues =
+            validate_config_contents("opacity = nan\nfont_scale = inf\nchrome_font_scale = nan\n")
+                .unwrap();
+        for key in ["opacity", "font_scale", "chrome_font_scale"] {
             assert!(issues.iter().any(|issue| {
                 issue.path == key
                     && issue.level == ConfigIssueLevel::Warning

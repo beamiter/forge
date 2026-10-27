@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Release-bundle entry point. The shared uninstaller's historical source-build
-# default is ~/.cargo/bin, while install-release.sh deliberately owns
-# ~/.local/bin; inject the matching prefix before forwarding user overrides.
+# Release-bundle entry point. Source and release installs both default to
+# ~/.local/bin; make that prefix explicit before forwarding user overrides.
 
 set -Eeuo pipefail
 

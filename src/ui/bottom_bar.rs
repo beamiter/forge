@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use vte4::TerminalExt as _;
 
-use jterm_core::bottom_bar::{compose, Segment, Snapshot, Tone};
+use jterm_core::bottom_bar::{compose, Segment, SegmentKind, Snapshot, Tone};
 
 use super::{PaneLeaf, UiState};
 use crate::block_view::TermView;
@@ -54,6 +54,10 @@ fn set_segments(container: &gtk4::Box, segments: &[Segment]) {
     for segment in segments {
         let label = gtk4::Label::new(Some(&segment.text));
         label.add_css_class(tone_css_class(segment.tone));
+        if matches!(segment.kind, SegmentKind::Cwd | SegmentKind::Git) {
+            label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+            label.set_tooltip_text(Some(&segment.text));
+        }
         container.append(&label);
     }
 }
@@ -174,5 +178,118 @@ impl UiState {
         set_segments(&self.bottom_bar_left, &content.left);
         set_segments(&self.bottom_bar_right, &content.right);
         *self.bottom_bar_content.borrow_mut() = content;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libadwaita as adw;
+
+    #[test]
+    #[ignore = "requires an isolated GTK display"]
+    fn long_status_segments_keep_compact_geometry_and_full_text() {
+        adw::init().unwrap();
+        gtk4::Settings::default()
+            .unwrap()
+            .set_gtk_enable_animations(false);
+        for (name, branch) in [
+            ("short".to_string(), "main".to_string()),
+            ("a".repeat(200), "main".to_string()),
+            ("short".to_string(), "branch".repeat(40)),
+            ("界".repeat(80), "分支".repeat(40)),
+        ] {
+            let cwd = PathBuf::from("/tmp").join(&name);
+            let meta = jterm_core::git_meta::RepoMeta {
+                branch: branch.clone(),
+                dirty: false,
+                ahead: None,
+                behind: None,
+            };
+            let content = compose(&Snapshot {
+                cwd: Some(&cwd),
+                git: Some(&meta),
+                cols: 80,
+                rows: 24,
+                tab_count: 2,
+                ..Snapshot::default()
+            });
+            let (bar, left, right) = build_bottom_bar();
+            set_segments(&left, &content.left);
+            set_segments(&right, &content.right);
+            let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            let filler = gtk4::Label::new(Some("inert status-bar fixture"));
+            filler.set_vexpand(true);
+            root.append(&filler);
+            root.append(&bar);
+            let window = adw::Window::builder()
+                .default_width(500)
+                .default_height(160)
+                .content(&root)
+                .build();
+            window.present();
+            let context = glib::MainContext::default();
+            for _ in 0..50 {
+                while context.pending() {
+                    context.iteration(false);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let minimum = bar.measure(gtk4::Orientation::Horizontal, -1).0;
+            let right_bounds = right.compute_bounds(&window).unwrap();
+            eprintln!(
+                "cwd_bytes={} branch_bytes={} minimum={} window_width={} right_end={}",
+                name.len(),
+                branch.len(),
+                minimum,
+                window.width(),
+                right_bounds.x() + right_bounds.width()
+            );
+            if name.len() == 200 {
+                if let Some(path) = std::env::var_os("FORGE_STATUS_WIDTH_SCREENSHOT") {
+                    let paintable = gtk4::WidgetPaintable::new(Some(&window));
+                    let snapshot = gtk4::Snapshot::new();
+                    paintable.snapshot(&snapshot, window.width() as f64, window.height() as f64);
+                    let renderer =
+                        gtk4::gsk::Renderer::for_surface(&window.surface().unwrap()).unwrap();
+                    renderer
+                        .render_texture(snapshot.to_node().unwrap(), None)
+                        .save_to_png(path)
+                        .unwrap();
+                    renderer.unrealize();
+                }
+            }
+            assert!(
+                minimum <= 500 && window.width() <= 500,
+                "long status metadata must not widen a compact window"
+            );
+            assert!(
+                right_bounds.x() >= 0.0
+                    && right_bounds.x() + right_bounds.width() <= window.width() as f32,
+                "grid and tab metadata must remain visible"
+            );
+            let mut child = left.first_child();
+            let mut ellipsized = false;
+            for segment in &content.left {
+                let label = child.clone().unwrap().downcast::<gtk4::Label>().unwrap();
+                assert_eq!(label.text().as_str(), segment.text);
+                assert_eq!(label.tooltip_text().as_deref(), Some(segment.text.as_str()));
+                ellipsized |= label.layout().is_ellipsized();
+                child = child.unwrap().next_sibling();
+            }
+            assert_eq!(
+                ellipsized,
+                name.len() > 5 || branch.len() > 4,
+                "only long rendered metadata should need ellipsization"
+            );
+            let mut child = right.first_child();
+            for segment in &content.right {
+                let label = child.clone().unwrap().downcast::<gtk4::Label>().unwrap();
+                assert_eq!(label.text().as_str(), segment.text);
+                assert!(!label.layout().is_ellipsized());
+                child = child.unwrap().next_sibling();
+            }
+            window.close();
+        }
     }
 }

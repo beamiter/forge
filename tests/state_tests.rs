@@ -356,3 +356,70 @@ fn test_parse_tabs_state_only_current_page() {
     assert_eq!(current, Some(2));
     assert_eq!(tabs.len(), 0);
 }
+
+#[test]
+fn restored_active_tab_tracks_its_surviving_layout() {
+    let invalid = serde_json::json!({"type":"leaf","dir":"","sid":"invalid"});
+    let contents = format!(
+        "current_page=1\ntab=Rejected\t{invalid}\ntab=Selected\t/tmp/selected\tselected\ntab=Later\t/tmp/later\tlater\n"
+    );
+    let (current, tabs) = parse_tabs_state(&contents);
+    assert_eq!(tabs.len(), 2);
+    assert_eq!(current, Some(0));
+    assert_eq!(
+        tabs[current.unwrap() as usize].0.as_deref(),
+        Some("Selected")
+    );
+}
+
+#[test]
+fn rejected_active_tab_uses_the_closest_surviving_predecessor() {
+    let invalid = serde_json::json!({"type":"leaf","dir":"","sid":"invalid"});
+    let contents = format!(
+        "current_page=2\ntab=First\t/tmp/first\tfirst\ntab=Rejected\t{invalid}\ntab=Selected-invalid\t{invalid}\ntab=Later\t/tmp/later\tlater\n"
+    );
+    let (current, tabs) = parse_tabs_state(&contents);
+    assert_eq!(tabs.len(), 2);
+    assert_eq!(current, Some(0));
+    assert_eq!(tabs[current.unwrap() as usize].0.as_deref(), Some("First"));
+}
+
+#[test]
+fn restored_active_tab_mapping_ignores_metadata_and_blank_lines() {
+    let invalid = serde_json::json!({"type":"leaf","dir":"","sid":"invalid"});
+    let contents = format!(
+        "\nai_conversation={{not-json}}\ntab=Rejected\t{invalid}\n\ntab=Selected\t/tmp/selected\tselected\ntab=Later\t/tmp/later\tlater\ncurrent_page=1\n"
+    );
+    let (current, tabs) = parse_tabs_state(&contents);
+    assert_eq!(current, Some(0));
+    assert_eq!(
+        tabs[current.unwrap() as usize].0.as_deref(),
+        Some("Selected")
+    );
+}
+
+#[test]
+fn restore_cap_keeps_selection_metadata_after_the_tab_lines() {
+    let mut contents = (0..40)
+        .map(|index| format!("tab=Tab-{index}\t/tmp/tab-{index}\tsid-{index}\n"))
+        .collect::<String>();
+    contents.push_str("current_page=5\n");
+    let (current, tabs) = parse_tabs_state(&contents);
+    assert_eq!(tabs.len(), 32);
+    assert_eq!(current, Some(5));
+    assert_eq!(tabs[current.unwrap() as usize].0.as_deref(), Some("Tab-5"));
+}
+
+#[test]
+fn active_tab_mapping_preserves_legacy_paths_and_empty_snapshot_contract() {
+    let (current, tabs) = parse_tabs_state("current_page=1\n/tmp/first\n/tmp/second\n");
+    assert_eq!(current, Some(1));
+    assert_eq!(tabs.len(), 2);
+    assert_eq!(parse_tabs_state("current_page=2\n").0, Some(2));
+    let invalid = serde_json::json!({"type":"leaf","dir":"","sid":"invalid"});
+    let (current, tabs) = parse_tabs_state(&format!(
+        "current_page=0\ntab=Rejected\t{invalid}\ntab=First\t/tmp/first\tfirst\n"
+    ));
+    assert_eq!(current, Some(0));
+    assert_eq!(tabs.len(), 1);
+}

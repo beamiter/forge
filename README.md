@@ -4,10 +4,17 @@ forge 是一个面向开发工作流的原生 GTK4 终端。它默认使用 Bloc
 
 ## 能力概览
 
+- 原生 [Vim9 GUI buffer](docs/VIM9_IDE.md)：默认只保留编辑区，IDE 控件/面板可在 `[vim9]` 中逐项开启；真实 Vim 9 编辑语义 + GTK/Pango 原生 buffer 渲染（读取 GUI RGB 高亮、编辑器字体/行距、连字、原生输入法预编辑；复杂视图明确回退兼容显示），GTK 项目/缓冲区导航、全项目模糊快速打开、行列跳转、Vim 双向分屏、受保护的缓冲区关闭、保存全部后构建、项目搜索、诊断定位、异步构建与输出，以及按 Vim 实际能力启用的语言服务按钮。在本地交互命令行运行 `vim` 自动打开原生 GUI（保留参数、目录和退出码）；也可用 `forge --ide ~/project` 或 `Ctrl+Alt+I`。滚动保留触摸板小数位移，按分屏投递并跟随显示器帧时钟。
 - 默认 Block、连续滚屏 Unified、传统 VTE 的三终端后端
+- Unified 专用命令导航条：实时/阅读历史状态、未读完成计数、前后命令、复制当前命令、Find、Browse 和返回实时
 - 标签页、混合后端分屏、方向导航、缩放、前台进程关闭确认与多窗口独立会话恢复
 - 拖动普通单-pane 标签到目标 pane 四边即可无损并入分屏；拖动分屏标题栏回标签栏即可恢复为普通标签。短暂悬停会预览目标页，取消或中心释放不会重启、复制 PTY
 - 跨命令块搜索、失败/慢命令筛选、只记录元数据的 JSONL 命令历史
+- 搜索栏 Preview：在有界、冻结的已完成记录保留文本中逐个高亮同一行的重复匹配；不改变原生终端选择
+- 跨终端区域拖选以整区轮廓标记，按显示顺序复制完整保留文本；单区域仍使用原生按字选区，不抢占 PRIMARY
+- 活动选择卡片常驻 Review selection 操作；审阅关闭后恢复原历史操作焦点，保留滚动和未读状态
+- 原生 Block review：完整命令、工作目录、完成/捕获来源，以及按历史顺序审阅与安全复制多选命令
+- Block / Unified 输出审阅：明确选择两次命令比较输出，或仅导出所选记录为 Markdown / JSON
 - 统一模糊面板：动作、历史、YAML/TOML workflow 和自然语言命令入口
 - 可执行 `.jtnb.md` Notebook，逐 cell 运行/停止并分离 stdout 与 stderr
 - 基于现代 GTK4 列表模型的异步文件树、Git 分支/脏状态条、长命令桌面通知
@@ -17,6 +24,70 @@ forge 是一个面向开发工作流的原生 GTK4 终端。它默认使用 Bloc
 - CJK 输入法和 Unicode 安全的搜索/通知显示
 
 分屏会继承当前 pane 的后端：Block 创建 Block sibling，VTE 创建 VTE sibling，并可继续嵌套。每个可见 pane 都独立拥有并清理其进程，关闭 pane、标签或窗口前会统一检查前台任务。
+
+Ctrl+滚轮按鼠标位置独立缩放：顶部栏与侧栏共用一组字号，主内容区（含分屏、Block/Chat/VTE）为另一组；基础字号与倍率分别保存并在重启后恢复。普通滚动不变，字号快捷键仍控制主内容区。
+
+附加字体回退列表不会再把多余空格当作字体名的一部分，缺失主字体时可正确解析显式回退字体。
+
+默认字体 `JetBrainsMono Nerd Font Mono` 未安装时，运行时自动使用系统 `Monospace` 等宽字体；
+不会改写配置或覆盖自定义字体/字体列表。安装字体后重启即可使用。
+
+## Unified：连续终端中的命令导航
+
+Unified 在一个持续运行的原生 VTE 中保留命令、输出和 shell 提示符。终端上方的紧凑导航条
+占用独立布局空间，显示 `Live` 或 `Reading history`；阅读旧输出期间完成的新命令会累积
+未读计数。`Return to live` 回到原生滚屏底部、清除未读并把输入焦点交回同一 pane。
+普通滚轮、原生文本拖选、shell 编辑键和现有 `Ctrl+Up` / `Ctrl+Down` 滚动语义保持不变。
+
+`Previous command` 从实时位置选择最近完成的命令。此后前后按钮按保留记录顺序逐条移动，
+不循环；在最新命令之后按 `Next command` 会返回实时。同一屏中的多个命令仍各有自己的
+导航身份。手动滚动或开始 Find 会释放原导航记录；再次导航时，从当前视口中已有明确位置
+证明的命令头选择方向邻居。若终端重排、重置或历史淘汰使位置无法证明，导航会明确提示，
+可以通过 `Browse` 查看保留记录及仍可用的输出快照。
+
+`Copy current command` 仅复制明确导航到、仍保留的完整命令，保留原始换行，不改动终端
+文本选区。没有当前命令、记录已淘汰、命令来源已截断、超过 256 KiB 或包含隐藏控制字符
+时不会复制部分内容。Find、Preview 和 Browse 均绑定到点击导航条的 pane；在其他分屏
+仍有输入焦点时也不会搜索或复制错终端。退出 Find 后，搜索栏仍持有焦点时会回到其原 pane。
+
+全屏终端应用进入 alternate screen 时，导航条自动隐藏并重新同步终端网格；退出后恢复。
+下列动作也可从命令面板找到，或在 `[keybindings]` 中自定义，均不占用新的默认快捷键：
+
+| 动作 | 配置键 |
+| --- | --- |
+| Previous command | `previous_command` |
+| Next command | `next_command` |
+| Return to live | `return_to_live` |
+| Copy current command | `copy_current_command` |
+
+## 比较两次命令与导出所选记录
+
+在命令面板选择 **Review and compare command output**，或点击 Unified 导航条的输出审阅按钮。
+审阅窗列出当前 pane 保留的最近 256 条记录，以及已选中的更早记录；可按命令、目录和记录 ID
+筛选。Block 模式沿用已选卡片，Unified 模式预选明确导航到的命令，然后用复选框补选另一条。
+选择只发生在审阅窗内，不改动终端文本选区、滚动位置或 shell 输入。
+
+选择 **恰好两条命令** 后点击 **Compare 2 outputs**，按终端先后顺序显示 Before / After、
+命令、目录、退出状态，以及逐行 `+` / `-` 差异与增加、删除、相同行数。同名命令仍按记录 ID
+区分。比较是冻结的只读结果；修改选择会立即清空旧报告，再次比较才获取新的保留快照。
+缺失快照会明确提示；已截断的尾部或前缀、比较预算限制以及粗略对齐均会标记，不能当作完整输出一致。
+
+**Export selected Markdown / JSON** 只导出勾选的 1–64 条记录，按原终端顺序保存稳定 ID、
+命令、目录、退出/捕获信息和仍保留的输出。JSON 明确区分“输出不可用”和“可用的空输出”，
+并记录 `output_truncated`；Markdown 直接说明缺失与部分保留。单次文件上限 8 MiB，超过时
+拒绝整份导出，不会悄悄少导出几条。文件保存到 `$XDG_DATA_HOME/forge/exports/`
+（未设置时为 `~/.local/share/forge/exports/`），完成后显示完整路径；同秒重试不会覆盖已有文件。
+
+命令面板同时提供以下可自定义、默认不占快捷键的动作。若尚未选择记录，导出动作先打开审阅窗：
+
+| 动作 | 配置键 |
+| --- | --- |
+| Review and compare command output | `compare_selected_outputs` |
+| Export selected command records as Markdown | `export_selected_markdown` |
+| Export selected command records as JSON | `export_selected_json` |
+
+源 pane 与记录身份在打开时绑定。记录被淘汰后会保留一个明确的不可用选择项，取消它才能继续；
+导出与比较都不会把邻近的新记录当作原选择。传统 VTE 后端不保留此类结构化记录，因此没有该能力。
 
 ## 构建与运行
 
@@ -63,7 +134,7 @@ ShellCheck，不会在检查过程中解析出另一份依赖图。
 `make package` 刻意使用宿主 Cargo 与系统 GTK/VTE 开发库：发行归档按兼容系统的动态库
 ABI 分发，不能把 Nix store 解释器/RPATH 烘进裸二进制。日常构建和验收仍使用上面的 Nix 门禁。
 
-安装脚本默认优先使用 Nix；没有 Nix 时自动退回 Cargo，并且不会覆盖已有配置：
+安装脚本默认优先使用 Nix；没有 Nix 时自动退回 Cargo。已有配置仅在字段结构变化时备份并替换；仅默认值、注释或顺序变化时保留原配置。使用 `--no-config` 可始终保留自定义配置：
 
 ```bash
 ./scripts/install.sh
@@ -73,7 +144,7 @@ ABI 分发，不能把 Nix store 解释器/RPATH 烘进裸二进制。日常构�
 ./scripts/install.sh --dry-run
 ```
 
-无参数源码安装沿用 `~/.cargo/bin/forge`，显式 `--prefix` 时二进制改为
+无参数源码安装统一使用 `~/.local/bin/forge`，显式 `--prefix` 时二进制改为
 `PREFIX/bin/forge`；安装与卸载使用同一规则。脚本同时安装 `forge-support-bundle`，并把
 shell 集成、内置 workflow 和欢迎 Notebook 安装到 `~/.local/share/forge/`；安装器会自动纳入
 共享加载器接受的全部 `.toml` / `.yaml` / `.yml` 示例，卸载时只移除这些自带文件并保留同目录的用户 workflow。配置使用
@@ -190,6 +261,7 @@ forge --check-config ~/my-forge.toml
 ```bash
 forge ~/project
 forge --mode block --no-restore
+forge --mode chat --no-restore
 forge -d /tmp --execute bash -lc 'printf "hello\\n"'
 forge --safe-mode
 ```
@@ -266,7 +338,7 @@ UTF-8 的路径，且 Home 探测冻结启动时的 filesystem authority；配�
 root、rows、selection 与 history；失败、被取消或乱序的结果只恢复标题和位置选择器，旧树保持
 完全可用。标题栏提供 Back/Forward（分支导航会清空 Forward），每边最多保留 64 个已提交目标；
 Up、Home、Open Folder、终端 cwd 自动跟随与 profile 重映射都复用同一提交边界。点击路径标题
-会打开安全的绝对路径输入与祖先面包屑；输入在 4096 字节内做 POSIX 词法规范化，并拒绝相对路径、
+会打开安全的绝对路径输入与祖先面包屑；长目录名在中间省略以保留操作按钮，悬停可查看完整显示名称，点击仍使用原始完整路径。目录层级较深时，祖先列表可在窗口内滚动，路径输入与 Open/Cancel 保持可见，键盘聚焦会显示对应祖先按钮。输入在 4096 字节内做 POSIX 词法规范化，并拒绝相对路径、
 越过 `/`、控制字符和视觉欺骗字符。扫描日志分别记录 queue/list/reconcile 延迟、入队深度和
 对账增删量；活跃子树由 GTK 保持稳定对象身份，旁路注册表使用弱引用，已回收子树不会被缓存永久钉住。
 配置重排会按完整 profile 重映射历史；无法证明的历史点直接丢弃。若数字索引已指向另一 profile，
@@ -312,6 +384,8 @@ forge --generate-completion pwsh | Out-String | Invoke-Expression
 
 Block 模式可通过 `finished_block_viewport_rows` 调整长块出现顶部/底部导航控件的行数阈值；`block_compact = true` 可启用更接近 anvil/Warp 的紧凑块间距。两项配置均保持 GTK4 原生实现，不增加运行时依赖。
 
+底部状态栏的长路径和 Git 信息会按可用宽度在中间省略，避免把窗口撑得过宽；悬停可查看完整状态文本，网格、退出状态和标签计数保持正常显示。
+
 ### 安装与更新 jsh
 
 forge 优先使用配套 shell [`jsh`](https://github.com/beamiter/jsh)，找不到时才退回 bash。
@@ -355,6 +429,27 @@ jsh_update_check = "daily"    # "startup" 每次启动联网；"daily" 复用缓
 | Agent 任务面板（需 `agent_tasks_enabled`） | `Ctrl+Alt+Shift+T` |
 | 字号增 / 减 / 复位 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
 
+Tasks 面板显示当前可见数与搜索匹配数，各状态按钮也显示当前搜索下的任务数量；在搜索框按 **Enter** 打开首个匹配任务。
+**Clear filters** 清除搜索和状态筛选；
+当前任务被筛选隐藏时，**Show selected task** 恢复它的详情并保留原选择。
+任务卡的 **Agent terminal** 与 **Validation output** 可返回已有终端或验证输出，
+包括其他标签页中的分屏。
+失败和等待处理的任务会在列表中显示原因预览，悬停可查看有界完整说明。
+
+本地 ASCII 生命体默认开启，会响应命令与 Agent 状态；设为 `ascii_organism_enabled = false` 可关闭。
+关闭期间的 Agent 活动不会改变它的生命状态，也不会在重新开启时补发反应。
+
+每个 GUI 只有一个生命体。切换 block、分屏或标签页时，原来的身体先隐藏，再由当前本地窗格接管；
+常驻的 organism 卡片已移除，滚动阅读时的小头像与活跃区域身体互斥，非焦点 VTE 分屏整行隐去，保留原有尺寸以避免终端重排。
+生命状态、环境习惯、问候冷却和聊天语气在窗口内共享；Static 仍保留同一个静态身体。
+**Inspect ASCII companion** 以文字显示状态，并提供 **Say hello / Keep me company / Tell a story / Take a break**。
+回复来自本地编写的短对话和轮换故事，使用面板打开时的活动快照，不执行命令、不调用 Agent。
+
+可在该面板开启 **Gentle break reminders**；持久配置 `ascii_organism_care_enabled` 默认 `false`。
+累计前台近期有人类输入的工作时间后，伴侣只在空闲安全时通过普通 toast 轻声提醒喝水、活动或远眺；
+**Later** 延后 20 分钟，**Take a break** 重置本次工作计时。后台窗格、输入中、运行命令、全屏程序或模态对话框期间不提醒。
+Static 模式只限制动画，仍支持用户明确开启的文字提醒。
+
 命令面板中的应用动作及其当前绑定可在 `Ctrl+Shift+P` 中搜索；这些动作可在
 `[keybindings]` 中覆盖，设为 `false` 可解除绑定。Block 视图内的上下文键
 `Alt+Shift+F`（过滤）、`Ctrl+Shift+B`（书签）和 `Ctrl+,` / `Ctrl+.`（前后书签）
@@ -364,6 +459,12 @@ Block 历史统一使用 `Ctrl+Shift+H`。
 AI provider、model、endpoint 和 API key 均可在 Settings 的 **AI & Agent** 分组配置；面板输入的 key 会原子保存到独立的 owner-only 文件，绝不会写入 `config.toml`，环境变量仍具有最高优先级。AI 面板的分隔条宽度会随配置持久化。**New chat** 会创建并选中一个新会话，旧会话继续保留在可搜索的 **Chats** 会话库中；会话自动取标题，也可 Rename、Archive/Unarchive，Delete 前会要求确认；会话库上限为 50，槽位全满且当前会话是最后一个未归档会话时，Archive 会在改动任何状态之前被拒绝并提示先删除一个会话，避免留下一个全部已归档、没有可写会话的库。输入框使用 `Enter` 或 `Ctrl+Enter` 发送，`Shift+Enter` 换行，并保留输入法候选确认语义。请求期间可 **Stop**，失败或停止后可按原 chat/context **Retry**；选中 Block 会显示可清除的 context chip，输出被截断时 chip 会明确提示。空会话也提供只填充、不自动发送的快捷提示。
 
 当前选择、每个 chat 的草稿和实际发送的选中 Block 上下文会跟随各自窗口快照恢复；快速关窗会先强制刷新草稿，发送失败或中途退出的问题也会作为可重试 draft 恢复，Ask selected Block 不会覆盖正在编辑的文字，关窗时其内存重试也会转成可恢复 draft/context。集合最多保存 50 条 chat metadata、每个 chat 最多 100 个 turn，紧凑 JSON 总预算仍为 8 MiB；超出总预算时只裁剪最旧的完整问答对，不会删除在途问题，并在对应会话显示 `truncated`。出站请求另保留最近至多 40 个 turn/256 KiB，单条输入、Block 输出和模型文本分别有 64 KiB、64 KiB、256 KiB 硬上限，可见 AI/Agent activity 各限制为 1 MiB，同时最多运行 4 个 provider 请求。非流式成功响应保持 raw bytes，先通过 jagent 的 1 MiB envelope gate 才解码 JSON；非 2xx 响应最多只有前 2 KiB 可进入诊断 JSON 解析器。窗口状态另为完整 chat metadata 预留 64 KiB，Pane/Tab 数据挤压空间时也不会静默删除整个 Chats 库。旧版单会话 schema v1 会自动迁移。后台回复始终绑定发起请求的 chat，切换不会串话，已经 Delete 的 chat 收到迟到回复时会直接丢弃。默认脱敏覆盖 active、non-active、archived chat 及其 draft/context；`--safe-mode` 与 `--no-restore` 的隔离和恢复语义保持不变。
+
+工作流列表在后台刷新，打开时先显示已有结果；刷新保留当前查询和仍存在的选中工作流，关闭后的结果不会重开旧窗口。参数窗口关闭后释放对关联控件与 pane 的引用；提交时再次校验原 pane，失效时保留参数并拒绝回填。
+
+命令面板先显示当前 pane 的命令，磁盘历史随后在后台合并；慢盘不再阻塞窗口打开，加载失败仍保留当前命令，关闭重开不会接收旧窗口的结果。历史回填、工作流与 AI 建议绑定打开时的 pane；确认时该 pane 已退出或不再活动，会拒绝回填。
+
+历史命令即使预览被截短，命令面板仍检索完整保留文本，选中后回填原始命令。
 
 命令面板使用模糊匹配；输入 `>` 只看动作、`@` 只看 JSONL 历史、`:` 只看 workflow、`?` 提交自然语言命令请求。历史和 workflow 只写入当前编辑行；`?` 请求会绑定当前 Block pane，在块流中显示可 Stop/Retry/Regenerate 的审阅卡，并携带可见的 selected Block 不可信上下文。它与命令纠正、Shell Agent proposal 共用可编辑、复制、动态风险提示的审阅逻辑，主操作只会 **Insert for review**，不会执行。所有审阅式插入都拒绝 CR、LF、Tab、NUL 和终端控制字符，避免多行条目越过“不提交”边界。`Ctrl+Alt+G` 或顶部栏的 **Agent** 开关会打开绑定当前 Block pane 的 Shell Agent；若打开时已选中 finished Block，它会作为可见、可移除的不可信上下文附加。Agent 显示目标、provider/model、shell、回合进度、activity 与实时 prompt readiness，可单独 Stop/Retry 当前模型请求，并可切换持久化的 typo-like 命令纠正。严格 JSON proposal 可复制、编辑、Reject、**Insert only** 或逐条 **Approve & Run**；Insert only 只回填普通 shell 编辑行并在 Agent 上下文记录“未执行”，危险命令执行仍需第二次确认。完成块的退出码和截断输出随后回灌到下一轮；`done` 后可用 **Follow up** 保留上下文追问，回合耗尽后可用 **New task** 在同一 pane 重置 Agent transcript 与预算。
 
@@ -384,8 +485,10 @@ pane 重播。它是不可点击且不参与测量
 Out` 可把搜索限制到全部文本、命令或输出，`Ctrl+O` 循环切换；范围过滤发生在 500 条结果
 上限之前，因此另一类文本不会挤占所选范围的结果预算。`Failed` 只保留真正失败的块（不把用户
 主动中断算失败），`Slow`
-只保留耗时至少 1 秒的块；两者可组合且同样先于结果上限执行。查询为空时，任一元数据筛选仍会
-为每个符合条件且在所选范围有内容的保留块生成一条可定位代表结果，因此可独立浏览失败或慢块。
+只保留耗时至少 1 秒的块；两者可组合且同样先于结果上限执行。查询为空时直接浏览保留块，无需
+先开启筛选；每个符合条件且在所选范围有内容的块生成一条代表结果，筛选可进一步收窄到失败、慢块
+或书签。`All` / `Cmd` 的命令行直接来自命令元数据，无需为未使用的大段输出消耗扫描预算。
+同一 pane 的连续扫描与刷新会复用已编译查询；无效正则也只编译一次，直到查询或匹配选项变化。
 结果列表显示当前位置，并支持
 `↑/↓` 循环、`Home/End` 首尾跳转及 `PageUp/PageDown` 十条分页；查询框保持焦点且选中行
 会自动滚入可视区域。`Enter` 定位并关闭；`Shift+Enter` 在成功定位实时终端结果后保持面板并
@@ -470,6 +573,7 @@ AI / Agent / 命令面板的建议仍然只 **Insert for review**，永不自行
 `Delete` 删除**整个选区**（不只是 active edge），并且可撤销：命令面板里的
 **Undo removing blocks** 把它们放回按 id 该在的位置——即使期间又跑过新命令，删掉的块也回到
 中间而不是被塞到最前面。撤销槽是单级的：一次新的移除（删除或清空）会替换掉上一次。
+清空后的 Toast 提供 **Undo**；清空恢复会把仍保留的旧块书签和多选状态与新状态合并。空 Pane 再次清空不会覆盖撤销槽。全屏程序占用 Pane 或历史容量不足时会保留撤销槽并提示重试，Toast 的 **Undo** 也仍可用。
 **Show only failed blocks** / **Show only slow blocks** / **Show only bookmarked blocks** 会真正
 收窄块流：不匹配的卡片被隐藏且不再占据虚拟画布高度（滚动条随之变短），选择用的方向键会跳过
 它们，过滤期间新完成的命令若不匹配也不会冒出来；**Show all blocks** 恢复全部。被信号停止的
@@ -477,7 +581,19 @@ AI / Agent / 命令面板的建议仍然只 **Insert for review**，永不自行
 **Collapse all blocks** / **Expand all blocks** / **Collapse or expand block** 同样在命令面板里，
 用于快速收拢一长串输出；这三个和 Undo 一样默认不占快捷键，可在 `[keybindings]` 里自行绑定
 （`collapse_all_blocks`、`expand_all_blocks`、`toggle_block_collapsed`、`undo_clear_blocks`）。
-折叠状态目前不跨重启保存。
+**Collapse selected output** / **Expand selected output** 则明确处理完整的已选完成块集合，
+混合选区可直接统一收拢或展开；对应 `collapse_selected_blocks` / `expand_selected_blocks`，默认
+不占快捷键。空选区不会退回最新块，任何已选 id 过期都会拒绝整批，无可折叠输出的块保持原状，
+提示只统计实际改变的块数。选区、焦点、实时输入与运行中命令状态保持不变，虚拟化高度按批次更新。
+折叠状态目前不跨重启保存。空查询浏览、四端一致的相邻 pane 定位与验证命令见
+[Block workspace navigation and triage](docs/block-workspace.md)。
+卡片 header 的 **Block actions**（⋮）始终可见，鼠标、触摸和 Tab 键都能找到完整操作，
+与右键菜单共用同一动作和安全门禁；不必先知道右键或快捷键。菜单高度有界，长菜单可滚动，
+反复点击不会叠出多个实例。header 快捷区只保留复制输出与 **Insert for review**，后者只回填
+可编辑命令而不执行；过滤、顶部/底部跳转、展开、折叠等统一从菜单可达，窄分屏不再为六个
+隐藏图标预留宽度。快捷按钮持有键盘焦点时，鼠标移出不会让它消失；cwd/git/时间/耗时汇成一条可收缩的上下文
+摘要，省略后的完整可见文本可通过 tooltip 查看，状态与动作保持独立。
+
 右键多选区域可批量复制命令、输出或完整块；长 Block 提供顶部/底部跳转与 sticky header，
 后台异步输出使用独立 Block 样式。历史恢复和撤销清空重建的块与新块拥有完全相同的右键菜单。
 
@@ -524,9 +640,128 @@ forge 以 **MIT OR Apache-2.0** 双许可证发布，使用者可任选其一；
 - Agent snapshot 只通过 jagent 的有预算 decoder 进入内存，Forge 再直接审计该 bounded view 的 proposal 连续性、观察生命周期和状态绑定，不会二次走普通 serde collection 解码。
 - 可执行 Notebook 在独立进程组运行，关闭或停止 cell 会终止其进程组；安全模式完全禁用 Notebook 执行。
 - 命令历史只保存 command、cwd、exit code 和完成时间，不保存输出，并限制单条/总文件大小。
-- 每个窗口使用独立的原子会话快照；并发窗口互不覆盖，崩溃遗留快照会在下次启动回收。
+- Block 历史加载失败后，Retry 会重新加载；重试仍失败时常驻提示会再次显示，不会因先前错误已读而静默消失。
+- Unified 历史解码会校验所有条目，但只保留最新 64 条记录，避免大量微小条目撑大临时数组；不完整恢复仍保留原文件。
+- Unified 历史恢复失败后会保留原文件，空 pane 关闭和后续保存都不会覆盖它；pane 内常驻提示会说明修复或移走文件后需重新打开。更换历史路径也必须先恢复该路径，不能继承旧路径的写入许可。
+- 恢复上限舍弃标签或拆分布局时，原始窗口快照会先保留为恢复副本；若无法保留，窗口会报告并暂停会话保存。恢复副本沿用最多 8 份的既有保留策略。
+- 每个窗口使用独立的原子会话快照；并发窗口互不覆盖，崩溃遗留快照会在下次启动回收。恢复时跳过无效或超限布局不会把活动选择移到其他标签；选中布局无法恢复时，选择其前方最近的保留标签，没有则选择第一个。
 - 配置、会话快照、JSONL 命令历史和 Block 历史使用 owner-only 权限；关键替换路径使用同步写入与原子 rename，降低信息泄露和断电损坏风险。
 - `forge-support-bundle` 不读取或打包上述内容，只报告脱敏诊断与文件元数据，并以 `0600` 创建归档。
 - 项目采用 `MIT OR Apache-2.0` 双许可证；Cargo 包仍有意保留 `publish = false`，不将仓库许可自动等同于 crates.io 发布。依赖继续由每周 RustSec 审计与 Dependabot 检查。
 
 进一步说明见 [用户指南](docs/USER_GUIDE.md)、[架构说明](docs/ARCHITECTURE.md)、[Block 模式验收清单](docs/BLOCK_MODE_ACCEPTANCE.md)、[AI / Agent / Chat 验收矩阵](docs/AI_AGENT_CHAT_ACCEPTANCE.md)、[性能指南](docs/PERFORMANCE.md)、[发布流程](docs/RELEASING.md) 和 [Tailscale/SSH 配置](docs/tailscale-setup.md)。参与开发前请阅读 [贡献指南](CONTRIBUTING.md)、[安全策略](SECURITY.md) 与 [变更日志](CHANGELOG.md)。
+
+### Files 远端文件安全约束
+
+远端重命名/移动、复制和目录上传的发布阶段需要 Linux、Python 3，以及 libc 和目标文件系统支持 `renameat2(RENAME_NOREPLACE)`。探针先在目标文件系统检查该能力；不支持时明确失败，不回退到普通 `mv`，也不安装远端软件。浏览、新建空文件和单文件硬链接上传不依赖 Python。
+
+上传目录先在本地生成有界、私有的完整归档，确认 tar 成功后才连接远端发布；远端在私有同父目录 staging 内解包并原子拒绝同名目标。失败不会删除其他进程创建的目标。子进程组在主进程被回收前终止；非阻塞管道和期限确保继承管道的逃逸子进程无法让取消或超时永久等待。
+
+### Native Chat terminal mode
+
+Select `forge --mode chat` or `terminal_mode = "chat"` for right-aligned command
+capsules, wide output cards and a docked native multiline shell composer. This
+is independent of AI Chat and needs no LLM. The original PTY, shell editor,
+completion, password input and interactive applications remain in control;
+running commands and alternate-screen programs temporarily own the same native
+terminal. Existing defaults and existing panes are unchanged. See
+[Chat mode behavior and acceptance](docs/CHAT_MODE_ACCEPTANCE.md).
+
+### Source install upgrades
+
+`./scripts/install.sh` installs the executable to `~/.local/bin` by default.
+`--prefix PATH` selects `PATH/bin`; `--bin-dir PATH` overrides only the binary
+directory. Existing binaries are replaced atomically.
+
+The configuration is installed to `${XDG_CONFIG_HOME:-$HOME/.config}/forge/config.toml`.
+On first installation, the bundled defaults are installed. For an existing
+regular config, the installer compares its TOML field structure with the bundled
+config, including nested tables. Changes only to values, comments, or ordering
+keep the existing file and do not create a backup. Added, removed, or renamed
+fields trigger a private `config.toml.backup.<unique suffix>` copy followed by
+atomic replacement with the bundled defaults. Array lengths and element values
+are ignored; fields within table elements are compared when both arrays contain
+tables. Copy selected custom settings back from the backup after a field change,
+or use `--no-config` to always retain your current settings.
+
+Comparison uses Python 3.11+ `tomllib`, or `tomli` on older Python 3 versions.
+If the parser is unavailable or either file cannot be parsed, the installer
+reports the reason and keeps the existing config. Symlinked configs are left
+unchanged. `--dry-run` does not write binaries, configs, or backups.
+
+An already-running terminal keeps its current process; restart it to use the new
+binary and configuration. If an older copy comes first in PATH, the installer
+prints the conflicting path.
+
+When installing to the default path, an older `~/.cargo/bin/forge` is backed up
+inside a private `.forge.backup.*` directory and replaced with a compatibility
+symlink to `~/.local/bin/forge`. This prevents the old PATH entry from launching
+stale code. Repeated installs reuse that link. Uninstall removes only a matching
+compatibility link and leaves the backup available for recovery. Other prefixes
+and unrelated PATH entries are not modified.
+
+
+### Agent management
+
+Open **Agent Sessions** using the grid button in the top bar,
+**Ctrl+Alt+Shift+G**, or the command palette. The `open_agent_sessions`
+keybinding (also accepted as `agent:sessions`) can be rebound in configuration.
+This manager discovers existing Codex and Claude CLI history across projects,
+including custom `CODEX_HOME` and `CLAUDE_CONFIG_DIR` locations. It is separate
+from the isolated-worktree Tasks dashboard and does not require an API key.
+
+The **Agent Manager** adds quick views for active conversations, recorded input
+requests, observed live CLIs, pins and local archives. Choose a project and its
+subdirectories, give conversations local names and tags, or archive and restore
+them without changing provider history. **Save** and **Revert** act on the selected
+conversation; unsaved drafts survive row changes and background refreshes.
+Saved organization is shared with Anvil, Ember and Frost on the same account.
+
+Search by project, title, session ID, branch, or conversation preview; combine
+provider and recorded-state filters. Aliases and tags are searchable too:
+`provider:codex tag:review`, `title:"release plan"`, `project:/work/repo` and
+`-tag:done` can be combined. Invalid queries explain what needs correcting.
+Select a conversation to inspect its
+original directory, branch, recent text and exact resume command, then choose
+**Resume in New Tab**. The provider receives an argv directly in a conventional
+PTY at the original project directory. Selecting a session already opened by
+this window focuses its existing terminal. Missing directories and archived
+sessions show an explanation instead of launching in the wrong project.
+
+Discovery runs on a bounded background worker and refreshes while the manager
+is open. Transcript states are labeled as *last recorded*; they do not claim a
+process is still alive. No provider is started until explicit confirmation.
+
+The **Tasks** panel adds Attention, Recent, Oldest, Title and Project sorting,
+plus **Next needs you** navigation across the visible tasks. Filters and sorting
+preserve task identity and follow-up drafts. See the
+[Agent management guide](docs/agent-management.md) for the workflow, search syntax
+and storage compatibility details.
+
+**New task** now creates work directly from a project, with a multiline goal,
+provider choice and an optional explicit validation recipe. Worktree preparation
+keeps the form and draft available until registration succeeds. **Details**
+shows the real repository, runtime and validation state; authored work without
+a validation recipe uses the explicit **Accept reviewed work** action. Native
+Codex, Claude and Kimi start through the existing consent and approval gates.
+
+In Agent Manager, independent checkboxes support atomic batches of up to 256
+sessions: pin/unpin, archive/restore and add/remove one tag. The selected,
+visible and hidden counts make filtered selections explicit. Failed writes
+retain the selection and drafts, and organization never starts a provider.
+
+Resuming a conversation that another CLI is still running asks for **Resume
+anyway** before a second process is started. Background refreshes never move
+your selection, and **Copy command** copies the exact resume command. In the
+Tasks panel, **Hide** keeps the worktree and **Hidden tasks (N)** restores a task
+to its previous state; the top-bar Tasks button shows how many tasks need you.
+
+Development builds use the sibling `../jterm_core` checkout. Isolated Nix
+builds unpack the deterministic `packaging/jterm-core-src.tar.gz` snapshot
+beside this application. After shared-core changes, refresh it with
+`scripts/package-shared-core.sh`; its companion SHA-256 file records the exact
+packaged source. Targets and Git internals are excluded.
+
+Resume resolves the CLI executable and its runtime when activated, including
+Node installations managed by NVM when a desktop launcher supplies a minimal
+`PATH`. The resolved runtime search path applies only to the new CLI process.

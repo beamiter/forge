@@ -35,8 +35,8 @@ labelled synthetic “yesterday” record so
 the final cross-day memory line is reproducible. It does not write that demo
 record to disk.
 
-The production organism now lives in Forge itself behind
-`ascii_organism_enabled = true` (or `FORGE_ASCII_ORGANISM_ENABLED=1`). It uses
+The production organism now lives in Forge itself and is enabled by default.
+Set `ascii_organism_enabled = false` (or `FORGE_ASCII_ORGANISM_ENABLED=0`) to disable it. It uses
 real Block command lifecycle events, private repo memory, an inline widget, and
 one focus-owned spatial overlay. This standalone harness remains useful as a
 deterministic historical life-state experiment, but it is no longer a parity

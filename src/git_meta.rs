@@ -4,13 +4,12 @@
 //! [`jterm_core::git_meta`], shared with the other terminals; this module is
 //! only forge's surface for them, plus the non-blocking UI variant below.
 //!
-//! `jterm_core::git_meta::read` already runs Git in a bounded worker, but waits
-//! briefly for that worker so command-line/background callers can receive a
-//! fresh answer. A 12ms wait is still most of a 60Hz frame, so the GTK strip
-//! goes through [`read_cached_and_refresh`]: it reads the last completed value
-//! immediately while one app worker performs the possibly-waiting shared call.
+//! The GTK strip goes through [`read_cached_and_refresh`]: it reads the last
+//! completed value immediately while one app worker calls the shared bounded
+//! `read_fresh` endpoint. The frame-budgeted `read` endpoint may return stale
+//! data after 12ms, so its answer cannot safely earn this adapter's fresh TTL.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
@@ -31,14 +30,17 @@ const MAX_CACHE_ENTRIES: usize = 256;
 /// those call [`invalidate`]; this ceiling exists only so a change made by
 /// another window or another terminal is eventually noticed too.
 const CACHE_TTL: Duration = Duration::from_secs(30);
+/// Failed/ambiguous probes remain stale, but must not run on every UI tick.
+const FAILURE_RETRY_BACKOFF: Duration = Duration::from_secs(10);
 
 type ProbeResult = Option<RepoMeta>;
 
 #[derive(Clone)]
 struct CacheEntry {
     result: ProbeResult,
-    /// When the probe that produced `result` finished, or `None` for an entry
-    /// no probe has answered for yet.
+    /// When a definitive probe last earned freshness, or `None` if no probe
+    /// has answered yet or the last attempt failed. A failed refresh retains
+    /// the previous visible result without granting it a new freshness TTL.
     ///
     /// [`UiGitMetaService::invalidate`] creates such an entry so a report about
     /// a directory Git has never been asked about still has somewhere to live.
@@ -46,9 +48,11 @@ struct CacheEntry {
     /// entry does not have, and the whole point of the TTL is that a recent
     /// answer may be served without asking again.
     refreshed_at: Option<Instant>,
+    /// Failure cooldown, independent from freshness and invalidation debt.
+    next_retry_at: Option<Instant>,
     /// How many times this window has reported a change in this directory.
-    /// Only ever grows; [`Self::invalidated`] reads it against the generation
-    /// the stored answer was asked for.
+    /// Saturates on exhaustion; new requests at the limit are refused.
+    /// [`Self::invalidated`] compares it with the stored answer's generation.
     invalidations: u64,
     /// `invalidations` as it stood when the probe that produced `result` was
     /// queued.
@@ -66,8 +70,8 @@ struct CacheEntry {
 
 impl CacheEntry {
     /// Something in this window changed the repository since this answer was
-    /// asked for, so the next read re-probes regardless of the TTL — while
-    /// still showing this value, so the bar does not blank out waiting for Git.
+    /// asked for, so the next read re-probes regardless of the freshness TTL,
+    /// subject to the separate failure cooldown, while showing the old value.
     fn invalidated(&self) -> bool {
         self.invalidations != self.probed_at_invalidations
     }
@@ -90,17 +94,30 @@ fn probe_is_due(cached_age: Option<Duration>, invalidated: bool) -> bool {
     invalidated || cached_age.is_none_or(|age| age >= CACHE_TTL)
 }
 
+fn cached_probe_is_due(entry: Option<&CacheEntry>, now: Instant) -> bool {
+    let Some(entry) = entry else {
+        return true;
+    };
+    entry.next_retry_at.is_none_or(|retry_at| now >= retry_at)
+        && probe_is_due(
+            entry
+                .refreshed_at
+                .map(|at| now.saturating_duration_since(at)),
+            entry.invalidated(),
+        )
+}
+
 struct UiGitMetaService {
     request_tx: mpsc::SyncSender<ProbeRequest>,
     cache: Arc<Mutex<HashMap<PathBuf, CacheEntry>>>,
-    pending: Arc<Mutex<HashSet<PathBuf>>>,
+    pending: Arc<Mutex<HashMap<PathBuf, u64>>>,
 }
 
 impl UiGitMetaService {
     fn new() -> Option<Self> {
         let (request_tx, request_rx) = mpsc::sync_channel(MAX_QUEUED_PROBES);
         let cache = Arc::new(Mutex::new(HashMap::new()));
-        let pending = Arc::new(Mutex::new(HashSet::new()));
+        let pending = Arc::new(Mutex::new(HashMap::new()));
         let worker_cache = cache.clone();
         let worker_pending = pending.clone();
         thread::Builder::new()
@@ -130,16 +147,31 @@ impl UiGitMetaService {
     /// before ever hearing about, and a cold repository is the slowest probe
     /// there is, so this is the likeliest way to lose one — not the rarest.
     fn invalidate(&self, path: &Path) {
+        // Pending identities outlive cache eviction. Lock pending before cache
+        // everywhere so completion cannot clear a report in the gap between
+        // these two stores. The queue plus its one worker bounds this registry.
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        if let Some(generation) = pending.get_mut(path) {
+            *generation = generation.saturating_add(1);
+        }
         if let Ok(mut cache) = self.cache.lock() {
             match cache.get_mut(path) {
-                Some(entry) => entry.invalidations = entry.invalidations.saturating_add(1),
+                Some(entry) => {
+                    entry.invalidations = pending
+                        .get(path)
+                        .copied()
+                        .unwrap_or_else(|| entry.invalidations.saturating_add(1));
+                }
                 None => insert_bounded(
                     &mut cache,
                     path.to_path_buf(),
                     CacheEntry {
                         result: None,
                         refreshed_at: None,
-                        invalidations: 1,
+                        next_retry_at: None,
+                        invalidations: pending.get(path).copied().unwrap_or(1),
                         probed_at_invalidations: 0,
                     },
                 ),
@@ -159,19 +191,22 @@ impl UiGitMetaService {
 
     fn request(&self, path: &Path) -> bool {
         let path = path.to_path_buf();
+        let queued_at_invalidations;
         {
             let Ok(mut pending) = self.pending.lock() else {
                 return false;
             };
-            if !pending.insert(path.clone()) {
+            if pending.contains_key(&path) {
                 return true;
             }
+            queued_at_invalidations = self.invalidations(&path);
+            // Never admit a probe at an exhausted generation: an additional
+            // invalidation could otherwise compare equal to its completion.
+            if queued_at_invalidations == u64::MAX {
+                return false;
+            }
+            pending.insert(path.clone(), queued_at_invalidations);
         }
-        // Read the generation as late as possible, but still before the worker
-        // can start Git. A report that lands in the gap costs one redundant
-        // probe, which is the safe direction: the alternative is an answer
-        // that silently claims to cover a change it was never asked about.
-        let queued_at_invalidations = self.invalidations(&path);
         if self
             .request_tx
             .try_send(ProbeRequest {
@@ -207,39 +242,68 @@ fn insert_bounded(cache: &mut HashMap<PathBuf, CacheEntry>, path: PathBuf, entry
 fn worker_loop(
     requests: mpsc::Receiver<ProbeRequest>,
     cache: &Mutex<HashMap<PathBuf, CacheEntry>>,
-    pending: &Mutex<HashSet<PathBuf>>,
+    pending: &Mutex<HashMap<PathBuf, u64>>,
+) {
+    worker_loop_with_probe(requests, cache, pending, jterm_core::git_meta::read_fresh)
+}
+
+fn worker_loop_with_probe(
+    requests: mpsc::Receiver<ProbeRequest>,
+    cache: &Mutex<HashMap<PathBuf, CacheEntry>>,
+    pending: &Mutex<HashMap<PathBuf, u64>>,
+    mut probe: impl FnMut(&Path) -> Result<ProbeResult, jterm_core::git_meta::FreshReadError>,
 ) {
     for ProbeRequest {
         path,
         queued_at_invalidations,
     } in requests
     {
-        let result = jterm_core::git_meta::read(&path);
+        let result = probe(&path);
+        let Ok(mut pending) = pending.lock() else {
+            continue;
+        };
+        // A completion belongs only to its registered single-flight path.
+        let Some(invalidations) = pending.get(&path).copied() else {
+            continue;
+        };
         if let Ok(mut cache) = cache.lock() {
-            // Carry the running count forward instead of resetting it: an
-            // `invalidate` that arrived while Git was running has already
-            // pushed it past the generation this probe was asked for, and that
-            // gap is the entry's only memory of a change this answer predates.
-            // The entry it reads may be one `invalidate` created for exactly
-            // that purpose, which is why a report never needs an answer to
-            // survive.
-            let invalidations = cache
-                .get(&path)
-                .map_or(queued_at_invalidations, |entry| entry.invalidations);
-            insert_bounded(
-                &mut cache,
-                path.clone(),
-                CacheEntry {
-                    result,
-                    refreshed_at: Some(Instant::now()),
-                    invalidations,
-                    probed_at_invalidations: queued_at_invalidations,
-                },
-            );
+            match result {
+                Ok(result) => insert_bounded(
+                    &mut cache,
+                    path.clone(),
+                    CacheEntry {
+                        result,
+                        refreshed_at: Some(Instant::now()),
+                        next_retry_at: None,
+                        invalidations,
+                        probed_at_invalidations: queued_at_invalidations,
+                    },
+                ),
+                Err(_) => {
+                    // Busy admission, timeout and probe failure do not earn a
+                    // 30-second TTL and do not erase the last visible answer.
+                    let next_retry_at = Some(Instant::now() + FAILURE_RETRY_BACKOFF);
+                    if let Some(entry) = cache.get_mut(&path) {
+                        entry.refreshed_at = None;
+                        entry.next_retry_at = next_retry_at;
+                        entry.invalidations = invalidations;
+                    } else {
+                        insert_bounded(
+                            &mut cache,
+                            path.clone(),
+                            CacheEntry {
+                                result: None,
+                                refreshed_at: None,
+                                next_retry_at,
+                                invalidations,
+                                probed_at_invalidations: queued_at_invalidations,
+                            },
+                        );
+                    }
+                }
+            }
         }
-        if let Ok(mut pending) = pending.lock() {
-            pending.remove(&path);
-        }
+        pending.remove(&path);
     }
 }
 
@@ -269,12 +333,7 @@ pub fn read_cached_and_refresh(cwd: &Path) -> Option<RepoMeta> {
     }
     let service = service()?;
     let cached = service.cached(cwd);
-    let due = probe_is_due(
-        cached
-            .as_ref()
-            .and_then(|entry| entry.refreshed_at.map(|at| at.elapsed())),
-        cached.as_ref().is_some_and(CacheEntry::invalidated),
-    );
+    let due = cached_probe_is_due(cached.as_ref(), Instant::now());
     if due {
         let _ = service.request(cwd);
     }
@@ -302,7 +361,7 @@ mod tests {
         let service = UiGitMetaService {
             request_tx,
             cache: Arc::new(Mutex::new(HashMap::new())),
-            pending: Arc::new(Mutex::new(HashSet::new())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
         };
         let path = Path::new("/work/repo");
 
@@ -347,7 +406,7 @@ mod tests {
         let service = UiGitMetaService {
             request_tx,
             cache: Arc::new(Mutex::new(HashMap::new())),
-            pending: Arc::new(Mutex::new(HashSet::new())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
         };
         let path = Path::new("/work/repo");
         service.cache.lock().unwrap().insert(
@@ -355,6 +414,7 @@ mod tests {
             CacheEntry {
                 result: None,
                 refreshed_at: Some(Instant::now()),
+                next_retry_at: None,
                 invalidations: 0,
                 probed_at_invalidations: 0,
             },
@@ -398,23 +458,24 @@ mod tests {
     /// the report it filed must survive the answer that predates it.
     #[test]
     fn a_probe_that_raced_an_invalidation_leaves_the_entry_still_owing_one() {
-        // Never a directory, so the shared reader answers `None` without
-        // forking Git; this test is about the bookkeeping around the answer.
-        let path = PathBuf::from("/proc/self/exe/not-a-directory");
+        // A synthetic completion keeps this bookkeeping test filesystem- and
+        // process-free; production uses the same completion path.
+        let path = PathBuf::from("/fixture/repo");
         let cache = Mutex::new(HashMap::new());
-        let pending = Mutex::new(HashSet::new());
+        let pending = Mutex::new(HashMap::new());
         cache.lock().unwrap().insert(
             path.clone(),
             CacheEntry {
                 result: None,
                 refreshed_at: Some(Instant::now() - CACHE_TTL),
+                next_retry_at: None,
                 // Two commands have finished; the probe in flight was queued
                 // after the first one and knows nothing of the second.
                 invalidations: 2,
                 probed_at_invalidations: 0,
             },
         );
-        pending.lock().unwrap().insert(path.clone());
+        pending.lock().unwrap().insert(path.clone(), 2);
 
         let (request_tx, request_rx) = mpsc::sync_channel(1);
         request_tx
@@ -424,7 +485,7 @@ mod tests {
             })
             .expect("the queue takes one request");
         drop(request_tx);
-        worker_loop(request_rx, &cache, &pending);
+        worker_loop_with_probe(request_rx, &cache, &pending, |_| Ok(None));
 
         let entry = cache.lock().unwrap().get(&path).cloned().expect("answered");
         assert!(
@@ -443,6 +504,7 @@ mod tests {
         // The re-probe that follows is queued for the newer generation, and
         // clears the debt when nothing moves under it.
         let (request_tx, request_rx) = mpsc::sync_channel(1);
+        pending.lock().unwrap().insert(path.clone(), 2);
         request_tx
             .send(ProbeRequest {
                 path: path.clone(),
@@ -450,7 +512,7 @@ mod tests {
             })
             .expect("the queue takes one request");
         drop(request_tx);
-        worker_loop(request_rx, &cache, &pending);
+        worker_loop_with_probe(request_rx, &cache, &pending, |_| Ok(None));
 
         let entry = cache.lock().unwrap().get(&path).cloned().expect("answered");
         assert!(
@@ -472,14 +534,14 @@ mod tests {
     /// instance of the race rather than an exotic one.
     #[test]
     fn a_first_probe_that_raced_an_invalidation_leaves_the_entry_still_owing_one() {
-        // Never a directory, so the shared reader answers `None` without
-        // forking Git; this test is about the bookkeeping around the answer.
-        let path = PathBuf::from("/proc/self/exe/not-a-directory");
+        // A synthetic completion keeps this bookkeeping test filesystem- and
+        // process-free; production uses the same completion path.
+        let path = PathBuf::from("/fixture/repo");
         let (request_tx, request_rx) = mpsc::sync_channel(1);
         let service = UiGitMetaService {
             request_tx,
             cache: Arc::new(Mutex::new(HashMap::new())),
-            pending: Arc::new(Mutex::new(HashSet::new())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // The bar's first read of a pane that has just opened: nothing cached,
@@ -498,7 +560,7 @@ mod tests {
         let (worker_tx, worker_rx) = mpsc::sync_channel(1);
         worker_tx.send(queued).expect("the queue takes one request");
         drop(worker_tx);
-        worker_loop(worker_rx, &service.cache, &service.pending);
+        worker_loop_with_probe(worker_rx, &service.cache, &service.pending, |_| Ok(None));
 
         let entry = service.cached(&path).expect("answered");
         assert!(
@@ -521,7 +583,7 @@ mod tests {
         let service = UiGitMetaService {
             request_tx,
             cache: Arc::new(Mutex::new(HashMap::new())),
-            pending: Arc::new(Mutex::new(HashSet::new())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
         };
 
         for index in 0..MAX_CACHE_ENTRIES * 2 {
@@ -553,7 +615,7 @@ mod tests {
         let service = UiGitMetaService {
             request_tx,
             cache: Arc::new(Mutex::new(HashMap::new())),
-            pending: Arc::new(Mutex::new(HashSet::new())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
         };
         let ran_the_command = Path::new("/work/anvil");
         let merely_focused = Path::new("/work/forge");
@@ -563,6 +625,7 @@ mod tests {
                 CacheEntry {
                     result: None,
                     refreshed_at: Some(Instant::now()),
+                    next_retry_at: None,
                     invalidations: 0,
                     probed_at_invalidations: 0,
                 },
@@ -593,5 +656,180 @@ mod tests {
                 b"bad\0path",
             ))));
         }
+    }
+}
+
+#[cfg(test)]
+mod adapter_cache_regressions {
+    use super::*;
+    fn service() -> (UiGitMetaService, mpsc::Receiver<ProbeRequest>) {
+        let (request_tx, requests) = mpsc::sync_channel(4);
+        (
+            UiGitMetaService {
+                request_tx,
+                cache: Arc::new(Mutex::new(HashMap::new())),
+                pending: Arc::new(Mutex::new(HashMap::new())),
+            },
+            requests,
+        )
+    }
+    fn run_queued(
+        service: &UiGitMetaService,
+        request: ProbeRequest,
+        result: Result<ProbeResult, FreshReadError>,
+    ) {
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(request).unwrap();
+        drop(tx);
+        worker_loop_with_probe(rx, &service.cache, &service.pending, |_| result.clone());
+    }
+    #[test]
+    fn in_flight_invalidation_survives_actual_bounded_eviction() {
+        let (service, requests) = service();
+        for index in 0..MAX_CACHE_ENTRIES {
+            service.invalidate(Path::new(&format!("/fixture/{index}")));
+        }
+        let victim = service.cache.lock().unwrap().keys().next().unwrap().clone();
+        assert!(service.request(&victim));
+        let request = requests.try_recv().unwrap();
+        service.invalidate(&victim);
+        service.invalidate(Path::new("/fixture/forces-eviction"));
+        assert!(!service.cache.lock().unwrap().contains_key(&victim));
+        run_queued(&service, request, Ok(None));
+        assert!(service.cached(&victim).unwrap().invalidated());
+        assert!(service.pending.lock().unwrap().is_empty());
+        assert_eq!(service.cache.lock().unwrap().len(), MAX_CACHE_ENTRIES);
+    }
+    #[test]
+    fn unavailable_or_timed_out_probe_never_earns_fresh_ttl_or_erases_previous_value() {
+        for error in [FreshReadError::Unavailable, FreshReadError::Timeout] {
+            let (service, requests) = service();
+            let path = Path::new("/fixture/slow");
+            assert!(service.request(path));
+            run_queued(&service, requests.try_recv().unwrap(), Err(error));
+            let cold = service
+                .cached(path)
+                .expect("a bounded failure cooldown is retained");
+            assert!(cold.result.is_none());
+            assert!(cold.refreshed_at.is_none());
+            assert!(!cached_probe_is_due(Some(&cold), Instant::now()));
+            let previous = Some(RepoMeta {
+                branch: "previous".into(),
+                dirty: true,
+                ahead: None,
+                behind: None,
+            });
+            insert_bounded(
+                &mut service.cache.lock().unwrap(),
+                path.into(),
+                CacheEntry {
+                    result: previous.clone(),
+                    refreshed_at: Some(Instant::now()),
+                    next_retry_at: None,
+                    invalidations: 0,
+                    probed_at_invalidations: 0,
+                },
+            );
+            service.invalidate(path);
+            assert!(service.request(path));
+            run_queued(&service, requests.try_recv().unwrap(), Err(error));
+            let entry = service.cached(path).unwrap();
+            assert_eq!(entry.result, previous);
+            assert!(entry.refreshed_at.is_none());
+            assert!(entry.invalidated());
+            assert!(service.pending.lock().unwrap().is_empty());
+        }
+    }
+    #[test]
+    fn definitive_completed_absence_earns_ttl_but_unregistered_completion_cannot_publish() {
+        let (service, requests) = service();
+        let path = Path::new("/fixture/non-directory");
+        assert!(service.request(path));
+        run_queued(&service, requests.try_recv().unwrap(), Ok(None));
+        assert!(service.cached(path).unwrap().refreshed_at.is_some());
+        let absent = PathBuf::from("/fixture/unregistered");
+        run_queued(
+            &service,
+            ProbeRequest {
+                path: absent.clone(),
+                queued_at_invalidations: 0,
+            },
+            Ok(None),
+        );
+        assert!(service.cached(&absent).is_none());
+    }
+    #[test]
+    fn generation_exhaustion_retains_debt_and_refuses_new_requests() {
+        let (service, requests) = service();
+        let path = Path::new("/fixture/exhausted");
+        insert_bounded(
+            &mut service.cache.lock().unwrap(),
+            path.into(),
+            CacheEntry {
+                result: None,
+                refreshed_at: None,
+                next_retry_at: None,
+                invalidations: u64::MAX - 1,
+                probed_at_invalidations: u64::MAX - 1,
+            },
+        );
+        assert!(service.request(path));
+        service.invalidate(path);
+        service.invalidate(path);
+        run_queued(&service, requests.try_recv().unwrap(), Ok(None));
+        let entry = service.cached(path).unwrap();
+        assert_eq!(entry.invalidations, u64::MAX);
+        assert!(entry.invalidated());
+        assert!(!service.request(path));
+        assert!(service.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_or_full_request_admission_leaves_no_unbounded_identity() {
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let service = UiGitMetaService {
+            request_tx: tx,
+            cache: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+        };
+        assert!(service.request(Path::new("/fixture/one")));
+        for index in 0..100 {
+            assert!(!service.request(Path::new(&format!("/fixture/full/{index}"))));
+        }
+        assert_eq!(service.pending.lock().unwrap().len(), 1);
+    }
+    #[test]
+    fn failures_obey_a_separate_bounded_retry_cooldown_even_after_invalidation() {
+        let (service, requests) = service();
+        let path = Path::new("/fixture/backoff");
+        assert!(service.request(path));
+        run_queued(
+            &service,
+            requests.try_recv().unwrap(),
+            Err(FreshReadError::Unavailable),
+        );
+        let failed = service.cached(path).unwrap();
+        let retry_at = failed.next_retry_at.unwrap();
+        assert_eq!(FAILURE_RETRY_BACKOFF, Duration::from_secs(10));
+        assert!(failed.refreshed_at.is_none());
+        assert!(!cached_probe_is_due(
+            Some(&failed),
+            retry_at - Duration::from_nanos(1)
+        ));
+        assert!(cached_probe_is_due(Some(&failed), retry_at));
+        service.invalidate(path);
+        let changed = service.cached(path).unwrap();
+        assert!(changed.invalidated());
+        assert_eq!(changed.next_retry_at, Some(retry_at));
+        assert!(!cached_probe_is_due(
+            Some(&changed),
+            retry_at - Duration::from_nanos(1)
+        ));
+        assert!(service.request(path));
+        run_queued(&service, requests.try_recv().unwrap(), Ok(None));
+        let completed = service.cached(path).unwrap();
+        assert!(completed.refreshed_at.is_some());
+        assert!(completed.next_retry_at.is_none());
+        assert!(!completed.invalidated());
     }
 }
