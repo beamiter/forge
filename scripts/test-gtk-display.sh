@@ -279,6 +279,10 @@ PY_BINARY
         "$diagnostic_status" "$original_status" | tee -a "$diagnostic_dir/status.txt"
 }
 
+passed_count=0
+failed_cases=()
+failed_statuses=()
+
 for test_name in "${tests[@]}"; do
     printf 'GTK display regression: %s\n' "${test_name}"
     # These fixtures check accessible values; GTK caches the backend at init.
@@ -294,14 +298,28 @@ for test_name in "${tests[@]}"; do
         xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
         cargo test --lib --all-features --locked "${test_name}" -- \
         --ignored --exact --nocapture; then
-        :
+        passed_count=$((passed_count + 1))
     else
         original_status=$?
+        failed_cases+=("${test_name}")
+        failed_statuses+=("${original_status}")
+        printf 'GTK display regression failed (exit %d): %s\n' "$original_status" "$test_name" >&2
         if [[ "${FORGE_NATIVE_CRASH_DIAGNOSTICS:-0}" == 1 && "$test_name" == ui::organism::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers ]]; then
             capture_vte_crash "$original_status" || printf 'F08 diagnostic collection failed; preserving original status %s\n' "$original_status" >&2
         fi
-        exit "$original_status"
+        # Each case has its own process/display/bus. Keep collecting results
+        # after a case failure so unrelated failures cannot hide later Chat
+        # regressions. Setup and registration above still fail immediately.
     fi
 done
 
-printf 'GTK display regressions passed: %d/%d.\n' "${#tests[@]}" "${#tests[@]}"
+printf 'GTK display regressions passed: %d/%d.\n' "$passed_count" "${#tests[@]}"
+if (( ${#failed_cases[@]} > 0 )); then
+    printf 'Failed GTK display regressions (%d):\n' "${#failed_cases[@]}" >&2
+    for index in "${!failed_cases[@]}"; do
+        printf '  %s (exit %d)\n' "${failed_cases[index]}" "${failed_statuses[index]}" >&2
+    done
+    # Preserve the first failure exactly, including timeout/signal statuses.
+    # A diagnostic replay or a later passing case must never turn the run green.
+    exit "${failed_statuses[0]}"
+fi
