@@ -1094,6 +1094,10 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         "ascii_organism_enabled".into(),
         toml::Value::Boolean(config.ascii_organism_enabled),
     );
+    table.insert(
+        "ascii_organism_care_enabled".into(),
+        toml::Value::Boolean(config.ascii_organism_care_enabled),
+    );
     if let Some(motion) = config.ascii_organism_motion {
         table.insert(
             "ascii_organism_motion".into(),
@@ -1929,6 +1933,8 @@ mod tests {
         let path = directory.join("config.toml");
         let mut config = default_config();
         config.ascii_organism_enabled = true;
+        assert!(!config.ascii_organism_care_enabled);
+        config.ascii_organism_care_enabled = true;
         config.ascii_organism_motion = Some(config::OrganismMotion::Calm);
 
         let mut revision =
@@ -1937,6 +1943,12 @@ mod tests {
             .unwrap()
             .parse::<toml::Table>()
             .unwrap();
+        assert_eq!(
+            table
+                .get("ascii_organism_care_enabled")
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
         assert_eq!(
             table
                 .get("ascii_organism_enabled")

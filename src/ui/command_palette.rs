@@ -343,6 +343,36 @@ struct PaletteSnapshot {
     workflows: Vec<crate::workflows::Workflow>,
 }
 
+const MAX_PALETTE_HISTORY: usize = 2_000;
+
+struct PaletteHistoryLoad {
+    entries: Vec<HistoryEntry>,
+    failed: bool,
+}
+
+fn start_palette_history_load(
+    live: Vec<String>,
+    load: impl FnOnce() -> Result<Vec<jterm_core::command_history::CommandHistoryRecord>, ()>
+        + Send
+        + 'static,
+) -> jterm_core::workflows::BackgroundRefresh<PaletteHistoryLoad> {
+    let state = jterm_core::workflows::BackgroundRefresh::new(PaletteHistoryLoad {
+        entries: merge_palette_history(live.clone(), Vec::new(), MAX_PALETTE_HISTORY),
+        failed: false,
+    });
+    state.refresh(move || match load() {
+        Ok(persisted) => PaletteHistoryLoad {
+            entries: merge_palette_history(live, persisted, MAX_PALETTE_HISTORY),
+            failed: false,
+        },
+        Err(()) => PaletteHistoryLoad {
+            entries: merge_palette_history(live, Vec::new(), MAX_PALETTE_HISTORY),
+            failed: true,
+        },
+    });
+    state
+}
+
 /// Merge newest-first live Block commands with the newest-first JSONL tail.
 /// Live commands win duplicate identity because they are the UI's freshest
 /// observation; persisted metadata remains available for older commands.
@@ -372,6 +402,14 @@ fn merge_palette_history(
         }
     }
     merged
+}
+
+fn palette_target_matches<T: PartialEq>(
+    expected: Option<&T>,
+    current: Option<&T>,
+    mapped: bool,
+) -> bool {
+    mapped && expected.is_some() && expected == current
 }
 
 fn palette_title(mode: PaletteMode) -> &'static str {
@@ -427,39 +465,49 @@ impl UiState {
         }
     }
 
-    fn palette_snapshot(&self) -> PaletteSnapshot {
-        const MAX_PALETTE_HISTORY: usize = 2_000;
+    fn palette_snapshot(
+        &self,
+    ) -> (
+        PaletteSnapshot,
+        jterm_core::workflows::BackgroundRefresh<PaletteHistoryLoad>,
+    ) {
         let live = self
             .current_term_view()
             .map(|view| view.command_history_bounded(MAX_PALETTE_HISTORY))
             .unwrap_or_default();
-        let persisted = {
+        let request = {
             let config = self.config.borrow();
-            if config.command_history_enabled {
-                config
-                    .command_history_path
-                    .as_deref()
-                    .map(std::path::Path::new)
-                    .and_then(|path| {
-                        jterm_core::command_history::read_recent(
-                            path,
+            config
+                .command_history_enabled
+                .then(|| {
+                    config.command_history_path.as_ref().map(|path| {
+                        (
+                            std::path::PathBuf::from(path),
                             (config.command_history_max_entries as usize).min(MAX_PALETTE_HISTORY),
                         )
-                        .map_err(|error| {
-                            log::warn!("command palette history snapshot: {error}");
-                            error
-                        })
-                        .ok()
                     })
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            }
+                })
+                .flatten()
         };
-        PaletteSnapshot {
-            history: merge_palette_history(live, persisted, MAX_PALETTE_HISTORY),
-            workflows: crate::workflows::load_all(),
-        }
+        let history = if let Some((path, limit)) = request {
+            start_palette_history_load(live, move || {
+                jterm_core::command_history::read_recent(&path, limit).map_err(|error| {
+                    log::warn!("command palette history snapshot: {error}");
+                })
+            })
+        } else {
+            jterm_core::workflows::BackgroundRefresh::new(PaletteHistoryLoad {
+                entries: merge_palette_history(live, Vec::new(), MAX_PALETTE_HISTORY),
+                failed: false,
+            })
+        };
+        (
+            PaletteSnapshot {
+                history: history.snapshot().value.entries.clone(),
+                workflows: self.workflow_library.snapshot().value.as_ref().clone(),
+            },
+            history,
+        )
     }
 
     fn gather_palette_entries(
@@ -504,56 +552,70 @@ impl UiState {
         }
     }
 
-    /// `workflows` is the library this palette listed, not a fresh scan — see
-    /// the `RunWorkflow` arm.
-    fn accept_palette_entry(&self, entry: Entry, workflows: &[crate::workflows::Workflow]) {
+    pub(super) fn palette_input_target(
+        &self,
+        target: &Option<gtk4::glib::WeakRef<gtk4::Widget>>,
+    ) -> Option<super::PaneLeaf> {
+        let root = target.as_ref()?.upgrade()?;
+        let current = self.current_pane_leaf().map(|pane| pane.root_widget());
+        if !palette_target_matches(Some(&root), current.as_ref(), root.is_mapped()) {
+            return None;
+        }
+        super::PaneLeaf::from_widget(&root)
+    }
+
+    /// Input belongs to the opening's pane; global actions retain their own
+    /// dispatch policy. Never retarget a history/workflow/AI choice after exit.
+    fn accept_palette_entry(
+        &self,
+        entry: Entry,
+        workflows: &[crate::workflows::Workflow],
+        target: &Option<gtk4::glib::WeakRef<gtk4::Widget>>,
+    ) {
         match entry.accept {
             Accept::Action(action) => self.execute_action(action),
-            Accept::TypeCommand(command) => {
-                if command.is_empty() {
+            accept => {
+                if matches!(&accept, Accept::TypeCommand(text) | Accept::AskAi(text) if text.is_empty())
+                {
                     return;
                 }
-                if let Some(pane) = self.current_pane_leaf() {
-                    self.insert_review_text(&pane, &command);
-                }
-            }
-            Accept::AskAi(request) => {
-                if request.is_empty() {
-                    return;
-                }
-                self.generate_command_for_review(request);
-            }
-            Accept::RunWorkflow(path) => {
-                // The library this palette was built from, not a second full
-                // five-tier disk walk: forge re-ran `load_all()` here on every
-                // activation, on the GTK main loop, having already walked the
-                // same path to populate the list the user just picked from.
-                let Some(workflow) = workflows
-                    .iter()
-                    .find(|workflow| workflow.source_path.as_deref() == Some(path.as_path()))
-                else {
-                    log::warn!(
-                        "workflow disappeared before activation: {}",
-                        jterm_core::review_input::safe_inline_display(
-                            &path.to_string_lossy(),
-                            crate::workflows::MAX_LOGGED_PATH_BYTES
-                        )
-                    );
+                let Some(pane) = self.palette_input_target(target) else {
+                    self.toast_overlay.add_toast(adw::Toast::new(
+                        "Nothing was inserted: the palette's original pane is no longer active.",
+                    ));
                     return;
                 };
-                let Some(pane) = self.current_pane_leaf() else {
-                    return;
-                };
-                if workflow.args.is_empty() {
-                    self.insert_workflow(&pane, workflow);
-                } else {
-                    self.show_workflow_args_dialog(workflow.clone(), pane);
+                match accept {
+                    Accept::TypeCommand(command) => {
+                        self.insert_review_text(&pane, &command);
+                    }
+                    Accept::AskAi(request) => self.generate_command_for_review(request, pane),
+                    Accept::RunWorkflow(path) => {
+                        let Some(workflow) = workflows.iter().find(|workflow| {
+                            workflow.source_path.as_deref() == Some(path.as_path())
+                        }) else {
+                            log::warn!(
+                                "workflow disappeared before activation: {}",
+                                jterm_core::review_input::safe_inline_display(
+                                    &path.to_string_lossy(),
+                                    crate::workflows::MAX_LOGGED_PATH_BYTES,
+                                )
+                            );
+                            return;
+                        };
+                        if workflow.args.is_empty() {
+                            self.insert_workflow(&pane, workflow);
+                        } else {
+                            self.show_workflow_args_dialog(workflow.clone(), pane);
+                        }
+                    }
+                    Accept::Action(_) => unreachable!("global actions were dispatched above"),
                 }
             }
         }
     }
 
-    fn generate_command_for_review(&self, request: String) {
+    fn generate_command_for_review(&self, request: String, pane: super::PaneLeaf) {
         match crate::ai::client_from_config(&self.config.borrow()) {
             Ok(_) => {}
             Err(error) => {
@@ -561,7 +623,7 @@ impl UiState {
                 return;
             }
         }
-        let Some(target) = self.current_term_view() else {
+        let Some(target) = pane.block_view() else {
             self.show_ai_error(
                 "AI command suggestions require an active Block pane. Switch this pane to Block mode and try again.",
             );
@@ -797,12 +859,19 @@ impl UiState {
             return;
         }
 
-        // All disk/config-backed sources are captured once at open. Search
-        // changes below are pure in-memory filtering and never do per-key I/O.
+        // Capture the current pane immediately; disk history and workflows
+        // arrive in the background without delaying dialog presentation.
+        let input_target = self
+            .current_pane_leaf()
+            .map(|pane| pane.root_widget().downgrade());
         let greeting_target = self.organism_greeting_target();
         let vte_presentation_target = self.vte_companion_target();
         let output_review_target = self.current_term_view().map(|view| Rc::downgrade(&view));
-        let snapshot = Rc::new(self.palette_snapshot());
+        let library = self.workflow_library.snapshot().value;
+        // Queue this opening's history before optional workflow discovery.
+        let (snapshot, history_load) = self.palette_snapshot();
+        self.refresh_workflow_library();
+        let snapshot = Rc::new(RefCell::new(snapshot));
         let dialog = adw::Dialog::builder()
             .title(palette_title(initial_mode))
             .content_width(620)
@@ -828,7 +897,7 @@ impl UiState {
         let entries = Rc::new(RefCell::new(self.gather_palette_entries(
             "",
             initial_mode,
-            &snapshot,
+            &snapshot.borrow(),
         )));
         render_rows(&list, &entries.borrow());
 
@@ -843,23 +912,33 @@ impl UiState {
         filter.set_margin_top(8);
         filter.set_margin_bottom(8);
         body.append(&filter);
+        let history_status = Label::new(Some("Loading command history…"));
+        history_status.set_wrap(true);
+        history_status.add_css_class("dim-label");
+        history_status.set_visible(history_load.snapshot().loading);
+        body.append(&history_status);
+        let load_status = Label::new(Some("Refreshing workflows…"));
+        load_status.set_wrap(true);
+        load_status.add_css_class("dim-label");
+        body.append(&load_status);
         body.append(&scrolled);
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&header);
         toolbar.set_content(Some(&body));
         dialog.set_child(Some(&toolbar));
 
+        let rendered_query = Rc::new(RefCell::new(String::new()));
         let refresh_query = {
             let ui = self.clone();
             let list = list.clone();
             let entries = entries.clone();
             let snapshot = snapshot.clone();
-            let rendered_query = RefCell::new(String::new());
+            let rendered_query = rendered_query.clone();
             Rc::new(move |query: &str| {
                 if *rendered_query.borrow() == query {
                     return;
                 }
-                let next = ui.gather_palette_entries(query, initial_mode, &snapshot);
+                let next = ui.gather_palette_entries(query, initial_mode, &snapshot.borrow());
                 render_rows(&list, &next);
                 *entries.borrow_mut() = next;
                 *rendered_query.borrow_mut() = query.to_string();
@@ -910,13 +989,18 @@ impl UiState {
                         *action == crate::keybindings::Action::ExpandVteCompanion,
                     );
                 } else {
-                    ui.accept_palette_entry(entry, &snapshot.workflows);
+                    ui.accept_palette_entry(entry, &snapshot.borrow().workflows, &input_target);
                 }
             })
         };
         {
             let activate = activate.clone();
-            list.connect_row_activated(move |_, row| activate(row.index() as usize));
+            list.connect_row_activated(move |list, row| {
+                let index = row.index();
+                if index >= 0 && list.row_at_index(index).as_ref() == Some(row) {
+                    activate(index as usize);
+                }
+            });
         }
 
         let keys = palette_controller(
@@ -930,6 +1014,73 @@ impl UiState {
         );
         dialog.add_controller(keys);
 
+        let refresh_rows = {
+            let ui = self.clone();
+            let snapshot = snapshot.clone();
+            let entries = entries.clone();
+            let list = list.downgrade();
+            let filter = filter.downgrade();
+            Rc::new(move || {
+                let (Some(list), Some(filter)) = (list.upgrade(), filter.upgrade()) else {
+                    return;
+                };
+                let selected = list.selected_row().and_then(|row| {
+                    entries
+                        .borrow()
+                        .get(row.index() as usize)
+                        .map(|entry| entry.accept.clone())
+                });
+                let query = filter.text();
+                let next = ui.gather_palette_entries(&query, initial_mode, &snapshot.borrow());
+                let selected = selected
+                    .and_then(|accept| next.iter().position(|entry| entry.accept == accept));
+                render_rows(&list, &next);
+                if let Some(row) = selected.and_then(|index| list.row_at_index(index as i32)) {
+                    list.select_row(Some(&row));
+                }
+                *entries.borrow_mut() = next;
+                *rendered_query.borrow_mut() = query.to_string();
+            })
+        };
+        {
+            let snapshot = snapshot.clone();
+            let refresh_rows = refresh_rows.clone();
+            self.watch_workflow_library(&dialog, &load_status, library, move |workflows| {
+                snapshot.borrow_mut().workflows = workflows.to_vec();
+                refresh_rows();
+            });
+        }
+        {
+            let dialog = dialog.downgrade();
+            let status = history_status.downgrade();
+            let snapshot = snapshot.clone();
+            gtk4::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                let (Some(dialog), Some(status)) = (dialog.upgrade(), status.upgrade()) else {
+                    return gtk4::glib::ControlFlow::Break;
+                };
+                // Each opening owns its load handle and widgets. Retiring it
+                // cannot update a reopened palette or another pane's snapshot.
+                if dialog.parent().is_none() {
+                    return gtk4::glib::ControlFlow::Break;
+                }
+                let state = history_load.snapshot();
+                if state.loading {
+                    return gtk4::glib::ControlFlow::Continue;
+                }
+                let failed = state.error.is_some() || state.value.failed;
+                status.set_label(if failed {
+                    "Command history could not load. Current pane commands remain available."
+                } else {
+                    ""
+                });
+                status.set_visible(failed);
+                if snapshot.borrow().history != state.value.entries {
+                    snapshot.borrow_mut().history = state.value.entries.clone();
+                    refresh_rows();
+                }
+                gtk4::glib::ControlFlow::Break
+            });
+        }
         let slot = self.command_palette_dialog.clone();
         dialog.connect_closed(move |_| *slot.borrow_mut() = None);
         *self.command_palette_dialog.borrow_mut() = Some(dialog.clone());
@@ -1135,5 +1286,102 @@ mod tests {
             Key::p,
             ctrl_shift
         ));
+    }
+    fn wait_history(state: &jterm_core::workflows::BackgroundRefresh<super::PaletteHistoryLoad>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.snapshot().loading {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "history worker did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn palette_history_live_commands_are_available_while_disk_load_is_blocked() {
+        let (release, wait) = std::sync::mpsc::channel();
+        let state = super::start_palette_history_load(vec!["cargo test".into()], move || {
+            wait.recv().unwrap();
+            Ok(vec![jterm_core::command_history::CommandHistoryRecord {
+                command: "git status".into(),
+                cwd: None,
+                exit_code: 0,
+                end_time_ms: None,
+            }])
+        });
+        let initial = state.snapshot();
+        assert!(initial.loading);
+        assert_eq!(initial.value.entries[0].command, "cargo test");
+        assert_eq!(initial.value.entries.len(), 1);
+        release.send(()).unwrap();
+        wait_history(&state);
+        let completed = state.snapshot();
+        assert_eq!(
+            completed
+                .value
+                .entries
+                .iter()
+                .map(|entry| entry.command.as_str())
+                .collect::<Vec<_>>(),
+            ["cargo test", "git status"]
+        );
+        assert!(!completed.value.failed);
+    }
+
+    #[test]
+    fn palette_history_reopen_has_separate_results_and_failure_keeps_live_commands() {
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, running) = std::sync::mpsc::channel();
+        let old = super::start_palette_history_load(vec!["old pane".into()], move || {
+            started.send(()).unwrap();
+            wait.recv().unwrap();
+            Ok(Vec::new())
+        });
+        running
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let reopened = super::start_palette_history_load(vec!["new pane".into()], || Err(()));
+        drop(old);
+        release.send(()).unwrap();
+        wait_history(&reopened);
+        let completed = reopened.snapshot();
+        assert!(completed.value.failed);
+        assert_eq!(completed.value.entries.len(), 1);
+        assert_eq!(completed.value.entries[0].command, "new pane");
+    }
+    #[test]
+    fn palette_input_rejects_closed_switched_or_missing_opening_targets() {
+        assert!(super::palette_target_matches(Some(&1), Some(&1), true));
+        assert!(!super::palette_target_matches(Some(&1), Some(&2), true));
+        assert!(!super::palette_target_matches(Some(&1), None, true));
+        assert!(!super::palette_target_matches(Some(&1), Some(&1), false));
+        assert!(!super::palette_target_matches(None::<&u64>, Some(&1), true));
+    }
+
+    #[test]
+    fn palette_input_and_ai_dispatch_use_the_captured_pane() {
+        let source = include_str!("command_palette.rs");
+        let accept = source
+            .split("    fn accept_palette_entry(")
+            .nth(1)
+            .unwrap()
+            .split("    fn generate_command_for_review(")
+            .next()
+            .unwrap();
+        assert!(accept.contains("self.palette_input_target(target)"));
+        assert!(!accept.contains("current_pane_leaf()"));
+        assert!(accept.contains("self.insert_review_text(&pane, &command)"));
+        assert!(accept.contains("self.generate_command_for_review(request, pane)"));
+        assert!(accept.contains("self.show_workflow_args_dialog(workflow.clone(), pane)"));
+        let ai = source
+            .split("    fn generate_command_for_review(")
+            .nth(1)
+            .unwrap()
+            .split("    pub(crate) fn toggle_unified_command_palette(")
+            .next()
+            .unwrap();
+        assert!(ai.contains("pane.block_view()"));
+        assert!(!ai.contains("current_term_view()"));
     }
 }

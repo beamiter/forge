@@ -15,6 +15,27 @@ available. The same context appears in the optional native status bar. No
 extra panel is enabled, and the native buffer retains all space when the
 picker is closed. Context collection does not start Git, LSP, or remote jobs.
 
+The picker now provides **Git**, **Code**, **Tree**, **Plugins**, and **Status**
+filters. Each button shows the corresponding live cached state on hover;
+selecting it keeps focus in the search field and displays a detailed summary.
+The filters can also be typed directly:
+
+| Filter | Available workflows |
+| --- | --- |
+| `>simplegit` | Status, diff, hunk preview/navigation/staging/confirmed undo, blame and history |
+| `>simplecc` | Language actions, diagnostics, language-service status/restart/log |
+| `>simpletree` | Toggle, reveal and refresh the project tree |
+| `>simpleplug` | Plugin status, update checks, install/update/stop, change review, startup profile and health |
+| `>simpleline` or `>simplestatusbar` | Statusline health and visibility |
+
+A filter chooses a category; a command runs only after selecting a result.
+Unavailable commands retain their explanation. Switching filters clears old
+selection/activation state, and every editor action is resolved against the
+current source buffer, window, changedtick and cursor. Plugin progress, LSP
+state, tree context and statusline state refresh from the Vim configuration's
+published caches. The normal minimal editor layout is unchanged when the
+picker closes.
+
 Vim and the Simple plugins continue to own the action's editing behavior and
 popups. Ordinary supported completion menus use the native paint path; other
 plugin popups and preview views can still use the live compatibility display.
@@ -90,6 +111,17 @@ those advanced content renderers are already implemented.
 
 ## Native buffer rendering
 
+Native paint rejects invisible ink before shaping it and builds diagnostic
+waves only for the visible horizontal span, including cursor inversion.
+Clipping keeps the original row baseline and wave phase during fractional
+scrolling; a partially visible row does not move its underline to the edge.
+
+Completion and popup render nodes are retained across unchanged cursor/focus
+frames. Their own contents, GUI theme, widget clip, font settings, scale or
+Pango context changes rebuild the overlay without invalidating unrelated text.
+Closing the final overlay releases the retained node.
+
+
 Native rendering is enabled by default for supported ordinary buffer views.
 The rendering menu reports **GUI · RGB / Pango** while the native surface is drawing;
 `status_bar = true` also enables the header badge.
@@ -114,14 +146,21 @@ horizontal, vertical and nested Vim splits. Vim's status lines, split dividers
 and command area remain live in the compatibility display. Every pane uses its
 own buffer text, syntax and viewport; the active Vim window alone owns the
 native cursor and IME preedit. The bridge explicitly falls back for display
-features it cannot yet reproduce faithfully, including closed folds, wrapped
-continuation rows, diff, general popup windows and complex/scrolling completion menus,
+features it cannot yet reproduce faithfully, including blockwise selections
+over closed folds, virtual text on wrapped lines, diff, general popup windows and complex/scrolling completion menus,
 complex signs or fold columns, virtual text, complex match patterns, concealment,
 and complex bidirectional text. The default single sign column, ordinary
 diagnostic text-property highlights and simple search matches use their GUI
 styles. If any pane needs compatibility, the whole editor shows live Vim until
 all panes can be sampled faithfully. The rendering menu gives the reason; native
-rendering then resumes automatically. Resize transitions also
+rendering then resumes automatically. Closed folds are native rows (render
+protocol 8): Pango paints the fold text and filler in Vim's `Folded` colors,
+rows below keep Vim's positions, touchpad and wheel scrolling move across a
+fold as one row, and clicks in a folded split go to Vim's own mouse handling. Soft-wrapped lines are native rows too
+(render protocol 9): continuation rows, `showbreak`/`breakindent` and
+`smoothscroll` partial lines keep Vim's exact layout, and touchpad or wheel
+scrolling moves one wrapped row at a time. Clicks and drags on continuation rows
+stay native, and `colorcolumn`/`cursorcolumn` guides follow Vim onto wrapped rows. Resize transitions also
 retain the compatibility view until Vim publishes matching geometry, so a stale
 frame cannot cover a differently sized input grid. Selecting terminal text
 with Shift-drag temporarily reveals the compatibility display so selection

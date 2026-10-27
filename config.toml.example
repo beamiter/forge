@@ -69,6 +69,8 @@ block_compact = false
 # Settings 或 Reload Config 可立即应用。临时关闭：FORGE_ASCII_ORGANISM_ENABLED=0。
 # 连续状态与 repo/day 统计保存到 XDG state 目录；不保存命令或输出。
 ascii_organism_enabled = true
+# Optional quiet break prompts after sustained foreground use; off by default.
+ascii_organism_care_enabled = false
 # 身体动效等级："full"（动画+游走+行走过渡）、"calm"（只在行为边界换姿，
 # 无游走/摆动/帧交替）、"static"（只保留 prompt 上方的 inline 卡片）。
 # 未设置时跟随桌面动画偏好（gtk-enable-animations 关闭时自动 calm）。

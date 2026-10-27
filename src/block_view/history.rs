@@ -2757,6 +2757,7 @@ impl TermView {
                 visible_indices: &self.visible_indices,
                 failure_marker_redraw: self.failure_marker_redraw.as_ref(),
             },
+            &self.scroll_debouncer,
         );
 
         let skipped = loaded.total_loaded.saturating_sub(restored.len());

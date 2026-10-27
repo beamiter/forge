@@ -134,7 +134,7 @@ ShellCheck，不会在检查过程中解析出另一份依赖图。
 `make package` 刻意使用宿主 Cargo 与系统 GTK/VTE 开发库：发行归档按兼容系统的动态库
 ABI 分发，不能把 Nix store 解释器/RPATH 烘进裸二进制。日常构建和验收仍使用上面的 Nix 门禁。
 
-安装脚本默认优先使用 Nix；没有 Nix 时自动退回 Cargo，并在备份已有配置后替换为随版本提供的默认配置（保留自定义配置请加 `--no-config`）：
+安装脚本默认优先使用 Nix；没有 Nix 时自动退回 Cargo。已有配置仅在字段结构变化时备份并替换；仅默认值、注释或顺序变化时保留原配置。使用 `--no-config` 可始终保留自定义配置：
 
 ```bash
 ./scripts/install.sh
@@ -439,6 +439,17 @@ Tasks 面板显示当前可见数与搜索匹配数，各状态按钮也显示�
 本地 ASCII 生命体默认开启，会响应命令与 Agent 状态；设为 `ascii_organism_enabled = false` 可关闭。
 关闭期间的 Agent 活动不会改变它的生命状态，也不会在重新开启时补发反应。
 
+每个 GUI 只有一个生命体。切换 block、分屏或标签页时，原来的身体先隐藏，再由当前本地窗格接管；
+常驻的 organism 卡片已移除，滚动阅读时的小头像与活跃区域身体互斥，非焦点 VTE 分屏整行隐去，保留原有尺寸以避免终端重排。
+生命状态、环境习惯、问候冷却和聊天语气在窗口内共享；Static 仍保留同一个静态身体。
+**Inspect ASCII companion** 以文字显示状态，并提供 **Say hello / Keep me company / Tell a story / Take a break**。
+回复来自本地编写的短对话和轮换故事，使用面板打开时的活动快照，不执行命令、不调用 Agent。
+
+可在该面板开启 **Gentle break reminders**；持久配置 `ascii_organism_care_enabled` 默认 `false`。
+累计前台近期有人类输入的工作时间后，伴侣只在空闲安全时通过普通 toast 轻声提醒喝水、活动或远眺；
+**Later** 延后 20 分钟，**Take a break** 重置本次工作计时。后台窗格、输入中、运行命令、全屏程序或模态对话框期间不提醒。
+Static 模式只限制动画，仍支持用户明确开启的文字提醒。
+
 命令面板中的应用动作及其当前绑定可在 `Ctrl+Shift+P` 中搜索；这些动作可在
 `[keybindings]` 中覆盖，设为 `false` 可解除绑定。Block 视图内的上下文键
 `Alt+Shift+F`（过滤）、`Ctrl+Shift+B`（书签）和 `Ctrl+,` / `Ctrl+.`（前后书签）
@@ -448,6 +459,12 @@ Block 历史统一使用 `Ctrl+Shift+H`。
 AI provider、model、endpoint 和 API key 均可在 Settings 的 **AI & Agent** 分组配置；面板输入的 key 会原子保存到独立的 owner-only 文件，绝不会写入 `config.toml`，环境变量仍具有最高优先级。AI 面板的分隔条宽度会随配置持久化。**New chat** 会创建并选中一个新会话，旧会话继续保留在可搜索的 **Chats** 会话库中；会话自动取标题，也可 Rename、Archive/Unarchive，Delete 前会要求确认；会话库上限为 50，槽位全满且当前会话是最后一个未归档会话时，Archive 会在改动任何状态之前被拒绝并提示先删除一个会话，避免留下一个全部已归档、没有可写会话的库。输入框使用 `Enter` 或 `Ctrl+Enter` 发送，`Shift+Enter` 换行，并保留输入法候选确认语义。请求期间可 **Stop**，失败或停止后可按原 chat/context **Retry**；选中 Block 会显示可清除的 context chip，输出被截断时 chip 会明确提示。空会话也提供只填充、不自动发送的快捷提示。
 
 当前选择、每个 chat 的草稿和实际发送的选中 Block 上下文会跟随各自窗口快照恢复；快速关窗会先强制刷新草稿，发送失败或中途退出的问题也会作为可重试 draft 恢复，Ask selected Block 不会覆盖正在编辑的文字，关窗时其内存重试也会转成可恢复 draft/context。集合最多保存 50 条 chat metadata、每个 chat 最多 100 个 turn，紧凑 JSON 总预算仍为 8 MiB；超出总预算时只裁剪最旧的完整问答对，不会删除在途问题，并在对应会话显示 `truncated`。出站请求另保留最近至多 40 个 turn/256 KiB，单条输入、Block 输出和模型文本分别有 64 KiB、64 KiB、256 KiB 硬上限，可见 AI/Agent activity 各限制为 1 MiB，同时最多运行 4 个 provider 请求。非流式成功响应保持 raw bytes，先通过 jagent 的 1 MiB envelope gate 才解码 JSON；非 2xx 响应最多只有前 2 KiB 可进入诊断 JSON 解析器。窗口状态另为完整 chat metadata 预留 64 KiB，Pane/Tab 数据挤压空间时也不会静默删除整个 Chats 库。旧版单会话 schema v1 会自动迁移。后台回复始终绑定发起请求的 chat，切换不会串话，已经 Delete 的 chat 收到迟到回复时会直接丢弃。默认脱敏覆盖 active、non-active、archived chat 及其 draft/context；`--safe-mode` 与 `--no-restore` 的隔离和恢复语义保持不变。
+
+工作流列表在后台刷新，打开时先显示已有结果；刷新保留当前查询和仍存在的选中工作流，关闭后的结果不会重开旧窗口。参数窗口关闭后释放对关联控件与 pane 的引用；提交时再次校验原 pane，失效时保留参数并拒绝回填。
+
+命令面板先显示当前 pane 的命令，磁盘历史随后在后台合并；慢盘不再阻塞窗口打开，加载失败仍保留当前命令，关闭重开不会接收旧窗口的结果。历史回填、工作流与 AI 建议绑定打开时的 pane；确认时该 pane 已退出或不再活动，会拒绝回填。
+
+历史命令即使预览被截短，命令面板仍检索完整保留文本，选中后回填原始命令。
 
 命令面板使用模糊匹配；输入 `>` 只看动作、`@` 只看 JSONL 历史、`:` 只看 workflow、`?` 提交自然语言命令请求。历史和 workflow 只写入当前编辑行；`?` 请求会绑定当前 Block pane，在块流中显示可 Stop/Retry/Regenerate 的审阅卡，并携带可见的 selected Block 不可信上下文。它与命令纠正、Shell Agent proposal 共用可编辑、复制、动态风险提示的审阅逻辑，主操作只会 **Insert for review**，不会执行。所有审阅式插入都拒绝 CR、LF、Tab、NUL 和终端控制字符，避免多行条目越过“不提交”边界。`Ctrl+Alt+G` 或顶部栏的 **Agent** 开关会打开绑定当前 Block pane 的 Shell Agent；若打开时已选中 finished Block，它会作为可见、可移除的不可信上下文附加。Agent 显示目标、provider/model、shell、回合进度、activity 与实时 prompt readiness，可单独 Stop/Retry 当前模型请求，并可切换持久化的 typo-like 命令纠正。严格 JSON proposal 可复制、编辑、Reject、**Insert only** 或逐条 **Approve & Run**；Insert only 只回填普通 shell 编辑行并在 Agent 上下文记录“未执行”，危险命令执行仍需第二次确认。完成块的退出码和截断输出随后回灌到下一轮；`done` 后可用 **Follow up** 保留上下文追问，回合耗尽后可用 **New task** 在同一 pane 重置 Agent transcript 与预算。
 
@@ -657,11 +674,20 @@ terminal. Existing defaults and existing panes are unchanged. See
 directory. Existing binaries are replaced atomically.
 
 The configuration is installed to `${XDG_CONFIG_HOME:-$HOME/.config}/forge/config.toml`.
-An existing regular config is backed up as `config.toml.backup.<unique suffix>`
-before replacing it with the bundled defaults. Identical configs do not create
-extra backups. Use `--no-config` to retain all custom settings, or copy selected
-settings back from the private backup after installation. Symlinked configs are
-left unchanged. `--dry-run` does not write binaries, configs, or backups.
+On first installation, the bundled defaults are installed. For an existing
+regular config, the installer compares its TOML field structure with the bundled
+config, including nested tables. Changes only to values, comments, or ordering
+keep the existing file and do not create a backup. Added, removed, or renamed
+fields trigger a private `config.toml.backup.<unique suffix>` copy followed by
+atomic replacement with the bundled defaults. Array lengths and element values
+are ignored; fields within table elements are compared when both arrays contain
+tables. Copy selected custom settings back from the backup after a field change,
+or use `--no-config` to always retain your current settings.
+
+Comparison uses Python 3.11+ `tomllib`, or `tomli` on older Python 3 versions.
+If the parser is unavailable or either file cannot be parsed, the installer
+reports the reason and keeps the existing config. Symlinked configs are left
+unchanged. `--dry-run` does not write binaries, configs, or backups.
 
 An already-running terminal keeps its current process; restart it to use the new
 binary and configuration. If an older copy comes first in PATH, the installer
@@ -673,3 +699,69 @@ symlink to `~/.local/bin/forge`. This prevents the old PATH entry from launching
 stale code. Repeated installs reuse that link. Uninstall removes only a matching
 compatibility link and leaves the backup available for recovery. Other prefixes
 and unrelated PATH entries are not modified.
+
+
+### Agent management
+
+Open **Agent Sessions** using the grid button in the top bar,
+**Ctrl+Alt+Shift+G**, or the command palette. The `open_agent_sessions`
+keybinding (also accepted as `agent:sessions`) can be rebound in configuration.
+This manager discovers existing Codex and Claude CLI history across projects,
+including custom `CODEX_HOME` and `CLAUDE_CONFIG_DIR` locations. It is separate
+from the isolated-worktree Tasks dashboard and does not require an API key.
+
+The **Agent Manager** adds quick views for active conversations, recorded input
+requests, observed live CLIs, pins and local archives. Choose a project and its
+subdirectories, give conversations local names and tags, or archive and restore
+them without changing provider history. **Save** and **Revert** act on the selected
+conversation; unsaved drafts survive row changes and background refreshes.
+Saved organization is shared with Anvil, Ember and Frost on the same account.
+
+Search by project, title, session ID, branch, or conversation preview; combine
+provider and recorded-state filters. Aliases and tags are searchable too:
+`provider:codex tag:review`, `title:"release plan"`, `project:/work/repo` and
+`-tag:done` can be combined. Invalid queries explain what needs correcting.
+Select a conversation to inspect its
+original directory, branch, recent text and exact resume command, then choose
+**Resume in New Tab**. The provider receives an argv directly in a conventional
+PTY at the original project directory. Selecting a session already opened by
+this window focuses its existing terminal. Missing directories and archived
+sessions show an explanation instead of launching in the wrong project.
+
+Discovery runs on a bounded background worker and refreshes while the manager
+is open. Transcript states are labeled as *last recorded*; they do not claim a
+process is still alive. No provider is started until explicit confirmation.
+
+The **Tasks** panel adds Attention, Recent, Oldest, Title and Project sorting,
+plus **Next needs you** navigation across the visible tasks. Filters and sorting
+preserve task identity and follow-up drafts. See the
+[Agent management guide](docs/agent-management.md) for the workflow, search syntax
+and storage compatibility details.
+
+**New task** now creates work directly from a project, with a multiline goal,
+provider choice and an optional explicit validation recipe. Worktree preparation
+keeps the form and draft available until registration succeeds. **Details**
+shows the real repository, runtime and validation state; authored work without
+a validation recipe uses the explicit **Accept reviewed work** action. Native
+Codex, Claude and Kimi start through the existing consent and approval gates.
+
+In Agent Manager, independent checkboxes support atomic batches of up to 256
+sessions: pin/unpin, archive/restore and add/remove one tag. The selected,
+visible and hidden counts make filtered selections explicit. Failed writes
+retain the selection and drafts, and organization never starts a provider.
+
+Resuming a conversation that another CLI is still running asks for **Resume
+anyway** before a second process is started. Background refreshes never move
+your selection, and **Copy command** copies the exact resume command. In the
+Tasks panel, **Hide** keeps the worktree and **Hidden tasks (N)** restores a task
+to its previous state; the top-bar Tasks button shows how many tasks need you.
+
+Development builds use the sibling `../jterm_core` checkout. Isolated Nix
+builds unpack the deterministic `packaging/jterm-core-src.tar.gz` snapshot
+beside this application. After shared-core changes, refresh it with
+`scripts/package-shared-core.sh`; its companion SHA-256 file records the exact
+packaged source. Targets and Git internals are excluded.
+
+Resume resolves the CLI executable and its runtime when activated, including
+Node installations managed by NVM when a desktop launcher supplies a minimal
+`PATH`. The resolved runtime search path applies only to the new CLI process.

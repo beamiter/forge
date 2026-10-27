@@ -8,6 +8,9 @@ pub(super) struct TaskFilters {
     pub provider: Option<AgentProvider>,
     pub workspace: Option<PathBuf>,
     pub status: Option<TaskStatus>,
+    /// Show only hidden (archived) tasks, which can be restored. The normal
+    /// views never include them.
+    pub hidden: bool,
 }
 
 pub(super) const STATES: [TaskStatus; 9] = [
@@ -30,11 +33,25 @@ impl TaskFilters {
         query: &str,
         view: DashboardView,
     ) -> DashboardSnapshot {
-        let candidates = source
+        let mut result = self.scope(source, workspaces, query);
+        result
             .rows
-            .iter()
-            .filter(|row| {
-                row.status != TaskStatus::Archived
+            .retain(|row| self.status.is_none_or(|status| row.status == status));
+        result.apply_view(view, None, Default::default());
+        result
+    }
+
+    /// Provider/project/query scope for both badges and the final list. State
+    /// and quick-view narrowing happen afterward without a second search.
+    pub fn scope(
+        &self,
+        source: &DashboardSnapshot,
+        workspaces: &HashMap<TaskId, PathBuf>,
+        query: &str,
+    ) -> DashboardSnapshot {
+        DashboardSnapshot::filter_iter_unsorted(
+            source.rows.iter().filter(|row| {
+                (row.status == TaskStatus::Archived) == self.hidden
                     && self
                         .provider
                         .is_none_or(|provider| row.provider == provider)
@@ -42,15 +59,22 @@ impl TaskFilters {
                         .workspace
                         .as_ref()
                         .is_none_or(|path| workspaces.get(&row.id) == Some(path))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        // Reuse shared text matching, counts, quick views and deterministic sort.
-        let mut result = DashboardSnapshot::filter_rows(&candidates, query, view);
-        result
-            .rows
-            .retain(|row| self.status.is_none_or(|status| row.status == status));
-        result
+            }),
+            query,
+            DashboardView::All,
+        )
+    }
+
+    /// Original, lossless project identity of a currently visible selection.
+    /// Hidden selections and missing workspace facts never broaden the scope.
+    pub fn selected_project(
+        visible: &DashboardSnapshot,
+        selected: Option<TaskId>,
+        workspaces: &HashMap<TaskId, PathBuf>,
+    ) -> Option<PathBuf> {
+        let id = selected?;
+        visible.selected_index(Some(id))?;
+        workspaces.get(&id).cloned()
     }
 
     pub fn workspace_choices(&self, workspaces: &HashMap<TaskId, PathBuf>) -> Vec<PathBuf> {
@@ -90,6 +114,58 @@ mod tests {
     }
 
     #[test]
+    fn hidden_scope_is_exactly_the_archived_tasks_and_keeps_other_filters() {
+        let rows = vec![
+            row(AgentProvider::Codex, TaskStatus::Archived),
+            row(AgentProvider::Claude, TaskStatus::Archived),
+            row(AgentProvider::Codex, TaskStatus::Failed),
+        ];
+        let ids = rows.iter().map(|row| row.id).collect::<Vec<_>>();
+        let source = DashboardSnapshot {
+            rows,
+            ..Default::default()
+        };
+        let workspaces = HashMap::new();
+        let visible = TaskFilters::default().scope(&source, &workspaces, "");
+        assert_eq!(
+            visible.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            [ids[2]]
+        );
+        let hidden = TaskFilters {
+            hidden: true,
+            ..Default::default()
+        };
+        let mut scope = hidden.scope(&source, &workspaces, "");
+        scope.sort_rows(Default::default());
+        assert_eq!(scope.rows.len(), 2);
+        assert_eq!(scope.counts.archived, 2);
+        assert!(scope
+            .rows
+            .iter()
+            .all(|row| row.status == TaskStatus::Archived));
+        let codex = TaskFilters {
+            provider: Some(AgentProvider::Codex),
+            ..hidden.clone()
+        };
+        assert_eq!(
+            codex
+                .scope(&source, &workspaces, "")
+                .rows
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            [ids[0]]
+        );
+        assert!(
+            hidden
+                .scope(&source, &workspaces, "status:archived")
+                .rows
+                .len()
+                == 2
+        );
+    }
+
+    #[test]
     fn exact_workspace_provider_state_intersection_keeps_counts_before_state_view() {
         let rows = vec![
             row(AgentProvider::Codex, TaskStatus::Working),
@@ -119,6 +195,7 @@ mod tests {
             provider: Some(AgentProvider::Codex),
             workspace: Some("/one/same".into()),
             status: Some(TaskStatus::Failed),
+            hidden: false,
         };
         let result = filters.project(&source, &paths, "same", DashboardView::All);
         assert_eq!(result.rows.len(), 1);
@@ -176,6 +253,38 @@ mod tests {
             .project(&source, &HashMap::new(), "", DashboardView::All)
             .rows
             .is_empty());
+    }
+
+    #[test]
+    fn selected_project_uses_original_identity_and_refuses_hidden_or_missing_sources() {
+        use std::os::unix::ffi::OsStringExt;
+        let a = PathBuf::from(std::ffi::OsString::from_vec(b"/repo/\xff".to_vec()));
+        let b = PathBuf::from(std::ffi::OsString::from_vec(b"/repo/\xfe".to_vec()));
+        assert_eq!(a.to_string_lossy(), b.to_string_lossy());
+        let rows = vec![
+            row(AgentProvider::Codex, TaskStatus::Working),
+            row(AgentProvider::Codex, TaskStatus::Failed),
+        ];
+        let selected = rows[0].id;
+        let paths = HashMap::from([(selected, a.clone()), (rows[1].id, b)]);
+        let mut visible = DashboardSnapshot {
+            rows,
+            ..Default::default()
+        };
+        assert_eq!(
+            TaskFilters::selected_project(&visible, Some(selected), &paths),
+            Some(a)
+        );
+        assert_eq!(TaskFilters::selected_project(&visible, None, &paths), None);
+        assert_eq!(
+            TaskFilters::selected_project(&visible, Some(selected), &HashMap::new()),
+            None
+        );
+        visible.rows.remove(0);
+        assert_eq!(
+            TaskFilters::selected_project(&visible, Some(selected), &paths),
+            None
+        );
     }
 
     #[test]

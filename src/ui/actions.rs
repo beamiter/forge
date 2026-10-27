@@ -608,6 +608,27 @@ impl UiState {
                 log::debug!("Ask AI about selected block");
                 self.ask_ai_about_selected_block();
             }
+            Action::OpenAgentSessions => {
+                let owner = self.unified_navigation_owner.borrow().clone();
+                super::agent_sessions::show(
+                    &self.window,
+                    current_terminal
+                        .as_ref()
+                        .and_then(terminal_working_directory)
+                        .map(PathBuf::from),
+                    self.agent_session_library.clone(),
+                    self.agent_session_tabs.borrow().keys().cloned().collect(),
+                    move |request| {
+                        if let Some(ui) = owner.upgrade() {
+                            ui.add_agent_session_tab(request);
+                        } else {
+                            let _ = request
+                                .completion
+                                .send(Err("The terminal window closed.".into()));
+                        }
+                    },
+                );
+            }
             Action::OpenAgent => self.toggle_agent_panel(),
             Action::ToggleTasksPanel => {
                 log::debug!("Toggle agent Tasks panel");

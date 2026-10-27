@@ -150,10 +150,15 @@ class ShellOracles(unittest.TestCase):
                 sock.bind(str(endpoint))
     def records(self):
         result = []
-        for path, token in [('key', 'first-token'), ('pst', 'second-token')]:
+        for n, (path, token) in enumerate([('key', 'first-token'), ('pst', 'second-token')], 1):
+            execution_id = f'forge-bash-42-{n}'
             result.append(dict(path=path, token=token, pid=42, tty='/dev/pts/7',
                 capsule=dict(font='DejaVu Sans Mono 14', rows=4, padding=[1,1,1,1]),
-                accepted_hex=b'\0'.join([token.encode(), ('中文 e\u0301 ＡＢＣ '*8).encode(), b'42', b'/dev/pts/7', b'']).hex()))
+                metadata_identity=dict(execution_id=execution_id, block_id=n, events=[
+                    dict(phase='start', execution_id=execution_id, block_id=n, command_source='Screen'),
+                    dict(phase='end', execution_id=execution_id, correlation='MatchedUntrusted', exit_code=0),
+                    dict(phase='record', execution_id=execution_id, block_id=n, command_source='Screen', completion_provenance='ShellReported')]),
+                accepted_hex=b'\0'.join([token.encode(), ('中文 e\u0301 ＡＢＣ '*8).encode(), b'42', b'/dev/pts/7', execution_id.encode(), b'']).hex()))
         return result
     def test_accepts_exact_same_owned_shell_and_equal_capsules(self):
         m.shell_acceptance(self.records())
@@ -164,6 +169,21 @@ class ShellOracles(unittest.TestCase):
         for key,value in [('pid',43),('tty','/dev/pts/8'),('token','first-token'),('capsule',{})]:
             r=self.records();r[1][key]=value
             with self.assertRaises(RuntimeError):m.shell_acceptance(r)
+    def test_rejects_unrelated_or_incomplete_history_disabled_capsules(self):
+        for index, field, value in [(0, 'block_id', 99), (1, 'execution_id', 'foreign'),
+                                    (1, 'exit_code', 1), (1, 'correlation', 'Unmatched'),
+                                    (2, 'completion_provenance', 'BoundaryInferred')]:
+            records = self.records()
+            records[0]['metadata_identity']['events'][index][field] = value
+            with self.assertRaises(RuntimeError): m.shell_acceptance(records)
+        records = self.records()
+        records[0]['metadata_identity']['events'].pop()
+        with self.assertRaises(RuntimeError): m.shell_acceptance(records)
+    def test_rejects_reused_history_disabled_execution_or_capsule(self):
+        for field in ['execution_id', 'block_id']:
+            records = self.records()
+            records[1]['metadata_identity'][field] = records[0]['metadata_identity'][field]
+            with self.assertRaises(RuntimeError): m.shell_acceptance(records)
     def test_rejects_missing_path(self):
         with self.assertRaises(RuntimeError):m.shell_acceptance(self.records()[:1])
 

@@ -135,6 +135,8 @@ pub(crate) enum Action {
     AskAiAboutSelectedBlock,
     /// Open the approval-gated multi-turn shell Agent for the active Block pane.
     OpenAgent,
+    /// Browse and resume provider-owned Codex and Claude conversations.
+    OpenAgentSessions,
     /// Show or hide the native Codex agent Tasks panel (isolated-worktree
     /// tasks). Ctrl+Alt+Shift+T by default; requires `agent_tasks_enabled`.
     ToggleTasksPanel,
@@ -259,6 +261,7 @@ impl Action {
             Action::ToggleAiPanel => "Toggle AI panel",
             Action::OpenAiPanel => "Open AI panel",
             Action::AskAiAboutSelectedBlock => "Ask AI about selected block",
+            Action::OpenAgentSessions => "Agent Sessions: browse and resume Codex / Claude",
             Action::OpenAgent => "Open shell Agent",
             Action::ToggleTasksPanel => "Toggle agent Tasks panel",
             Action::HistoryPalette => "Command history palette",
@@ -362,6 +365,7 @@ impl Action {
             Action::ToggleAiPanel => Some("toggle_ai_panel"),
             Action::OpenAiPanel => None,
             Action::AskAiAboutSelectedBlock => Some("ask_ai_about_selected_block"),
+            Action::OpenAgentSessions => Some("open_agent_sessions"),
             Action::OpenAgent => Some("open_agent"),
             Action::ToggleTasksPanel => Some("toggle_tasks_panel"),
             Action::HistoryPalette => Some("history_palette"),
@@ -463,6 +467,7 @@ impl Action {
             Action::ToggleAiPanel,
             Action::AskAiAboutSelectedBlock,
             Action::OpenAgent,
+            Action::OpenAgentSessions,
             Action::ToggleTasksPanel,
             Action::HistoryPalette,
             Action::CrossBlockSearch,
@@ -476,6 +481,9 @@ impl Action {
     /// used by sibling jterm frontends. Canonical keys remain the values
     /// returned by [`Self::config_key`].
     pub(crate) fn from_config_key(key: &str) -> Option<Action> {
+        if key == "agent:sessions" {
+            return Some(Action::OpenAgentSessions);
+        }
         let alias = match key {
             "block:collapse_selected" => Some(Action::CollapseSelectedBlocks),
             "block:expand_selected" => Some(Action::ExpandSelectedBlocks),
@@ -578,6 +586,7 @@ impl KeybindingMap {
         bind("Ctrl+Alt+Shift+A", Action::ToggleAiPanel);
         bind("Ctrl+Shift+Q", Action::AskAiAboutSelectedBlock);
         bind("Ctrl+Alt+G", Action::OpenAgent);
+        bind("Ctrl+Alt+Shift+G", Action::OpenAgentSessions);
         bind("Ctrl+Alt+Shift+T", Action::ToggleTasksPanel);
         // Ctrl+R is consumed by bash readline in the live VTE, so the chord
         // for our block-history palette is Ctrl+Shift+H ("history").
@@ -1162,6 +1171,7 @@ mod tests {
             ("Ctrl+Alt+Shift+A", Action::ToggleAiPanel),
             ("Ctrl+Shift+Q", Action::AskAiAboutSelectedBlock),
             ("Ctrl+Alt+G", Action::OpenAgent),
+            ("Ctrl+Alt+Shift+G", Action::OpenAgentSessions),
             ("Ctrl+Alt+Shift+T", Action::ToggleTasksPanel),
             // Block-history palette (Ctrl+R is bash readline, so we use Ctrl+Shift+H).
             ("Ctrl+Shift+H", Action::HistoryPalette),

@@ -1500,27 +1500,36 @@ fn block_edge_scroll_target(
     target.clamp(lower, max_value)
 }
 
-/// Move one adjustment by a wheel delta. Returns false when it is already at
-/// the requested edge, letting a nested scroll surface hand off only there.
-fn scroll_adjustment(adj: &gtk4::Adjustment, dy: f64) -> bool {
-    let max_value = (adj.upper() - adj.page_size()).max(adj.lower());
-    if dy < 0.0 && adj.value() <= adj.lower() + f64::EPSILON {
-        return false;
-    }
-    if dy > 0.0 && adj.value() >= max_value - f64::EPSILON {
-        return false;
-    }
-    let step = adj.step_increment().max(1.0);
-    let target = (adj.value() + dy * step).clamp(adj.lower(), max_value);
-    adj.set_value(target);
-    true
-}
-
 /// Move one adjustment by a wheel delta at VTE's native wheel speed (a tenth
 /// of a page per unit, minimum one row) — `scroll_adjustment` moves by the
 /// adjustment's own step, which for a VTE is a single row and feels stuck on
 /// long output. Returns false at the requested edge so the caller can hand
 /// the wheel off to the outer history only there.
+/// A capped terminal's adjustment is measured in rows. Precision input is
+/// converted using this terminal's actual row height, without page scaling.
+/// A fit-to-content terminal has no range and immediately yields to the canvas.
+pub(crate) fn scroll_adjustment_by_input(
+    adjustment: &gtk4::Adjustment,
+    delta: f64,
+    surface: bool,
+    row_height: f64,
+) -> bool {
+    if !surface {
+        return scroll_adjustment_by_wheel(adjustment, delta);
+    }
+    if !delta.is_finite() || delta == 0.0 {
+        return false;
+    }
+    let upper = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+    let target =
+        (adjustment.value() + delta / row_height.max(1.0)).clamp(adjustment.lower(), upper);
+    if (target - adjustment.value()).abs() < f64::EPSILON {
+        return false;
+    }
+    adjustment.set_value(target);
+    true
+}
+
 pub(crate) fn scroll_adjustment_by_wheel(adj: &gtk4::Adjustment, dy: f64) -> bool {
     let max_value = (adj.upper() - adj.page_size()).max(adj.lower());
     if dy < 0.0 && adj.value() <= adj.lower() + f64::EPSILON {
@@ -1535,31 +1544,10 @@ pub(crate) fn scroll_adjustment_by_wheel(adj: &gtk4::Adjustment, dy: f64) -> boo
     true
 }
 
-/// A scroll event's vertical delta in wheel steps. GTK 4.14 on Wayland
-/// delivers touchpad scrolls in surface pixels, and `EventControllerScroll`
-/// converts them only when asked for discrete steps, which these controllers
-/// are not; taken as steps, a 20px swipe moved two pages. A wheel-unit delta
-/// (±1.0 per notch) is returned unchanged.
-pub(crate) fn wheel_steps(dy: f64, surface_unit: bool) -> f64 {
-    if surface_unit {
-        dy / jterm_core::wheel::SURFACE_UNITS_PER_STEP
-    } else {
-        dy
-    }
-}
-
 /// Whether the event being handled by `controller` measures its delta in
 /// surface pixels rather than wheel steps.
 pub(crate) fn scroll_unit_is_surface(controller: &gtk4::EventControllerScroll) -> bool {
     controller.unit() == gtk4::gdk::ScrollUnit::Surface
-}
-
-pub(crate) fn forward_outer_scroll(outer: &gtk4::ScrolledWindow, dy: f64) {
-    let outer_adj = outer.vadjustment();
-    let step = outer_adj.step_increment().max(outer_adj.page_size() * 0.1);
-    let max_value = (outer_adj.upper() - outer_adj.page_size()).max(outer_adj.lower());
-    let target = (outer_adj.value() + dy * step).clamp(outer_adj.lower(), max_value);
-    outer_adj.set_value(target);
 }
 
 fn schedule_block_edge_scroll(widget: &gtk4::Box, outer: &gtk4::ScrolledWindow, bottom: bool) {
@@ -4221,22 +4209,29 @@ impl FinishedBlock {
         command_scroll.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let outer_for_command = outer.downgrade();
         let debouncer_for_command = debouncer.clone();
+        debouncer.watch_gesture(&command_scroll, outer);
         command_scroll.connect_scroll(move |controller, _dx, dy| {
             let Some(outer_for_command) = outer_for_command.upgrade() else {
                 return glib::Propagation::Proceed;
             };
-            let steps = wheel_steps(dy, scroll_unit_is_surface(controller));
-            forward_outer_scroll(&outer_for_command, steps);
-            debouncer_for_command.record_wheel_intent(&outer_for_command);
+            debouncer_for_command.scroll_wheel(
+                &outer_for_command,
+                dy,
+                scroll_unit_is_surface(controller),
+            );
             glib::Propagation::Stop
         });
         self.command_vte.add_controller(command_scroll);
 
         let scroll_ctrl =
             gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+        // Decide canvas/overflow ownership before VTE can swallow a wheel
+        // event even when its fitted output has no private scroll range.
+        scroll_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let vte = self.output_vte.downgrade();
         let outer_for_vte = outer.downgrade();
         let debouncer_for_vte = debouncer.clone();
+        debouncer.watch_gesture(&scroll_ctrl, outer);
         scroll_ctrl.connect_scroll(move |controller, _dx, dy| {
             let (Some(vte), Some(outer_for_vte)) = (vte.upgrade(), outer_for_vte.upgrade()) else {
                 return glib::Propagation::Proceed;
@@ -4260,15 +4255,10 @@ impl FinishedBlock {
                 if !scroll_unit_is_surface(controller) {
                     return glib::Propagation::Proceed;
                 }
-                scroll_adjustment_by_wheel(&inner_adj, wheel_steps(dy, true));
+                scroll_adjustment_by_input(&inner_adj, dy, true, vte.char_height() as f64);
                 return glib::Propagation::Stop;
             }
-            // Drive the outer ScrolledWindow by one step in the wheel direction.
-            forward_outer_scroll(
-                &outer_for_vte,
-                wheel_steps(dy, scroll_unit_is_surface(controller)),
-            );
-            debouncer_for_vte.record_wheel_intent(&outer_for_vte);
+            debouncer_for_vte.scroll_wheel(&outer_for_vte, dy, scroll_unit_is_surface(controller));
             glib::Propagation::Stop
         });
         self.output_vte.add_controller(scroll_ctrl);
@@ -4283,20 +4273,24 @@ impl FinishedBlock {
         let vte_for_scrollbar = self.output_vte.downgrade();
         let outer_for_scrollbar = outer.downgrade();
         let debouncer_for_scrollbar = debouncer.clone();
+        debouncer.watch_gesture(&scrollbar_scroll, outer);
         scrollbar_scroll.connect_scroll(move |controller, _dx, dy| {
-            let steps = wheel_steps(dy, scroll_unit_is_surface(controller));
             let (Some(vte), Some(outer)) =
                 (vte_for_scrollbar.upgrade(), outer_for_scrollbar.upgrade())
             else {
                 return glib::Propagation::Proceed;
             };
             if let Some(inner_adj) = vte.vadjustment() {
-                if scroll_adjustment(&inner_adj, steps) {
+                if scroll_adjustment_by_input(
+                    &inner_adj,
+                    dy,
+                    scroll_unit_is_surface(controller),
+                    vte.char_height() as f64,
+                ) {
                     return glib::Propagation::Stop;
                 }
             }
-            forward_outer_scroll(&outer, steps);
-            debouncer_for_scrollbar.record_wheel_intent(&outer);
+            debouncer_for_scrollbar.scroll_wheel(&outer, dy, scroll_unit_is_surface(controller));
             glib::Propagation::Stop
         });
         self.output_scrollbar.add_controller(scrollbar_scroll);

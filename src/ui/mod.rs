@@ -1,6 +1,8 @@
 use gtk4::glib::prelude::ObjectExt;
 use gtk4::Notebook;
-use gtk4::{CssProvider, ScrolledWindow, SearchBar, SearchEntry, Stack, ToggleButton};
+use gtk4::{
+    Button, CssProvider, Label, ScrolledWindow, SearchBar, SearchEntry, Stack, ToggleButton,
+};
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -13,6 +15,7 @@ use crate::keybindings::KeybindingMap;
 
 mod actions;
 mod agent_panel;
+mod agent_sessions;
 mod ai_chat_store;
 mod ai_panel;
 mod bottom_bar;
@@ -47,6 +50,7 @@ mod tab_strip;
 mod tabs;
 mod task_ops;
 mod tasks_panel;
+mod workflow_library;
 mod zoom;
 
 pub(crate) use tab_strip::install_top_tab_geometry_reveal;
@@ -264,6 +268,25 @@ pub(crate) fn tab_display_title(
     }
 }
 
+/// Accessible name and default tooltip of the top-bar Tasks button.
+pub(crate) const TASKS_BUTTON_LABEL: &str = "Toggle agent Tasks panel";
+pub(crate) const TASKS_BUTTON_TOOLTIP: &str = "Agent tasks · Toggle Tasks (Ctrl+Alt+Shift+T)";
+
+/// Tooltip and accessible name for the Tasks button. Attention is counted by
+/// the shared dashboard rule; hidden tasks never count.
+pub(crate) fn tasks_button_presentation(count: usize, summary: Option<&str>) -> (String, String) {
+    let tooltip = match summary {
+        Some(summary) if count > 0 => format!("{summary} · Toggle Tasks (Ctrl+Alt+Shift+T)"),
+        _ => TASKS_BUTTON_TOOLTIP.to_string(),
+    };
+    let label = if count > 0 {
+        format!("{TASKS_BUTTON_LABEL}, {count} need you")
+    } else {
+        TASKS_BUTTON_LABEL.to_string()
+    };
+    (tooltip, label)
+}
+
 #[derive(Clone)]
 pub(crate) struct UiState {
     /// Navigation widgets upgrade the window controller only for a click;
@@ -277,6 +300,9 @@ pub(crate) struct UiState {
     /// separate toast per step.
     pub(crate) opacity_toast: Rc<RefCell<Option<adw::Toast>>>,
     pub(crate) notebook: Notebook,
+    pub(crate) agent_session_tabs:
+        RefCell<HashMap<agent_sessions::SessionIdentity, gtk4::glib::WeakRef<Terminal>>>,
+    pub(crate) agent_session_library: Rc<RefCell<jterm_core::agent_sessions::SessionLibraryStore>>,
     pub(crate) tab_counter: Rc<Cell<u32>>,
     pub(crate) font_scale: Rc<Cell<f64>>,
     /// Generation token for generic debounced config writes. Sliders, paned
@@ -391,6 +417,8 @@ pub(crate) struct UiState {
     /// Window-lifetime, memory-only search intent; never persisted in config
     /// or workspace snapshots.
     pub(crate) cross_block_search_memory: Rc<RefCell<dialogs::CrossBlockSearchMemory>>,
+    pub(crate) workflow_library:
+        jterm_core::workflows::BackgroundRefresh<Vec<crate::workflows::Workflow>>,
     pub(crate) workflows_palette_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     pub(crate) settings_dialog: Rc<RefCell<Option<adw::PreferencesDialog>>>,
     pub(crate) organism_settings_controls:
@@ -426,6 +454,11 @@ pub(crate) struct UiState {
     /// Visible top-bar control reflecting whether a Shell Agent session is
     /// currently active.
     pub(crate) agent_toggle: ToggleButton,
+    /// Top-bar Tasks button and its attention count.
+    pub(crate) tasks_button: Button,
+    pub(crate) tasks_badge: Label,
+    /// Last Tasks button state, to skip redundant widget updates.
+    pub(crate) task_badge_state: RefCell<Option<(bool, usize, Option<String>)>>,
     /// Suppresses a storm of identical persistence alerts while a continuous
     /// setting (opacity/font size) emits multiple change notifications.
     pub(crate) config_save_error_visible: Rc<Cell<bool>>,

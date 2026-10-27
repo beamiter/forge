@@ -891,6 +891,8 @@ pub struct Config {
     /// The widget reacts only to local command lifecycle events and never runs a
     /// command or sends terminal contents elsewhere.
     pub(crate) ascii_organism_enabled: bool,
+    /// Optional gentle breaks; one foreground clock for the whole window.
+    pub(crate) ascii_organism_care_enabled: bool,
     /// Explicit motion level for the organism body; `None` follows the
     /// desktop animation preference.
     pub(crate) ascii_organism_motion: Option<OrganismMotion>,
@@ -1035,6 +1037,7 @@ impl Config {
             focus_reporting_enabled: true,
             preserve_live_scrollback: false,
             ascii_organism_enabled: false,
+            ascii_organism_care_enabled: false,
             ascii_organism_motion: None,
             ai_enabled: false,
             agent_enabled: false,
@@ -1570,6 +1573,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "focus_reporting_enabled",
     "preserve_live_scrollback",
     "ascii_organism_enabled",
+    "ascii_organism_care_enabled",
     "ascii_organism_motion",
     "ai_enabled",
     "agent_enabled",
@@ -1714,6 +1718,7 @@ fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
         "focus_reporting_enabled",
         "preserve_live_scrollback",
         "ascii_organism_enabled",
+        "ascii_organism_care_enabled",
         "sidebar_visible",
         "ai_enabled",
         "agent_enabled",
@@ -2391,6 +2396,7 @@ struct FileConfig {
     focus_reporting_enabled: Option<bool>,
     preserve_live_scrollback: Option<bool>,
     ascii_organism_enabled: Option<bool>,
+    ascii_organism_care_enabled: Option<bool>,
     ascii_organism_motion: Option<String>,
     ai_enabled: Option<bool>,
     agent_enabled: Option<bool>,
@@ -2646,6 +2652,9 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
             .and_then(|v| v.as_bool()),
         ascii_organism_enabled: table
             .get("ascii_organism_enabled")
+            .and_then(|v| v.as_bool()),
+        ascii_organism_care_enabled: table
+            .get("ascii_organism_care_enabled")
             .and_then(|v| v.as_bool()),
         ascii_organism_motion: table
             .get("ascii_organism_motion")
@@ -3041,6 +3050,9 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let ascii_organism_enabled = env_bool("FORGE_ASCII_ORGANISM_ENABLED")
         .or(fc.ascii_organism_enabled)
         .unwrap_or(true);
+    let ascii_organism_care_enabled = env_bool("FORGE_ASCII_ORGANISM_CARE_ENABLED")
+        .or(fc.ascii_organism_care_enabled)
+        .unwrap_or(false);
     let ascii_organism_motion = resolve_setting_text(
         env_string("FORGE_ASCII_ORGANISM_MOTION"),
         fc.ascii_organism_motion,
@@ -3134,6 +3146,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         focus_reporting_enabled: fc.focus_reporting_enabled.unwrap_or(true),
         preserve_live_scrollback: fc.preserve_live_scrollback.unwrap_or(false),
         ascii_organism_enabled,
+        ascii_organism_care_enabled,
         ascii_organism_motion,
         ai_enabled,
         agent_enabled,

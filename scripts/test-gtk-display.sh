@@ -52,8 +52,11 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    block_view::scroll::canvas_native_tests::retained_canvas_scrolls_through_frames_and_yields_to_reading
     ui::organism::inspector::tests::snapshot_dialog_is_scrollable_and_closes_without_an_animation_source
     ui::organism::tests::inspection_captures_real_state_without_attention_or_lifecycle_changes
+    ui::organism::tests::one_companion_crosses_splits_without_cloning_its_body_or_mind
+    ui::organism_vte::tests::one_companion_moves_between_vte_splits_without_resizing_grids
     ui::tasks_panel::tests::cached_selected_row_survives_no_focus_move_hide_and_reveal
     ui::tasks_panel::tests::task_filters_route_real_x11_keyboard_by_identity
     ui::tasks_panel::tests::task_filters_keep_identity_hidden_updates_and_keyboard_routing
@@ -64,6 +67,7 @@ tests=(
     terminal::launch_recovery::tests::close_and_exit_retire_pending_commands_and_background_retry_keeps_focus
     block_view::search_navigation_tests::native_search_identity_characterization
     ui::dialogs::native_palette_activation_tests::palette_activation_preserves_snapshot_unfold_failure_focus_and_stale_ownership
+    ui::dialogs::tests::workflow_form_weak_callbacks_release_closed_widgets
     ui::tasks_panel::tests::approval_details_are_paged_read_only_and_stale_controls_cannot_decide
     block_view::incremental_find_tests::block_native_find_controls_keep_query_caret_and_tab_focus
     block_view::incremental_find_tests::chat_native_find_controls_keep_query_caret_and_tab_focus
@@ -77,8 +81,15 @@ tests=(
     ui::tasks_panel::tests::dashboard_filters_preserve_selection_without_actions
     ui::tasks_panel::tests::dashboard_search_activate_selects_current_visible_result_only
     ui::tasks_panel::tests::dashboard_filter_counts_follow_search_not_selected_view
+    ui::tasks_panel::tests::selected_project_focus_keeps_query_identity_and_rejects_hidden_selection
+    vim9_ide::native_buffer::tests::retained_overlays_reuse_blink_frames_then_refresh_theme_contents_and_pango
     ui::tasks_panel::tests::task_terminal_buttons_only_emit_focus_for_existing_bindings
     ui::tasks_panel::tests::task_reason_updates_and_disappears_without_retargeting
+    ui::tasks_panel::tests::hidden_tasks_offer_only_restore_and_hide_follows_manager_gates
+    ui::agent_sessions::native_tests::session_manager_filters_preserves_selection_and_resumes_exact_argv
+    ui::agent_sessions::native_tests::agent_management_v4_refresh_never_retargets_and_guards_live_resume
+    ui::agent_sessions::session_bulk::native_tests::agent_management_v3_batch_controls_keep_exact_targets_and_drafts
+    ui::tasks_panel::control_tests::task_control_center_preserves_search_action_identity_and_rejected_drafts
     ui::task_ops::focus_tests::task_terminal_focus_tracks_reordered_split_and_closed_leaf
     terminal::tests::explicit_focus_return_respects_reopened_search
     block_view::task_focus_tests::task_button_held_enter_never_submits_to_focused_terminal

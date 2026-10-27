@@ -9,6 +9,14 @@
 //! the pure parts are headless-testable. Ported from ember's `app/tasks.rs`
 //! and frost's `agent_task_ui.rs` via anvil's GTK adaptation.
 
+#[path = "task_composer.rs"]
+pub(crate) mod task_composer;
+pub(crate) use task_composer::TaskProjectRequest;
+
+#[path = "task_follow_up.rs"]
+mod task_follow_up;
+pub(crate) use task_follow_up::{FollowUpReceipts, TaskFollowUpRequest};
+
 /// Resolve the current binding without interpreting its opaque session identity.
 pub(crate) fn task_terminal_binding(
     task: &crate::agent_task::AgentTask,
@@ -48,25 +56,13 @@ pub(crate) fn task_reason(
     status_detail: Option<&str>,
     validation_detail: Option<&str>,
 ) -> Option<String> {
-    use crate::agent_task::{TaskStatus, TaskValidationStatus};
-    let nonempty = |text: &&str| !text.trim().is_empty();
-    let validation_reason = matches!(
-        validation,
-        TaskValidationStatus::Failed | TaskValidationStatus::Inconclusive
-    )
-    .then_some(validation_detail)
-    .flatten()
-    .filter(nonempty);
-    let task_reason = matches!(
+    crate::agent_task::TaskGuidance::reason_for(
         status,
-        TaskStatus::Failed | TaskStatus::WaitingForHuman | TaskStatus::WaitingForApproval
+        validation,
+        status_detail,
+        validation_detail,
     )
-    .then_some(status_detail)
-    .flatten()
-    .filter(nonempty);
-    validation_reason
-        .or(task_reason)
-        .map(|text| jterm_core::review_input::safe_inline_display(text.trim(), 1024))
+    .map(|reason| jterm_core::review_input::safe_inline_display(&reason, 1024))
 }
 
 use crate::agent_task::{
@@ -124,27 +120,77 @@ pub(crate) fn native_follow_up_can_send(text: &str, completed_turns: usize) -> b
 pub(crate) enum TaskPanelAction {
     /// Create a task from the active pane's selected block evidence.
     CreateFromBlock,
-    StartCodex(TaskId),
+    ComposeProject,
+    CreateProject(TaskProjectRequest),
+    StartNative(TaskId),
     StartTerminal(TaskId),
     FocusTerminal(TaskId),
     FocusValidation(TaskId),
     StopCodex(TaskId),
-    FollowUp(TaskId, String),
+    FollowUp(TaskFollowUpRequest),
     FinishCodex(TaskId),
     Approve(TaskId, crate::agent_task::ApprovalId),
     Deny(TaskId, crate::agent_task::ApprovalId),
     RunValidation(TaskId),
     Complete(TaskId),
+    AcceptReviewed(TaskId),
     ReviewDiff(TaskId),
     Archive(TaskId),
+    /// Return a hidden task to the state it had when hidden.
+    Restore(TaskId),
     Select(TaskId),
     Close,
+}
+
+/// Read-only details use the shared bounded projection and contain no inferred history.
+pub(crate) fn task_inspector_text(task: &crate::agent_task::AgentTask) -> String {
+    let inspector = crate::agent_task::TaskInspector::from_task(task);
+    let mut text = inspector
+        .fields
+        .into_iter()
+        .map(|field| format!("{}\n{}", field.label, field.value))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if let Some(goal) = inspector.goal {
+        text.push_str("\n\nGoal\n");
+        text.push_str(&goal);
+    }
+    if task.brief.is_some() {
+        text.push_str("\n\nTerminal brief\n");
+        text.push_str(&format!("On Start terminal, read {} inside the task worktree. Sharing consent is required before the brief is written.", crate::agent_task::pty_task_brief_relative()));
+    }
+    text
+}
+
+/// Deliver an authored goal only after the existing explicit sharing gate allows it.
+pub(crate) fn prepare_authored_terminal(
+    task: &crate::agent_task::AgentTask,
+    policy: NativePromptPolicy,
+    launch: crate::agent_task::AgentLaunchSpec,
+) -> Result<crate::agent_task::AgentLaunchSpec, String> {
+    if task.brief.is_none() {
+        return Ok(launch);
+    }
+    let brief =
+        crate::agent_task::write_pty_task_brief(task, policy).map_err(|error| error.to_string())?;
+    if brief.is_none() {
+        return Err(
+            "Enable AI features and command-context sharing before starting this authored task"
+                .into(),
+        );
+    }
+    Ok(launch.with_pty_seed_prompt(&format!(
+        "Read {} and carry out the task goal inside this isolated worktree.",
+        crate::agent_task::pty_task_brief_relative()
+    )))
 }
 
 /// Fully prepared task registration produced by the background worktree
 /// worker. The UI thread only registers it with the task manager.
 pub(crate) struct PreparedTask {
-    pub(crate) context: SemanticCommandContext,
+    pub(crate) project_request: Option<TaskProjectRequest>,
+    pub(crate) context: Option<SemanticCommandContext>,
+    pub(crate) brief: Option<crate::agent_task::TaskBrief>,
     pub(crate) title: String,
     pub(crate) provider: AgentProvider,
     pub(crate) worktree: ManagedWorktree,
@@ -181,10 +227,6 @@ pub(crate) fn begin_worktree_creation(
     context: SemanticCommandContext,
     provider: AgentProvider,
 ) -> Result<PendingTaskCreation, String> {
-    let worktree_root = dirs::data_local_dir()
-        .ok_or_else(|| "cannot locate the per-user data directory".to_string())?
-        .join("forge")
-        .join("agent-tasks");
     let cwd = context
         .cwd
         .as_deref()
@@ -196,16 +238,52 @@ pub(crate) fn begin_worktree_creation(
         "Fix {}",
         visible_bounded(command, MAX_TASK_TITLE_DISPLAY_BYTES)
     );
+    begin_task_worktree_creation(cwd, title, provider, Some(context), None, None)
+}
+
+pub(crate) fn begin_project_worktree_creation(
+    request: TaskProjectRequest,
+) -> Result<PendingTaskCreation, String> {
+    let draft = request.draft.clone();
+    draft.validate()?;
+    if request.cancelled() {
+        return Err("Task creation was cancelled".into());
+    }
+    begin_task_worktree_creation(
+        draft.directory,
+        draft.title,
+        draft.provider,
+        None,
+        Some(draft.brief),
+        Some(request),
+    )
+}
+
+fn begin_task_worktree_creation(
+    cwd: PathBuf,
+    title: String,
+    provider: AgentProvider,
+    context: Option<SemanticCommandContext>,
+    brief: Option<crate::agent_task::TaskBrief>,
+    project_request: Option<TaskProjectRequest>,
+) -> Result<PendingTaskCreation, String> {
+    let worktree_root = dirs::data_local_dir()
+        .ok_or_else(|| "cannot locate the per-user data directory".to_string())?
+        .join("forge")
+        .join("agent-tasks");
     let token = uuid::Uuid::new_v4().simple().to_string();
     let task_name = format!("task-{token}");
     let branch = format!("forge/{task_name}");
     let (sender, receiver) = mpsc::sync_channel(1);
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = project_request
+        .as_ref()
+        .map(TaskProjectRequest::worktree_cancel_flag)
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let worker_cancel = Arc::clone(&cancel);
     let worker = std::thread::Builder::new()
         .name("forge-task-worktree".to_string())
         .spawn(move || {
-            let result = (|| {
+            let result: Result<PreparedTask, String> = (|| {
                 let service = WorktreeService::new(worktree_root)
                     .map_err(|error| error.to_string())?
                     .with_cancel_flag(worker_cancel);
@@ -219,12 +297,17 @@ pub(crate) fn begin_worktree_creation(
                     .create(&request)
                     .map_err(|error| error.to_string())?;
                 Ok(PreparedTask {
+                    project_request: project_request.clone(),
                     context,
+                    brief,
                     title,
                     provider,
                     worktree,
                 })
             })();
+            if let (Some(request), Err(error)) = (&project_request, &result) {
+                request.finish(Err(error.clone()));
+            }
             let _ = sender.send(result);
         })
         .map_err(|error| format!("could not start task worktree worker: {error}"))?;
@@ -359,8 +442,14 @@ pub(crate) fn order_task_rows(rows: &mut [TaskRowSnapshot], updated_at_ms: impl 
 
 /// One-line status summary for a row, bounded for display.
 pub(crate) fn row_status_line(row: &TaskRowSnapshot) -> String {
-    let base = if row.native_preparing {
-        "preparing native Codex".to_string()
+    // A pending approval or question outranks background preparation.
+    let base = if row.native_preparing
+        && !matches!(
+            row.status,
+            crate::agent_task::TaskStatus::WaitingForApproval
+                | crate::agent_task::TaskStatus::WaitingForHuman
+        ) {
+        format!("Preparing native {}", row.provider.display_name())
     } else {
         row.status.label().to_string()
     };
@@ -650,11 +739,11 @@ pub(crate) fn approval_summary(approval: &crate::agent_task::CodexAppServerAppro
 #[cfg(test)]
 mod tests {
     #[test]
-    fn task_reason_prefers_validation_and_drops_stale_or_empty_detail() {
+    fn task_reason_prefers_current_requests_then_validation_and_drops_stale_detail() {
         use crate::agent_task::{TaskStatus as S, TaskValidationStatus as V};
         assert_eq!(
             super::task_reason(
-                S::Failed,
+                S::ReadyForReview,
                 V::Failed,
                 Some("task failed"),
                 Some("tests failed")
@@ -664,7 +753,7 @@ mod tests {
         );
         assert_eq!(
             super::task_reason(
-                S::Failed,
+                S::ReadyForReview,
                 V::Inconclusive,
                 Some("task failed"),
                 Some("no exit status")
@@ -681,7 +770,31 @@ mod tests {
                 super::task_reason(status, V::NotRun, Some("needs a decision"), None).as_deref(),
                 Some("needs a decision")
             );
+            assert_eq!(
+                super::task_reason(
+                    status,
+                    V::Failed,
+                    Some("approve the current command"),
+                    Some("old validation failure")
+                )
+                .as_deref(),
+                Some("approve the current command")
+            );
+            assert_eq!(
+                super::task_reason(status, V::Failed, None, Some("old validation failure")),
+                None
+            );
         }
+        assert_eq!(
+            super::task_reason(
+                S::ReadyForReview,
+                V::Cancelled,
+                None,
+                Some("validation interrupted")
+            )
+            .as_deref(),
+            Some("validation interrupted")
+        );
         assert_eq!(
             super::task_reason(
                 S::Completed,
@@ -891,7 +1004,11 @@ mod tests {
             "Ready for review · validation Passed"
         );
         row.native_preparing = true;
-        assert!(row_status_line(&row).starts_with("preparing native Codex"));
+        assert!(row_status_line(&row).starts_with("Preparing native Codex"));
+        row.provider = AgentProvider::Claude;
+        assert!(row_status_line(&row).starts_with("Preparing native Claude"));
+        row.status = TaskStatus::WaitingForApproval;
+        assert!(row_status_line(&row).starts_with("Waiting for approval"));
     }
 
     #[test]
