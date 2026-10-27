@@ -14,6 +14,16 @@ forge --execute bash -lc 'cargo test'
 
 `--execute` 后的参数原样作为 argv，不经过额外 shell 拆词。显式 cwd、`--execute`、`--no-restore` 和 `--safe-mode` 都不会意外领取普通恢复快照；execute/safe-mode 窗口也不发布会话快照。单独使用 `--mode` 只覆盖本窗口后端，仍可恢复窗口布局。
 
+Block 历史保存失败的常驻提示中，Retry 会在加载失败时先重新读取文件。修复后重试会恢复并保存；如果重试仍失败，提示会再次出现。普通自动保存不会反复弹出同一错误。
+
+Unified 恢复历史时会校验所有记录，但只在解码队列中保留最新 64 条；数量筛选完成后才应用输出字节上限，避免丢弃原本能保留的近期输出。
+
+Unified 历史文件若版本不受支持、损坏或无法读取，pane 仍可使用，但不会删除或覆盖原文件，也不会保存该 pane 的新历史。常驻提示的工具提示包含文件位置和原因；请先修复或移走该历史文件，再重新打开 pane。仅修改磁盘文件后重试保存不会丢弃尚未恢复的内容。缺失的文件是正常新会话，仍可保存；合法的空历史与读取失败会分别处理。若旧文件因恢复数量或内存上限只载入一部分，原文件也会保留；请先备份，再缩减或移走该文件并重新打开 pane。
+
+恢复窗口时，超出标签或拆分布局上限的原始快照会先移到同目录的 `.corrupt-*` 恢复副本，再保存当前工作区；这些副本沿用最多保留 8 份的既有清理策略，并非永久备份。如果移动失败，窗口会提示文件位置并暂停会话保存，原文件保持不变。请先备份该文件，解决存储问题后重新打开窗口；只有实际重新读取成功后才恢复写入。
+
+恢复会话时，先前的活动标签只要保留下来就仍会被选中。若它因无效或超限布局被跳过，则选择其前方最近的保留标签；没有前方标签时选择第一个。
+
 以下命令在 GTK 初始化前完成，可用于 SSH、TTY 和 CI：
 
 ```bash
@@ -35,6 +45,10 @@ forge --print-default-config
 forge --config ~/configs/work.toml
 forge --check-config ~/configs/work.toml
 ```
+
+自动配置目录必须是绝对路径：优先使用有效的 `XDG_CONFIG_HOME`，否则使用绝对 `HOME` 下的 `.config`，最后尝试 GLib 提供的绝对配置目录。无法确定时不会转向当前工作目录；配置、窗口及 Agent 会话的自动持久化暂停，已有文件保持不变。显式 `--config` / `FORGE_CONFIG` 仍可选择相对路径；显式 `--check-config PATH` 不依赖自动目录。
+
+`--check-config --json` 的正常路径报告保留原有字段类型。仅在未指定路径、且自动目录无法确定时，错误报告的 `path` 与 `exists` 为 `null`（未知），`valid` 为 `false`、`errors` 为 `1`，并以失败状态退出。脚本应先检查退出状态及 `valid`，再读取路径字段；未知目录不能当作首次运行或文件不存在。`--doctor` 同样将无法检查的备份及会话数量报告为错误，而不是零。
 
 安装版还提供隐私保护的支持归档工具：
 
@@ -81,6 +95,10 @@ terminal_mode = "block"
   `boundary_inferred` / `degraded`，不伪造退出码、结束时刻或耗时。
 - `vte` 是传统终端，适合要求完整滚屏语义的 TUI 或兼容性排查。
 
+Unified 运行中的分区元数据同时受 `max_visible_blocks` 与每 pane 128 MiB 估算内存上限约束（包含命令和 cwd 字符串容量），从最旧记录开始淘汰，最新记录始终保留；输出快照另受 4 MiB 总量限制。淘汰元数据会清理其书签和 badge，但不擦除 VTE 自身的滚屏文本。
+
+Unified 的重启历史保留最近至多 64 个分区，命令、cwd 与输出合计最多 4 MiB，实际 JSON 文件最多 8 MiB（包括转义与元数据）。达到上限时先舍弃较旧输出，再舍弃较旧分区；保留下来的截断提示不会伪装成完整输出。
+
 Kitty 支持刻意限定为 direct `a=T` 静态显示（`i`、`c/r/C`，PNG/RGB/RGBA）与 `a=q`
 探针；`a=t`、`I`、crop/z/relative placement、delete/replacement 返回 `ENOTSUP`。
 Unified 遵守这些单元格坐标；Block 保留既有“图片作为完成卡片附件”的 profile，不保证
@@ -88,14 +106,15 @@ Unified 遵守这些单元格坐标；Block 保留既有“图片作为完成卡
 
 ### 实验性 ASCII organism
 
-Block pane 可以显式启用一个完全本地、无 LLM 的 ASCII organism：
+ASCII organism 默认开启，完全本地、无 LLM。可通过配置关闭：
 
 ```toml
-ascii_organism_enabled = true
+ascii_organism_enabled = false
 ```
 
-临时试用可设置 `FORGE_ASCII_ORGANISM_ENABLED=1`；修改该键后需新建 Block
-pane 或重启 Forge。它监听 Forge 从 OSC 133
+临时关闭可设置 `FORGE_ASCII_ORGANISM_ENABLED=0`。Settings 的启停和动作等级会立即
+作用于已打开的本地 Block / Unified pane；修改配置文件后使用 Reload Config，无需重建
+pane。关闭会立即收起身体、卡片和该 pane 的动画定时器；重复启停不会重复挂接。它监听 Forge 从 OSC 133
 边界捕获的真实 command start/finished 事件。生命体平时沿 live terminal surface
 缓慢移动，命令运行时靠近输出区观察；用户上滚查看历史时，它缩成 sticky header
 里的单行形态。PTY 真正接收键入、粘贴或进程控制键后，live body 会立即收起；
@@ -103,7 +122,26 @@ pane 或重启 Forge。它监听 Forge 从 OSC 133
 打断工作专注。Agent、纠错和命令面板的程序化写入不会伪装成真人输入。alternate screen
 和放不下完整 sprite 的窄小 surface 会直接隐藏空间身体，结果仍保留在 prompt
 上方的 inline widget。图层不参与 GTK 测量、不改变 PTY 行列、不可点击，也不向
-PTY 注入 ANSI；VTE pane 不显示。
+PTY 注入 ANSI。传统 VTE pane 使用独立的中性伴随体，默认紧凑显示；命令面板中的
+**Expand VTE neutral companion** / **Collapse VTE neutral companion** 可展开或收起它。
+该形态不感知命令或 alternate screen，不显示命令反应，也不提供 live Say hello；
+Settings 中的离线预览仍可使用。
+
+在可见的静息身体旁停留指针约 600ms，它会轻轻抬头回应约 2 秒；同一窗口的分屏共享
+8 秒冷却。点击与拖选仍交给终端，身体不接管键盘或焦点。真实输入、命令开始、切 pane、
+窗口失焦、全屏应用或几何变化会取消驻留；忙碌和错误守望不会被问候打断。Calm 只切换
+静态姿态，Static 不显示空间身体。此互动不修改真实生命状态或记忆。
+
+Settings 的 Organism Preview 可查看八种姿态、解释和本地 Say hello 示例，即使生命体
+关闭也可预览。预览不运行命令、不写养成记忆；隐藏或关闭设置后不保留动画定时器。
+
+命令面板的 **Inspect ASCII companion** 可查看当前 pane 的真实状态快照：姿态与原因、
+命令是否还在运行及已用时间、最近反应、未解决的构建/恢复、成长天数与恢复次数，以及八个
+有名称的状态刻度。刻度描述的是模拟生命体自身。查看不会改变生命状态、触发问候或写记忆，
+也不会开启轮询和动画；重新打开即可刷新。可以在 `[keybindings]` 中按需设置
+`inspect_ascii_organism = "F10"`，默认不占用快捷键。快照不持有 pane，关掉终端后不会
+留下 PTY。传统 VTE 显示能力说明，不会编造命令结果。人类命令与 Shell Agent 的输出节奏
+都有对应的解释；“输出安静”明确仍是运行中，不代表完成或卡死。
 
 感知只在内存中保留“不含内容”的 accepted-input/output-activity 脉冲，不记录
 按键、剪贴板或输出文本。它会观察 build/test、检查非零退出，并在失败后成功或
@@ -218,7 +256,8 @@ tooltip，避免日常界面长期暴露 `E72 M62 …` 这一类调试仪表盘�
 
 同一窗口现在只有一具完整空间身体：它属于当前真正获焦的本地 Block pane；其他
 pane 仍保留自己的 inline 事件卡和 sticky 微姿态，但不再各自游走。焦点落到搜索、
-对话框、VTE/远程 pane，或窗口失活时，live body 会全部撤下；切回本地 Block 后先
+对话框、VTE/远程 pane，或窗口失活时，Block 的 live body 会撤下；传统 VTE 的
+中性伴随体使用自己的焦点与显示条件。切回本地 Block 后先
 重新测量再出现。切 tab、分屏关闭、zoom 和 alternate screen 都沿用同一弱引用
 仲裁，不搬运 GTK widget，也不会让旧 pane 从 rmcup 恢复一个过期位置。
 Notebook 切页会在 signal 当下先撤销旧 owner，待 GTK 提交新页后再认领，因此切换
@@ -317,9 +356,31 @@ reducer、不新增落盘字段；repo 无法验证或身份切换中时使用�
 
 每个进程维护独立 active 快照。正常关闭后才原子发布为 ready；并发窗口不会读取或覆盖彼此 active 状态。后续启动逐个领取最近快照，确认 owner PID 已结束后才回收崩溃遗留的 active 快照，最多保留 32 个 ready 快照。旧版 `tabs.state` 会在首次启动时迁移。
 
+底部状态栏中的长路径或 Git 信息会在中间省略以适应窗口宽度，悬停可查看完整状态文本。网格尺寸、退出状态和标签计数保持正常显示。
+
 ## 5. 搜索与 Block 操作
 
-`Ctrl+Shift+F` 打开当前标签搜索：普通文本不区分大小写，`/expression/` 使用正则；Enter/Shift+Enter 前后跳转，Escape 关闭。清空输入立即清除 VTE 和 Block 高亮。查询上限为 8 KiB；增量搜索最多检查 4 MiB，并以 12 ms 为 surface 间的停止目标，最多记录 10,000 个命中。达到任一边界时状态栏会显示结果不完整，请缩小关键词。可能产生零宽命中的正则会明确拒绝，避免游标与高亮失去同步。全屏程序（alternate screen）占据 pane 时，搜索只针对正在显示的 live 终端，不统计被隐藏的已完成块。 命令运行期间，live 终端的命中数取自它自己的缓冲区（scrollback 加屏幕），与 Enter 逐个跳转经过的文本一致。
+`Ctrl+Shift+F` 打开当前标签搜索：普通文本不区分大小写，`/expression/` 使用正则；Enter/Shift+Enter 前后跳转，Escape 关闭。清空输入立即清除 VTE 和 Block 高亮。查询上限为 8 KiB；增量搜索最多检查 4 MiB，并以 12 ms 为 surface 间的停止目标，最多记录 10,000 个命中。达到任一边界时状态栏会显示结果不完整，请缩小关键词。可能产生零宽命中的正则会明确拒绝，避免游标与高亮失去同步。全屏程序（alternate screen）占据 pane 时，搜索只针对正在显示的 live 终端，不统计被隐藏的已完成块。 命令运行期间，live 终端的命中数取自它自己的缓冲区（scrollback 加屏幕），原生 VTE 游标仍有同一行多次匹配和软换行跳转限制；不能把增量计数视为逐字范围证明。
+
+### 保留文本精确预览
+
+搜索栏的 **Preview** 打开独立的只读窗口，冻结当前 pane 已完成记录中仍然保留的
+prompt、command 和 output。它不读取 live VTE、不跳转原终端、不替换现有 Find。
+“Preview: 2 of 3”只计算该快照中可搜索的保留文本；缺失的 prompt/output 数量会显示，
+部分保留的输出（可能只有尾部或前缀）会明确标注。它不是完整 scrollback 的总数。
+
+在预览自己的输入框修改关键词；**Regex** 使用 Rust regex 语义。默认不区分大小写（正则内联 flags 遵循 Rust 语义），
+逐逻辑行、逐字段、非重叠匹配；不能跨硬换行或字段。软换行和窗口缩放不会改变快照。
+零宽/可能匹配空串、lookaround 和 backreference 模式会拒绝；消耗字符的 `^word$`
+等模式可用。控制字符和双向文本控制符显示为转义，搜索也针对显示后的同一份文本，
+不另行规范化 Unicode。Previous/Next 或 Shift+Enter/Enter 在同一快照循环导航；
+当前命中使用 TextView 标记，不创建原生终端 selection 或取得 PRIMARY。
+
+快照不随终端输出刷新；关闭再打开可重新捕获。原 pane 被移除或窗口关闭后，不会把旧结果
+用于别的 pane。查询超过 8 KiB、保留原文或转换后的显示文本超过各自 1 MiB、字段超过
+4096、单逻辑行超过 64 KiB、命中超过 10,000 或扫描触及时间目标时，请求整体拒绝，不展示部分总数或沿用旧命中。
+扫描在后台单 worker 执行；100 ms 是协作检查目标，并不是单次正则编译/长行匹配的硬实时上限。
+详见 [预览范围与验收](SEARCH_PREVIEW_ACCEPTANCE.md)。
 
 | Block 功能 | 快捷键 |
 |---|---|
@@ -404,6 +465,7 @@ Block Search 4.2 新增 **Bookmarked** 元数据筛选。它与 Failed、Slow、
 - `Delete` 删除整个选区，一次按键即可移除用 `Shift+Up/Down` 建立的整段范围；命令面板中的
   **Undo removing blocks** 把它们放回按 id 该在的位置，因此期间新跑的命令不会把恢复的块挤到
   最前面。撤销槽是单级的：删除和清空共用它，新的一次移除会替换上一次。
+- 清空后的 Toast 提供 **Undo**，也可用命令面板 **Undo removing blocks**；恢复会合并仍保留的旧书签和多选状态。空 Pane 重复清空不会覆盖撤销槽，全屏程序占用 Pane 或历史容量不足时会保留撤销并提示重试。
 - **Show only failed blocks** / **Show only slow blocks**（≥1s）/ **Show only bookmarked blocks**
   把块流收窄到匹配的卡片：不匹配的被隐藏且不再占据虚拟画布高度，`Up/Down` 选择会跳过它们，
   `Ctrl+Shift+A` 只选中可见的，过滤期间新完成且不匹配的命令也不会出现。**Show all blocks** 恢复
@@ -516,6 +578,8 @@ name = "env"
 ## 8. 文件树
 
 侧栏 Files 页以当前标签 cwd 为根：双击目录展开/折叠；双击普通文件把 shell 引号保护后的路径插入编辑行，不自动执行；双击 `.jtnb.md` 打开 Notebook。向上按钮进入父目录，主页按钮回到当前终端 cwd。Block 走自管 PTY 输入，VTE 走 VTE child input。
+
+点击 Files 路径标题可打开绝对路径输入和祖先目录按钮。长目录名会在中间省略，避免挤出 Open/Cancel；悬停查看完整显示名称，点击仍跳转到原始完整路径。目录层级较深时，祖先列表在对话框内滚动，路径输入、错误提示和 Open/Cancel 固定可见；键盘聚焦会滚动到对应按钮，手动滚动后静置不会自动跳回。
 
 ## 9. Flatpak 与桌面安装
 
@@ -657,6 +721,12 @@ dashboard 和 Settings 中的 **AI command correction** 开关控制 `command_co
 
 ## 12. 配置保存与快捷键
 
+显式图标/备用字体会以正确的 Pango 列表格式附加，不会因字体名前多出的空格而被忽略；字号、粗体、斜体和保存的设置不变。
+
+默认字体为 `JetBrainsMono Nerd Font Mono 14`。若系统未安装此字体，显示时会使用系统的
+`Monospace` 等宽字体，避免默认替代字体使字符间距失真；不会改写保存的配置。自定义字体
+和字体列表保持原样，已安装的默认字体仍优先使用。安装字体后请重启 Forge。
+
 完整字段见 `config.toml.example`。保存后自动热重载，`Ctrl+Shift+R` 手动重载。语法或语义错误不会替换当前有效配置。
 
 应用内设置保存还会：获取进程级 advisory lock、检查加载时 revision、拒绝并发编辑冲突、用 owner-only 临时文件 `fsync` 后原子替换，并轮换 `.bak` / `.bak.1` 两份经过验证的备份。恢复前的当前文件另存为 `.before-restore`。冲突、验证拒绝、锁超时和 I/O 错误会在窗口中明确提示；内存中的临时改动仍有效，但磁盘不会被覆盖。发生冲突时先重载配置再重新应用改动；必要时运行 `forge --restore-config-backup`。safe mode 中的设置只影响当前窗口，也会明确提示不会保存。
@@ -707,3 +777,63 @@ forge-support-bundle .
 - 长命令无通知：检查 `notify_long_blocks`、阈值、`notify-send` 和通知服务；通知只在窗口未激活或该 pane 不在当前标签页时弹出。
 - SSH 无目标：添加 `[[remote_hosts]]` 后按 `Ctrl+Shift+S`。
 - 配置修改没生效：先运行 `--check-config`；并发冲突需要重载后再保存。
+
+
+### Block 卡片动作与键盘焦点
+
+每张完成卡片都有始终可见的 **Block actions**（⋮），可用鼠标、触摸或 Tab + Enter 打开。
+它和右键共用操作菜单及提示符安全检查；历史恢复和撤销恢复也不会失去动作。菜单过长时可滚动，
+Escape 关闭，重复激活不会创建叠加菜单。
+
+悬停/选中的快捷区保留 **Copy output** 和 **Insert for review**；插入不会提交执行，
+提示符忙碌或已有输入时仍会拒绝。其余复制、过滤、折叠、展开和长输出导航在菜单内。
+快捷按钮有键盘焦点时移开鼠标不会隐藏或禁用它；离开快捷区后才恢复正常显示规则。
+窄分屏中的 cwd 与 git 名称会省略，tooltip 保留完整可见文本。
+
+
+### Block review：审阅保留的命令记录
+
+选中卡片后，在活动选择边缘点击 **Review selection (数量)**，也可点击完成卡片的
+cwd/时长元数据区域，或在常驻 Block actions 菜单中选择
+**Review Block / Selection**。Details 页显示完整保留命令、工作目录、退出状态、
+可信时长、命令精确性和完成来源。缺少退出状态不会显示成功；缺少可靠计时不会伪造时长。
+输出被截断、从日志恢复、命令只获得尽力捕获等情况会明确说明。
+
+已选多块时，顶部选择器按从旧到新顺序切换记录；Command order 页显示同一顺序的命令
+及每条命令的捕获来源。Copy commands 按该顺序复制命令，忽略无命令的后台输出块。
+窗口本身不会回填或执行命令，原有提示符和运行中程序保持不变。
+
+审阅是打开时的只读快照；后续完成的块不会插进当前列表。复制会重新检查所审阅的 ID
+和命令；任何块已被淘汰或变化时整次拒绝。为保护长会话，最多审阅 64 块和 256 KiB
+命令文本；范围过大或缺少记录时会提示缩小选择，禁用复制。输出和图片留在原卡片，不为
+审阅创建另一份副本。隐藏控制/双向格式字符会安全显示，并禁用与显示内容不一致的复制。
+
+Escape 或 Close 关闭窗口并把键盘焦点交回打开审阅的历史操作或卡片；仅当该卡片已卸载时
+回到 live 终端。关闭不会清除选择或未读计数。窗口不改变 PTY 网格、不展开虚拟化历史，
+也不跳到最新输出。Unified 和 VTE 后端保持各自的原有交互。
+
+
+### 跨终端区域拖选
+
+在一个命令或输出 VTE 内拖动仍使用原生按字选区。拖动跨过区域边界后，轮廓标记整区选择；复制包含这些区域的全部保留文本（含其 VTE 滚屏），按界面从旧到新排列，而不是只取端点部分行。区域折叠、卸载或内容改变时会撤销选区；复制超过 32 MiB、读取过慢或任一记录失效时整次拒绝，保留原剪贴板。拖选本身不覆盖 PRIMARY 或普通剪贴板；只有明确复制才更新普通剪贴板。
+
+流式 live 终端仍在拖选时暂停显示刷新；复制、继续输入、取消或达到既有缓冲上限后恢复。真正的单区域原生选区可以接替整区选区。GTK/X11 回归通过实际指针事件检查两个拖动方向、顺序、剪贴板边界与暂停数据恢复；可在隔离 Xvfb 中设置 `FORGE_XTEST_DRIVER="$PWD/scripts/qa-cross-selection-pointer.py"` 运行 `scripts/test-gtk-display.sh`（需 Python 3、libX11、libXtst）。
+
+## Chat 终端模式
+
+用 `forge --mode chat --no-restore` 或 `terminal_mode = "chat"` 开启。
+设置中的 Terminal Backend → Chat 仅应用到新建和恢复的本地 pane。
+右侧显示命令胶囊，左侧保留宽日志输出卡，底部固定原生多行 shell 输入区。
+它不依赖 LLM，也不是 AI Chat：补全、历史、多行、密码与交互进程仍走原来的 VTE/PTY。
+发送箭头等于一次 Enter，不重新粘贴命令；运行时同一个终端进入结果区，底部有耗时和 Stop。
+vim/top 接管原生终端，退出后按实际 shell 状态返回；缺少集成时同一 PTY 继续透传。
+复制、搜索、折叠和历史恢复继续使用原始记录。
+详见 [Chat 验收清单](CHAT_MODE_ACCEPTANCE.md)。
+
+## 分组字号
+
+Ctrl+滚轮根据鼠标所在区域缩放，而不是键盘焦点：顶部栏、左右侧栏（标签、文件树、AI Chats/Tasks）和底部状态栏共用 UI 组；中心终端区域的 Block/Chat/VTE、全部分屏及中心搜索栏使用主内容组。普通滚轮保持原来的滚动行为；独立对话框、全窗浮层及区域之间的分隔条不绑定分组缩放控制器；主内容内部的终端分屏分隔条仍归主内容组。
+
+两组基础字号及倍率独立保存，倍率范围为 0.1–10.0，连续触控板滚动保留小数增量。旧配置加载时从 `font` 和 `font_scale` 固定 UI 组的初值；之后只改其中一组不会改变另一组，重启后亦然。UI 组使用 `chrome_font_size`（如 "14" 点或 "17px"）和 `chrome_font_scale`，主内容使用原来的 `font` 与 `font_scale`。
+
+设置中的 Main Content Font Size/Scale 只改主内容；Sidebar & Top Bar Font Size/Scale 只改 UI 组。`Ctrl+=` / `Ctrl+-` / `Ctrl+0` 仍控制主内容组。更改主内容的基础字号不会再连带改变侧顶栏字号。

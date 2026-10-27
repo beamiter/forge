@@ -11,13 +11,13 @@ platform safety boundary.
 
 | Area | Required behavior in both frontends |
 | --- | --- |
-| Tabs and panes | New tabs, close/duplicate/reorder/mark/pin, top/sidebar tabs, drag-to-split, zoom, focus and resize actions. A split inherits the focused leaf's backend and cwd. Spawn failure leaves the old layout intact. |
-| Block mode | Structured running/finished blocks, selection, search and filters, failure markers/navigation, pinning, clear/undo-clear, re-input, Markdown/JSON export, long-output private scrolling, running Stop and jump controls, and bounded virtualization. |
+| Tabs and panes | New tabs, close/duplicate/reorder/mark/pin, top/sidebar tabs, drag-to-split, zoom, focus and resize actions. Directional focus uses the shared rectangle-edge/overlap selector and skips unmapped panes. A split inherits the focused leaf's backend and cwd. Spawn failure leaves the old layout intact. |
+| Block mode | Structured running/finished blocks, exact selected-output folding, empty-query history browsing, pane-owned prepared search, search and filters, failure markers/navigation, pinning, clear/undo-clear, re-input, Markdown/JSON export, long-output private scrolling, running Stop and jump controls, and bounded virtualization. |
 | VTE mode | Conventional VTE behavior, shell integration, OSC title/cwd/bell/notification handling, search, clipboard controls, and remote/container launch. |
 | AI Chats | Persistent right panel, chat library and search, new/rename/archive/delete, per-chat draft and block context, streaming, Stop/Retry, strict request-to-chat ownership, width/visibility persistence, and bounded session restore. |
 | Shell Agent | Approval-gated proposals and exact-command review. Automatic execution is allowed only after a private shell capability handshake and insert-then-exact-readback verification; unsupported shells, remote/host bridges, and lost identity fail closed. |
 | Command correction | Editable local/AI suggestions after narrowly classified failures; no automatic acceptance and exact verification before any explicit Run action. |
-| ASCII organism | Same local reducer, memory schema, motion modes, focus ownership, command/Agent lifecycle signals, visible lifetime phenotype, content-free output rhythm, semantic bridges, repo territory habits, session attention arbitration, live/sticky/inline surfaces, and shutdown flush. No command or terminal output is persisted by this feature. |
+| ASCII organism | Same local reducer, memory schema, motion modes, focus ownership, command/Agent lifecycle signals, visible lifetime phenotype, content-free output rhythm, semantic bridges, repo territory habits, session attention arbitration, live/sticky/inline surfaces, immediate settings, a passive cooldown-bounded pointer greeting, explained pose previews, and shutdown flush. Traditional VTE has a separate compact/expandable neutral companion, with no command reactions or live greetings. No command or terminal output is persisted by this feature. |
 | Settings | Same groups, row order, labels, value ranges, safe-mode sensitivity, remote-host add/edit/delete flow, AI key-file handling, AI panel controls, and organism controls. Widgets remain native to each frontend. |
 | Configuration | Same public keys, defaults, validation ranges, preservation rules, and atomic/revision-checked persistence. Environment prefixes remain product-specific (`ANVIL_` and `FORGE_`). |
 | Actions | Same built-in shortcuts and palette actions. Direction keys also have H/J/K/L fallbacks. Historical action spellings remain accepted as aliases. |
@@ -33,6 +33,8 @@ frontend's canonical key:
 - `open_history_palette` and `history_palette`
 - `open_workflows` and `workflows_palette`
 - `open_palette` and `toggle_command_palette`
+- `block:collapse_selected` and `collapse_selected_blocks`
+- `block:expand_selected` and `expand_selected_blocks`
 
 Indexed remote actions are `connect_remote_1` through `connect_remote_9` in
 both frontends.

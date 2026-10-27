@@ -10,13 +10,43 @@ use vte4::Terminal;
 use vte4::TerminalExt;
 
 use super::*;
-use crate::block_view::{RecordNavigationResult, SessionExportFormat, TermView};
+use crate::block_view::{RecordNavigationResult, SessionExportFormat, TermView, UndoClearResult};
 use crate::keybindings::{Action, Direction};
 use crate::terminal::terminal_working_directory;
 
 const MIN_AI_PANEL_WIDTH: i32 = 240;
 const MAX_AI_PANEL_WIDTH: i32 = 1200;
 const MIN_AI_WORKSPACE_WIDTH: i32 = 200;
+
+fn cleared_blocks_message(count: usize) -> Option<String> {
+    (count > 0).then(|| {
+        let plural = if count == 1 { "" } else { "s" };
+        format!("Cleared {count} block{plural}.")
+    })
+}
+
+fn undo_clear_message(result: UndoClearResult) -> String {
+    match result {
+        UndoClearResult::Restored(count) => {
+            let plural = if count == 1 { "" } else { "s" };
+            format!("Restored {count} removed block{plural}.")
+        }
+        UndoClearResult::Empty => "No removed blocks to restore.".to_string(),
+        UndoClearResult::Fullscreen => {
+            "Exit the full-screen app before restoring removed blocks.".to_string()
+        }
+        UndoClearResult::AtCapacity => {
+            "History retention limits prevent restoration. Undo is still available.".to_string()
+        }
+    }
+}
+
+fn undo_clear_is_retryable(result: UndoClearResult) -> bool {
+    matches!(
+        result,
+        UndoClearResult::Fullscreen | UndoClearResult::AtCapacity
+    )
+}
 
 fn apply_ai_panel_width(paned: &gtk4::Paned, requested_width: u32) {
     let total_width = paned.width();
@@ -72,6 +102,37 @@ fn record_navigation_toast(result: RecordNavigationResult) -> Option<&'static st
     }
 }
 
+/// AdwToast retires its action button and dismisses the old toast after the
+/// click signal. A retry needs a fresh toast, not a reset of the old object's
+/// timeout. Both callbacks retain only weak references to their pane/window.
+fn show_clear_undo_toast(
+    overlay: &adw::ToastOverlay,
+    term_view: std::rc::Weak<TermView>,
+    message: &str,
+) {
+    let toast = adw::Toast::new(message);
+    toast.set_button_label(Some("Undo"));
+    toast.set_timeout(8);
+    let overlay = overlay.downgrade();
+    let retry_overlay = overlay.clone();
+    toast.connect_button_clicked(move |_| {
+        let result = term_view.upgrade().map_or(UndoClearResult::Empty, |view| {
+            view.undo_clear_blocks_result()
+        });
+        let message = undo_clear_message(result);
+        if let Some(overlay) = retry_overlay.upgrade() {
+            if undo_clear_is_retryable(result) {
+                show_clear_undo_toast(&overlay, term_view.clone(), &message);
+            } else {
+                overlay.add_toast(adw::Toast::new(&message));
+            }
+        }
+    });
+    if let Some(overlay) = overlay.upgrade() {
+        overlay.add_toast(toast);
+    }
+}
+
 impl UiState {
     /// Hotkey path for opacity: apply to the window, write through to the
     /// config (same persistence as the settings dialog, so the value survives
@@ -118,6 +179,12 @@ impl UiState {
         let current_terminal = self.current_terminal();
 
         match action {
+            Action::CompareSelectedOutputs
+            | Action::ExportSelectedMarkdown
+            | Action::ExportSelectedJson => {
+                let owner = self.current_term_view().map(|view| Rc::downgrade(&view));
+                self.review_command_output_for(&owner, action);
+            }
             Action::NewTab => {
                 log::info!("New tab");
                 let working_directory = current_terminal
@@ -190,6 +257,54 @@ impl UiState {
             Action::ToggleSearch => {
                 log::debug!("Toggle search");
                 self.toggle_search();
+            }
+            Action::PreviousCommand
+            | Action::NextCommand
+            | Action::ReturnToLive
+            | Action::CopyCurrentCommand => {
+                if let Some(view) = self.current_term_view() {
+                    self.execute_unified_navigation_for(&view, action);
+                }
+            }
+            // Palette-only: these require the opening target, never a fallback
+            // to the pane current at delayed generic action dispatch.
+            Action::ExpandVteCompanion | Action::CollapseVteCompanion => {}
+            Action::GreetAsciiOrganism => {
+                let target = self.organism_greeting_target();
+                self.greet_ascii_organism_for(&target);
+            }
+            Action::InspectAsciiOrganism => {
+                let target = self.organism_greeting_target();
+                self.inspect_ascii_organism_for(&target);
+            }
+            Action::OpenVim9Ide => {
+                if std::env::var_os("FORGE_SAFE_MODE").is_some() {
+                    self.toast_overlay
+                        .add_toast(adw::Toast::new("Vim9 IDE is unavailable in safe mode."));
+                    return;
+                }
+                if self
+                    .current_pane_leaf()
+                    .is_some_and(|leaf| leaf.is_remote())
+                {
+                    self.toast_overlay.add_toast(adw::Toast::new(
+                        "Vim9 IDE opens local projects. Select a local terminal pane first.",
+                    ));
+                    return;
+                }
+                let root = current_terminal
+                    .as_ref()
+                    .and_then(terminal_working_directory)
+                    .map(std::path::PathBuf::from)
+                    .filter(|path| path.is_dir())
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| std::path::PathBuf::from("/"));
+                if let Err(error) =
+                    crate::vim9_ide::launch(jterm_core::vim9::Vim9EntryRequest::user_action(root))
+                {
+                    self.toast_overlay
+                        .add_toast(adw::Toast::new(&format!("Cannot open Vim9 IDE: {error}")));
+                }
             }
             Action::ToggleCommandPalette => {
                 log::debug!("Toggle command palette");
@@ -389,12 +504,12 @@ impl UiState {
                 log::info!("Clear finished blocks");
                 if let Some(term_view) = self.current_term_view() {
                     let count = term_view.clear_blocks();
-                    if count > 0 {
-                        let plural = if count == 1 { "" } else { "s" };
-                        let message = format!(
-                            "Cleared {count} block{plural} — \"Undo removing blocks\" restores them."
+                    if let Some(message) = cleared_blocks_message(count) {
+                        show_clear_undo_toast(
+                            &self.toast_overlay,
+                            Rc::downgrade(&term_view),
+                            &message,
                         );
-                        self.toast_overlay.add_toast(adw::Toast::new(&message));
                     } else if !term_view.supports_block_mutation() {
                         // In Block, "nothing to clear" is self-evident from an
                         // empty pane. In Unified the pane is full of output
@@ -422,6 +537,15 @@ impl UiState {
                     }
                 }
             }
+            Action::CollapseSelectedBlocks | Action::ExpandSelectedBlocks => {
+                let collapse = action == Action::CollapseSelectedBlocks;
+                let result = self.current_term_view().map_or(
+                    crate::block_view::FoldSelectionResult::Unavailable,
+                    |view| view.set_selected_blocks_collapsed(collapse),
+                );
+                self.toast_overlay
+                    .add_toast(adw::Toast::new(&result.notice(collapse)));
+            }
             Action::ToggleBlockCollapsed => {
                 log::info!("Toggle block output");
                 if let Some(term_view) = self.current_term_view() {
@@ -431,13 +555,8 @@ impl UiState {
             Action::UndoClearBlocks => {
                 log::info!("Undo clear finished blocks");
                 if let Some(term_view) = self.current_term_view() {
-                    let count = term_view.undo_clear_blocks();
-                    let message = if count == 0 {
-                        "No removed blocks to restore.".to_string()
-                    } else {
-                        let plural = if count == 1 { "" } else { "s" };
-                        format!("Restored {count} removed block{plural}.")
-                    };
+                    let result = term_view.undo_clear_blocks_result();
+                    let message = undo_clear_message(result);
                     self.toast_overlay.add_toast(adw::Toast::new(&message));
                 }
             }
@@ -488,6 +607,27 @@ impl UiState {
             Action::AskAiAboutSelectedBlock => {
                 log::debug!("Ask AI about selected block");
                 self.ask_ai_about_selected_block();
+            }
+            Action::OpenAgentSessions => {
+                let owner = self.unified_navigation_owner.borrow().clone();
+                super::agent_sessions::show(
+                    &self.window,
+                    current_terminal
+                        .as_ref()
+                        .and_then(terminal_working_directory)
+                        .map(PathBuf::from),
+                    self.agent_session_library.clone(),
+                    self.agent_session_tabs.borrow().keys().cloned().collect(),
+                    move |request| {
+                        if let Some(ui) = owner.upgrade() {
+                            ui.add_agent_session_tab(request);
+                        } else {
+                            let _ = request
+                                .completion
+                                .send(Err("The terminal window closed.".into()));
+                        }
+                    },
+                );
             }
             Action::OpenAgent => self.toggle_agent_panel(),
             Action::ToggleTasksPanel => {
@@ -742,6 +882,46 @@ impl UiState {
         }
     }
 
+    /// Palette and toolbar callers capture the owner before focus moves into
+    /// their UI. A disappeared pane cannot be replaced by a new active tab.
+    pub(super) fn review_command_output_for(
+        &self,
+        owner: &Option<std::rc::Weak<TermView>>,
+        action: Action,
+    ) {
+        let Some(owner) = owner
+            .as_ref()
+            .and_then(std::rc::Weak::upgrade)
+            .filter(|view| view.widget().root().is_some_and(|root| root.is_realized()))
+        else {
+            self.toast_overlay.add_toast(adw::Toast::new(
+                "The source pane has no retained command records or is no longer available.",
+            ));
+            return;
+        };
+        let result = match action {
+            Action::CompareSelectedOutputs => owner.show_command_output_review().map(|_| None),
+            Action::ExportSelectedMarkdown => {
+                owner.export_selected_records_or_review(SessionExportFormat::Markdown)
+            }
+            Action::ExportSelectedJson => {
+                owner.export_selected_records_or_review(SessionExportFormat::Json)
+            }
+            _ => return,
+        };
+        match result {
+            Ok(Some(path)) => self.show_session_export_result(
+                "Selected records exported",
+                &format!(
+                    "Wrote {}",
+                    jterm_core::review_input::safe_inline_display(&path.to_string_lossy(), 4096)
+                ),
+            ),
+            Ok(None) => {}
+            Err(message) => self.toast_overlay.add_toast(adw::Toast::new(&message)),
+        }
+    }
+
     fn show_session_export_result(&self, heading: &str, message: &str) {
         let dialog = adw::AlertDialog::new(Some(heading), Some(message));
         dialog.add_response("ok", "OK");
@@ -805,6 +985,41 @@ impl UiState {
             .and_then(|node| node.active_leaf())
     }
 
+    /// Receive the emitting pane directly; no operation depends on a delayed
+    /// focus event making that pane the application-wide current terminal.
+    pub(super) fn execute_unified_navigation_for(&self, view: &Rc<TermView>, action: Action) {
+        if !view.widget().is_mapped() || !view.unified_navigation_available() {
+            return;
+        }
+        match action {
+            Action::PreviousCommand | Action::NextCommand => {
+                match view.navigate_command(action == Action::NextCommand) {
+                    Ok(RecordNavigationResult::SnapshotView { record_id }) => {
+                        self.show_record_snapshot_dialog_for(view, record_id);
+                    }
+                    Ok(result) => self.report_record_navigation(result),
+                    Err(message) => self.toast_overlay.add_toast(adw::Toast::new(message)),
+                }
+            }
+            Action::ReturnToLive => {
+                view.return_to_live();
+            }
+            Action::CopyCurrentCommand => {
+                let message = match view.copy_current_command() {
+                    Ok(()) => "Current command copied.",
+                    Err(message) => message,
+                };
+                self.toast_overlay.add_toast(adw::Toast::new(message));
+            }
+            Action::ToggleSearch => self.show_search_for(view),
+            Action::CrossBlockSearch => self.show_cross_block_search_for(view.clone()),
+            Action::CompareSelectedOutputs => {
+                self.review_command_output_for(&Some(Rc::downgrade(view)), action);
+            }
+            _ => {}
+        }
+    }
+
     pub(crate) fn current_term_view(&self) -> Option<Rc<TermView>> {
         self.current_pane_leaf().and_then(|leaf| leaf.block_view())
     }
@@ -813,10 +1028,11 @@ impl UiState {
 #[cfg(test)]
 mod tests {
     use super::{
-        ai_panel_width_from_geometry, record_navigation_toast, remote_host_index_for_action,
-        restored_ai_panel_position,
+        ai_panel_width_from_geometry, cleared_blocks_message, record_navigation_toast,
+        remote_host_index_for_action, restored_ai_panel_position, undo_clear_is_retryable,
+        undo_clear_message,
     };
-    use crate::block_view::RecordNavigationResult;
+    use crate::block_view::{RecordNavigationResult, UndoClearResult};
 
     #[test]
     fn ai_panel_geometry_preserves_workspace_and_clamps_configured_limits() {
@@ -861,5 +1077,42 @@ mod tests {
             None,
             "the snapshot dialog, not a toast, answers this result"
         );
+    }
+
+    #[test]
+    fn clear_block_toasts_cover_empty_singular_and_plural_results() {
+        assert_eq!(cleared_blocks_message(0), None);
+        assert_eq!(
+            cleared_blocks_message(1).as_deref(),
+            Some("Cleared 1 block.")
+        );
+        assert_eq!(
+            cleared_blocks_message(2).as_deref(),
+            Some("Cleared 2 blocks.")
+        );
+        assert_eq!(
+            undo_clear_message(UndoClearResult::Empty),
+            "No removed blocks to restore."
+        );
+        assert_eq!(
+            undo_clear_message(UndoClearResult::Fullscreen),
+            "Exit the full-screen app before restoring removed blocks."
+        );
+        assert_eq!(
+            undo_clear_message(UndoClearResult::AtCapacity),
+            "History retention limits prevent restoration. Undo is still available."
+        );
+        assert_eq!(
+            undo_clear_message(UndoClearResult::Restored(1)),
+            "Restored 1 removed block."
+        );
+        assert_eq!(
+            undo_clear_message(UndoClearResult::Restored(2)),
+            "Restored 2 removed blocks."
+        );
+        assert!(undo_clear_is_retryable(UndoClearResult::Fullscreen));
+        assert!(undo_clear_is_retryable(UndoClearResult::AtCapacity));
+        assert!(!undo_clear_is_retryable(UndoClearResult::Empty));
+        assert!(!undo_clear_is_retryable(UndoClearResult::Restored(1)));
     }
 }

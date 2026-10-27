@@ -11,6 +11,49 @@ use std::rc::Rc;
 use vte4::Terminal;
 use vte4::TerminalExt;
 
+/// A compact native reveal target. The preview is display-only and ellipsized;
+/// its width must never become the minimum width of a narrow split pane.
+fn set_folded_summary(button: &gtk4::Button, summary: &str, preview: Option<&str>) {
+    let body = button
+        .child()
+        .and_then(|child| child.downcast::<gtk4::Box>().ok());
+    let body = body.unwrap_or_else(|| {
+        let body = gtk4::Box::new(Orientation::Vertical, 2);
+        for class in ["block-output-summary-title", "block-output-preview"] {
+            let label = gtk4::Label::new(None);
+            label.add_css_class(class);
+            label.set_xalign(0.0);
+            label.set_hexpand(true);
+            label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            label.set_single_line_mode(true);
+            label.set_width_chars(1);
+            label.set_max_width_chars(72);
+            if class == "block-output-preview" {
+                label.add_css_class("dim-label");
+            }
+            body.append(&label);
+        }
+        button.set_child(Some(&body));
+        button.set_halign(gtk4::Align::Fill);
+        button.set_hexpand(true);
+        body
+    });
+    let title = body.first_child().and_downcast::<gtk4::Label>().unwrap();
+    let detail = body.last_child().and_downcast::<gtk4::Label>().unwrap();
+    title.set_text(summary);
+    if let Some(preview) = preview {
+        detail.set_text(&format!("Preview: {preview}"));
+        detail.set_visible(!preview.is_empty());
+    }
+    let accessible = if detail.get_visible() {
+        format!("{summary}. {}", detail.text())
+    } else {
+        summary.to_string()
+    };
+    button.update_property(&[gtk4::accessible::Property::Label(&accessible)]);
+    button.set_tooltip_text(Some(&accessible));
+}
+
 /// Conservative per-pane estimated-memory budget for completed-block objects.
 ///
 /// This is deliberately independent of the configurable record-count limit:
@@ -497,9 +540,6 @@ pub(crate) enum BlockOutcome {
     Unknown,
 }
 
-/// `128 + SIGTSTP`: the shell's status for a job stopped by Ctrl+Z.
-const SUSPENDED_EXIT_CODE: i32 = 148;
-
 impl BlockOutcome {
     /// Exit statuses that mean "this was stopped", not "this went wrong".
     ///
@@ -509,26 +549,25 @@ impl BlockOutcome {
     /// itself, too: the live card's Stop button writes `\x03`, so the block it
     /// produces was interrupted by Forge's own UI.
     ///
-    /// `128 + signal`, restricted to the three signals that carry no fault:
+    /// `128 + signal`, including the three terminating signals that carry no fault:
     /// SIGINT (Ctrl+C), SIGPIPE (the reader went away, as in `... | head`) and
     /// SIGTERM (an orderly stop request). Faults keep their failure styling:
     /// SIGSEGV, SIGABRT and SIGQUIT are real crashes, and SIGKILL is usually
     /// the OOM killer, all of which the user needs to see in red.
     ///
-    /// SIGTSTP (148, Ctrl+Z) joins them: codex and claude suspend on Ctrl+Z,
-    /// and the shell reports 128 + SIGTSTP when it takes the terminal back.
-    /// The job is suspended, not failed; `fg` resumes it.
+    /// The four job-control stops (147–150) join them. The job is suspended,
+    /// not failed; `fg` resumes it.
     ///
     /// A script that genuinely exits 130 for its own reasons is misread here.
     /// The raw code stays visible in the badge, in export and in history for
     /// exactly that reason.
-    const fn interrupt_signal(exit_code: i32) -> Option<&'static str> {
-        match exit_code {
-            130 => Some("SIGINT"),
-            141 => Some("SIGPIPE"),
-            143 => Some("SIGTERM"),
-            SUSPENDED_EXIT_CODE => Some("SIGTSTP"),
-            _ => None,
+    fn interrupt_signal(exit_code: i32) -> Option<&'static str> {
+        match jterm_core::exit_status::interrupt_signal(exit_code) {
+            Some(signal) => Some(signal),
+            None if jterm_core::exit_status::is_job_stop(exit_code) => {
+                jterm_core::exit_status::signal_name_for_exit(exit_code)
+            }
+            None => None,
         }
     }
 
@@ -537,10 +576,11 @@ impl BlockOutcome {
     /// classified as interrupted here, and the number is how the user tells
     /// the two apart.
     fn interrupted_badge(code: i32) -> (String, String) {
-        if code == SUSPENDED_EXIT_CODE {
+        if jterm_core::exit_status::is_job_stop(code) {
+            let signal = Self::interrupt_signal(code).unwrap_or("a stop signal");
             return (
                 format!("exit:{code} · suspended"),
-                "Stopped by SIGTSTP — resume with fg".to_string(),
+                format!("Stopped by {signal} — resume with fg"),
             );
         }
         let signal = Self::interrupt_signal(code).unwrap_or("signal");
@@ -630,7 +670,9 @@ impl BlockOutcome {
             Self::Background => "Background output",
             Self::Success => "Command succeeded",
             Self::Failure(_) => "Command failed",
-            Self::Interrupted(SUSPENDED_EXIT_CODE) => "Command suspended",
+            Self::Interrupted(code) if jterm_core::exit_status::is_job_stop(code) => {
+                "Command suspended"
+            }
             Self::Interrupted(_) => "Command interrupted",
             Self::Unknown => "Command exit status unavailable",
         }
@@ -710,13 +752,18 @@ pub(crate) struct FinishedBlock {
     /// the lifetime of the block (finished blocks are append-once in practice).
     pub(crate) stripped_output: Rc<RefCell<Option<String>>>,
     pub(crate) cmd_text: String,
+    /// Presentation cache only; execution re-checks the current BlockData.
+    pub(crate) command_replay_is_exact: Rc<Cell<bool>>,
+    command_source_notice: gtk4::Label,
     pub(crate) copy_cmd_btn: gtk4::Button,
     pub(crate) copy_output_btn: gtk4::Button,
     pub(crate) rerun_btn: gtk4::Button,
     pub(crate) header_row: gtk4::Box,
+    pub(super) more_btn: gtk4::Button,
     pub(crate) action_box: gtk4::Box,
     /// Keyboard affordances shown only while this block is selected.
     pub(crate) selection_hint: gtk4::Label,
+    pub(crate) review_selection: gtk4::Button,
     /// Persistent selection legend kept separate from transient refusal text.
     /// A second refusal may arrive before the first timeout; restoring from
     /// the label itself would then preserve the first refusal indefinitely.
@@ -730,6 +777,7 @@ pub(crate) struct FinishedBlock {
     /// pane can drive it in bulk: triaging a long session should not mean one
     /// chevron click per card.
     set_collapsed: Rc<dyn Fn(bool)>,
+    pub(crate) can_collapse: bool,
     /// The card's folded state. The collapsed summary's visibility is the one
     /// signal that is also correct for image-only cards, whose output VTE stays
     /// hidden while expanded.
@@ -759,7 +807,7 @@ pub(crate) struct FinishedBlock {
     /// What the output VTE currently holds. A find pass records this with each
     /// surface it scans; a resize, an expand or a filter changes it, and the
     /// recorded native search cursor for that surface is then meaningless.
-    render_stamp: Rc<Cell<RenderStamp>>,
+    render_stamp: Rc<RenderStampState>,
     /// Font scale a virtualized card has not adopted yet. Ctrl+scroll emits a
     /// notch every 0.025, and each one used to reset the font metrics of two
     /// VTEs on every retained card — including the ones virtualization had
@@ -770,6 +818,7 @@ pub(crate) struct FinishedBlock {
     displayed_generation: Rc<Cell<u64>>,
     /// Warp-style jump affordance for oversized output.
     pub(crate) jump_bottom_btn: gtk4::Button,
+    pub(crate) expand_btn: gtk4::Button,
     pub(crate) bookmark_star: gtk4::Label,
     pub(crate) status_icon: gtk4::Label,
     /// Header chip naming an untrusted completion; hidden on healthy/background records.
@@ -802,6 +851,8 @@ impl Clone for FinishedBlock {
             output_vte: self.output_vte.clone(),
             output_scrollbar: self.output_scrollbar.clone(),
             cmd_text: self.cmd_text.clone(),
+            command_replay_is_exact: self.command_replay_is_exact.clone(),
+            command_source_notice: self.command_source_notice.clone(),
             full_output: self.full_output.clone(),
             displayed_output: self.displayed_output.clone(),
             stripped_output: self.stripped_output.clone(),
@@ -809,12 +860,15 @@ impl Clone for FinishedBlock {
             copy_output_btn: self.copy_output_btn.clone(),
             rerun_btn: self.rerun_btn.clone(),
             header_row: self.header_row.clone(),
+            more_btn: self.more_btn.clone(),
             action_box: self.action_box.clone(),
             selection_hint: self.selection_hint.clone(),
+            review_selection: self.review_selection.clone(),
             selection_hint_steady: self.selection_hint_steady.clone(),
             selection_feedback_generation: self.selection_feedback_generation.clone(),
             toggle_filter: self.toggle_filter.clone(),
             set_collapsed: self.set_collapsed.clone(),
+            can_collapse: self.can_collapse,
             collapsed_summary: self.collapsed_summary.clone(),
             filtered_out: self.filtered_out.clone(),
             restore_live_focus: self.restore_live_focus.clone(),
@@ -824,6 +878,7 @@ impl Clone for FinishedBlock {
             pending_font_scale: self.pending_font_scale.clone(),
             displayed_generation: self.displayed_generation.clone(),
             jump_bottom_btn: self.jump_bottom_btn.clone(),
+            expand_btn: self.expand_btn.clone(),
             bookmark_star: self.bookmark_star.clone(),
             status_icon: self.status_icon.clone(),
             lifecycle_chip: self.lifecycle_chip.clone(),
@@ -923,17 +978,18 @@ pub(crate) fn highlight_command_to_ansi(cmd: &str) -> String {
 
 /// Filter raw output (ANSI preserved) to the lines matching `query`, honoring
 /// regex / case / invert and `context` lines of surroundings (Warp's
-/// BlockFilterQuery). Empty query, or an invalid regex, returns `full` verbatim.
-fn filter_output_lines(
-    full: &str,
+/// BlockFilterQuery). An empty query or byte-identical result borrows `full`;
+/// invalid regexes remain errors so the UI can report them.
+fn filter_output_lines<'a>(
+    full: &'a str,
     query: &str,
     use_regex: bool,
     case_sensitive: bool,
     invert: bool,
     context: usize,
-) -> Result<String, regex::Error> {
+) -> Result<std::borrow::Cow<'a, str>, regex::Error> {
     if query.is_empty() {
-        return Ok(full.to_string());
+        return Ok(std::borrow::Cow::Borrowed(full));
     }
     let re = if use_regex {
         Some(
@@ -944,13 +1000,7 @@ fn filter_output_lines(
     } else {
         None
     };
-    let ascii_query = (!case_sensitive && query.is_ascii()).then(|| {
-        query
-            .as_bytes()
-            .iter()
-            .map(|b| b.to_ascii_lowercase())
-            .collect::<Vec<_>>()
-    });
+    let ascii_query = (!case_sensitive && query.is_ascii()).then(|| query.to_ascii_lowercase());
     let lc_query = if case_sensitive || ascii_query.is_some() {
         String::new()
     } else {
@@ -963,7 +1013,11 @@ fn filter_output_lines(
         } else if case_sensitive {
             line.contains(query)
         } else if let Some(ref q) = ascii_query {
-            contains_case_insensitive(line.as_bytes(), q)
+            if line.is_ascii() {
+                contains_case_insensitive(line.as_bytes(), q.as_bytes())
+            } else {
+                line.to_lowercase().contains(q.as_str())
+            }
         } else {
             line.to_lowercase().contains(&lc_query)
         };
@@ -979,17 +1033,31 @@ fn filter_output_lines(
             }
         }
     }
-    let mut out = String::new();
+    // Joining lines normalizes CRLF and removes a final LF. Borrow only
+    // when every line is retained and those transformations are inert.
+    if keep.iter().all(|kept| *kept) && !full.ends_with('\n') && !full.contains("\r\n") {
+        return Ok(std::borrow::Cow::Borrowed(full));
+    }
+    let (kept_lines, kept_bytes) = lines
+        .iter()
+        .zip(&keep)
+        .filter(|(_, kept)| **kept)
+        .fold((0usize, 0usize), |(count, bytes), (line, _)| {
+            (count + 1, bytes + line.len())
+        });
+    let mut out = String::with_capacity(kept_bytes + kept_lines.saturating_sub(1));
+    let mut wrote_line = false;
     for (line, keep) in lines.iter().zip(keep.iter()) {
         if !*keep {
             continue;
         }
-        if !out.is_empty() {
+        if wrote_line {
             out.push('\n');
         }
         out.push_str(line);
+        wrote_line = true;
     }
-    Ok(out)
+    Ok(std::borrow::Cow::Owned(out))
 }
 
 /// Resolve the text currently shown by a finished output surface. The common
@@ -1002,8 +1070,11 @@ pub(crate) fn resolved_finished_output<'a>(
     display_override.as_deref().unwrap_or(full)
 }
 
-fn filtered_output_override(full: &str, shown: String) -> Option<String> {
-    (shown != full).then_some(shown)
+fn filtered_output_override(full: &str, shown: std::borrow::Cow<'_, str>) -> Option<String> {
+    match shown {
+        std::borrow::Cow::Borrowed(_) => None,
+        std::borrow::Cow::Owned(shown) => (shown != full).then_some(shown),
+    }
 }
 
 fn output_row_count(text: &str) -> i64 {
@@ -1071,14 +1142,47 @@ pub(crate) fn output_visual_row_count(text: &str, cols: i64) -> i64 {
 
     text.split('\n')
         .map(|line| {
-            let mut width = 0usize;
-            for ch in line.trim_end_matches('\r').chars() {
-                width += match ch {
-                    '\t' => 8 - (width % 8),
-                    _ => UnicodeWidthChar::width(ch).unwrap_or(0),
-                };
+            // Preserve the existing conservative estimate for a degenerate
+            // one-column grid, where a two-cell glyph cannot fit at all.
+            if cols == 1 {
+                let mut width = 0usize;
+                for ch in line.trim_end_matches('\r').chars() {
+                    width += match ch {
+                        '\t' => 8 - (width % 8),
+                        _ => UnicodeWidthChar::width(ch).unwrap_or(0),
+                    };
+                }
+                return width.max(1) as i64;
             }
-            width.max(1).div_ceil(cols) as i64
+
+            let mut rows = 1i64;
+            let mut column = 0usize;
+            for ch in line.trim_end_matches('\r').chars() {
+                if ch == '\t' {
+                    // VTE's default tab stops are eight columns apart. HT
+                    // stops at the right margin and never triggers autowrap;
+                    // after a full row it leaves the pending wrap untouched.
+                    // Custom tab-stop escape sequences are outside this
+                    // stripped-text estimate, as are custom cursor margins.
+                    if column < cols {
+                        column = (column + 8 - column % 8).min(cols - 1);
+                    }
+                    continue;
+                }
+                let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if width == 0 {
+                    continue;
+                }
+                // VTE wraps a wide glyph as a unit when only one cell remains.
+                // A full last row wraps only upon the next positive-width
+                // character, never a combining mark or trailing tab.
+                if column + width > cols {
+                    rows += 1;
+                    column = 0;
+                }
+                column += width;
+            }
+            rows
         })
         .sum::<i64>()
         .max(1)
@@ -1159,6 +1263,29 @@ fn collapsed_output_summary(rows: i64) -> String {
     format!("▸ {} hidden — click to show", line_count_text(rows))
 }
 
+fn collapsed_content_summary(rows: i64, has_text: bool, hidden_image_count: usize) -> String {
+    if hidden_image_count == 0 {
+        return if has_text {
+            collapsed_output_summary(rows)
+        } else {
+            "▸ No output to show".to_string()
+        };
+    }
+    let images = if hidden_image_count == 1 {
+        "1 image".to_string()
+    } else {
+        format!("{hidden_image_count} images")
+    };
+    if has_text {
+        format!(
+            "▸ {} and {images} hidden — click to show",
+            line_count_text(rows)
+        )
+    } else {
+        format!("▸ {images} hidden — click to show")
+    }
+}
+
 /// Human duration for the header badge. Minute-plus durations keep their
 /// seconds ("1m32s") — a bare "2m" can't distinguish a 61s build from a 179s
 /// one, which is exactly the range users compare across runs.
@@ -1187,6 +1314,19 @@ pub(crate) fn format_block_duration(dur_ms: u64) -> String {
 }
 
 pub(crate) use jterm_core::exit_status::signal_name_for_exit;
+
+/// Badge text for a non-zero exit, shared by Block cards and cross-block search
+/// hit rows so one record cannot read `exit:137` beside `exit:137 SIGKILL`.
+pub(crate) fn record_exit_badge_text(code: i32) -> String {
+    if BlockOutcome::interrupt_signal(code).is_some() {
+        BlockOutcome::interrupted_badge(code).0
+    } else {
+        match signal_name_for_exit(code) {
+            Some(sig) => format!("exit:{code} {sig}"),
+            None => format!("exit:{code}"),
+        }
+    }
+}
 
 /// Gregorian date for a count of days since 1970-01-01 (may be negative).
 /// Howard Hinnant's civil-from-days; avoids pulling a chrono dependency for
@@ -1360,27 +1500,36 @@ fn block_edge_scroll_target(
     target.clamp(lower, max_value)
 }
 
-/// Move one adjustment by a wheel delta. Returns false when it is already at
-/// the requested edge, letting a nested scroll surface hand off only there.
-fn scroll_adjustment(adj: &gtk4::Adjustment, dy: f64) -> bool {
-    let max_value = (adj.upper() - adj.page_size()).max(adj.lower());
-    if dy < 0.0 && adj.value() <= adj.lower() + f64::EPSILON {
-        return false;
-    }
-    if dy > 0.0 && adj.value() >= max_value - f64::EPSILON {
-        return false;
-    }
-    let step = adj.step_increment().max(1.0);
-    let target = (adj.value() + dy * step).clamp(adj.lower(), max_value);
-    adj.set_value(target);
-    true
-}
-
 /// Move one adjustment by a wheel delta at VTE's native wheel speed (a tenth
 /// of a page per unit, minimum one row) — `scroll_adjustment` moves by the
 /// adjustment's own step, which for a VTE is a single row and feels stuck on
 /// long output. Returns false at the requested edge so the caller can hand
 /// the wheel off to the outer history only there.
+/// A capped terminal's adjustment is measured in rows. Precision input is
+/// converted using this terminal's actual row height, without page scaling.
+/// A fit-to-content terminal has no range and immediately yields to the canvas.
+pub(crate) fn scroll_adjustment_by_input(
+    adjustment: &gtk4::Adjustment,
+    delta: f64,
+    surface: bool,
+    row_height: f64,
+) -> bool {
+    if !surface {
+        return scroll_adjustment_by_wheel(adjustment, delta);
+    }
+    if !delta.is_finite() || delta == 0.0 {
+        return false;
+    }
+    let upper = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+    let target =
+        (adjustment.value() + delta / row_height.max(1.0)).clamp(adjustment.lower(), upper);
+    if (target - adjustment.value()).abs() < f64::EPSILON {
+        return false;
+    }
+    adjustment.set_value(target);
+    true
+}
+
 pub(crate) fn scroll_adjustment_by_wheel(adj: &gtk4::Adjustment, dy: f64) -> bool {
     let max_value = (adj.upper() - adj.page_size()).max(adj.lower());
     if dy < 0.0 && adj.value() <= adj.lower() + f64::EPSILON {
@@ -1395,31 +1544,10 @@ pub(crate) fn scroll_adjustment_by_wheel(adj: &gtk4::Adjustment, dy: f64) -> boo
     true
 }
 
-/// A scroll event's vertical delta in wheel steps. GTK 4.14 on Wayland
-/// delivers touchpad scrolls in surface pixels, and `EventControllerScroll`
-/// converts them only when asked for discrete steps, which these controllers
-/// are not; taken as steps, a 20px swipe moved two pages. A wheel-unit delta
-/// (±1.0 per notch) is returned unchanged.
-pub(crate) fn wheel_steps(dy: f64, surface_unit: bool) -> f64 {
-    if surface_unit {
-        dy / jterm_core::wheel::SURFACE_UNITS_PER_STEP
-    } else {
-        dy
-    }
-}
-
 /// Whether the event being handled by `controller` measures its delta in
 /// surface pixels rather than wheel steps.
 pub(crate) fn scroll_unit_is_surface(controller: &gtk4::EventControllerScroll) -> bool {
     controller.unit() == gtk4::gdk::ScrollUnit::Surface
-}
-
-pub(crate) fn forward_outer_scroll(outer: &gtk4::ScrolledWindow, dy: f64) {
-    let outer_adj = outer.vadjustment();
-    let step = outer_adj.step_increment().max(outer_adj.page_size() * 0.1);
-    let max_value = (outer_adj.upper() - outer_adj.page_size()).max(outer_adj.lower());
-    let target = (outer_adj.value() + dy * step).clamp(outer_adj.lower(), max_value);
-    outer_adj.set_value(target);
 }
 
 fn schedule_block_edge_scroll(widget: &gtk4::Box, outer: &gtk4::ScrolledWindow, bottom: bool) {
@@ -1467,10 +1595,10 @@ pub(crate) fn estimated_cell_height_px(config: &Config) -> i32 {
 /// structural rows explicit is important for virtualization: an extra phantom
 /// row makes a card at the viewport boundary alternate between its measured and
 /// placeholder heights.
-/// Non-terminal vertical chrome in a finished card. The ten-pixel difference
+/// Non-terminal vertical chrome in a finished card. The six-pixel difference
 /// is exactly the density switch's imperative geometry: outer top/bottom
-/// margins shrink by six pixels and header top/bottom margins by four.
-const FINISHED_CARD_ROOMY_VCHROME_PX: i32 = 34;
+/// margins shrink by two pixels and header top/bottom margins by four.
+const FINISHED_CARD_ROOMY_VCHROME_PX: i32 = 30;
 const FINISHED_CARD_COMPACT_VCHROME_PX: i32 = 24;
 
 const fn finished_card_vchrome_px(compact: bool) -> i32 {
@@ -1505,8 +1633,9 @@ fn finished_block_height_for_rows(
 /// a 1.3 MB transcript a second time for a number the caller was already
 /// holding. `None` keeps the old self-sufficient behavior for restore paths
 /// and tests.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct FinishedBlockPrecomputed {
+    pub(crate) output_preview: Option<String>,
     pub(crate) output_rows: Option<i64>,
 }
 
@@ -1571,8 +1700,8 @@ pub(crate) const SELECTION_HINT_RECALL: &str = "Esc cancel  ·  ↵ recall";
 pub(crate) const SELECTION_HINT_REMOVE: &str = "Esc cancel";
 pub(crate) const SELECTION_HINT_MIN_CHARS: i32 = 14;
 
-/// Natural-width cap for the right-hand metadata run (timestamp, duration,
-/// exit badge). Wide enough that these never ellipsize at ordinary pane
+/// Natural-width cap for the right-hand exit badge. Wide enough that it
+/// never ellipsizes at ordinary pane
 /// widths, and small enough that a narrow split makes them yield instead of
 /// forcing the header past the pane's own width.
 const HEADER_META_MAX_CHARS: i32 = 22;
@@ -1612,37 +1741,13 @@ pub(crate) fn failure_badge_tooltip(code: i32, signal: &str) -> String {
 }
 
 /// The finished card's notices that its text is not the command's whole
-/// output; see `finished_output_notice`.
-pub(crate) const FINISHED_OUTPUT_NOT_RETAINED: &str = "Earlier output not retained";
-pub(crate) const FINISHED_OUTPUT_TEXT_TRUNCATED: &str = "Output text truncated";
-pub(crate) const FINISHED_OUTPUT_PARTLY_RETAINED: &str = "Output only partly retained";
-
-/// The notice `text` names, when it is one of the finished-card notices. A
-/// notice read back from saved history is shown only through this.
-pub(crate) fn known_output_notice(text: &str) -> Option<&'static str> {
-    [
-        FINISHED_OUTPUT_NOT_RETAINED,
-        FINISHED_OUTPUT_TEXT_TRUNCATED,
-        FINISHED_OUTPUT_PARTLY_RETAINED,
-    ]
-    .into_iter()
-    .find(|notice| *notice == text)
-}
-
-/// What each notice means, for its tooltip.
-pub(crate) fn output_notice_tooltip(notice: &str) -> Option<&'static str> {
-    match known_output_notice(notice)? {
-        FINISHED_OUTPUT_NOT_RETAINED => Some(
-            "The command wrote more than a finished block keeps; its oldest output was dropped",
-        ),
-        FINISHED_OUTPUT_TEXT_TRUNCATED => Some(
-            "The command wrote more than a finished block keeps; the text stops before the end of its output",
-        ),
-        _ => Some(
-            "The command wrote more than a finished block keeps; both its oldest and its latest output were dropped",
-        ),
-    }
-}
+/// output; see `finished_output_notice`. Shared with anvil via jterm_core.
+pub(crate) use jterm_core::output_notice::{
+    known_output_notice, output_notice_tooltip,
+    EARLIER_OUTPUT_NOT_RETAINED as FINISHED_OUTPUT_NOT_RETAINED,
+    OUTPUT_PARTLY_RETAINED as FINISHED_OUTPUT_PARTLY_RETAINED,
+    OUTPUT_TEXT_TRUNCATED as FINISHED_OUTPUT_TEXT_TRUNCATED,
+};
 
 /// Fade a card's quick-action strip in or out without changing its allocation.
 ///
@@ -1654,6 +1759,9 @@ pub(crate) fn output_notice_tooltip(notice: &str) -> Option<&'static str> {
 /// opacity-zero child that remains pickable creates a transparent dead zone in
 /// the card header for touch and other no-hover input.
 pub(crate) fn reveal_block_actions(action_box: &gtk4::Box, revealed: bool) {
+    // Pointer exit and selection changes must not disable a keyboard-focused
+    // descendant. Focus leave performs the final hide once navigation moves on.
+    let revealed = revealed || action_box.has_css_class("block-actions-focused");
     action_box.set_opacity(if revealed { 1.0 } else { 0.0 });
     action_box.set_can_target(revealed);
     action_box.set_sensitive(revealed);
@@ -1680,18 +1788,43 @@ fn filter_row_key_closes(keyval: gtk4::gdk::Key, modifiers: gtk4::gdk::ModifierT
         && !modifiers.contains(ModifierType::CONTROL_MASK)
 }
 
-fn flash_button_icon(btn: &gtk4::Button, icon_name: &'static str, tooltip: &'static str) {
-    let old_icon_name = btn.icon_name().map(|name| name.to_string());
-    let old_tooltip = btn.tooltip_text().map(|s| s.to_string());
-    btn.set_icon_name(icon_name);
-    btn.set_tooltip_text(Some(tooltip));
-    let btn_for_restore = btn.clone();
-    glib::timeout_add_local_once(std::time::Duration::from_millis(900), move || {
-        if let Some(icon_name) = old_icon_name {
-            btn_for_restore.set_icon_name(&icon_name);
+/// One feedback timer per action. Rapid clicks extend the latest feedback
+/// without adopting a previous transient icon/tooltip as the permanent state.
+struct ButtonFeedback {
+    icon: Option<glib::GString>,
+    tooltip: Option<glib::GString>,
+    pending: RefCell<Option<glib::SourceId>>,
+}
+
+impl ButtonFeedback {
+    fn new(button: &gtk4::Button) -> Rc<Self> {
+        Rc::new(Self {
+            icon: button.icon_name(),
+            tooltip: button.tooltip_text(),
+            pending: RefCell::new(None),
+        })
+    }
+
+    fn flash(self: &Rc<Self>, button: &gtk4::Button, icon: &str, tooltip: &str) {
+        if let Some(pending) = self.pending.borrow_mut().take() {
+            pending.remove();
         }
-        btn_for_restore.set_tooltip_text(old_tooltip.as_deref());
-    });
+        button.set_icon_name(icon);
+        button.set_tooltip_text(Some(tooltip));
+        let button = button.downgrade();
+        let state = self.clone();
+        let pending =
+            glib::timeout_add_local_once(std::time::Duration::from_millis(900), move || {
+                state.pending.borrow_mut().take();
+                if let Some(button) = button.upgrade() {
+                    if let Some(icon) = &state.icon {
+                        button.set_icon_name(icon);
+                    }
+                    button.set_tooltip_text(state.tooltip.as_deref());
+                }
+            });
+        *self.pending.borrow_mut() = Some(pending);
+    }
 }
 
 /// SGR reset + home + clear screen + clear scrollback, fed ahead of every
@@ -1725,6 +1858,63 @@ fn finished_snapshot_stream(display_text: &str) -> Vec<u8> {
 /// are both unchanged; any difference means a re-feed or a re-window happened,
 /// which moves every match position inside that VTE.
 pub(crate) type RenderStamp = (i64, i64, bool, u64);
+
+/// Keep render identity even when geometry/text stamps repeat. Explicit feeds
+/// advance the revision; map/refit probes that leave the stamp alone do not.
+pub(crate) struct RenderStampState {
+    stamp: Cell<RenderStamp>,
+    revision: Cell<u64>,
+    pending_feed: Cell<Option<u64>>,
+}
+
+impl RenderStampState {
+    fn new(stamp: RenderStamp) -> Self {
+        Self {
+            stamp: Cell::new(stamp),
+            revision: Cell::new(0),
+            pending_feed: Cell::new(None),
+        }
+    }
+
+    fn get(&self) -> RenderStamp {
+        self.stamp.get()
+    }
+
+    fn set(&self, stamp: RenderStamp) {
+        // Never wrap back to a revision an outstanding callback could hold.
+        self.revision.set(
+            self.revision
+                .get()
+                .checked_add(1)
+                .expect("finished-output render revision exhausted"),
+        );
+        self.stamp.set(stamp);
+    }
+
+    fn replace(&self, stamp: RenderStamp) -> RenderStamp {
+        let previous = self.get();
+        if previous != stamp {
+            self.set(stamp);
+        }
+        previous
+    }
+
+    fn revision(&self) -> u64 {
+        self.revision.get()
+    }
+
+    fn mark_feed_pending(&self) {
+        self.pending_feed.set(Some(self.revision()));
+    }
+
+    fn pending_revision(&self) -> Option<u64> {
+        self.pending_feed.get()
+    }
+
+    fn acknowledge_contents_changed(&self) {
+        self.pending_feed.set(None);
+    }
+}
 
 /// The stamp a surface reports when it has no per-record snapshot to
 /// invalidate. It is the value a freshly constructed card starts from, and it
@@ -1765,6 +1955,9 @@ fn rewindow_finished_vte(
     expand_to_buffer: bool,
     expected_tail: Option<&str>,
 ) {
+    #[cfg(test)]
+    super::alt_screen::trace_find_render("rewindow-before", vte);
+
     let (cols, visible_rows, scrollback) =
         bounded_finished_vte_geometry(cols, visible_rows.max(1), requested_scrollback.max(64));
     let cell_height = vte.char_height() as i32;
@@ -1789,8 +1982,12 @@ fn rewindow_finished_vte(
     if let Some(adj) = vte.vadjustment() {
         adj.set_value(adj.lower());
     }
+    #[cfg(test)]
+    super::alt_screen::trace_find_render("rewindow-after", vte);
 }
 
+// Keep the existing geometry arguments explicit; render_state only tracks ownership.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_bytes_into_finished_vte(
     vte: &vte4::Terminal,
     text: &str,
@@ -1799,7 +1996,11 @@ pub(crate) fn render_bytes_into_finished_vte(
     viewport_cap: i64,
     capture_rows: i64,
     expand_to_buffer: bool,
+    render_state: &RenderStampState,
 ) {
+    #[cfg(test)]
+    super::alt_screen::trace_find_render("render-before-reset-feed", vte);
+
     let display_text = output_display_text(text);
     // The pixel height request below is based on this same row count. Capping
     // the VTE grid at 32 while requesting a taller widget created the large
@@ -1822,6 +2023,9 @@ pub(crate) fn render_bytes_into_finished_vte(
     vte.set_size(cols, visible_rows);
     vte.set_scrollback_lines(scrollback);
     vte.feed(&finished_snapshot_stream(display_text));
+    render_state.mark_feed_pending();
+    #[cfg(test)]
+    super::alt_screen::trace_find_render("render-after-queued-feed", vte);
     let settle_tail = snapshot_settle_tail(display_text);
     if expand_to_buffer {
         settle_finished_terminal_after_feed(vte, settle_tail.as_deref());
@@ -1879,8 +2083,9 @@ fn apply_card_density(outer: &gtk4::Box, compact: bool) {
         outer.set_margin_end(4);
     } else {
         outer.remove_css_class("block-compact");
-        outer.set_margin_top(4);
-        outer.set_margin_bottom(4);
+        // Match the native renderers: two 2px edges form a 4px seam.
+        outer.set_margin_top(2);
+        outer.set_margin_bottom(2);
         outer.set_margin_start(8);
         outer.set_margin_end(8);
     }
@@ -2181,6 +2386,7 @@ impl FinishedBlock {
                 reused.remove_css_class(stripe);
             }
             reused.remove_css_class("block-compact");
+            reused.remove_css_class("chat-pair");
             reused
         } else {
             let b = gtk4::Box::new(Orientation::Vertical, 0);
@@ -2214,7 +2420,7 @@ impl FinishedBlock {
         let hover_ctrl = gtk4::EventControllerMotion::new();
 
         // ── Header row ──────────────────────────────────────────────────────
-        let header_row = gtk4::Box::new(Orientation::Horizontal, 8);
+        let header_row = gtk4::Box::new(Orientation::Horizontal, 6);
         header_row.add_css_class("block-header");
         header_row.set_tooltip_text(Some(if is_background {
             "Click to select · Shift-click range · Ctrl+Shift-click toggle"
@@ -2261,6 +2467,15 @@ impl FinishedBlock {
         lifecycle_chip.set_visible(false);
         header_row.append(&lifecycle_chip);
 
+        let command_source_notice = gtk4::Label::new(None);
+        command_source_notice.add_css_class("block-output-notice");
+        command_source_notice.set_halign(gtk4::Align::Start);
+        command_source_notice.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        command_source_notice.set_width_chars(1);
+        command_source_notice.set_max_width_chars(24);
+        command_source_notice.set_visible(false);
+        header_row.append(&command_source_notice);
+
         // Lost output is stated, not hidden: a long session whose capture
         // outgrew its bounds would otherwise start partway through with
         // nothing saying so. A header note rather than a row above the output,
@@ -2272,24 +2487,23 @@ impl FinishedBlock {
         output_notice.set_visible(false);
         header_row.append(&output_notice);
 
-        // Context chips (Warp-style): cwd pill + git-branch pill.
+        // A single flexible context summary yields width as a unit. Separate
+        // cwd/git/time/duration chips each imposed a minimum plus spacing, which
+        // could push More and collapse out of a narrow split.
+        let mut context_parts = Vec::new();
+        let mut context_details = Vec::new();
         if let Some(cwd_path) = cwd {
             let shortened =
                 jterm_core::review_input::safe_inline_display(&shorten_path(cwd_path), 512);
-            let cwd_chip = gtk4::Label::new(Some(&format!("cwd · {shortened}")));
-            cwd_chip.add_css_class("block-chip");
-            cwd_chip.set_halign(gtk4::Align::Start);
-            cwd_chip.set_ellipsize(gtk4::pango::EllipsizeMode::Start);
-            cwd_chip.set_max_width_chars(40);
-            header_row.append(&cwd_chip);
-
+            context_parts.push(format!("cwd · {shortened}"));
+            context_details.push(format!(
+                "Directory: {}",
+                jterm_core::review_input::safe_inline_display(cwd_path, 4096)
+            ));
             if let Some(branch) = git_branch_for(cwd_path) {
-                let git_chip = gtk4::Label::new(Some(&format!("git · {branch}")));
-                git_chip.add_css_class("block-chip-git");
-                git_chip.set_halign(gtk4::Align::Start);
-                git_chip.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-                git_chip.set_max_width_chars(28);
-                header_row.append(&git_chip);
+                let branch = jterm_core::review_input::safe_inline_display(&branch, 512);
+                context_parts.push(format!("git · {branch}"));
+                context_details.push(format!("Branch: {branch}"));
             }
         }
 
@@ -2317,12 +2531,6 @@ impl FinishedBlock {
         selection_hint.set_accessible_role(gtk4::AccessibleRole::Status);
         header_row.append(&selection_hint);
 
-        // Spacer
-        let spacer = gtk4::Box::new(Orientation::Horizontal, 0);
-        spacer.set_hexpand(true);
-        header_row.append(&spacer);
-
-        // Timestamp label
         if let Some(et_ms) = end_time_ms {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2330,26 +2538,45 @@ impl FinishedBlock {
                 .unwrap_or(et_ms);
             let (label, tooltip) =
                 format_block_timestamp(et_ms, now_ms, chrono_local_offset_secs());
-            let ts_label = gtk4::Label::new(Some(&label));
-            ts_label.add_css_class("block-header-label");
-            ts_label.set_tooltip_text(Some(&tooltip));
-            // Every other chip in this row ellipsizes; these did not, so in a
-            // narrow split the metadata run pushed the whole header wider than
-            // the pane instead of yielding. The tooltip already carries the
-            // full value.
-            ts_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-            ts_label.set_max_width_chars(HEADER_META_MAX_CHARS);
-            header_row.append(&ts_label);
+            context_parts.push(label);
+            context_details.push(tooltip);
         }
-
-        // Duration badge
         if let Some(dur_ms) = duration_ms {
-            let dur_label = gtk4::Label::new(Some(&format_block_duration(dur_ms)));
-            dur_label.add_css_class("block-meta-badge");
-            dur_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-            dur_label.set_max_width_chars(HEADER_META_MAX_CHARS);
-            header_row.append(&dur_label);
+            let duration = format_block_duration(dur_ms);
+            context_parts.push(duration.clone());
+            context_details.push(format!("Duration: {duration}"));
         }
+        let context_label = gtk4::Label::new(Some(&context_parts.join(" · ")));
+        context_label.add_css_class("block-header-label");
+        context_label.add_css_class("block-context-summary");
+        context_label.set_hexpand(true);
+        context_label.set_xalign(0.0);
+        context_label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+        context_label.set_width_chars(1);
+        context_label.set_max_width_chars(48);
+        context_label.set_tooltip_text(Some(&context_details.join("\n")));
+        context_label.update_property(&[gtk4::accessible::Property::Label(
+            &context_details.join("; "),
+        )]);
+        let review_button = gtk4::Button::new();
+        review_button.set_child(Some(&context_label));
+        review_button.set_hexpand(true);
+        review_button.add_css_class("flat");
+        review_button.add_css_class("block-review-button");
+        review_button.set_focus_on_click(true);
+        // The production group belongs to the outer card and is mounted after
+        // construction, including on restored/pooled cards. Resolve it there.
+        let review_card = outer.downgrade();
+        review_button.connect_clicked(move |_| {
+            if let Some(card) = review_card.upgrade() {
+                let _ = card.activate_action("block.review", None);
+            }
+        });
+        review_button.set_tooltip_text(Some(
+            "Review full command, working directory and capture details",
+        ));
+        review_button.update_property(&[gtk4::accessible::Property::Label("Review block details")]);
+        header_row.append(&review_button);
 
         // Exit code badge. A successful command shows none; an unknown status
         // gets its own badge rather than silently looking like a success.
@@ -2408,9 +2635,9 @@ impl FinishedBlock {
         copy_output_btn.set_tooltip_text(Some("Copy output"));
         copy_output_btn.update_property(&[gtk4::accessible::Property::Label("Copy output")]);
         let rerun_btn = gtk4::Button::from_icon_name("insert-text-symbolic");
-        rerun_btn.set_tooltip_text(Some("Insert command at prompt"));
+        rerun_btn.set_tooltip_text(Some("Recall command · fill prompt without running"));
         rerun_btn.update_property(&[gtk4::accessible::Property::Label(
-            "Insert command at prompt",
+            "Recall command · fill prompt without running",
         )]);
         copy_cmd_btn.set_visible(!is_background);
         rerun_btn.set_visible(!is_background);
@@ -2443,7 +2670,45 @@ impl FinishedBlock {
             btn.set_focus_on_click(false);
             action_box.append(btn);
         }
+        // Secondary actions remain owned by the card, but no longer consume
+        // scarce header width. The permanent More menu exposes the same actions
+        // as right click, including on touch and keyboard-only sessions.
+        for secondary in [&copy_cmd_btn, &filter_btn, &jump_bottom_btn, &expand_btn] {
+            secondary.set_child_visible(false);
+        }
         header_row.append(&action_box);
+        let more_btn = gtk4::Button::from_icon_name("view-more-symbolic");
+        more_btn.add_css_class("block-action-btn");
+        more_btn.add_css_class("block-more-btn");
+        more_btn.add_css_class("flat");
+        more_btn.set_tooltip_text(Some("Block actions"));
+        more_btn.update_property(&[gtk4::accessible::Property::Label("Block actions")]);
+        more_btn.set_focus_on_click(false);
+        // No action owner until the backend binds this exact card.
+        more_btn.set_sensitive(false);
+        header_row.append(&more_btn);
+
+        let focus = gtk4::EventControllerFocus::new();
+        let actions = action_box.downgrade();
+        focus.connect_enter(move |_| {
+            if let Some(actions) = actions.upgrade() {
+                actions.add_css_class("block-actions-focused");
+                reveal_block_actions(&actions, true);
+            }
+        });
+        let actions = action_box.downgrade();
+        let card = outer.downgrade();
+        focus.connect_leave(move |_| {
+            if let (Some(actions), Some(card)) = (actions.upgrade(), card.upgrade()) {
+                actions.remove_css_class("block-actions-focused");
+                reveal_block_actions(
+                    &actions,
+                    card.has_css_class("block-hovered")
+                        || card.has_css_class("block-selection-active"),
+                );
+            }
+        });
+        action_box.add_controller(focus);
 
         let outer_for_enter = outer.downgrade();
         let action_box_for_enter = action_box.downgrade();
@@ -2483,6 +2748,25 @@ impl FinishedBlock {
         header_row.append(&collapse_btn);
 
         content.append(&header_row);
+
+        // A separate, compact shelf keeps range review discoverable without
+        // competing with metadata or making a narrow header wider.
+        let review_selection = gtk4::Button::with_label("Review selection");
+        review_selection.add_css_class("flat");
+        review_selection.add_css_class("block-review-selection");
+        review_selection.set_halign(gtk4::Align::Start);
+        review_selection.set_margin_start(8);
+        let review_card = outer.downgrade();
+        review_selection.connect_clicked(move |_| {
+            if let Some(card) = review_card.upgrade() {
+                let _ = card.activate_action("block.review", None);
+            }
+        });
+        review_selection.set_tooltip_text(Some(
+            "Review selected blocks in terminal order; copy only, nothing runs",
+        ));
+        review_selection.set_visible(false);
+        content.append(&review_selection);
 
         // ── VTE-rendered command + output ─────────────────────────────────
         // Command VTE: full-height read-only renderer for the executed command.
@@ -2553,7 +2837,17 @@ impl FinishedBlock {
         // document, re-clamps the scroll, and re-toggles boundary cards —
         // the self-sustaining flicker loop on narrow panes. Cols start at 0
         // (below any real value) so the first map always renders.
-        let render_stamp: Rc<Cell<RenderStamp>> = Rc::new(Cell::new(NEUTRAL_RENDER_STAMP));
+        let render_stamp = Rc::new(RenderStampState::new(NEUTRAL_RENDER_STAMP));
+        {
+            let render_stamp = Rc::downgrade(&render_stamp);
+            output_vte.connect_contents_changed(move |_| {
+                if let Some(render_stamp) = render_stamp.upgrade() {
+                    // Finished outputs have no PTY. Supported VTE versions drain
+                    // queued app-fed bytes before emitting this signal.
+                    render_stamp.acknowledge_contents_changed();
+                }
+            });
+        }
         let pending_font_scale: Rc<Cell<Option<f64>>> = Rc::new(Cell::new(None));
         {
             // Virtualization hides `content`, so its map is exactly the moment a
@@ -2625,7 +2919,13 @@ impl FinishedBlock {
                     max_expanded_cap_for_map,
                 );
                 let stamp = output_render_stamp(eff_cols, rows, cap, generation_for_map.get());
-                if stamp_for_map.replace(stamp) == stamp {
+                let previous_stamp = stamp_for_map.replace(stamp);
+                #[cfg(test)]
+                super::alt_screen::trace_find_render(
+                    &format!("output-map stamp={previous_stamp:?} -> {stamp:?}"),
+                    w,
+                );
+                if previous_stamp == stamp {
                     return;
                 }
                 let (_, visible_rows, _) =
@@ -2642,6 +2942,7 @@ impl FinishedBlock {
                     cap,
                     capture_rows,
                     fit_to_content,
+                    &stamp_for_map,
                 );
                 // Capped snapshots keep grid and pixel request identical.
                 // Full-document snapshots let the post-feed VTE measurement
@@ -2710,6 +3011,7 @@ impl FinishedBlock {
                     cap,
                     capture_rows,
                     fit_to_content,
+                    &stamp_for_btn,
                 );
                 if !fit_to_content {
                     let ch = output_vte_for_btn.char_height() as i32;
@@ -2798,6 +3100,11 @@ impl FinishedBlock {
                 let cap = finished_output_cap(rows, fitted_cap, false, max_expanded_cap_for_refit);
                 let stamp = output_render_stamp(eff_cols, rows, cap, generation_for_refit.get());
                 let previous_stamp = stamp_for_refit.replace(stamp);
+                #[cfg(test)]
+                super::alt_screen::trace_find_render(
+                    &format!("output-refit stamp={previous_stamp:?} -> {stamp:?}"),
+                    &output_vte,
+                );
                 if previous_stamp == stamp {
                     return None;
                 }
@@ -2816,6 +3123,7 @@ impl FinishedBlock {
                         cap,
                         capture_rows,
                         fit_to_content,
+                        &stamp_for_refit,
                     );
                 } else {
                     let settle_tail = snapshot_settle_tail(output_display_text(text));
@@ -2894,6 +3202,9 @@ impl FinishedBlock {
         // a max-height bound so a tall plot doesn't push the next block
         // off-screen; one shared box lets the collapse chevron hide them
         // together with the text output.
+        // Count only Pictures actually owned by this foldable box. Live
+        // Unified images and text/preview placeholders are not hidden here.
+        let mut hidden_image_count = 0;
         let images_box: Option<gtk4::Box> = if images.is_empty() {
             None
         } else {
@@ -2911,6 +3222,7 @@ impl FinishedBlock {
                 // rows of block real estate; the outer history scrolls past.
                 pic.set_size_request(-1, tex.height().clamp(64, 600));
                 ib.append(&pic);
+                hidden_image_count += 1;
             }
             content.append(&ib);
             Some(ib)
@@ -2921,7 +3233,14 @@ impl FinishedBlock {
         // had scrolled away from the pointer. Keep a compact, keyboard-focusable
         // summary in the document instead; it both preserves the output's scale
         // and is a large, obvious target to restore it.
-        let collapsed_summary = gtk4::Button::with_label(&collapsed_output_summary(output_rows));
+        let summary = collapsed_content_summary(output_rows, has_output, hidden_image_count);
+        let original_preview = Rc::new(
+            precomputed
+                .output_preview
+                .filter(|_| !repaint_collapsed)
+                .unwrap_or_else(|| super::fold_preview::from_output(output)),
+        );
+        let collapsed_summary = gtk4::Button::with_label(&summary);
         collapsed_summary.add_css_class("block-output-summary");
         collapsed_summary.add_css_class("flat");
         collapsed_summary.set_halign(gtk4::Align::Start);
@@ -2930,6 +3249,8 @@ impl FinishedBlock {
         collapsed_summary.set_margin_bottom(4);
         collapsed_summary.set_tooltip_text(Some("Show block output"));
         collapsed_summary.set_focus_on_click(false);
+        let summary_title = collapsed_summary.label().unwrap_or_default();
+        set_folded_summary(&collapsed_summary, &summary_title, Some(&original_preview));
         collapsed_summary.set_visible(false);
         content.append(&collapsed_summary);
 
@@ -2962,7 +3283,7 @@ impl FinishedBlock {
             crate::terminal::install_hyperlink_hover_tooltip(&output_vte);
         }
 
-        let has_images = images_box.is_some();
+        let has_images = hidden_image_count > 0;
         // Output-only controls are noise for commands such as `cd`,
         // `mkdir`, and successful redirects. Image-only commands (`kitten
         // icat`) still keep the collapse chevron so their Pictures fold away.
@@ -2985,6 +3306,9 @@ impl FinishedBlock {
             let collapse_btn = collapse_btn.downgrade();
             let images_box = images_box.as_ref().map(|ib| ib.downgrade());
             Rc::new(move |collapsed| {
+                if !has_output && !has_images {
+                    return;
+                }
                 let (Some(output_widget), Some(collapsed_summary), Some(collapse_btn)) = (
                     output_widget.upgrade(),
                     collapsed_summary.upgrade(),
@@ -3064,6 +3388,7 @@ impl FinishedBlock {
             let filter_btn_weak = filter_btn.downgrade();
             let jump_bottom_btn = jump_bottom_btn.downgrade();
             let collapsed_summary = collapsed_summary.downgrade();
+            let original_preview = original_preview.clone();
             let restore_live_focus_for_row = restore_live_focus.clone();
             let filter_toggle_for_row = filter_toggle_handle.clone();
             let build_filter_row: Rc<FilterRowBuilder> = {
@@ -3166,6 +3491,7 @@ impl FinishedBlock {
                         let filter_btn = filter_btn.clone();
                         let jump_bottom_btn = jump_bottom_btn.clone();
                         let collapsed_summary = collapsed_summary.clone();
+                        let original_preview = original_preview.clone();
                         let max_expanded_cap_for_filter = max_expanded_cap;
                         move || {
                             let (
@@ -3280,6 +3606,7 @@ impl FinishedBlock {
                                     active_cap,
                                     capture_rows,
                                     fit_to_content,
+                                    &render_stamp,
                                 );
                                 if !fit_to_content {
                                     let ch = output_vte.char_height() as i32;
@@ -3322,7 +3649,22 @@ impl FinishedBlock {
                                 filter_status.remove_css_class("block-filter-empty");
                                 filter_status.set_visible(false);
                             }
-                            collapsed_summary.set_label(&collapsed_output_summary(shown_rows));
+                            let preview = display_changed.then(|| {
+                                if display_override.is_none() {
+                                    original_preview.as_ref().clone()
+                                } else {
+                                    super::fold_preview::from_output(shown)
+                                }
+                            });
+                            set_folded_summary(
+                                &collapsed_summary,
+                                &collapsed_content_summary(
+                                    shown_rows,
+                                    !shown.trim().is_empty(),
+                                    hidden_image_count,
+                                ),
+                                preview.as_deref(),
+                            );
                             expand_btn.set_visible(can_expand);
                             jump_bottom_btn.set_visible(shown_visual_rows > fitted_cap);
                             // Keep `displayed_output` in sync so a later unmap → remap
@@ -3450,7 +3792,7 @@ impl FinishedBlock {
             toggle
         };
 
-        FinishedBlock {
+        let block = FinishedBlock {
             id,
             is_background,
             widget: outer,
@@ -3465,17 +3807,22 @@ impl FinishedBlock {
             displayed_output,
             stripped_output: Rc::new(RefCell::new(None)),
             cmd_text: cmd.to_string(),
+            command_replay_is_exact: Rc::new(Cell::new(false)),
+            command_source_notice,
             output_scrollbar,
             copy_cmd_btn,
             copy_output_btn,
             rerun_btn,
             header_row,
+            more_btn,
             action_box,
             selection_hint,
+            review_selection,
             selection_hint_steady: Rc::new(RefCell::new(String::new())),
             selection_feedback_generation: Rc::new(Cell::new(0)),
             toggle_filter,
             set_collapsed,
+            can_collapse: has_output || has_images,
             collapsed_summary,
             filtered_out: Rc::new(Cell::new(false)),
             restore_live_focus,
@@ -3485,6 +3832,7 @@ impl FinishedBlock {
             pending_font_scale,
             displayed_generation,
             jump_bottom_btn,
+            expand_btn,
             bookmark_star,
             status_icon,
             lifecycle_chip,
@@ -3493,7 +3841,11 @@ impl FinishedBlock {
             viewport_cap,
             long_output,
             estimated_retained_bytes,
-        }
+        };
+        // Constructors do not receive provenance. Old/restored records and
+        // direct callers start uncertain until the owner supplies metadata.
+        block.set_command_provenance(false, false);
+        block
     }
 
     pub(crate) const fn estimated_retained_bytes(&self) -> usize {
@@ -3502,6 +3854,48 @@ impl FinishedBlock {
 
     pub(crate) fn widget(&self) -> &gtk4::Box {
         &self.widget
+    }
+
+    /// Qualify captured command text separately from its completion or exit.
+    /// This cache controls presentation only; it never authorizes replay.
+    pub(crate) fn set_command_provenance(&self, exact: bool, truncated: bool) {
+        let exact = exact && !truncated && !self.is_background;
+        self.command_replay_is_exact.set(exact);
+        let (label, detail) = if truncated {
+            (
+                "Command report incomplete",
+                "The complete command is unavailable. Captured text is for review only.",
+            )
+        } else {
+            (
+                "Unverified command text",
+                "Best-effort terminal capture. Spacing or wrapping may differ from what the shell ran. Insert the capture to review it before running.",
+            )
+        };
+        self.command_source_notice.set_text(label);
+        self.command_source_notice.set_tooltip_text(Some(detail));
+        self.command_source_notice.update_property(&[
+            gtk4::accessible::Property::Label(label),
+            gtk4::accessible::Property::Description(detail),
+        ]);
+        self.command_source_notice
+            .set_visible(!self.is_background && !exact);
+        let copy = if exact {
+            "Copy command"
+        } else {
+            "Copy captured text"
+        };
+        let recall = if exact {
+            "Recall command · fill prompt without running"
+        } else {
+            "Insert captured text for review · fill prompt without running"
+        };
+        self.copy_cmd_btn.set_tooltip_text(Some(copy));
+        self.copy_cmd_btn
+            .update_property(&[gtk4::accessible::Property::Label(copy)]);
+        self.rerun_btn.set_tooltip_text(Some(recall));
+        self.rerun_btn
+            .update_property(&[gtk4::accessible::Property::Label(recall)]);
     }
 
     /// Show lifecycle provenance only when the completion is not fully trusted.
@@ -3539,6 +3933,55 @@ impl FinishedBlock {
                 self.output_notice.set_visible(false);
                 self.output_notice.set_tooltip_text(None);
             }
+        }
+    }
+
+    /// Native Chat command/result pairing. The VTEs, record identity, actions,
+    /// find targets and copy sources are unchanged. Output keeps the full width.
+    pub(crate) fn set_chat_layout(&self) {
+        if self.widget.has_css_class("chat-pair") {
+            return;
+        }
+        let Some(command) = self
+            .command_vte
+            .parent()
+            .and_then(|w| w.downcast::<gtk4::Box>().ok())
+        else {
+            return;
+        };
+        self.widget.add_css_class("chat-pair");
+        self.content.remove(&command);
+        let result = gtk4::Box::new(Orientation::Vertical, 0);
+        result.add_css_class("chat-result");
+        result.set_hexpand(true);
+        while let Some(child) = self.content.first_child() {
+            self.content.remove(&child);
+            result.append(&child);
+        }
+        command.add_css_class("chat-command");
+        command.set_halign(gtk4::Align::End);
+        command.set_hexpand(false);
+        command.set_margin_start(12);
+        command.set_margin_bottom(if self.is_background {
+            0
+        } else {
+            super::chat::COMMAND_GAP_PX
+        });
+        self.command_vte.add_css_class("chat-command-terminal");
+        self.command_vte.set_hexpand(false);
+        let cols = super::chat::command_columns(&self.cmd_text, self.command_vte.column_count());
+        let rows = output_visual_row_count(&self.cmd_text, cols).max(1);
+        self.command_vte.set_size(cols, rows);
+        self.command_vte
+            .set_color_background(&RGBA::new(0.0, 0.0, 0.0, 0.0));
+        self.content.append(&command);
+        self.content.append(&result);
+        if !self.is_background {
+            self.virtualized_height.set(
+                self.virtualized_height
+                    .get()
+                    .saturating_add(super::chat::COMMAND_GAP_PX),
+            );
         }
     }
 
@@ -3595,6 +4038,28 @@ impl FinishedBlock {
         }
     }
 
+    /// Adopt a fold-state estimate before GTK allocates the changed contents.
+    /// Keep the parked widget and its saved placeholder in the same geometry
+    /// as the document; visible cards converge to measured height after layout.
+    pub(crate) fn set_placeholder_height(&self, height: i32) -> i32 {
+        let height = if self.widget.has_css_class("chat-pair") && !self.is_background {
+            height.saturating_add(super::chat::COMMAND_GAP_PX)
+        } else {
+            height
+        };
+        self.remember_allocated_height(height)
+    }
+
+    /// Save a raw card height, already including Chat chrome when measured.
+    pub(crate) fn remember_allocated_height(&self, height: i32) -> i32 {
+        let height = height.max(1);
+        self.virtualized_height.set(height);
+        if self.virtualized.get() {
+            self.widget.set_height_request(height);
+        }
+        height
+    }
+
     /// Whether a pane-level filter is hiding this card.
     pub(crate) fn is_filtered_out(&self) -> bool {
         self.filtered_out.get()
@@ -3620,7 +4085,10 @@ impl FinishedBlock {
     /// Whether this card's output is folded away.
     pub(crate) fn is_collapsed(&self) -> bool {
         use gtk4::prelude::WidgetExt as _;
-        self.collapsed_summary.is_visible()
+        // Folding is stored in the summary's own property. Virtualization
+        // hides content and pane filtering hides the outer card; neither may
+        // turn a folded card into an apparently unfolded one.
+        self.collapsed_summary.get_visible()
     }
 
     /// Fold or unfold this card's output, reporting whether anything moved.
@@ -3628,6 +4096,9 @@ impl FinishedBlock {
     /// The pane uses the answer to skip the layout pass entirely when a bulk
     /// collapse found nothing to do.
     pub(crate) fn set_collapsed(&self, collapsed: bool) -> bool {
+        if !self.can_collapse {
+            return false;
+        }
         if self.is_collapsed() == collapsed {
             return false;
         }
@@ -3644,6 +4115,16 @@ impl FinishedBlock {
     /// the counter keeps counting.
     pub(crate) fn render_stamp(&self) -> RenderStamp {
         self.render_stamp.get()
+    }
+
+    /// Identity of the latest output render, including equal-stamp re-feeds.
+    pub(crate) fn render_revision(&self) -> u64 {
+        self.render_stamp.revision()
+    }
+
+    /// A queued output replay not yet observed at VTE's contents-change boundary.
+    pub(crate) fn pending_render_revision(&self) -> Option<u64> {
+        self.render_stamp.pending_revision()
     }
 
     /// Adopt a new font scale, or defer it if this card is virtualized.
@@ -3670,7 +4151,18 @@ impl FinishedBlock {
     /// virtualized cards — those refit through `connect_map` on their way back
     /// into the viewport.
     pub(crate) fn refit_output_to_viewport(&self) -> Option<i32> {
-        (self.refit_output)()
+        #[cfg(test)]
+        super::alt_screen::trace_find_render(
+            &format!("output-refit-entry stamp={:?}", self.render_stamp()),
+            &self.output_vte,
+        );
+        (self.refit_output)().map(|height| {
+            if self.widget.has_css_class("chat-pair") && !self.is_background {
+                height.saturating_add(super::chat::COMMAND_GAP_PX)
+            } else {
+                height
+            }
+        })
     }
 
     /// Scroll this block's top or bottom edge into the outer history canvas.
@@ -3717,22 +4209,29 @@ impl FinishedBlock {
         command_scroll.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let outer_for_command = outer.downgrade();
         let debouncer_for_command = debouncer.clone();
+        debouncer.watch_gesture(&command_scroll, outer);
         command_scroll.connect_scroll(move |controller, _dx, dy| {
             let Some(outer_for_command) = outer_for_command.upgrade() else {
                 return glib::Propagation::Proceed;
             };
-            let steps = wheel_steps(dy, scroll_unit_is_surface(controller));
-            forward_outer_scroll(&outer_for_command, steps);
-            debouncer_for_command.record_wheel_intent(&outer_for_command);
+            debouncer_for_command.scroll_wheel(
+                &outer_for_command,
+                dy,
+                scroll_unit_is_surface(controller),
+            );
             glib::Propagation::Stop
         });
         self.command_vte.add_controller(command_scroll);
 
         let scroll_ctrl =
             gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+        // Decide canvas/overflow ownership before VTE can swallow a wheel
+        // event even when its fitted output has no private scroll range.
+        scroll_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let vte = self.output_vte.downgrade();
         let outer_for_vte = outer.downgrade();
         let debouncer_for_vte = debouncer.clone();
+        debouncer.watch_gesture(&scroll_ctrl, outer);
         scroll_ctrl.connect_scroll(move |controller, _dx, dy| {
             let (Some(vte), Some(outer_for_vte)) = (vte.upgrade(), outer_for_vte.upgrade()) else {
                 return glib::Propagation::Proceed;
@@ -3756,15 +4255,10 @@ impl FinishedBlock {
                 if !scroll_unit_is_surface(controller) {
                     return glib::Propagation::Proceed;
                 }
-                scroll_adjustment_by_wheel(&inner_adj, wheel_steps(dy, true));
+                scroll_adjustment_by_input(&inner_adj, dy, true, vte.char_height() as f64);
                 return glib::Propagation::Stop;
             }
-            // Drive the outer ScrolledWindow by one step in the wheel direction.
-            forward_outer_scroll(
-                &outer_for_vte,
-                wheel_steps(dy, scroll_unit_is_surface(controller)),
-            );
-            debouncer_for_vte.record_wheel_intent(&outer_for_vte);
+            debouncer_for_vte.scroll_wheel(&outer_for_vte, dy, scroll_unit_is_surface(controller));
             glib::Propagation::Stop
         });
         self.output_vte.add_controller(scroll_ctrl);
@@ -3779,20 +4273,24 @@ impl FinishedBlock {
         let vte_for_scrollbar = self.output_vte.downgrade();
         let outer_for_scrollbar = outer.downgrade();
         let debouncer_for_scrollbar = debouncer.clone();
+        debouncer.watch_gesture(&scrollbar_scroll, outer);
         scrollbar_scroll.connect_scroll(move |controller, _dx, dy| {
-            let steps = wheel_steps(dy, scroll_unit_is_surface(controller));
             let (Some(vte), Some(outer)) =
                 (vte_for_scrollbar.upgrade(), outer_for_scrollbar.upgrade())
             else {
                 return glib::Propagation::Proceed;
             };
             if let Some(inner_adj) = vte.vadjustment() {
-                if scroll_adjustment(&inner_adj, steps) {
+                if scroll_adjustment_by_input(
+                    &inner_adj,
+                    dy,
+                    scroll_unit_is_surface(controller),
+                    vte.char_height() as f64,
+                ) {
                     return glib::Propagation::Stop;
                 }
             }
-            forward_outer_scroll(&outer, steps);
-            debouncer_for_scrollbar.record_wheel_intent(&outer);
+            debouncer_for_scrollbar.scroll_wheel(&outer, dy, scroll_unit_is_surface(controller));
             glib::Propagation::Stop
         });
         self.output_scrollbar.add_controller(scrollbar_scroll);
@@ -3823,12 +4321,22 @@ impl FinishedBlock {
 
         let vte_for_cmd = vte.downgrade();
         let cmd_for_copy = self.cmd_text.clone();
+        let copy_is_exact = self.command_replay_is_exact.clone();
+        let feedback = ButtonFeedback::new(&self.copy_cmd_btn);
         self.copy_cmd_btn.connect_clicked(move |btn| {
             let Some(vte_for_cmd) = vte_for_cmd.upgrade() else {
                 return;
             };
             vte_for_cmd.clipboard().set_text(&cmd_for_copy);
-            flash_button_icon(btn, "object-select-symbolic", "Command copied");
+            feedback.flash(
+                btn,
+                "object-select-symbolic",
+                if copy_is_exact.get() {
+                    "Command copied"
+                } else {
+                    "Captured text copied"
+                },
+            );
         });
 
         let vte_for_out = vte.downgrade();
@@ -3836,6 +4344,7 @@ impl FinishedBlock {
         // lines shown in output_buffer before "Show more" is clicked.
         let full_output_for_copy = self.full_output.clone();
         let stripped_output_for_copy = self.stripped_output.clone();
+        let feedback = ButtonFeedback::new(&self.copy_output_btn);
         self.copy_output_btn.connect_clicked(move |btn| {
             let Some(vte_for_out) = vte_for_out.upgrade() else {
                 return;
@@ -3846,7 +4355,7 @@ impl FinishedBlock {
                 |s| s.to_string(),
             );
             vte_for_out.clipboard().set_text(&text);
-            flash_button_icon(btn, "object-select-symbolic", "Output copied");
+            feedback.flash(btn, "object-select-symbolic", "Output copied");
         });
 
         let verified_submission_for_rerun = verified_submission.clone();
@@ -3854,6 +4363,8 @@ impl FinishedBlock {
         let active_for_rerun = Rc::downgrade(active);
         let bracketed_for_rerun = bracketed_paste.clone();
         let cmd_for_rerun = self.cmd_text.clone();
+        let recall_is_exact = self.command_replay_is_exact.clone();
+        let feedback = ButtonFeedback::new(&self.rerun_btn);
         self.rerun_btn.connect_clicked(move |btn| {
             let suggestion = click_cursor::suggestion_rgb(&config_for_rerun.borrow().palette);
             if verified_submission_for_rerun.try_recall_command(
@@ -3864,9 +4375,17 @@ impl FinishedBlock {
                 if let Some(active_for_rerun) = active_for_rerun.upgrade() {
                     active_for_rerun.borrow().grab_focus();
                 }
-                flash_button_icon(btn, "object-select-symbolic", "Command inserted");
+                feedback.flash(
+                    btn,
+                    "object-select-symbolic",
+                    if recall_is_exact.get() {
+                        "Command inserted"
+                    } else {
+                        "Capture inserted; review before running"
+                    },
+                );
             } else {
-                flash_button_icon(
+                feedback.flash(
                     btn,
                     "dialog-warning-symbolic",
                     "Wait for an editable prompt",
@@ -3955,6 +4474,71 @@ pub(crate) struct ActiveBlock {
     /// clone exists only so live-find can read a bounded prefix
     /// ([`Self::output_text_prefix`]).
     raw_output: Rc<RefCell<BoundedByteRing>>,
+}
+
+/// GTK4 allocates a widget's CSS box but reports content coordinates to VTE.
+/// Reserve those insets once in the enclosing clip and grid request. Otherwise
+/// the final row extends past a clip sized only as `rows * char_height`.
+#[allow(deprecated)] // GTK4 has no replacement getters for the computed CSS box.
+pub(super) fn terminal_vertical_insets(vte: &Terminal) -> i32 {
+    let style = vte.style_context();
+    let padding = style.padding();
+    let border = style.border();
+    let margin = style.margin();
+    (i32::from(padding.top())
+        + i32::from(padding.bottom())
+        + i32::from(border.top())
+        + i32::from(border.bottom())
+        + i32::from(margin.top())
+        + i32::from(margin.bottom())
+        + vte.margin_top()
+        + vte.margin_bottom())
+    .max(0)
+}
+
+// Chat keeps a measured gutter even without scrollback: changing scrollbar
+// paint visibility must never resize the shell's grid. Other presentations
+// retain their existing overlay policy.
+fn chat_live_width_budget(clip: i32, minimum: i32, gutter: i32) -> (i32, i32) {
+    let clip = clip.max(0);
+    let gutter = gutter.max(0);
+    if clip.saturating_sub(gutter) >= minimum.max(1) {
+        (clip - gutter, gutter)
+    } else {
+        // Below the space for one native minimum terminal plus the scrollbar,
+        // prioritize the terminal. Its native minimum cells may be clipped by
+        // live_clip, but its request must not retain a previous wide grid.
+        (clip, 0)
+    }
+}
+
+fn sync_live_scrollbar_visibility(
+    vte: &Terminal,
+    scrollbar: &gtk4::Scrollbar,
+    clip: &gtk4::Overlay,
+    overflows: bool,
+) -> i32 {
+    if vte.has_css_class("chat-live-terminal") {
+        scrollbar.set_visible(true);
+        let natural = scrollbar.measure(Orientation::Horizontal, -1).1;
+        let minimum = vte.measure(Orientation::Horizontal, -1).0;
+        let (_, gutter) = chat_live_width_budget(clip.width(), minimum, natural);
+        let interactive = overflows && gutter > 0;
+        scrollbar.set_opacity(if interactive { 1.0 } else { 0.0 });
+        scrollbar.set_can_target(interactive);
+        scrollbar.set_can_focus(interactive);
+        scrollbar.update_state(&[gtk4::accessible::State::Hidden(!interactive)]);
+        gutter
+    } else {
+        scrollbar.set_visible(overflows);
+        0
+    }
+}
+
+fn live_rows_height_px(cell_h: i32, rows: i64, insets: i32) -> i32 {
+    (rows.clamp(1, i32::MAX as i64) as i32)
+        .saturating_mul(cell_h.max(1))
+        .saturating_add(insets.max(0))
 }
 
 impl ActiveBlock {
@@ -4079,12 +4663,16 @@ impl ActiveBlock {
         // buffer has scrolled past the viewport.
         if let Some(adj) = active_vte.vadjustment() {
             let scrollbar = live_scrollbar.downgrade();
+            let terminal = active_vte.downgrade();
+            let clip = live_clip.downgrade();
             let sync_visibility = move |adj: &gtk4::Adjustment| {
-                let Some(scrollbar) = scrollbar.upgrade() else {
+                let (Some(scrollbar), Some(terminal), Some(clip)) =
+                    (scrollbar.upgrade(), terminal.upgrade(), clip.upgrade())
+                else {
                     return;
                 };
                 let overflows = adj.upper() - adj.lower() > adj.page_size() + f64::EPSILON;
-                scrollbar.set_visible(overflows);
+                sync_live_scrollbar_visibility(&terminal, &scrollbar, &clip, overflows);
             };
             sync_visibility(&adj);
             adj.connect_changed(sync_visibility);
@@ -4093,8 +4681,11 @@ impl ActiveBlock {
         // `realize` is too early: the VTE's IM context does not have a mapped
         // surface yet. Taking logical focus there can suppress the real
         // focus-in fcitx/ibus need. `map` is the first valid point to focus.
-        active_vte.connect_map(|terminal| {
-            terminal.grab_focus();
+        let first_map = Cell::new(true);
+        active_vte.connect_map(move |terminal| {
+            if !terminal.has_css_class("chat-live-terminal") || first_map.replace(false) {
+                terminal.grab_focus();
+            }
         });
 
         ActiveBlock {
@@ -4159,21 +4750,38 @@ impl ActiveBlock {
         let cell_h = cell_h.max(1);
         let grid_rows = grid_rows.max(1);
         let visible_rows = visible_rows.clamp(1, grid_rows);
-        let width_px = self.live_clip.width();
+        let clip_width = self.live_clip.width();
+        let gutter = if self.active_vte.has_css_class("chat-live-terminal") {
+            let overflows = self
+                .active_vte
+                .vadjustment()
+                .is_some_and(|adj| adj.upper() - adj.lower() > adj.page_size() + f64::EPSILON);
+            // GTK's native natural width includes the current theme's CSS
+            // margins; no fixed pixel constant or font-dependent guess.
+            sync_live_scrollbar_visibility(
+                &self.active_vte,
+                &self.live_scrollbar,
+                &self.live_clip,
+                overflows,
+            )
+        } else {
+            0
+        };
+        let width_px = clip_width.saturating_sub(gutter).max(0);
+        let insets = terminal_vertical_insets(&self.active_vte);
+        let visible_px = live_rows_height_px(cell_h, visible_rows, insets);
         if width_px <= 0 {
             // Before the first allocation there is no width to hand out, but
             // the card height does not depend on one and the caller has already
             // moved the holder's request: leave the two in step.
-            self.live_spacer
-                .set_height_request((visible_rows as i32).saturating_mul(cell_h));
+            self.live_spacer.set_height_request(visible_px);
             return false;
         }
         // Ask for a sliver more than the grid needs. The terminal takes its row
         // count from the allocation, and a container that hands back a pixel or
         // two less than requested would cost a whole row; anything under one
         // cell cannot add one.
-        let grid_px = (grid_rows as i32).saturating_mul(cell_h) + cell_h - 1;
-        let visible_px = (visible_rows as i32).saturating_mul(cell_h);
+        let grid_px = live_rows_height_px(cell_h, grid_rows, insets).saturating_add(cell_h - 1);
         let geometry = (width_px, grid_px, visible_px);
         if self.live_geometry.get() == geometry {
             return false;
@@ -4182,6 +4790,66 @@ impl ActiveBlock {
         self.vte_overlay.set_size_request(width_px, grid_px);
         self.live_spacer.set_height_request(visible_px);
         true
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_tiny_chat_allocations(&self) -> Vec<serde_json::Value> {
+        let original = (self.live_clip.width(), self.live_clip.height());
+        let rows = self.active_vte.row_count();
+        let cell = self.active_vte.char_height() as i32;
+        let visible_rows = (original.1 / cell).max(1) as i64;
+        let wide_columns = self.active_vte.column_count();
+        let minimum = self.active_vte.measure(Orientation::Horizontal, -1).0;
+        let mut reports = Vec::new();
+        // Drive GTK's actual child allocation directly: a normal toplevel may
+        // enforce a larger minimum, which would make a tiny-window test vacuous.
+        // Do not pump the parent frame clock while exercising these allocations.
+        for width in [1, 10, 17, original.0] {
+            self.live_clip.allocate(width, original.1, -1, None);
+            self.set_live_geometry(cell, rows, visible_rows);
+            self.live_clip.queue_allocate();
+            self.live_clip.allocate(width, original.1, -1, None);
+            assert_eq!(self.live_clip.width(), width);
+            let natural = self.live_scrollbar.measure(Orientation::Horizontal, -1).1;
+            let (requested, gutter) = chat_live_width_budget(width, minimum, natural);
+            assert_eq!(self.vte_overlay.width_request(), requested);
+            assert_eq!(self.live_geometry.get().0, requested);
+            let bounds = self.active_vte.compute_bounds(&self.live_clip).unwrap();
+            assert!(bounds.width() <= requested.max(minimum) as f32 + 1e-6);
+            assert!(self.active_vte.column_count() > 0);
+            if gutter == 0 {
+                assert_eq!(self.live_scrollbar.opacity(), 0.0);
+                assert!(!self.live_scrollbar.can_target());
+                assert!(!self.live_scrollbar.can_focus());
+                assert!(!self.live_scrollbar.grab_focus());
+                assert!(self.active_vte.column_count() < wide_columns);
+                assert_eq!(self.live_clip.overflow(), gtk4::Overflow::Hidden);
+            } else {
+                assert_eq!(width, original.0);
+                assert_eq!(self.active_vte.column_count(), wide_columns);
+            }
+            reports.push(serde_json::json!({
+                "clip_width": self.live_clip.width(), "request": requested,
+                "native_width": bounds.width(), "native_minimum": minimum,
+                "columns": self.active_vte.column_count(), "gutter": gutter,
+                "scope": "direct GTK child allocation; partial cells clipped at tiny widths"
+            }));
+        }
+        // Fresh non-Chat widgets retain the pre-existing overlay visibility
+        // policy. No Chat state or font assumptions enter this assertion.
+        let plain = Terminal::new();
+        let bar = gtk4::Scrollbar::new(Orientation::Vertical, None::<&gtk4::Adjustment>);
+        let clip = gtk4::Overlay::new();
+        for shown in [false, true, false] {
+            assert_eq!(
+                sync_live_scrollbar_visibility(&plain, &bar, &clip, shown),
+                0
+            );
+            assert_eq!(bar.is_visible(), shown);
+            assert_eq!(bar.opacity(), 1.0);
+            assert!(bar.can_target() && bar.can_focus());
+        }
+        reports
     }
 
     /// The measured live card. The frame-clock resize tick watches its width:
@@ -4358,27 +5026,39 @@ pub(crate) fn write_recalled_command(
     pty: &crate::pty::OwnedPty,
     cmd: &str,
     bracketed_paste: bool,
-    execute: bool,
 ) -> Result<bool, crate::pty::PtyWriteError> {
     let paste = build_command_recall(cmd, bracketed_paste);
     if paste.is_empty() {
         return Ok(false);
     }
     let truncated = paste.risk.truncated_to_first_line;
-    let mut payload = paste.bytes;
-    if execute {
-        // Outside the frame: readline does not execute a newline contained in a
-        // bracketed paste, so a CR inside the frame would be swallowed. Keep it
-        // in this same queue item: saturation can reject the whole submission,
-        // never the command while accepting its Enter (or vice versa).
-        payload.push(b'\r');
-    }
-    pty.write_bytes(&payload)?;
+    // This API is insertion-only. Historical execution must use the live
+    // record/provenance gate and verified-submission boundary in the owner.
+    pty.write_bytes(&paste.bytes)?;
     Ok(truncated)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn chat_gutter_tiny_width_budget_is_bounded_and_converges() {
+        for (clip, minimum, gutter, expected) in [
+            (-1, 24, 17, (0, 0)),
+            (0, 24, 17, (0, 0)),
+            (1, 24, 17, (1, 0)),
+            (10, 24, 17, (10, 0)),
+            (17, 24, 17, (17, 0)),
+            (40, 24, 17, (40, 0)),
+            (41, 24, 17, (24, 17)),
+            (780, 24, 17, (763, 17)),
+            (i32::MAX, i32::MAX, 17, (i32::MAX, 0)),
+        ] {
+            assert_eq!(
+                super::chat_live_width_budget(clip, minimum, gutter),
+                expected
+            );
+        }
+    }
     use super::{
         block_clipboard_text, collapsed_output_summary, completed_block_retention_plan,
         estimated_completed_block_retained_bytes, exit_code_for_shared_surface,
@@ -4402,6 +5082,165 @@ mod tests {
     }
 
     #[test]
+    fn live_clip_pixels_include_insets_without_adding_a_terminal_row() {
+        for insets in [0, 2, 14, 60] {
+            for cell_h in [1, 12, 25] {
+                for rows in [1, 6, 31] {
+                    let visible = super::live_rows_height_px(cell_h, rows, insets);
+                    assert_eq!(visible - insets, rows as i32 * cell_h);
+                    let grid = visible + cell_h - 1;
+                    assert_eq!((grid - insets) / cell_h, rows as i32);
+                    // Before the fix, 31 rows of 25px clipped the default
+                    // 1px top inset. Both zero and nonzero CSS boxes fit now.
+                    assert!(insets / 2 + rows as i32 * cell_h <= visible);
+                }
+            }
+        }
+        assert_eq!(super::live_rows_height_px(25, 31, 2), 777);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn live_clip_reserves_css_insets_without_an_extra_grid_row() {
+        use gtk4::prelude::*;
+        use vte4::TerminalExt;
+        gtk4::init().expect("gtk init");
+        let active = super::ActiveBlock::new(
+            &crate::config::Config::safe_defaults(),
+            Rc::new(RefCell::new(super::BoundedByteRing::new(1024))),
+        );
+        active.active_vte.add_css_class("ssh-inset-fixture");
+        let display = gtk4::prelude::WidgetExt::display(&active.active_vte);
+        let provider = gtk4::CssProvider::new();
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_USER,
+        );
+        let window = gtk4::Window::builder()
+            .default_width(800)
+            .default_height(700)
+            .child(active.widget())
+            .build();
+        window.present();
+        let settle = || {
+            let context = gtk4::glib::MainContext::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+            while std::time::Instant::now() < deadline {
+                while context.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        for padding in [0, 7] {
+            provider.load_from_string(&format!(
+                ".ssh-inset-fixture {{ padding: {padding}px; border: 0; margin: 0; }}"
+            ));
+            settle();
+            let insets = super::terminal_vertical_insets(&active.active_vte);
+            assert_eq!(insets, 2 * padding);
+            let cell_h = active.active_vte.char_height() as i32;
+            for visible_rows in [6, 12, 24] {
+                active.set_live_geometry(cell_h, 24, visible_rows);
+                settle();
+                assert_eq!(
+                    active.active_vte.row_count(),
+                    24,
+                    "CSS must not create or remove a PTY grid row"
+                );
+                let origin = active
+                    .active_vte
+                    .compute_point(&active.live_clip(), &gtk4::graphene::Point::new(0.0, 0.0))
+                    .expect("shared clip ancestor");
+                assert!(
+                    origin.y() + (visible_rows as i32 * cell_h) as f32
+                        <= active.live_clip().height() as f32,
+                    "padding={padding}, origin={}, rows={visible_rows}, cell={cell_h}, clip={}",
+                    origin.y(),
+                    active.live_clip().height()
+                );
+            }
+        }
+        window.close();
+        gtk4::style_context_remove_provider_for_display(&display, &provider);
+    }
+
+    #[test]
+    fn image_only_fold_summary_never_invents_text_rows() {
+        for rows in [0, 1, 20] {
+            assert_eq!(
+                super::collapsed_content_summary(rows, false, 1),
+                "▸ 1 image hidden — click to show"
+            );
+            assert_eq!(
+                super::collapsed_content_summary(rows, false, 3),
+                "▸ 3 images hidden — click to show"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_fold_summary_discloses_lines_and_images() {
+        for (rows, lines) in [(1, "1 line"), (2, "2 lines")] {
+            for (images, label) in [(1, "1 image"), (3, "3 images")] {
+                assert_eq!(
+                    super::collapsed_content_summary(rows, true, images),
+                    format!("▸ {lines} and {label} hidden — click to show")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn text_only_fold_summary_does_not_infer_images_from_content() {
+        for rows in [0, 1, 2, 42] {
+            assert_eq!(
+                super::collapsed_content_summary(rows, true, 0),
+                super::collapsed_output_summary(rows)
+            );
+        }
+    }
+
+    #[test]
+    fn empty_fold_summary_never_invents_text_rows() {
+        for rows in [0, 1, 20] {
+            assert_eq!(
+                super::collapsed_content_summary(rows, false, 0),
+                "▸ No output to show"
+            );
+        }
+    }
+
+    #[test]
+    fn filtering_text_preserves_folded_image_count() {
+        let images = 3;
+        for _ in 0..3 {
+            for (shown, rows, expected) in [
+                (
+                    "first\nlast",
+                    2,
+                    "▸ 2 lines and 3 images hidden — click to show",
+                ),
+                ("last", 1, "▸ 1 line and 3 images hidden — click to show"),
+                ("", 1, "▸ 3 images hidden — click to show"),
+                (" \r\n", 2, "▸ 3 images hidden — click to show"),
+            ] {
+                assert_eq!(
+                    super::collapsed_content_summary(rows, !shown.trim().is_empty(), images),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn folded_image_count_is_not_truncated() {
+        assert_eq!(
+            super::collapsed_content_summary(1, false, usize::MAX),
+            format!("▸ {} images hidden — click to show", usize::MAX)
+        );
+    }
+
+    #[test]
     fn a_stopped_jobs_badge_says_suspended_not_terminated() {
         for (code, signal) in [(147, "SIGSTOP"), (149, "SIGTTIN"), (150, "SIGTTOU")] {
             assert_eq!(
@@ -4413,6 +5252,206 @@ mod tests {
             super::failure_badge_tooltip(137, "SIGKILL"),
             "128 + signal number: terminated by SIGKILL"
         );
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn folded_state_survives_virtualization_and_pane_filtering() {
+        use gtk4::prelude::*;
+        gtk4::init().expect("gtk init");
+        let card = FinishedBlock::new(
+            1,
+            "$ ",
+            "seq 200",
+            None,
+            &"line\r\n".repeat(200),
+            Some(0),
+            &crate::config::Config::safe_defaults(),
+            None,
+            None,
+            None,
+            80,
+        );
+        for filtered in [false, true] {
+            assert!(card.set_collapsed(true));
+            if filtered {
+                card.set_filtered_out(true);
+            } else {
+                card.set_virtualized(true);
+            }
+            assert!(
+                card.collapsed_summary.get_visible(),
+                "folded state is stored locally"
+            );
+            assert!(
+                !card.collapsed_summary.is_visible(),
+                "ancestor hides the summary"
+            );
+            assert!(card.is_collapsed(), "offscreen or filtered is still folded");
+            assert!(
+                card.set_collapsed(false),
+                "hidden folded output must unfold"
+            );
+            assert!(!card.is_collapsed());
+            assert!(!card.collapsed_summary.get_visible());
+            if filtered {
+                card.set_filtered_out(false);
+            } else {
+                card.set_virtualized(false);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn chat_pair_keeps_native_surfaces_and_gap_is_not_accumulated() {
+        use gtk4::prelude::*;
+        use vte4::TerminalExt;
+        gtk4::init().expect("gtk init");
+        let block = FinishedBlock::new(
+            7,
+            "$ ",
+            "printf alpha",
+            None,
+            // Ordinary PTY output has CRLF (OPOST/ONLCR). Bare LF retains
+            // the cursor column, so those stair-step lines rewrap on resize.
+            "alpha\r\nbeta\r\ngamma\r\ndelta\r\nepsilon\r\nzeta\r\neta\r\ntheta\r\n",
+            Some(0),
+            &crate::config::Config::safe_defaults(),
+            Some(1),
+            None,
+            None,
+            80,
+        );
+        let command = block.command_vte.clone();
+        let output = block.output_vte.clone();
+        let height = block.virtualized_height.get();
+        block.set_chat_layout();
+        assert_eq!(
+            block.virtualized_height.get(),
+            height + super::super::chat::COMMAND_GAP_PX
+        );
+        block.set_chat_layout();
+        assert_eq!(
+            block.virtualized_height.get(),
+            height + super::super::chat::COMMAND_GAP_PX
+        );
+        let chat_height = block.set_compact(false);
+        block.set_compact(true);
+        assert_eq!(block.set_compact(false), chat_height);
+        assert_eq!(block.set_virtualized(true), chat_height);
+        assert_eq!(block.set_virtualized(false), chat_height);
+        assert!(block.set_collapsed(true));
+        assert!(block.set_collapsed(false));
+        assert_eq!(block.command_vte, command);
+        assert_eq!(block.output_vte, output);
+        assert_eq!(
+            block.content.first_child().unwrap().halign(),
+            gtk4::Align::End
+        );
+        assert!(block
+            .content
+            .last_child()
+            .unwrap()
+            .has_css_class("chat-result"));
+        assert!(block.output_vte.is_ancestor(&block.widget));
+        assert!(!block.output_vte.is_input_enabled());
+
+        super::super::install_block_css(&crate::config::Config::safe_defaults());
+        let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        root.add_css_class("term-chat-root");
+        // Match TermView's history hierarchy: the list fills the viewport,
+        // while each non-expanding card keeps its content height. A card used
+        // directly as the scroller child gets the viewport's allocation even
+        // when its output is folded, hiding any actual height change.
+        let block_list = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        block_list.set_vexpand(true);
+        block_list.add_css_class("block-list");
+        block_list.add_css_class("chat-transcript");
+        block_list.append(block.widget());
+        let scroll = gtk4::ScrolledWindow::new();
+        scroll.set_policy(gtk4::PolicyType::Automatic, gtk4::PolicyType::Automatic);
+        scroll.set_vexpand(true);
+        scroll.set_child(Some(&block_list));
+        root.append(&scroll);
+        let window = gtk4::Window::builder()
+            .default_width(800)
+            .default_height(500)
+            .child(&root)
+            .build();
+        window.present();
+        let settle = || {
+            for _ in 0..25 {
+                while gtk4::glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        settle();
+        assert!(block.command_vte.is_mapped());
+        assert!(block
+            .command_vte
+            .text_format(vte4::Format::Text)
+            .unwrap()
+            .contains("printf alpha"));
+        let captured = block.output_vte.text_format(vte4::Format::Text).unwrap();
+        assert_eq!(
+            captured.as_str(),
+            "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\n",
+            "ordinary PTY lines start at column zero before any resize"
+        );
+        assert!(captured.contains("alpha"));
+        assert!(
+            captured.contains("theta"),
+            "all eight output rows are rendered"
+        );
+        assert!(
+            block.output_vte.width() > block.command_vte.width(),
+            "result keeps log width"
+        );
+        let expanded_height = block.widget.height();
+        assert!(
+            expanded_height < block_list.height(),
+            "the card must not inherit the history viewport's spare height"
+        );
+        // Several rows are intentional: a one-line result can legitimately be
+        // shorter than its accessible collapsed-summary button.
+        let expanded_output_height = block.output_vte.height();
+        assert!(block.set_collapsed(true));
+        settle();
+        assert!(!block.output_vte.is_mapped());
+        assert!(block.collapsed_summary.is_mapped());
+        assert!(expanded_output_height > block.collapsed_summary.height());
+        assert!(
+            block.widget.height() < expanded_height,
+            "folding must shrink the card: expanded={expanded_height}, collapsed={}",
+            block.widget.height()
+        );
+        assert!(block.set_collapsed(false));
+        settle();
+        assert!(block.output_vte.is_mapped());
+        assert!(!block.collapsed_summary.is_mapped());
+        assert_eq!(block.widget.height(), expanded_height);
+        for width in [360, 800, 360, 800] {
+            window.set_default_size(width, 500);
+            settle();
+            block.refit_output_to_viewport();
+            settle();
+            let height = block.widget.height();
+            assert_eq!(block.set_virtualized(true), height);
+            settle();
+            block.set_virtualized(false);
+            settle();
+            assert_eq!(
+                block.output_vte.text_format(vte4::Format::Text).unwrap(),
+                captured,
+                "remap does not double-feed output"
+            );
+            assert!(
+                block.widget.height() <= expanded_height + block.output_vte.char_height() as i32,
+                "gap does not grow on refit/remap"
+            );
+        }
+        window.close();
     }
 
     #[test]
@@ -4436,17 +5475,18 @@ mod tests {
             80,
         );
 
-        // No button on a card takes focus on click — not the action row, not
-        // the collapse chevron, not the collapsed-output summary — so a click
-        // while an agent waits for Enter never leaves a button holding it.
+        // Inline quick actions leave a running prompt focused. Read-only
+        // review is the deliberate exception: its modal returns to history.
         let mut buttons = 0;
         let mut pending: Vec<gtk4::Widget> = vec![block.widget().clone().upcast()];
         while let Some(widget) = pending.pop() {
             if let Some(button) = widget.downcast_ref::<gtk4::Button>() {
                 buttons += 1;
                 assert!(
-                    !button.gets_focus_on_click(),
-                    "{:?} takes focus on click",
+                    button.gets_focus_on_click()
+                        == (button.has_css_class("block-review-button")
+                            || button.has_css_class("block-review-selection")),
+                    "{:?} has incorrect click focus policy",
                     button.css_classes()
                 );
             }
@@ -4573,6 +5613,7 @@ mod tests {
             block.header_row.margin_top(),
         );
         assert!(!block.widget().has_css_class("block-compact"));
+        assert_eq!(roomy.0 + block.widget().margin_bottom(), 4);
 
         // Virtualize before switching: this is the state whose explicit
         // height request and parallel BlockData model used to stay roomy.
@@ -4580,7 +5621,7 @@ mod tests {
         let mut block_data = VecDeque::from([block_with_exit(Some(0))]);
         block_data[0].estimated_height = roomy_placeholder;
         super::apply_finished_card_density(std::slice::from_ref(&block), &mut block_data, true);
-        let compact_placeholder = roomy_placeholder - 10;
+        let compact_placeholder = roomy_placeholder - 6;
         assert_eq!(block_data[0].estimated_height, compact_placeholder);
         assert_eq!(block.widget().height_request(), compact_placeholder);
         let compact = (
@@ -4590,6 +5631,7 @@ mod tests {
             block.header_row.margin_top(),
         );
         assert!(block.widget().has_css_class("block-compact"));
+        assert_eq!(compact.0 + block.widget().margin_bottom(), 2);
         assert!(
             compact.0 < roomy.0
                 && compact.1 < roomy.1
@@ -4694,10 +5736,215 @@ mod tests {
                 false
             ));
             assert!(!assistant.has_css_class("block-compact"));
-            assert_eq!(assistant.margin_top(), 4);
+            assert_eq!(assistant.margin_top(), 2);
             assert_eq!(header.margin_start(), 12);
             assert_eq!(body.margin_start(), 12);
         }
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn repeated_action_feedback_restores_the_original_affordance() {
+        use gtk4::prelude::*;
+        gtk4::init().expect("gtk init");
+        let button = gtk4::Button::from_icon_name("edit-copy-symbolic");
+        button.set_tooltip_text(Some("Copy output"));
+        let feedback = super::ButtonFeedback::new(&button);
+        feedback.flash(&button, "object-select-symbolic", "Output copied");
+        feedback.flash(&button, "dialog-warning-symbolic", "Try again");
+        assert_eq!(button.tooltip_text().as_deref(), Some("Try again"));
+        let context = gtk4::glib::MainContext::default();
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_millis(1100) {
+            while context.iteration(false) {}
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(button.icon_name().as_deref(), Some("edit-copy-symbolic"));
+        assert_eq!(button.tooltip_text().as_deref(), Some("Copy output"));
+        assert!(feedback.pending.borrow().is_none());
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn block_actions_remain_discoverable_without_hover() {
+        use gtk4::prelude::*;
+        gtk4::init().expect("gtk init");
+        let config = crate::config::Config::safe_defaults();
+        let view = super::super::TermView::new_with_spawner(
+            &config,
+            &crate::config::TerminalMode::Block,
+            &["sh".to_string()],
+            None,
+            None,
+            &[],
+            |_argv, _cwd, _env, _token| {
+                crate::pty::OwnedPty::for_tests(crate::pty::PtyForeground::Other)
+            },
+        )
+        .expect("a Block pane over a test PTY");
+        let card = super::FinishedBlock::new(
+            1,
+            "$ ",
+            "cargo test",
+            None,
+            "ok\r\n",
+            Some(0),
+            &config,
+            Some(5),
+            None,
+            None,
+            80,
+        );
+        // Mount real pane actions rather than leaving block.show-menu
+        // unresolved, which makes GTK disable the permanent More button.
+        assert!(card.more_btn.action_name().is_none());
+        assert!(!card.more_btn.is_sensitive(), "unbound More is inactive");
+        view.mount_rebuilt_block(&card);
+        let mut child = card.header_row.first_child();
+        let mut more = None;
+        while let Some(widget) = child {
+            if widget.has_css_class("block-more-btn") {
+                more = widget.clone().downcast::<gtk4::Button>().ok();
+            }
+            child = widget.next_sibling();
+        }
+        let more = more.expect("every card has a permanent More action");
+        // Root the card so GTK resolves the late-installed action through its
+        // widget ancestry, then wait for the actual mapped/enabled state.
+        let window = gtk4::Window::builder()
+            .default_width(700)
+            .default_height(300)
+            .child(card.widget())
+            .build();
+        window.present();
+        let context = gtk4::glib::MainContext::default();
+        let started = std::time::Instant::now();
+        while !(more.is_mapped() && more.is_sensitive())
+            && started.elapsed() < std::time::Duration::from_secs(2)
+        {
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(more.is_mapped(), "More is mapped in the presented card");
+        assert!(more.is_visible());
+        assert!(more.is_sensitive());
+        assert_eq!(more.action_name().as_deref(), Some("block.show-menu"));
+        assert!(!card.copy_cmd_btn.is_child_visible());
+        assert!(!card.jump_bottom_btn.is_child_visible());
+        assert!(!card.expand_btn.is_child_visible());
+        assert!(card.copy_output_btn.is_child_visible());
+        assert!(card.rerun_btn.is_child_visible());
+        assert_eq!(
+            card.rerun_btn.tooltip_text().as_deref(),
+            Some("Insert captured text for review · fill prompt without running"),
+            "the visible recall action must explicitly promise insert-only behavior",
+        );
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn pointer_leave_never_disables_keyboard_focused_actions() {
+        use gtk4::prelude::*;
+        gtk4::init().expect("gtk init");
+        let actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        actions.add_css_class("block-actions-focused");
+        super::reveal_block_actions(&actions, false);
+        assert!(actions.is_sensitive());
+        assert!(actions.can_target());
+        assert_eq!(actions.opacity(), 1.0);
+        actions.remove_css_class("block-actions-focused");
+        super::reveal_block_actions(&actions, false);
+        assert!(!actions.is_sensitive());
+        assert!(!actions.can_target());
+        assert_eq!(actions.opacity(), 0.0);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn outputless_cards_cannot_create_a_phantom_collapsed_summary() {
+        gtk4::init().expect("gtk init");
+        let card = super::FinishedBlock::new(
+            1,
+            "$ ",
+            "true",
+            None,
+            "",
+            Some(0),
+            &crate::config::Config::safe_defaults(),
+            None,
+            None,
+            None,
+            80,
+        );
+        assert!(!card.can_collapse);
+        assert!(!card.set_collapsed(true));
+        assert!(!card.is_collapsed());
+        (card.set_collapsed)(true);
+        assert!(!card.is_collapsed());
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn long_context_uses_one_flexible_accessible_summary() {
+        use gtk4::prelude::*;
+        gtk4::init().expect("gtk init");
+        let cwd = format!("/tmp/{}", "long-directory-".repeat(40));
+        let card = super::FinishedBlock::new(
+            1,
+            "$ ",
+            "echo ok",
+            None,
+            "ok\r\n",
+            Some(0),
+            &crate::config::Config::safe_defaults(),
+            Some(1234),
+            Some(1_700_000_000_000),
+            Some(&cwd),
+            80,
+        );
+        let activations = Rc::new(Cell::new(0));
+        let count = activations.clone();
+        let group = gtk4::gio::SimpleActionGroup::new();
+        let action = gtk4::gio::SimpleAction::new("review", None);
+        action.connect_activate(move |_, _| count.set(count.get() + 1));
+        group.add_action(&action);
+        card.widget().insert_action_group("block", Some(&group));
+        let mut summaries = Vec::new();
+        let mut child = card.header_row.first_child();
+        while let Some(widget) = child {
+            if widget.has_css_class("block-review-button") {
+                let button = widget.clone().downcast::<gtk4::Button>().unwrap();
+                assert!(button.is_sensitive());
+                button.emit_clicked();
+                assert_eq!(
+                    activations.get(),
+                    1,
+                    "metadata invokes the owning card action"
+                );
+                summaries.push(button.child().unwrap().downcast::<gtk4::Label>().unwrap());
+            }
+            child = widget.next_sibling();
+        }
+        assert!(
+            !card.review_selection.is_visible(),
+            "no selection has no shelf"
+        );
+        card.review_selection.emit_clicked();
+        assert_eq!(
+            activations.get(),
+            2,
+            "selection shelf shares the same action"
+        );
+        assert_eq!(summaries.len(), 1);
+        let summary = &summaries[0];
+        assert!(summary.hexpands());
+        assert_eq!(summary.width_chars(), 1);
+        assert_eq!(summary.ellipsize(), gtk4::pango::EllipsizeMode::Middle);
+        let detail = summary.tooltip_text().unwrap();
+        assert!(detail.contains(&cwd));
+        assert!(detail.contains("Duration:"));
+        assert_eq!(card.header_row.spacing(), 6);
     }
 
     /// The pointer crossing a card must not move its metadata. The quick-action
@@ -4830,6 +6077,7 @@ mod tests {
             None,
             super::FinishedBlockPrecomputed {
                 output_rows: Some(rows),
+                output_preview: Some(super::super::fold_preview::from_plain(&output)),
             },
         );
         let calls = super::OUTPUT_VISUAL_ROW_COUNT_CALLS.with(Cell::get);
@@ -5083,8 +6331,7 @@ mod tests {
             assert_ne!(outcome.status_css_class(), "block-status-bad");
         }
 
-        // Faults stay red: these are things the user needs to see. SIGSTOP,
-        // SIGTTIN and SIGTTOU are not Ctrl+Z and keep their plain status.
+        // Faults stay red: these are things the user needs to see.
         for code in [
             1, 2, 127, 131, /* SIGQUIT */
             134, /* SIGABRT */
@@ -5101,28 +6348,34 @@ mod tests {
         }
     }
 
-    /// Ctrl+Z on codex or claude suspends the job, and the shell reports 148
-    /// (128 + SIGTSTP). That card used to be a red `exit:148` failure that
-    /// the Failed filter and failure navigation then stopped on.
+    /// Job-control stops suspend the process. They must not produce a red
+    /// failure card or appear in the Failed filter and failure navigation.
     #[test]
-    fn a_ctrl_z_suspend_is_not_a_failure() {
-        let outcome = BlockOutcome::classify(Some("codex"), Some(148));
-        assert_eq!(outcome, BlockOutcome::Interrupted(148));
-        assert!(!outcome.is_failure());
-        assert_eq!(outcome.reported_exit_code(), Some(148));
-        assert_eq!(outcome.accessible_label(), "Command suspended");
-        assert_eq!(
-            BlockOutcome::interrupted_badge(148),
-            (
-                "exit:148 · suspended".to_string(),
-                "Stopped by SIGTSTP — resume with fg".to_string()
-            )
-        );
+    fn job_control_stops_are_not_failures() {
+        for (code, signal) in [
+            (147, "SIGSTOP"),
+            (148, "SIGTSTP"),
+            (149, "SIGTTIN"),
+            (150, "SIGTTOU"),
+        ] {
+            let outcome = BlockOutcome::classify(Some("codex"), Some(code));
+            assert_eq!(outcome, BlockOutcome::Interrupted(code));
+            assert!(!outcome.is_failure());
+            assert_eq!(outcome.reported_exit_code(), Some(code));
+            assert_eq!(outcome.accessible_label(), "Command suspended");
+            assert_eq!(
+                BlockOutcome::interrupted_badge(code),
+                (
+                    format!("exit:{code} · suspended"),
+                    format!("Stopped by {signal} — resume with fg")
+                )
+            );
+            assert!(!BlockOutcome::classify_foreground(Some(code)).is_failure());
+        }
         assert_eq!(
             BlockOutcome::interrupted_badge(130).0,
             "exit:130 · interrupted"
         );
-        assert!(!BlockOutcome::classify_foreground(Some(148)).is_failure());
     }
 
     /// The pool clears stripe classes by list; the list must cover every value
@@ -5203,6 +6456,55 @@ mod tests {
         for required in ["\x1b[H", "\x1b[2J", "\x1b[3J"] {
             assert!(clear.contains(required), "missing {required:?}");
         }
+    }
+
+    #[test]
+    fn pending_render_revision_tracks_only_queued_feeds() {
+        let first = super::output_render_stamp(80, 3, 3, 0);
+        let second = super::output_render_stamp(66, 3, 3, 0);
+        let state = super::RenderStampState::new(first);
+        assert_eq!(state.pending_revision(), None);
+        state.set(first);
+        assert_eq!(state.pending_revision(), None);
+        state.mark_feed_pending();
+        assert_eq!(state.pending_revision(), Some(1));
+        assert_eq!(state.replace(first), first);
+        assert_eq!(state.pending_revision(), Some(1));
+
+        // Re-windowing does not claim a feed or erase one already in the queue.
+        assert_eq!(state.replace(second), first);
+        assert_eq!(state.pending_revision(), Some(1));
+        state.mark_feed_pending();
+        assert_eq!(state.pending_revision(), Some(2));
+        state.acknowledge_contents_changed();
+        assert_eq!(state.pending_revision(), None);
+        assert_eq!(state.revision(), 2);
+    }
+
+    #[test]
+    fn render_revision_distinguishes_refeeds_and_stamp_aba() {
+        let first = super::output_render_stamp(80, 3, 3, 0);
+        let second = super::output_render_stamp(66, 3, 3, 0);
+        let state = super::RenderStampState::new(first);
+        assert_eq!(state.get(), first);
+        assert_eq!(state.revision(), 0);
+
+        // An unchanged map/refit probe is not another render.
+        assert_eq!(state.replace(first), first);
+        assert_eq!(state.revision(), 0);
+
+        // Explicit re-feeds invalidate outstanding work even at the same stamp.
+        state.set(first);
+        assert_eq!(state.get(), first);
+        assert_eq!(state.revision(), 1);
+
+        assert_eq!(state.replace(second), first);
+        assert_eq!(state.revision(), 2);
+        assert_eq!(state.replace(first), second);
+        assert_eq!(state.get(), first);
+        assert_eq!(state.revision(), 3);
+        assert_eq!(state.replace(first), first);
+        assert_eq!(state.revision(), 3);
     }
 
     #[test]
@@ -5346,12 +6648,150 @@ mod tests {
     }
 
     #[test]
+    fn output_filter_borrows_only_byte_identical_results() {
+        use std::borrow::Cow;
+        for full in ["", "keep", "keep\nkeep", "\x1b[31mkeep\x1b[0m", "keep\r"] {
+            let shown = filter_output_lines(full, "keep", false, true, false, 0).unwrap();
+            assert!(matches!(shown, Cow::Borrowed(_)), "{full:?}");
+            assert_eq!(shown, full);
+            assert!(super::filtered_output_override(full, shown).is_none());
+        }
+        let full = "\r\nkeep\n";
+        assert!(matches!(
+            filter_output_lines(full, "", true, false, true, 10).unwrap(),
+            Cow::Borrowed(_)
+        ));
+        for (full, expected) in [
+            ("keep\n", "keep"),
+            ("keep\r\nkeep", "keep\nkeep"),
+            ("\nkeep\n", "\nkeep"),
+            ("\r\nkeep\r\n", "\nkeep"),
+        ] {
+            let shown = filter_output_lines(full, "keep", false, true, false, 1).unwrap();
+            assert!(matches!(shown, Cow::Owned(_)), "{full:?}");
+            assert_eq!(shown, expected);
+            assert_eq!(
+                super::filtered_output_override(full, shown).as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn output_filter_borrowing_preserves_selection_and_raw_ansi() {
+        for (full, query, regex, case, invert, context, expected) in [
+            (
+                "skip\n\n\nmatch\nafter",
+                "match",
+                false,
+                true,
+                false,
+                2,
+                "\n\nmatch\nafter",
+            ),
+            ("\n\nx", "^$", true, true, false, 0, "\n"),
+            ("\n\nx", "absent", false, true, true, 0, "\n\nx"),
+            (
+                "keep\nER\x1b[31mROR\x1b[0m",
+                "ERROR",
+                false,
+                true,
+                false,
+                0,
+                "",
+            ),
+            (
+                "keep\n\x1b[31mred\x1b[0m",
+                "31m",
+                false,
+                true,
+                false,
+                0,
+                "\x1b[31mred\x1b[0m",
+            ),
+            ("skip\nİΣ你好🙂\nlast", "İσ", false, false, false, 0, ""),
+            (
+                "skip\nİΣ你好🙂\nlast",
+                "İς",
+                false,
+                false,
+                false,
+                0,
+                "İΣ你好🙂",
+            ),
+            (
+                "skip\nERROR\nlast",
+                "^error$",
+                true,
+                false,
+                false,
+                0,
+                "ERROR",
+            ),
+        ] {
+            assert_eq!(
+                filter_output_lines(full, query, regex, case, invert, context).unwrap(),
+                expected
+            );
+        }
+        assert!(filter_output_lines("keep", "[", true, false, false, 0).is_err());
+    }
+
+    #[test]
+    fn output_filter_large_identical_selection_borrows_without_truncation() {
+        use std::borrow::Cow;
+        let full = std::iter::repeat_n("\x1b[31mkeep 你好🙂\x1b[0m", 100_000)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for regex in [false, true] {
+            for context in [0, 2] {
+                let shown =
+                    filter_output_lines(&full, "keep", regex, true, false, context).unwrap();
+                assert!(matches!(shown, Cow::Borrowed(_)));
+                assert_eq!(shown, full);
+                assert_eq!(shown.lines().count(), 100_000);
+            }
+        }
+    }
+
+    #[test]
     fn filter_output_lines_matches_ascii_case_insensitive() {
         assert_eq!(
             filter_output_lines("alpha\nERROR: nope\nomega", "error", false, false, false, 0)
                 .unwrap(),
             "ERROR: nope"
         );
+    }
+
+    #[test]
+    fn filter_output_lines_matches_unicode_lowercase_with_ascii_query() {
+        for (output, query) in [
+            ("Kelvin", "kelvin"),
+            ("İstanbul", "i"),
+            ("prefix\nK\nsuffix", "k"),
+            ("ſtraße", "s"),
+            ("Straße", "ss"),
+            ("ÉKİ MIX", "ki"),
+        ] {
+            let expected = output
+                .lines()
+                .filter(|line| line.to_lowercase().contains(query))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(
+                super::filter_output_lines(output, query, false, false, false, 0).unwrap(),
+                expected
+            );
+            let inverted = output
+                .lines()
+                .filter(|line| !line.to_lowercase().contains(query))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(
+                super::filter_output_lines(output, query, false, false, true, 0).unwrap(),
+                inverted
+            );
+        }
     }
 
     #[test]
@@ -5383,7 +6823,7 @@ mod tests {
             "\x1b[31mERROR: nope\x1b[0m"
         );
 
-        display_override = super::filtered_output_override(full, full.to_string());
+        display_override = super::filtered_output_override(full, full.to_string().into());
         assert!(display_override.is_none());
         assert_eq!(
             super::resolved_finished_output(full, &display_override),
@@ -5434,6 +6874,70 @@ mod tests {
     }
 
     #[test]
+    fn visual_row_count_wraps_wide_glyphs_before_the_last_cell() {
+        assert_eq!(super::output_visual_row_count(&"界".repeat(401), 81), 11);
+        assert_eq!(super::output_visual_row_count("界界界", 3), 3);
+        assert_eq!(super::output_visual_row_count("a界界", 2), 3);
+        assert_eq!(super::output_visual_row_count("界界界", 4), 2);
+        assert_eq!(super::output_visual_row_count("abc界", 4), 2);
+        assert_eq!(
+            super::output_visual_row_count("界\u{301}界\u{200d}界", 3),
+            3
+        );
+        assert_eq!(super::output_visual_row_count("🙂🙂🙂", 3), 3);
+    }
+
+    #[test]
+    fn visual_row_count_preserves_control_and_degenerate_boundaries() {
+        for cols in [1, 2, 3, 4, 81] {
+            let plain = "界界界\n界界界";
+            assert_eq!(
+                super::output_visual_row_count(plain, cols),
+                super::output_visual_row_count(&format!("\x1b[32m{plain}\x1b[0m"), cols),
+            );
+        }
+        assert_eq!(
+            super::output_visual_row_count("old\r\x1b[K界界界\r\n", 3),
+            3
+        );
+        assert_eq!(super::output_visual_row_count("abc\u{301}", 3), 1);
+        assert_eq!(super::output_visual_row_count("\u{301}\u{200d}\0", 3), 1);
+        assert_eq!(super::output_visual_row_count("界\n界\n", 3), 2);
+        assert_eq!(super::output_visual_row_count("a\tb", 4), 1);
+        assert_eq!(super::output_visual_row_count("界界", 1), 4);
+        assert_eq!(super::output_visual_row_count("界界", 0), 4);
+        assert_eq!(super::output_visual_row_count("", 3), 1);
+    }
+
+    #[test]
+    fn visual_row_count_tabs_stop_at_the_margin_without_wrapping() {
+        for (text, cols, expected) in [
+            ("界界界\t", 3, 3),
+            ("abc\t", 3, 1),
+            ("abcd\tX", 4, 2),
+            ("abc\tX", 4, 1),
+            ("abc\t界", 3, 2),
+            ("abc\t\u{301}", 3, 1),
+            ("\t\t\t", 3, 1),
+            ("\t界", 3, 2),
+            ("a\tb", 4, 1),
+            ("a\tb", 8, 1),
+            ("a\tb", 9, 1),
+            ("a\tb界", 9, 2),
+            ("a\tb\n界界界\t", 3, 4),
+            ("old\r\x1b[Ka\tb\r\n", 4, 1),
+        ] {
+            assert_eq!(
+                super::output_visual_row_count(text, cols),
+                expected,
+                "{text:?} at {cols} columns"
+            );
+        }
+        // The single-column fallback remains deliberately conservative.
+        assert_eq!(super::output_visual_row_count("a\tb", 1), 9);
+    }
+
+    #[test]
     fn visual_row_count_includes_terminal_wrapping() {
         assert_eq!(super::output_visual_row_count("123456789\nabc", 4), 4);
         assert_eq!(super::output_visual_row_count("界界界", 4), 2);
@@ -5472,11 +6976,11 @@ mod tests {
         // block below it in the virtualized document.
         assert_eq!(
             super::finished_block_height_for_rows(20, 1, 10, false),
-            12 * 20 + 34
+            12 * 20 + 30
         );
         assert_eq!(
             super::finished_block_height_for_rows(20, 1, 1, false),
-            3 * 20 + 34
+            3 * 20 + 30
         );
         assert_eq!(
             super::finished_block_height_for_rows(20, 1, 1, true),
@@ -5484,7 +6988,7 @@ mod tests {
         );
         assert_eq!(
             super::finished_block_height_for_rows(0, 1, 1, false),
-            3 + 34
+            3 + 30
         );
     }
 
@@ -5494,8 +6998,8 @@ mod tests {
         let command_with_output = super::finished_block_height_for_rows(20, 1, 1, false);
         let command_without_output = super::finished_block_height_for_rows(20, 1, 0, false);
 
-        assert_eq!(background, 2 * 20 + 34);
-        assert_eq!(command_without_output, 2 * 20 + 34);
+        assert_eq!(background, 2 * 20 + 30);
+        assert_eq!(command_without_output, 2 * 20 + 30);
         assert_eq!(command_with_output - background, 20);
     }
 
@@ -5709,6 +7213,22 @@ mod tests {
         assert_eq!(
             filter_output_lines("one\ntwo\nthree\nfour", "three", false, true, false, 1).unwrap(),
             "two\nthree\nfour"
+        );
+    }
+
+    #[test]
+    fn filter_output_lines_preserves_selected_leading_blank_lines() {
+        assert_eq!(
+            filter_output_lines("skip\n\n\nmatch\nafter", "match", false, true, false, 2).unwrap(),
+            "\n\nmatch\nafter"
+        );
+        assert_eq!(
+            filter_output_lines("\n\nnonempty", "^$", true, true, false, 0).unwrap(),
+            "\n"
+        );
+        assert_eq!(
+            filter_output_lines("\n\nx", "absent", false, true, true, 0).unwrap(),
+            "\n\nx"
         );
     }
 
@@ -5933,5 +7453,57 @@ mod tests {
         );
         assert_eq!(snapshot_settle_tail(""), None);
         assert_eq!(snapshot_settle_tail("\r\n   \r\n"), None);
+    }
+}
+
+#[cfg(test)]
+#[path = "fold_preview_tests.rs"]
+mod fold_preview_tests;
+
+#[cfg(test)]
+mod command_reuse_labels_tests {
+    use super::*;
+    use gtk4 as gtk;
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn recall_header_describes_insert_only_action() {
+        gtk::init().expect("GTK display");
+        let config = Config::safe_defaults();
+        let card = FinishedBlock::new(
+            1,
+            "$ ",
+            "printf hello",
+            None,
+            "hello",
+            Some(0),
+            &config,
+            None,
+            None,
+            None,
+            80,
+        );
+        assert_eq!(
+            card.rerun_btn.tooltip_text().as_deref(),
+            Some("Insert captured text for review · fill prompt without running")
+        );
+        assert!(!card.command_replay_is_exact.get());
+        assert!(card.command_source_notice.is_visible());
+        card.set_command_provenance(true, false);
+        assert!(card.command_replay_is_exact.get());
+        assert!(!card.command_source_notice.is_visible());
+        assert_eq!(
+            card.rerun_btn.tooltip_text().as_deref(),
+            Some("Recall command · fill prompt without running")
+        );
+        card.set_command_provenance(true, true);
+        assert!(
+            !card.command_replay_is_exact.get(),
+            "truncation wins over contradictory exactness"
+        );
+        assert_eq!(
+            card.command_source_notice.text().as_str(),
+            "Command report incomplete"
+        );
     }
 }

@@ -9,6 +9,8 @@
 # "unified"：实验模式——同一套 OSC 133 生命周期，但只有一块常驻全屏 VTE，
 # 不生成任何命令块外壳（完成的命令仅记录为内存中的 zone）。
 # 三种模式均支持分屏；新 pane 继承被分屏 pane 的后端，与 anvil 一致。
+# "chat"：独立对话布局，右侧命令胶囊、宽输出卡与固定原生 shell 输入区；不需要 LLM。
+# 仅新建/恢复的本地 pane 应用；现有 pane、PTY 与默认值不变。
 terminal_mode = "block"
 opacity = 0.95                 # 0.01 .. 1.0
 scrollback = 5000             # 0 .. 1000000
@@ -17,7 +19,9 @@ font = "JetBrainsMono Nerd Font Mono 14"
 # separators, devicons, codicons). Unset auto-picks an installed Nerd Font;
 # set "none" to leave those glyphs to fontconfig's own fallback.
 # icon_font = "Symbols Nerd Font Mono"
-font_scale = 1.0              # 0.1 .. 10.0
+font_scale = 1.0              # 主内容区，0.1 .. 10.0
+# chrome_font_scale = 1.0     # 顶部栏 + 侧栏，0.1 .. 10.0；缺省沿用旧 font_scale
+# chrome_font_size = "14"     # 侧顶栏基础字号；点数或 "17px"，缺省从 font 固定初值
 
 # default, light, solarized-dark, solarized-light, gruvbox-dark,
 # gruvbox-light, dracula, nord
@@ -61,10 +65,12 @@ max_collapsed_output_lines = 25
 virtual_scroll_margin = 1
 block_compact = false
 
-# 实验性、完全本地且无 LLM 的 ASCII organism。仅显示在新建的 Block pane；
-# 修改后请新建 pane 或重启 Forge。临时覆盖：FORGE_ASCII_ORGANISM_ENABLED=1。
+# 默认开启、完全本地且无 LLM 的 ASCII organism。
+# Settings 或 Reload Config 可立即应用。临时关闭：FORGE_ASCII_ORGANISM_ENABLED=0。
 # 连续状态与 repo/day 统计保存到 XDG state 目录；不保存命令或输出。
-ascii_organism_enabled = false
+ascii_organism_enabled = true
+# Optional quiet break prompts after sustained foreground use; off by default.
+ascii_organism_care_enabled = false
 # 身体动效等级："full"（动画+游走+行走过渡）、"calm"（只在行为边界换姿，
 # 无游走/摆动/帧交替）、"static"（只保留 prompt 上方的 inline 卡片）。
 # 未设置时跟随桌面动画偏好（gtk-enable-animations 关闭时自动 calm）。
@@ -168,6 +174,7 @@ ai_redact_secrets = true
 # opacity_decrease = "Ctrl+Alt+minus"
 # toggle_search = "Ctrl+Shift+F"
 # toggle_command_palette = "Ctrl+Shift+P"
+# open_vim9_ide = "Ctrl+Alt+I"
 # reload_config = "Ctrl+Shift+R"
 # show_remote_picker = "Ctrl+Shift+S"
 # connect_remote_1 = "F4"      # 直连第 1 个 [[remote_hosts]]；同理支持 1..9
@@ -177,6 +184,9 @@ ai_redact_secrets = true
 # undo_clear_blocks = "Ctrl+Shift+U"
 # collapse_all_blocks = "Ctrl+Shift+Left"
 # expand_all_blocks = "Ctrl+Shift+Right"
+# 以下两项仅作用于明确选中的完成块；默认没有快捷键。
+# collapse_selected_blocks = "F8"
+# expand_selected_blocks = "F9"
 # toggle_block_collapsed = "Ctrl+Shift+Slash"
 # jump_to_prev_failed = "Ctrl+Shift+Alt+Up"
 # jump_to_next_failed = "Ctrl+Shift+Alt+Down"
@@ -229,3 +239,17 @@ ai_redact_secrets = true
 #                  一个字节都不写——共享账号该用这个
 # 两种模式都不修改远端的 .bashrc/.profile/登录 shell，也不需要 root。
 # 开启 deploy 后 remote_shell 会被忽略：选哪个 shell 是启动器的事。
+
+
+# Vim buffer-first GUI. Applies to `vim` from local interactive shells and --ide.
+# Turn individual workbench surfaces on explicitly; missing keys use these defaults.
+[vim9]
+# Automatically open `vim` in a GUI window; the originating shell waits for :q.
+auto_gui = true
+native_buffer = true
+smooth_scroll = true
+toolbar = false
+buffer_tabs = false
+status_bar = false
+project_panel = false
+tool_panel = false

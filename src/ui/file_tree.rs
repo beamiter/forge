@@ -329,6 +329,7 @@ struct FileTreeNavigationRequest {
 
 #[derive(Default)]
 pub(crate) struct FileTreeNavigationState {
+    automatic_probe: Option<(u64, remote_fs::CancelToken)>,
     revision: u64,
     pending: Option<FileTreeNavigationRequest>,
     current: Option<FileTreeNavigationPoint>,
@@ -337,6 +338,29 @@ pub(crate) struct FileTreeNavigationState {
 }
 
 impl FileTreeNavigationState {
+    fn cancel_automatic_probe(&mut self) {
+        if let Some((_, cancellation)) = self.automatic_probe.take() {
+            cancellation.cancel();
+        }
+    }
+
+    fn begin_automatic_probe(&mut self, intent: u64) -> remote_fs::CancelToken {
+        self.cancel_automatic_probe();
+        let cancellation = remote_fs::CancelToken::default();
+        self.automatic_probe = Some((intent, cancellation.clone()));
+        cancellation
+    }
+
+    fn retire_automatic_probe(&mut self, intent: u64) {
+        if self
+            .automatic_probe
+            .as_ref()
+            .is_some_and(|(current, _)| *current == intent)
+        {
+            self.automatic_probe = None;
+        }
+    }
+
     fn push_bounded(
         history: &mut VecDeque<FileTreeNavigationPoint>,
         point: FileTreeNavigationPoint,
@@ -500,6 +524,47 @@ fn validate_absolute_navigation_path(value: &str) -> Result<PathBuf, &'static st
         }
     }
     Ok(normalized)
+}
+
+fn navigation_breadcrumb_button(ancestor: &Path) -> gtk4::Button {
+    let label = if ancestor == Path::new("/") {
+        "/".to_string()
+    } else {
+        ancestor
+            .file_name()
+            .map(|name| safe_file_label(&name.to_string_lossy()))
+            .unwrap_or_else(|| "/".to_string())
+    };
+    let button = gtk4::Button::with_label(&label);
+    button.add_css_class("flat");
+    if let Some(text) = button.child().and_downcast::<gtk4::Label>() {
+        text.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+    }
+    button.set_tooltip_text(Some(&label));
+    button
+}
+
+fn navigation_path_content(
+    entry: &adw::EntryRow,
+    error: &gtk4::Label,
+    breadcrumbs: &gtk4::FlowBox,
+) -> gtk4::Widget {
+    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.append(entry);
+    content.append(error);
+    let scroll = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vscrollbar_policy(gtk4::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .vexpand(true)
+        .child(breadcrumbs)
+        .build();
+    content.append(&scroll);
+    content.upcast()
 }
 
 fn navigation_breadcrumbs(path: &Path) -> Vec<PathBuf> {
@@ -934,12 +999,59 @@ impl ScanSchedulerState {
     }
 }
 
+/// Start a bounded pool without making temporary resource exhaustion fatal
+/// to the GUI. Keep workers already started; never admit work with zero.
+fn start_file_workers(
+    requested: usize,
+    mut spawn: impl FnMut(usize) -> io::Result<()>,
+) -> io::Result<usize> {
+    if requested == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file worker pool cannot be empty",
+        ));
+    }
+    let mut started = 0;
+    for index in 0..requested {
+        match spawn(index) {
+            Ok(()) => started += 1,
+            Err(error) if started == 0 => return Err(error),
+            Err(error) => {
+                log::warn!("File worker pool started {started} of {requested} workers: {error}");
+                break;
+            }
+        }
+    }
+    Ok(started)
+}
+
+#[derive(Debug)]
+struct FileWorkerStartupFailure(String);
+
+impl std::fmt::Display for FileWorkerStartupFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FileWorkerStartupFailure {}
+
+fn cached_file_scheduler<T>(
+    slot: &OnceLock<io::Result<T>>,
+    initialize: impl FnOnce() -> io::Result<T>,
+) -> io::Result<&T> {
+    slot.get_or_init(initialize)
+        .as_ref()
+        .map_err(|error| io::Error::new(error.kind(), FileWorkerStartupFailure(error.to_string())))
+}
+
 struct ScanScheduler {
     shared: Arc<(Mutex<ScanSchedulerState>, Condvar)>,
+    worker_count: usize,
 }
 
 impl ScanScheduler {
-    fn new(worker_count: usize, capacity: usize) -> Self {
+    fn new(worker_count: usize, capacity: usize) -> io::Result<Self> {
         let shared = Arc::new((
             Mutex::new(ScanSchedulerState {
                 queue: ScanQueue::new(capacity),
@@ -948,22 +1060,28 @@ impl ScanScheduler {
             }),
             Condvar::new(),
         ));
-        for index in 0..worker_count {
+        let worker_count = start_file_workers(worker_count, |index| {
             let shared = shared.clone();
             std::thread::Builder::new()
                 .name(format!("forge-file-tree-scan-{index}"))
                 .spawn(move || scan_worker(shared))
-                .expect("file-tree scan worker must start");
-        }
-        Self { shared }
+                .map(|_handle| ())
+        })?;
+        Ok(Self {
+            shared,
+            worker_count,
+        })
     }
 
-    fn global() -> &'static Self {
-        static SCHEDULER: OnceLock<ScanScheduler> = OnceLock::new();
-        SCHEDULER.get_or_init(|| Self::new(MAX_CONCURRENT_SCANS, MAX_PENDING_SCANS))
+    fn global() -> io::Result<&'static Self> {
+        static SCHEDULER: OnceLock<io::Result<ScanScheduler>> = OnceLock::new();
+        cached_file_scheduler(&SCHEDULER, || {
+            Self::new(MAX_CONCURRENT_SCANS, MAX_PENDING_SCANS)
+        })
     }
 
     fn enqueue(&self, priority: ScanPriority, job: ScanJob) -> io::Result<()> {
+        debug_assert!(self.worker_count > 0);
         let (lock, wake) = &*self.shared;
         let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let cancelled = state
@@ -1043,27 +1161,35 @@ type FsOpJob = Box<dyn FnOnce() + Send + 'static>;
 struct FsOpScheduler {
     shared: Arc<(Mutex<VecDeque<FsOpJob>>, Condvar)>,
     capacity: usize,
+    worker_count: usize,
 }
 
 impl FsOpScheduler {
-    fn new(worker_count: usize, capacity: usize) -> Self {
+    fn new(worker_count: usize, capacity: usize) -> io::Result<Self> {
         let shared = Arc::new((Mutex::new(VecDeque::<FsOpJob>::new()), Condvar::new()));
-        for index in 0..worker_count {
+        let worker_count = start_file_workers(worker_count, |index| {
             let shared = shared.clone();
             std::thread::Builder::new()
                 .name(format!("forge-file-tree-op-{index}"))
                 .spawn(move || fs_op_worker(shared))
-                .expect("file-tree operation worker must start");
-        }
-        Self { shared, capacity }
+                .map(|_handle| ())
+        })?;
+        Ok(Self {
+            shared,
+            capacity,
+            worker_count,
+        })
     }
 
-    fn global() -> &'static Self {
-        static SCHEDULER: OnceLock<FsOpScheduler> = OnceLock::new();
-        SCHEDULER.get_or_init(|| Self::new(MAX_CONCURRENT_FS_OPS, MAX_PENDING_FS_OPS))
+    fn global() -> io::Result<&'static Self> {
+        static SCHEDULER: OnceLock<io::Result<FsOpScheduler>> = OnceLock::new();
+        cached_file_scheduler(&SCHEDULER, || {
+            Self::new(MAX_CONCURRENT_FS_OPS, MAX_PENDING_FS_OPS)
+        })
     }
 
     fn enqueue(&self, job: FsOpJob) -> io::Result<()> {
+        debug_assert!(self.worker_count > 0);
         let (lock, wake) = &*self.shared;
         let mut queue = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if queue.len() >= self.capacity {
@@ -1135,7 +1261,7 @@ where
 {
     let (tx, rx) = mpsc::sync_channel(1);
     let authority = remote_fs::filesystem_identity(&loc, &hosts)?;
-    ScanScheduler::global().enqueue(
+    ScanScheduler::global()?.enqueue(
         priority,
         ScanJob {
             authority,
@@ -1162,7 +1288,7 @@ where
     W: FnOnce() -> io::Result<T> + Send + 'static,
 {
     let (tx, rx) = mpsc::sync_channel(1);
-    FsOpScheduler::global().enqueue(Box::new(move || {
+    FsOpScheduler::global()?.enqueue(Box::new(move || {
         let _ = tx.send(work());
     }))?;
     poll_worker(rx, apply, "file operation worker disconnected");
@@ -1631,7 +1757,9 @@ impl FileTreeModel {
         self.selection_after_refresh.borrow_mut().clear();
         self.root_path.borrow_mut().clear();
         cancel_directory_scans(&self.directory_scan_revisions.borrow());
-        ScanScheduler::global().retire_cancelled();
+        if let Ok(scheduler) = ScanScheduler::global() {
+            scheduler.retire_cancelled();
+        }
         self.directory_scan_revisions.borrow_mut().clear();
         set_drop_hover(&self.drop_hover, None);
         generation
@@ -1651,7 +1779,9 @@ impl FileTreeModel {
 
     fn cancel_pending_scans_preserve_tree(&self) {
         cancel_directory_scans(&self.directory_scan_revisions.borrow());
-        ScanScheduler::global().retire_cancelled();
+        if let Ok(scheduler) = ScanScheduler::global() {
+            scheduler.retire_cancelled();
+        }
         self.directory_scan_revisions.borrow_mut().clear();
     }
 
@@ -2179,6 +2309,12 @@ impl FileTreeModel {
 }
 
 fn public_directory_error_message(error: &io::Error) -> &'static str {
+    if error
+        .get_ref()
+        .is_some_and(|source| source.is::<FileWorkerStartupFailure>())
+    {
+        return "File workers could not start; restart Forge after freeing system resources";
+    }
     match error.kind() {
         io::ErrorKind::NotFound => "Directory not found or unavailable",
         io::ErrorKind::PermissionDenied => "Permission denied",
@@ -2198,6 +2334,12 @@ fn public_directory_error_message(error: &io::Error) -> &'static str {
 }
 
 fn public_file_operation_error_message(error: &io::Error) -> &'static str {
+    if error
+        .get_ref()
+        .is_some_and(|source| source.is::<FileWorkerStartupFailure>())
+    {
+        return "File workers could not start; restart Forge after freeing system resources";
+    }
     match error.kind() {
         io::ErrorKind::AlreadyExists => "An item with this name already exists",
         io::ErrorKind::NotFound => "The item no longer exists",
@@ -2343,7 +2485,9 @@ fn invalidate_removed_subtrees_parts(
     }
     // Cancelled queued work is removed immediately instead of consuming one
     // of the bounded queue's physical slots until a worker happens to pop it.
-    ScanScheduler::global().retire_cancelled();
+    if let Ok(scheduler) = ScanScheduler::global() {
+        scheduler.retire_cancelled();
+    }
     child_stores
         .borrow_mut()
         .retain(|path, _| !path_is_in_removed_subtree(path, removed));
@@ -3047,6 +3191,9 @@ impl UiState {
     }
 
     pub(crate) fn invalidate_file_tree_remote_follow(&self) {
+        self.file_tree_navigation
+            .borrow_mut()
+            .cancel_automatic_probe();
         let _ = self.next_file_tree_remote_follow_intent();
     }
 
@@ -3214,6 +3361,11 @@ impl UiState {
             location: self.file_tree_location.borrow().clone(),
             root: self.file_tree_root.borrow().clone(),
         };
+        let cancellation = self
+            .file_tree_navigation
+            .borrow_mut()
+            .begin_automatic_probe(intent);
+        let cancellation_for_apply = cancellation.clone();
         let location_for_work = location.clone();
         let hosts_for_work = hosts.clone();
         let ui = self.clone();
@@ -3221,8 +3373,13 @@ impl UiState {
         let argv_for_apply = source_argv.clone();
         let target_for_apply = target.clone();
         let overlay_for_apply = overlay.clone();
-        let apply = move |result: io::Result<PathBuf>| {
-            if std::env::var_os("FORGE_SAFE_MODE").is_some() {
+        let apply = move |result: io::Result<(PathBuf, Option<DirectoryScan>)>| {
+            ui.file_tree_navigation
+                .borrow_mut()
+                .retire_automatic_probe(intent);
+            if cancellation_for_apply.is_cancelled()
+                || std::env::var_os("FORGE_SAFE_MODE").is_some()
+            {
                 return;
             }
             let Some(source_root) = source_root.upgrade() else {
@@ -3264,7 +3421,7 @@ impl UiState {
             }
 
             match result {
-                Ok(root) => {
+                Ok((root, listing)) => {
                     let current_hosts = ui.config.borrow().remote_hosts.clone();
                     let Some(current_location) =
                         remap_remote_location(&location, &hosts, &current_hosts)
@@ -3296,23 +3453,44 @@ impl UiState {
                         );
                         return;
                     }
-                    let root = if same_target {
-                        ui.file_tree_root.borrow().clone()
-                    } else {
-                        root
-                    };
-                    ui.navigate_file_tree_point(
-                        FileTreeNavigationPoint {
-                            location: current_location,
-                            overlay: overlay_for_apply,
-                            root,
+                    let authority =
+                        match remote_fs::filesystem_identity(&current_location, &current_hosts) {
+                            Ok(authority) => authority,
+                            Err(_) => return,
+                        };
+                    let point = FileTreeNavigationPoint {
+                        location: current_location.clone(),
+                        overlay: overlay_for_apply.clone(),
+                        root: if same_target {
+                            ui.file_tree_root.borrow().clone()
+                        } else {
+                            root
                         },
+                    };
+                    let request = ui.file_tree_navigation.borrow_mut().begin(
+                        point,
                         if same_target {
                             FileTreeNavigationAction::Replace
                         } else {
                             FileTreeNavigationAction::Push
                         },
                     );
+                    if same_target {
+                        // This is an execution-route rebind within the exact
+                        // proven namespace, so retain rows and expansion.
+                        ui.file_tree_model.cancel_pending_scans_preserve_tree();
+                        if ui.file_tree_navigation.borrow_mut().commit(&request) {
+                            *ui.file_tree_location.borrow_mut() = current_location;
+                            *ui.file_tree_execution_overlay.borrow_mut() = overlay_for_apply;
+                            ui.file_tree_model.set_committed_authority(authority);
+                            ui.refresh_file_tree_location_selector();
+                            ui.refresh_file_tree_root_header();
+                        }
+                    } else if let Some(listing) = listing {
+                        // Source authority was checked after the first listing,
+                        // so publication has no second asynchronous boundary.
+                        ui.commit_file_tree_point_listing(&request, authority, listing);
+                    }
                 }
                 Err(error) => ui.show_remote_follow_failure(
                     source_for_apply,
@@ -3324,10 +3502,39 @@ impl UiState {
         };
         if let Err(error) = request_fs_op(
             move || {
-                remote_fs::start_dir_with_overlay(&location_for_work, &hosts_for_work, &overlay)
+                if cancellation.is_cancelled() {
+                    return Err(remote_fs::cancelled_error());
+                }
+                let root = remote_fs::start_dir_with_overlay_cancel(
+                    &location_for_work,
+                    &hosts_for_work,
+                    &overlay,
+                    &cancellation,
+                )?;
+                if cancellation.is_cancelled() {
+                    return Err(remote_fs::cancelled_error());
+                }
+                let listing = if same_target {
+                    None
+                } else {
+                    Some(scan_entries(
+                        &location_for_work,
+                        &hosts_for_work,
+                        &overlay,
+                        &root,
+                        &cancellation,
+                    )?)
+                };
+                if cancellation.is_cancelled() {
+                    return Err(remote_fs::cancelled_error());
+                }
+                Ok((root, listing))
             },
             apply,
         ) {
+            self.file_tree_navigation
+                .borrow_mut()
+                .cancel_automatic_probe();
             self.show_remote_follow_failure(source_session, source_argv, target, error);
         }
     }
@@ -3588,6 +3795,51 @@ impl UiState {
         }
     }
 
+    fn commit_file_tree_point_listing(
+        &self,
+        request: &FileTreeNavigationRequest,
+        expected_authority: remote_fs::FilesystemIdentity,
+        listing: DirectoryScan,
+    ) {
+        if !self.file_tree_navigation.borrow_mut().commit(request) {
+            return;
+        }
+        let reconcile_started = Instant::now();
+        let generation = self.file_tree_model.reset();
+        self.file_tree_model
+            .set_committed_authority(expected_authority.clone());
+        *self.file_tree_location.borrow_mut() = request.target.location.clone();
+        *self.file_tree_execution_overlay.borrow_mut() = request.target.overlay.clone();
+        *self.file_tree_root.borrow_mut() = request.target.root.clone();
+        self.file_tree_model.set_root_path(&request.target.root);
+        self.file_tree_model
+            .mark_snapshot_completed(&request.target.root);
+        let timing = listing.timing;
+        let entry_count = listing.entries.len();
+        self.file_tree_model
+            .replace_root(generation, listing.entries);
+        self.refresh_file_tree_location_selector();
+        self.refresh_file_tree_root_header();
+        let delta = StoreReconcileDelta {
+            inserted_rows: entry_count,
+            ..StoreReconcileDelta::default()
+        };
+        log_scan_timing(
+            &request.target.root,
+            timing,
+            reconcile_started.elapsed(),
+            &delta,
+        );
+        if listing.truncated {
+            self.toast_overlay.add_toast(adw::Toast::new(&format!(
+                "{} has more than {} entries; showing the first {}",
+                root_display_label(&request.target.location, &request.target.root),
+                remote_fs::MAX_DIRECTORY_ENTRIES,
+                remote_fs::MAX_DIRECTORY_ENTRIES
+            )));
+        }
+    }
+
     fn navigate_file_tree_point(
         &self,
         target: FileTreeNavigationPoint,
@@ -3608,7 +3860,9 @@ impl UiState {
             Ok(authority) => authority,
             Err(error) => {
                 self.file_tree_navigation.borrow_mut().fail(&request);
-                ScanScheduler::global().retire_cancelled();
+                if let Ok(scheduler) = ScanScheduler::global() {
+                    scheduler.retire_cancelled();
+                }
                 self.refresh_file_tree_root_header();
                 self.refresh_file_tree_location_selector();
                 let detail = public_directory_error_message(&error);
@@ -3660,52 +3914,11 @@ impl UiState {
                 }
                 match result {
                     Ok(listing) => {
-                        if !ui
-                            .file_tree_navigation
-                            .borrow_mut()
-                            .commit(&request_for_result)
-                        {
-                            return;
-                        }
-                        let reconcile_started = Instant::now();
-                        let generation = ui.file_tree_model.reset();
-                        ui.file_tree_model
-                            .set_committed_authority(expected_authority.clone());
-                        *ui.file_tree_location.borrow_mut() =
-                            request_for_result.target.location.clone();
-                        *ui.file_tree_execution_overlay.borrow_mut() =
-                            request_for_result.target.overlay.clone();
-                        *ui.file_tree_root.borrow_mut() = request_for_result.target.root.clone();
-                        ui.file_tree_model
-                            .set_root_path(&request_for_result.target.root);
-                        ui.file_tree_model
-                            .mark_snapshot_completed(&request_for_result.target.root);
-                        let timing = listing.timing;
-                        let entry_count = listing.entries.len();
-                        ui.file_tree_model.replace_root(generation, listing.entries);
-                        ui.refresh_file_tree_location_selector();
-                        ui.refresh_file_tree_root_header();
-                        let delta = StoreReconcileDelta {
-                            inserted_rows: entry_count,
-                            ..StoreReconcileDelta::default()
-                        };
-                        log_scan_timing(
-                            &request_for_result.target.root,
-                            timing,
-                            reconcile_started.elapsed(),
-                            &delta,
+                        ui.commit_file_tree_point_listing(
+                            &request_for_result,
+                            expected_authority.clone(),
+                            listing,
                         );
-                        if listing.truncated {
-                            ui.toast_overlay.add_toast(adw::Toast::new(&format!(
-                                "{} has more than {} entries; showing the first {}",
-                                root_display_label(
-                                    &request_for_result.target.location,
-                                    &request_for_result.target.root
-                                ),
-                                remote_fs::MAX_DIRECTORY_ENTRIES,
-                                remote_fs::MAX_DIRECTORY_ENTRIES
-                            )));
-                        }
                     }
                     Err(error) => {
                         ui.file_tree_navigation
@@ -3749,7 +3962,9 @@ impl UiState {
             // selector/header immediately and retire its queued scan.
             self.invalidate_file_tree_remote_follow();
             if self.file_tree_navigation.borrow_mut().cancel_pending() {
-                ScanScheduler::global().retire_cancelled();
+                if let Ok(scheduler) = ScanScheduler::global() {
+                    scheduler.retire_cancelled();
+                }
             }
             self.refresh_file_tree_root_header();
             self.refresh_file_tree_location_selector();
@@ -4300,6 +4515,8 @@ impl UiState {
     }
 
     pub(crate) fn present_file_tree_path_dialog(&self) {
+        let expected_generation = self.file_tree_model.generation.get();
+        let expected_location = self.file_tree_location.borrow().clone();
         let dialog = adw::Dialog::builder()
             .title("Open Filesystem Path")
             .content_width(440)
@@ -4315,38 +4532,25 @@ impl UiState {
         error.set_wrap(true);
         error.set_visible(false);
 
-        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-        content.set_margin_start(12);
-        content.set_margin_end(12);
-        content.set_margin_top(12);
-        content.set_margin_bottom(12);
-        content.append(&entry);
-        content.append(&error);
-
         let breadcrumbs = gtk4::FlowBox::new();
         breadcrumbs.set_selection_mode(gtk4::SelectionMode::None);
         breadcrumbs.set_column_spacing(4);
         breadcrumbs.set_row_spacing(4);
         for ancestor in navigation_breadcrumbs(&self.file_tree_root.borrow()) {
-            let label = if ancestor == Path::new("/") {
-                "/".to_string()
-            } else {
-                ancestor
-                    .file_name()
-                    .map(|name| safe_file_label(&name.to_string_lossy()))
-                    .unwrap_or_else(|| "/".to_string())
-            };
-            let button = gtk4::Button::with_label(&label);
-            button.add_css_class("flat");
+            let button = navigation_breadcrumb_button(&ancestor);
             let ui = self.clone();
             let dialog_for_ancestor = dialog.clone();
+            let expected_location = expected_location.clone();
             button.connect_clicked(move |_| {
+                if !ui.require_current_file_tree_context(expected_generation, &expected_location) {
+                    return;
+                }
                 dialog_for_ancestor.close();
                 ui.set_file_tree_root(ancestor.clone());
             });
             breadcrumbs.insert(&button, -1);
         }
-        content.append(&breadcrumbs);
+        let content = navigation_path_content(&entry, &error, &breadcrumbs);
 
         let header = adw::HeaderBar::new();
         header.set_show_start_title_buttons(false);
@@ -4367,8 +4571,11 @@ impl UiState {
         });
         let ui = self.clone();
         let dialog_for_navigate = dialog.clone();
-        navigate.connect_clicked(
-            move |_| match validate_absolute_navigation_path(&entry.text()) {
+        navigate.connect_clicked(move |_| {
+            if !ui.require_current_file_tree_context(expected_generation, &expected_location) {
+                return;
+            }
+            match validate_absolute_navigation_path(&entry.text()) {
                 Ok(path) => {
                     dialog_for_navigate.close();
                     ui.set_file_tree_root(path);
@@ -4377,8 +4584,8 @@ impl UiState {
                     error.set_text(message);
                     error.set_visible(true);
                 }
-            },
-        );
+            }
+        });
         dialog.present(Some(&self.window));
     }
 
@@ -5998,6 +6205,60 @@ fn copy_path_payload(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn file_worker_startup_keeps_only_the_actual_started_pool() {
+        let mut attempts = Vec::new();
+        let started = start_file_workers(8, |index| {
+            attempts.push(index);
+            if index == 2 {
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "thread limit"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(started, 2);
+        assert_eq!(attempts, [0, 1, 2]);
+        assert_eq!(start_file_workers(3, |_| Ok(())).unwrap(), 3);
+    }
+
+    #[test]
+    fn file_worker_startup_rejects_zero_workers_without_admission() {
+        let error = start_file_workers(8, |_| {
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "thread limit"))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(error.to_string(), "thread limit");
+        assert_eq!(
+            start_file_workers(0, |_| panic!("empty pool must not spawn"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput,
+        );
+        assert!(ScanScheduler::new(0, 1).is_err());
+        assert!(FsOpScheduler::new(0, 1).is_err());
+    }
+
+    #[test]
+    fn unavailable_file_scheduler_preserves_error_without_retry_or_queue() {
+        let slot: OnceLock<io::Result<usize>> = OnceLock::new();
+        let first = cached_file_scheduler(&slot, || {
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "thread limit"))
+        })
+        .unwrap_err();
+        let repeated = cached_file_scheduler(&slot, || {
+            panic!("failed pool initialization is stable for this process")
+        })
+        .unwrap_err();
+        for error in [first, repeated] {
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(error.to_string(), "thread limit");
+            assert!(public_directory_error_message(&error).contains("restart Forge"));
+            assert!(public_file_operation_error_message(&error).contains("restart Forge"));
+        }
+    }
+
     fn navigation_point(path: &str) -> FileTreeNavigationPoint {
         FileTreeNavigationPoint {
             location: FsLocation::Local,
@@ -6242,6 +6503,53 @@ mod tests {
     }
 
     #[test]
+    fn automatic_probe_replacement_and_late_retirement_keep_latest_cancellable() {
+        let mut state = FileTreeNavigationState::default();
+        let old = state.begin_automatic_probe(41);
+        let latest = state.begin_automatic_probe(42);
+        assert!(old.is_cancelled());
+        assert!(!latest.is_cancelled());
+
+        // The old UI callback can arrive after a replacement was admitted.
+        state.retire_automatic_probe(41);
+        state.cancel_automatic_probe();
+        assert!(latest.is_cancelled());
+        assert!(state.automatic_probe.is_none());
+    }
+
+    #[test]
+    fn completed_automatic_probe_is_retired_without_cancelling_its_result() {
+        let mut state = FileTreeNavigationState::default();
+        let completed = state.begin_automatic_probe(41);
+        state.retire_automatic_probe(41);
+        assert!(state.automatic_probe.is_none());
+        assert!(!completed.is_cancelled());
+
+        // Retiring before the final live-context gate must not reject a
+        // successful result by cancelling the callback's cloned token.
+        state.cancel_automatic_probe();
+        assert!(!completed.is_cancelled());
+    }
+
+    #[test]
+    fn automatic_probe_cancellation_preserves_user_navigation_authority() {
+        let mut state = FileTreeNavigationState::default();
+        let original = navigation_point("/original");
+        state.install_initial(original.clone());
+        let automatic = state.begin_automatic_probe(41);
+        let manual = state.begin(navigation_point("/chosen"), FileTreeNavigationAction::Push);
+
+        // A terminal-focus change invalidates automatic follow only. The
+        // user's explicit Files navigation retains its independent request.
+        state.cancel_automatic_probe();
+        assert!(automatic.is_cancelled());
+        assert!(!manual.cancel.is_cancelled());
+        assert!(state.commit(&manual));
+        assert_eq!(state.current, Some(navigation_point("/chosen")));
+        assert_eq!(state.back_target(), Some(original));
+    }
+
+    #[test]
     fn transactional_navigation_history_is_bounded_and_branches_on_commit() {
         let mut state = FileTreeNavigationState::default();
         state.install_initial(navigation_point("/0"));
@@ -6310,6 +6618,253 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an isolated GTK display"]
+    fn path_dialog_long_components_keep_open_visible_and_full_targets() {
+        adw::init().unwrap();
+        for component in ["short".to_string(), "x".repeat(200), "界".repeat(80)] {
+            let path = PathBuf::from("/tmp").join(&component);
+            let parent = adw::Window::builder()
+                .default_width(500)
+                .default_height(320)
+                .content(&gtk4::Label::new(Some("inert Files dialog fixture")))
+                .build();
+            parent.present();
+            let dialog = adw::Dialog::builder()
+                .title("Open Filesystem Path")
+                .content_width(440)
+                .build();
+            let entry = adw::EntryRow::new();
+            entry.set_title("Absolute path");
+            entry.set_text(&path.to_string_lossy());
+            let breadcrumbs = gtk4::FlowBox::new();
+            breadcrumbs.set_selection_mode(gtk4::SelectionMode::None);
+            breadcrumbs.set_column_spacing(4);
+            breadcrumbs.set_row_spacing(4);
+            let selected = Rc::new(RefCell::new(None));
+            let mut last = None;
+            for ancestor in navigation_breadcrumbs(&path) {
+                let button = navigation_breadcrumb_button(&ancestor);
+                let selected = Rc::clone(&selected);
+                button.connect_clicked(move |_| {
+                    *selected.borrow_mut() = Some(ancestor.clone());
+                });
+                breadcrumbs.insert(&button, -1);
+                last = Some(button);
+            }
+            let error = gtk4::Label::new(None);
+            error.set_visible(false);
+            let content = navigation_path_content(&entry, &error, &breadcrumbs);
+            let header = adw::HeaderBar::new();
+            header.set_show_start_title_buttons(false);
+            header.set_show_end_title_buttons(false);
+            header.pack_start(&gtk4::Button::with_label("Cancel"));
+            let open = gtk4::Button::with_label("Open");
+            header.pack_end(&open);
+            let toolbar = adw::ToolbarView::new();
+            toolbar.add_top_bar(&header);
+            toolbar.set_content(Some(&content));
+            dialog.set_child(Some(&toolbar));
+            dialog.present(Some(&parent));
+            let context = glib::MainContext::default();
+            for _ in 0..60 {
+                while context.pending() {
+                    context.iteration(false);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let minimum = breadcrumbs.measure(gtk4::Orientation::Horizontal, -1).0;
+            let open_bounds = open.compute_bounds(&parent).unwrap();
+            eprintln!(
+                "component_bytes={} window_width={} breadcrumb_minimum={} open_right={}",
+                component.len(),
+                parent.width(),
+                minimum,
+                open_bounds.x() + open_bounds.width()
+            );
+            if component.len() == 200 {
+                if let Some(path) = std::env::var_os("FORGE_PATH_DIALOG_SCREENSHOT") {
+                    let paintable = gtk4::WidgetPaintable::new(Some(&parent));
+                    let snapshot = gtk4::Snapshot::new();
+                    paintable.snapshot(&snapshot, parent.width() as f64, parent.height() as f64);
+                    let renderer =
+                        gtk4::gsk::Renderer::for_surface(&parent.surface().unwrap()).unwrap();
+                    renderer
+                        .render_texture(snapshot.to_node().unwrap(), None)
+                        .save_to_png(path)
+                        .unwrap();
+                    renderer.unrealize();
+                }
+            }
+            assert!(
+                minimum <= parent.width(),
+                "long components must fit the dialog"
+            );
+            assert!(
+                open_bounds.x() >= 0.0
+                    && open_bounds.x() + open_bounds.width() <= parent.width() as f32,
+                "Open must remain inside the window"
+            );
+            let button = last.unwrap();
+            assert_eq!(button.label().as_deref(), Some(component.as_str()));
+            assert_eq!(button.tooltip_text().as_deref(), Some(component.as_str()));
+            button.grab_focus();
+            button.emit_clicked();
+            assert_eq!(*selected.borrow(), Some(path));
+            dialog.close();
+            parent.close();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display"]
+    fn path_dialog_deep_ancestors_keep_actions_and_focus_reachable() {
+        adw::init().unwrap();
+        // This isolated fixture checks settled allocation, not a spring-animation frame.
+        gtk4::Settings::default()
+            .unwrap()
+            .set_gtk_enable_animations(false);
+        let path = PathBuf::from((0..40).map(|i| format!("/dir{i}")).collect::<String>());
+        let parent = adw::Window::builder()
+            .default_width(500)
+            .default_height(320)
+            .content(&gtk4::Label::new(Some("inert deep-path fixture")))
+            .build();
+        parent.present();
+        let dialog = adw::Dialog::builder()
+            .title("Open Filesystem Path")
+            .content_width(440)
+            .build();
+        let entry = adw::EntryRow::new();
+        entry.set_title("Absolute path");
+        entry.set_text(&path.to_string_lossy());
+        let error = gtk4::Label::new(None);
+        error.set_wrap(true);
+        error.set_visible(false);
+        let breadcrumbs = gtk4::FlowBox::new();
+        breadcrumbs.set_selection_mode(gtk4::SelectionMode::None);
+        breadcrumbs.set_column_spacing(4);
+        breadcrumbs.set_row_spacing(4);
+        let selected = Rc::new(RefCell::new(None));
+        let mut last = None;
+        for ancestor in navigation_breadcrumbs(&path) {
+            let button = navigation_breadcrumb_button(&ancestor);
+            let selected = Rc::clone(&selected);
+            button.connect_clicked(move |_| *selected.borrow_mut() = Some(ancestor.clone()));
+            breadcrumbs.insert(&button, -1);
+            last = Some(button);
+        }
+        let content = navigation_path_content(&entry, &error, &breadcrumbs);
+        let header = adw::HeaderBar::new();
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+        let cancel = gtk4::Button::with_label("Cancel");
+        let open = gtk4::Button::with_label("Open");
+        header.pack_start(&cancel);
+        header.pack_end(&open);
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&content));
+        dialog.set_child(Some(&toolbar));
+        dialog.present(Some(&parent));
+        let pump = || {
+            let context = glib::MainContext::default();
+            for _ in 0..60 {
+                while context.pending() {
+                    context.iteration(false);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        pump();
+        let last = last.unwrap();
+        let open_bounds = open.compute_bounds(&parent).unwrap();
+        let last_bounds = last.compute_bounds(&parent).unwrap();
+        eprintln!(
+            "parent_height={} open_top={} last_bottom={}",
+            parent.height(),
+            open_bounds.y(),
+            last_bounds.y() + last_bounds.height()
+        );
+        let capture = |key: &str| {
+            if let Some(path) = std::env::var_os(key) {
+                let paintable = gtk4::WidgetPaintable::new(Some(&parent));
+                let snapshot = gtk4::Snapshot::new();
+                paintable.snapshot(&snapshot, parent.width() as f64, parent.height() as f64);
+                let renderer =
+                    gtk4::gsk::Renderer::for_surface(&parent.surface().unwrap()).unwrap();
+                renderer
+                    .render_texture(snapshot.to_node().unwrap(), None)
+                    .save_to_png(path)
+                    .unwrap();
+                renderer.unrealize();
+            }
+        };
+        capture("FORGE_PATH_SCROLL_SCREENSHOT");
+        for action in [&open, &cancel] {
+            let bounds = action.compute_bounds(&parent).unwrap();
+            assert!(
+                bounds.y() >= 0.0 && bounds.y() + bounds.height() <= parent.height() as f32,
+                "dialog actions must remain inside the compact window"
+            );
+        }
+        assert!(last.grab_focus());
+        pump();
+        let bounds = last.compute_bounds(&parent).unwrap();
+        assert!(
+            bounds.y() >= 0.0 && bounds.y() + bounds.height() <= parent.height() as f32,
+            "focusing the final ancestor must reveal it"
+        );
+        let viewport = content
+            .last_child()
+            .unwrap()
+            .downcast::<gtk4::ScrolledWindow>()
+            .unwrap();
+        let viewport_bounds = viewport.compute_bounds(&parent).unwrap();
+        assert!(
+            bounds.y() >= viewport_bounds.y()
+                && bounds.y() + bounds.height() <= viewport_bounds.y() + viewport_bounds.height(),
+            "focused ancestor must be fully inside the scrolling viewport"
+        );
+        let adjustment = viewport.vadjustment();
+        assert!(adjustment.value() > 0.0);
+        capture("FORGE_PATH_SCROLL_FOCUS_SCREENSHOT");
+        adjustment.set_value(0.0);
+        pump();
+        assert!(
+            adjustment.value().abs() < 0.5,
+            "idle layout must not undo a manual scroll away from the focused ancestor"
+        );
+        capture("FORGE_PATH_SCROLL_IDLE_SCREENSHOT");
+        entry.set_text("relative");
+        error.set_text(validate_absolute_navigation_path(&entry.text()).unwrap_err());
+        error.set_visible(true);
+        adjustment.set_value(adjustment.upper() - adjustment.page_size());
+        assert!(entry.grab_focus());
+        pump();
+        let content_bounds = content.compute_bounds(&parent).unwrap();
+        for widget in [entry.upcast_ref::<gtk4::Widget>(), error.upcast_ref()] {
+            let bounds = widget.compute_bounds(&parent).unwrap();
+            assert!(
+                bounds.y() >= content_bounds.y()
+                    && bounds.y() + bounds.height() <= content_bounds.y() + content_bounds.height(),
+                "path entry and validation error must remain visible"
+            );
+        }
+        capture("FORGE_PATH_SCROLL_ERROR_SCREENSHOT");
+        open.grab_focus();
+        assert!(last.grab_focus());
+        pump();
+        assert!(
+            adjustment.value() > 0.0,
+            "explicit focus reveals the ancestor again"
+        );
+        last.emit_clicked();
+        assert_eq!(*selected.borrow(), Some(path));
+        dialog.close();
+        parent.close();
+    }
+
+    #[test]
     fn navigation_path_validation_is_absolute_normalized_and_spoof_safe() {
         assert_eq!(
             validate_absolute_navigation_path("/srv/./app/../logs"),
@@ -6369,7 +6924,7 @@ mod tests {
 
     #[test]
     fn fs_op_scheduler_uses_fixed_workers_and_hard_queue_backpressure() {
-        let scheduler = FsOpScheduler::new(1, 1);
+        let scheduler = FsOpScheduler::new(1, 1).expect("test worker starts");
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
         scheduler
@@ -7259,6 +7814,60 @@ mod tests {
             public_file_operation_error_message(&invalid),
             "The operation or remote response was invalid"
         );
+    }
+
+    /// File-op toasts must keep permission distinct from missing — same split
+    /// as directory_scan_errors_distinguish_permission_from_missing, but for
+    /// rename/delete/copy public copy (never collapse into the generic Other).
+    #[test]
+    fn file_operation_errors_distinguish_permission_from_missing() {
+        assert_eq!(
+            public_file_operation_error_message(&io::Error::from(io::ErrorKind::PermissionDenied)),
+            "Permission denied"
+        );
+        assert_eq!(
+            public_file_operation_error_message(&io::Error::from(io::ErrorKind::NotFound)),
+            "The item no longer exists"
+        );
+        assert_ne!(
+            public_file_operation_error_message(&io::Error::from(io::ErrorKind::PermissionDenied)),
+            public_file_operation_error_message(&io::Error::from(io::ErrorKind::NotFound))
+        );
+    }
+
+    /// Handoff/TODO leftover: empty listings are success rows, while permission
+    /// and missing roots must surface distinct public copy (Retry + toast stay
+    /// on the Error status path — never reuse the empty-directory presentation).
+    #[test]
+    fn directory_scan_errors_distinguish_permission_from_missing() {
+        assert_eq!(
+            public_directory_error_message(&io::Error::from(io::ErrorKind::PermissionDenied)),
+            "Permission denied"
+        );
+        assert_eq!(
+            public_directory_error_message(&io::Error::from(io::ErrorKind::NotFound)),
+            "Directory not found or unavailable"
+        );
+        let denied =
+            directory_error_status(&io::Error::from(io::ErrorKind::PermissionDenied), None);
+        let missing = directory_error_status(&io::Error::from(io::ErrorKind::NotFound), None);
+        match (&denied, &missing) {
+            (
+                DirectoryRowStatus::Error {
+                    message: denied_msg,
+                    ..
+                },
+                DirectoryRowStatus::Error {
+                    message: missing_msg,
+                    ..
+                },
+            ) => {
+                assert_eq!(denied_msg, "Permission denied");
+                assert_eq!(missing_msg, "Directory not found or unavailable");
+                assert_ne!(denied_msg, missing_msg);
+            }
+            _ => panic!("permission and missing scans must publish Error rows, not empty listings"),
+        }
     }
 
     #[test]

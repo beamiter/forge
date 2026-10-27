@@ -16,6 +16,12 @@ use std::sync::Arc;
 use vte4::{CursorBlinkMode, CursorShape, PtyFlags, Terminal};
 use vte4::{TerminalExt, TerminalExtManual};
 
+mod launch_owner;
+mod launch_recovery;
+mod launch_state;
+mod launch_success;
+pub(crate) use launch_recovery::close_terminal_launch;
+
 use crate::config::Config;
 use crate::process::{ChildLifecycle, EscalationPolicy, ReapOwner};
 
@@ -95,6 +101,12 @@ pub(crate) fn focus_terminal(terminal: &Terminal) {
         );
     } else {
         log::debug!("focus_terminal: skipped immediate grab (mapped={mapped} on_page={on_page})");
+    }
+    if mapped && on_page && terminal.has_focus() {
+        // The explicit request succeeded. Only repair that ownership; a
+        // reopened search or another pane selected before idle supersedes it.
+        crate::block_view::restore_live_focus_deferred(terminal);
+        return;
     }
     let deferred = terminal.clone();
     glib::idle_add_local_once(move || {
@@ -203,15 +215,18 @@ type VoidCallbacks = Rc<RefCell<Vec<Box<dyn Fn()>>>>;
 #[allow(dead_code)]
 pub struct VteTerminalView {
     root: gtk4::Box,
+    launch_recovery: Rc<launch_recovery::LaunchRecovery>,
     /// Status strip above the grid, shown only while this pane's tab is split.
     pane_header: crate::ui::PaneHeader,
     terminal: Terminal,
     config: Rc<RefCell<Config>>,
     cwd_callbacks: StrCallbacks,
     exited_callbacks: IntCallbacks,
+    launch_failed_callbacks: StrCallbacks,
     bell_callbacks: VoidCallbacks,
     title_callbacks: StrCallbacks,
     activity_callbacks: VoidCallbacks,
+    organism: Rc<crate::ui::VteOrganismSurface>,
 }
 
 #[allow(dead_code)]
@@ -239,12 +254,29 @@ impl VteTerminalView {
         root.add_css_class("vte-view-root");
         root.append(pane_header.widget());
         root.append(&content);
+        let organism = crate::ui::VteOrganismSurface::new(&root, &terminal, &config.borrow());
 
         let cwd_callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn(&str)>>::new()));
         let exited_callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn(i32)>>::new()));
+        let launch_failed_callbacks: StrCallbacks = Rc::new(RefCell::new(Vec::new()));
         let bell_callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn()>>::new()));
         let title_callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn(&str)>>::new()));
         let activity_callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn()>>::new()));
+
+        let launch_recovery = launch_recovery::LaunchRecovery::new(
+            &root,
+            &terminal,
+            &organism,
+            shell_argv,
+            working_directory,
+            session_id,
+            initial_commands,
+            env_extra,
+            config.borrow().vim9.auto_gui,
+            on_launched,
+            launch_failed_callbacks.clone(),
+        );
+        root.insert_child_after(&launch_recovery.panel, Some(pane_header.widget()));
 
         // Listen for OSC 7 (CWD changes)
         let cwd_callbacks_clone = cwd_callbacks.clone();
@@ -272,13 +304,18 @@ impl VteTerminalView {
         // pid: after this point the lifecycle refuses to signal a number VTE
         // has already released for reuse.
         let exited_callbacks_clone = exited_callbacks.clone();
+        let launch_owner = launch_recovery.owner.clone();
         terminal.connect_child_exited(move |term, status| {
             let Some(code) = crate::process::exit_code_from_wait_status(status) else {
                 // A stop or continue report: the child is still alive.
                 return;
             };
+            let admitted_child = launch_owner.note_exit(code);
             if let Some(lifecycle) = terminal_child_lifecycle(term) {
                 lifecycle.note_foreign_exit(code);
+            }
+            if !admitted_child {
+                return;
             }
             for callback in exited_callbacks_clone.borrow().iter() {
                 callback(code);
@@ -315,32 +352,45 @@ impl VteTerminalView {
             }
         });
 
-        // Spawn shell
-        spawn_shell(
-            &terminal,
-            shell_argv,
-            working_directory,
-            session_id,
-            initial_commands,
-            env_extra,
-            on_launched,
-        );
+        // Failure is separate from child-exited. Recovery is opt-in and never
+        // starts another process until its Retry launch button is activated.
+        launch_recovery.start();
 
         VteTerminalView {
             root,
+            launch_recovery,
             pane_header,
             terminal,
             config,
             cwd_callbacks,
             exited_callbacks,
+            launch_failed_callbacks,
             bell_callbacks,
             title_callbacks,
             activity_callbacks,
+            organism,
         }
+    }
+
+    /// Ordinary local shells only; never enable this for task or remote views.
+    pub(crate) fn enable_local_launch_recovery(&self) {
+        self.launch_recovery.enable();
     }
 
     pub(crate) fn pane_header(&self) -> &crate::ui::PaneHeader {
         &self.pane_header
+    }
+
+    pub(crate) fn organism_presentation_surface(&self) -> Rc<crate::ui::VteOrganismSurface> {
+        self.organism.clone()
+    }
+
+    pub(crate) fn set_organism_local(&self, local: bool) {
+        self.organism.set_local(local);
+    }
+
+    pub(crate) fn sync_organism(&self, enabled: bool, motion: crate::config::OrganismMotion) {
+        self.organism.apply_settings(enabled, motion);
     }
 
     pub fn widget(&self) -> gtk4::Widget {
@@ -363,6 +413,21 @@ impl VteTerminalView {
         F: Fn(i32) + 'static,
     {
         self.exited_callbacks.borrow_mut().push(Box::new(callback));
+    }
+
+    /// Observe an admitted successful spawn, never an exec failure or a
+    /// settlement-only cleanup notification.
+    pub(crate) fn connect_launched(&self, callback: impl FnOnce() + 'static) {
+        self.launch_recovery.connect_launched(callback);
+    }
+
+    pub(crate) fn connect_launch_failed<F>(&self, callback: F)
+    where
+        F: Fn(&str) + 'static,
+    {
+        self.launch_failed_callbacks
+            .borrow_mut()
+            .push(Box::new(callback));
     }
 
     pub fn grab_focus(&self) {
@@ -432,6 +497,7 @@ impl VteTerminalView {
     /// followed by the widget's own teardown — finds a termination already in
     /// flight and does nothing.
     pub fn kill(&self) {
+        self.launch_recovery.close();
         if let Some(lifecycle) = terminal_child_lifecycle(&self.terminal) {
             lifecycle.terminate(TERMINAL_ESCALATION);
         }
@@ -474,19 +540,36 @@ pub(crate) fn scrollbar_wrapper_of(term_widget: &gtk4::Widget) -> Option<gtk4::B
 }
 
 pub(crate) fn terminal_working_directory(terminal: &Terminal) -> Option<String> {
-    // Prefer OSC 7 reported directory
+    // This value starts local shells and navigates the local Files tree.
+    // GFile::path() discards a file URI's remote authority, so it cannot be
+    // the decoder here. Remote cwd metadata remains available on the view.
     if let Some(uri) = terminal.current_directory_uri() {
-        let file = gio::File::for_uri(uri.as_str());
-        if let Some(path) = file
-            .path()
-            .map(|p| p.to_string_lossy().to_string())
-            .filter(|s| !s.is_empty())
-        {
+        if let Some(path) = local_osc7_working_directory(uri.as_str()) {
             return Some(path);
         }
     }
     // Fallback: read /proc/<pid>/cwd
     crate::process::process_cwd(terminal_child_pid(terminal)?)
+}
+
+/// Decode an OSC 7 path only in this machine's filesystem namespace.
+fn local_osc7_working_directory(uri: &str) -> Option<String> {
+    // Bound allocation before percent-decoding an untrusted terminal report.
+    if uri.len() > 16 * 1024 {
+        return None;
+    }
+    let (path, host) = glib::filename_from_uri(uri).ok()?;
+    if host.as_deref().is_some_and(|host| {
+        !host.is_empty()
+            && !host.eq_ignore_ascii_case("localhost")
+            && !host.eq_ignore_ascii_case(glib::host_name().as_str())
+    }) {
+        return None;
+    }
+    let path = path.to_str()?;
+    (std::path::Path::new(path).is_absolute()
+        && jterm_core::execution_journal::is_valid_jsh_cwd(path))
+    .then(|| path.to_string())
 }
 
 /// Commands typed into a new shell on its behalf, one PTY line each.
@@ -555,15 +638,22 @@ impl InitialCommands {
     }
 }
 
-pub(crate) fn spawn_shell(
+#[allow(clippy::too_many_arguments)]
+fn spawn_shell(
     terminal: &Terminal,
     argv_owned: &[String],
     working_directory: Option<&str>,
     session_id: Option<&str>,
-    initial_commands: &[String],
+    launch_owner: Rc<launch_owner::LaunchOwner>,
     env_extra: Vec<(String, String)>,
-    on_launched: Option<Box<dyn FnOnce()>>,
+    auto_gui: bool,
+    on_settled: Option<Box<dyn FnOnce()>>,
+    cancellable: &Cancellable,
+    on_resolved: Box<dyn FnOnce(Result<(), String>)>,
 ) {
+    let Some(generation) = launch_owner.state.borrow_mut().begin() else {
+        return;
+    };
     // Append --session <id> to argv when restoring a session (only for jsh)
     let mut argv_vec: Vec<String> = argv_owned.to_vec();
     if let Some(sid) =
@@ -585,8 +675,14 @@ pub(crate) fn spawn_shell(
     // for ordinary shells; task terminals use it to pin validation children to
     // no-rc startup files. The pairs must reach both a native child (through
     // the frozen envv) and a flatpak-spawn host wrapper (through wrap_argv).
-    let env_extra_pairs: Vec<(&str, &str)> = env_extra
+    let vim_environment = if env_extra.is_empty() {
+        crate::vim9_ide::shell_environment(argv_owned, auto_gui)
+    } else {
+        Vec::new()
+    };
+    let env_extra_pairs: Vec<(&str, &str)> = vim_environment
         .iter()
+        .chain(env_extra.iter())
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect();
     let home = std::env::var("HOME").ok();
@@ -651,7 +747,6 @@ pub(crate) fn spawn_shell(
         spawn_flags |=
             SpawnFlags::from_bits_retain(jterm_core::child_env::VTE_SPAWN_NO_PARENT_ENVV_BITS);
     }
-    let cancellable: Option<&Cancellable> = None;
     let spawn_working_directory = if crate::host::is_flatpak() {
         None
     } else {
@@ -660,59 +755,193 @@ pub(crate) fn spawn_shell(
     let terminal_for_pid = terminal.clone();
 
     // If initial commands are provided, send them after the shell starts.
-    let init_cmds: Vec<String> = initial_commands.to_vec();
-    let terminal_for_init = terminal.clone();
 
-    terminal.spawn_async(
-        PtyFlags::DEFAULT,
+    // Unlike terminal.spawn_async, this lets us acquire the child's identity
+    // BEFORE installing VTE's foreign watcher. Pty spawn leaves the successful
+    // DO_NOT_REAP_CHILD PID unreaped for its caller to watch.
+    let pty = match terminal.pty_new_sync(PtyFlags::DEFAULT, Some(cancellable)) {
+        Ok(pty) => pty,
+        Err(error) => {
+            // Preserve the constructor's asynchronous observer-registration contract.
+            glib::idle_add_local_once(move || {
+                resolve_spawn(
+                    &terminal_for_pid,
+                    launch_owner,
+                    generation,
+                    None,
+                    Err(error),
+                    on_settled,
+                    on_resolved,
+                );
+            });
+            return;
+        }
+    };
+    let spawned_pty = pty.clone();
+    pty.spawn_async(
         spawn_working_directory,
         &argv,
         envv,
         spawn_flags,
         || {},
         -1,
-        cancellable,
+        Some(cancellable),
         move |res| {
-            log::debug!("spawn_async: {res:?}");
-            // The spawn resolved one way or the other: the child (on success)
-            // has already entered its working directory through the path it
-            // was handed, so launch-time pins may be released now. Runs on
-            // failure too — the pin must not leak on a failed spawn.
-            if let Some(on_launched) = on_launched {
-                on_launched();
-            }
-            if let Ok(pid) = res {
-                let pid_i32: i32 = pid.into_glib();
-                // VTE spawned this child through glib, and glib's child watch
-                // is what calls `waitpid` for it — hence `Foreign`. The
-                // lifecycle only ever signals it (through a pidfd), and learns
-                // the status from `child-exited`; reaping here would consume
-                // the status VTE is waiting for and free the pid behind its
-                // back.
-                match ChildLifecycle::new(pid_i32, ReapOwner::Foreign) {
-                    Ok(lifecycle) => set_terminal_child_lifecycle(&terminal_for_pid, lifecycle),
-                    Err(error) => {
-                        log::warn!("Cannot manage the lifecycle of VTE child {pid_i32}: {error}")
+            let unwatched = res
+                .as_ref()
+                .ok()
+                .copied()
+                .map(launch_owner::UnwatchedChild::from_spawn_success);
+            if let Some(child) = &unwatched {
+                if let Err(error) = child.acquire(&launch_owner, generation) {
+                    let report = !launch_owner.state.borrow().closed();
+                    let message = unwind_unowned_spawn(
+                        &launch_owner,
+                        unwatched.unwrap(),
+                        &terminal_for_pid,
+                        &spawned_pty,
+                        error,
+                    );
+                    if let Some(on_settled) = on_settled {
+                        on_settled();
                     }
+                    if report {
+                        on_resolved(Err(message));
+                    }
+                    return;
                 }
             }
-            // Feed initial commands after the shell has fully initialized.
-            // We delay to ensure the shell has entered raw mode; sending \r
-            // too early would hit the kernel's cooked-mode icrnl translation
-            // (turning \r into \n), which raw-mode shells don't treat as Enter.
-            // Each pre-parsed command is fed as exactly one line; splitting
-            // here would let a restored command's own bytes change boundaries.
-            if !init_cmds.is_empty() {
-                let cmds = init_cmds.clone();
-                glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
-                    for line in &cmds {
-                        let text = format!("{line}\r");
-                        terminal_for_init.feed_child(text.as_bytes());
-                    }
-                });
-            }
+            resolve_spawn(
+                &terminal_for_pid,
+                launch_owner,
+                generation,
+                unwatched.map(|child| (child, &spawned_pty)),
+                res,
+                on_settled,
+                on_resolved,
+            );
         },
     );
+}
+
+/// Exceptional pre-watch unwind shared with deterministic native coverage.
+fn unwind_unowned_spawn(
+    owner: &launch_owner::LaunchOwner,
+    child: launch_owner::UnwatchedChild,
+    terminal: &Terminal,
+    pty: &vte4::Pty,
+    error: std::io::Error,
+) -> String {
+    owner.state.borrow_mut().close();
+    owner.retain_for_reap(terminal);
+    let stopped = child.abort_before_watch();
+    child.watch(terminal, pty);
+    let detail = jterm_core::review_input::safe_inline_display(&error.to_string(), 256);
+    let message = if stopped.is_ok() {
+        format!(
+            "Terminal launch aborted: process ownership unavailable ({detail}). Close this pane and try again. Detached descendant cleanup could not be verified."
+        )
+    } else {
+        format!(
+            "Terminal launch could not be safely managed or stopped ({detail}). Close this pane and check the child process."
+        )
+    };
+    log::error!("{message}");
+    message
+}
+
+/// The production completion boundary also used by deterministic native races.
+#[allow(clippy::too_many_arguments)]
+fn resolve_spawn(
+    terminal_for_pid: &Terminal,
+    launch_owner: Rc<launch_owner::LaunchOwner>,
+    generation: launch_state::Generation,
+    unwatched_pty: Option<(launch_owner::UnwatchedChild, &vte4::Pty)>,
+    res: Result<glib::Pid, glib::Error>,
+    on_settled: Option<Box<dyn FnOnce()>>,
+    on_resolved: Box<dyn FnOnce(Result<(), String>)>,
+) {
+    let launch_state = launch_owner.state.clone();
+    let terminal_for_init = terminal_for_pid.clone();
+    log::debug!("spawn_async: {res:?}");
+    // The spawn resolved one way or the other: the child (on success)
+    // has already entered its working directory through the path it
+    // was handed, so launch-time pins may be released now. Runs on
+    // failure too — the pin must not leak on a failed spawn.
+    let accepted = launch_state.borrow_mut().resolve(generation, res.is_ok());
+    if res.is_ok() {
+        if accepted {
+            launch_owner.admit();
+            if let Some(child) = launch_owner.child(generation) {
+                set_terminal_child_lifecycle(terminal_for_pid, child);
+            }
+        }
+        // No watcher exists yet: the successful child/zombie pins its PID
+        // and its own process-group identity. Abort only through this token,
+        // with no delayed numeric signaling or /proc scans.
+        if let Some((child, pty)) = unwatched_pty {
+            if !accepted {
+                launch_owner.retain_for_reap(terminal_for_pid);
+                if let Err(error) = child.abort_before_watch() {
+                    log::error!("Cancelled terminal child could not be stopped: {error}");
+                }
+            }
+            child.watch(terminal_for_pid, pty);
+        }
+    }
+    if let Some(on_settled) = on_settled {
+        on_settled();
+    }
+    if !accepted {
+        return;
+    }
+    match res {
+        Ok(_) => {}
+        Err(error) => {
+            let detail = jterm_core::review_input::safe_inline_display(&error.to_string(), 2048);
+            let message = format!("Could not launch terminal: {detail}");
+            log::error!("{message}");
+            // Observers must retire the launch before the diagnostic
+            // can emit contents-changed (remote first-output badges).
+            let diagnostic = format!("\r\nforge: {message}\r\n");
+            if !launch_state.borrow().failed_generation(generation) {
+                return;
+            }
+            on_resolved(Err(message));
+            if launch_state.borrow().failed_generation(generation) {
+                terminal_for_pid.feed(diagnostic.as_bytes());
+            }
+            return;
+        }
+    };
+    if !launch_state.borrow().running_generation(generation) {
+        return;
+    }
+    on_resolved(Ok(()));
+    // Feed initial commands after the shell has fully initialized.
+    // We delay to ensure the shell has entered raw mode; sending \r
+    // too early would hit the kernel's cooked-mode icrnl translation
+    // (turning \r into \n), which raw-mode shells don't treat as Enter.
+    // Each pre-parsed command is fed as exactly one line; splitting
+    // here would let a restored command's own bytes change boundaries.
+    if launch_state.borrow().pending_count() != 0 {
+        glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
+            if terminal_for_init.root().is_none()
+                || terminal_child_lifecycle(&terminal_for_init)
+                    .is_none_or(|child| child.exit_code().is_some())
+            {
+                return;
+            }
+            let cmds = launch_state.borrow_mut().take_commands(generation);
+            for line in &cmds {
+                if !launch_state.borrow().running_generation(generation) {
+                    break;
+                }
+                let text = format!("{line}\r");
+                terminal_for_init.feed_child(text.as_bytes());
+            }
+        });
+    }
 }
 
 pub(crate) fn open_uri(uri: &str) {
@@ -1060,6 +1289,65 @@ pub(crate) fn reattach_terminal_to_tree(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn explicit_focus_return_respects_reopened_search() {
+        use gtk4::prelude::*;
+        use std::time::{Duration, Instant};
+        gtk4::init().unwrap();
+        let terminal = vte4::Terminal::new();
+        let search = gtk4::SearchEntry::new();
+        let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        root.append(&terminal);
+        root.append(&search);
+        let window = gtk4::Window::builder().child(&root).build();
+        window.present();
+        let context = gtk4::glib::MainContext::default();
+        let until = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < until {
+            while context.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(terminal.is_mapped());
+        for transient_owner in [false, true] {
+            // This is the production entry point used when closing Find.
+            super::focus_terminal(&terminal);
+            assert!(terminal.has_focus());
+            assert!(search.grab_focus());
+            if transient_owner {
+                GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+            }
+            while context.iteration(false) {}
+            assert!(!terminal.has_focus(), "newer search ownership wins at idle");
+            if !transient_owner {
+                let owner = GtkWindowExt::focus(&window).unwrap();
+                assert!(
+                    owner == *search.upcast_ref::<gtk4::Widget>() || owner.is_ancestor(&search)
+                );
+            }
+        }
+        // A temporary absence of focus without a newer owner still repairs.
+        super::focus_terminal(&terminal);
+        GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+        while context.iteration(false) {}
+        assert!(terminal.has_focus());
+        // Pending repair does not keep a removed terminal alive.
+        super::focus_terminal(&terminal);
+        let weak = terminal.downgrade();
+        let weak_window = window.downgrade();
+        // Release GTK's window focus ownership before testing the pending
+        // callback's lifetime. Do not drain idle until after these assertions.
+        GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+        assert!(GtkWindowExt::focus(&window).is_none());
+        root.remove(&terminal);
+        window.destroy();
+        drop(terminal);
+        drop(window);
+        assert!(weak.upgrade().is_none());
+        assert!(weak_window.upgrade().is_none());
+        while context.iteration(false) {}
+    }
+
     use super::InitialCommands;
 
     fn strings(values: &[&str]) -> Vec<String> {
@@ -1264,6 +1552,106 @@ mod tests {
         }
     }
 
+    /// A rejected exec has no child-exited signal. Its separate failure
+    /// notification must end both kinds of task session and release the pin.
+    #[test]
+    #[ignore = "requires a GTK display"]
+    fn a_failed_vte_spawn_retires_task_sessions_without_an_exit_code() {
+        use crate::agent_task::{
+            AgentProvider, NewTask, TaskManager, TaskStatus, TaskValidationStatus,
+        };
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        gtk4::init().expect("GTK display");
+        let context = gtk4::glib::MainContext::default();
+        let _guard = context.acquire().expect("own GTK main context");
+        for validation in [false, true] {
+            let mut manager = TaskManager::new();
+            let task_id = manager
+                .create(NewTask {
+                    title: "failed exec".into(),
+                    provider: AgentProvider::Codex,
+                    repo_root: "/repo".into(),
+                    worktree_path: "/tasks/failed-exec".into(),
+                    branch: "app/failed-exec".into(),
+                    base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+                    source_context: None,
+                })
+                .unwrap();
+            if validation {
+                manager
+                    .update_status(task_id, TaskStatus::ReadyForReview, None)
+                    .unwrap();
+                manager
+                    .bind_validation_session(task_id, "failed-launch".into())
+                    .unwrap();
+            } else {
+                manager
+                    .bind_terminal_session(task_id, "failed-launch".into())
+                    .unwrap();
+            }
+            let manager = Rc::new(RefCell::new(manager));
+            let resolved = Rc::new(Cell::new(false));
+            let release_pin = resolved.clone();
+            let view = super::VteTerminalView::new(
+                Rc::new(RefCell::new(crate::config::Config::safe_defaults())),
+                &["/forge-test/nonexistent-executable".into()],
+                Some("/tmp"),
+                None,
+                &[],
+                Vec::new(),
+                Some(Box::new(move || release_pin.set(true))),
+            );
+            let failure = Rc::new(RefCell::new(None));
+            let failure_callback = failure.clone();
+            let manager_callback = manager.clone();
+            view.connect_launch_failed(move |message| {
+                *failure_callback.borrow_mut() = Some(message.to_string());
+                manager_callback
+                    .borrow_mut()
+                    .handle_terminal_session_exit("failed-launch", None);
+            });
+            let exits = Rc::new(Cell::new(0));
+            let exits_callback = exits.clone();
+            view.connect_exited(move |_| exits_callback.set(exits_callback.get() + 1));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while failure.borrow().is_none() && std::time::Instant::now() < deadline {
+                context.iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert!(
+                resolved.get(),
+                "spawn resolution must release the validation pin"
+            );
+            assert!(
+                failure
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|message| message.contains("nonexistent-executable")),
+                "a failed exec must report its cause instead of leaving a task running"
+            );
+            assert_eq!(
+                exits.get(),
+                0,
+                "failed exec has no authoritative child exit"
+            );
+            let mut manager = manager.borrow_mut();
+            // Closing the diagnostic pane cannot rewrite the recorded failure.
+            manager.handle_terminal_session_closed("failed-launch");
+            let task = manager.get(task_id).unwrap();
+            if validation {
+                assert_eq!(task.validation.status, TaskValidationStatus::Inconclusive);
+                assert_eq!(task.validation.exit_code, None);
+                assert_eq!(manager.next_validation_attempt(task_id).unwrap(), 2);
+            } else {
+                assert_eq!(task.status, TaskStatus::Failed);
+                assert_eq!(task.exit_code, None);
+                assert!(manager.terminal_retry_session_id(task_id).is_ok());
+            }
+        }
+    }
+
     /// Needs a display: runs from `make test-display`.
     #[test]
     #[ignore = "requires a GTK display"]
@@ -1342,5 +1730,50 @@ mod tests {
             "{labelled:?}"
         );
         window.close();
+    }
+}
+
+#[cfg(test)]
+mod local_cwd_authority_tests {
+    use super::local_osc7_working_directory;
+
+    #[test]
+    fn remote_osc7_paths_never_become_local_working_directories() {
+        for uri in [
+            "file://remote.invalid/tmp",
+            "file://remote.invalid/",
+            "sftp://remote.invalid/tmp",
+        ] {
+            assert_eq!(local_osc7_working_directory(uri), None, "{uri}");
+        }
+    }
+
+    #[test]
+    fn local_osc7_authorities_preserve_exact_valid_paths() {
+        for uri in [
+            "file:///tmp/My%20Files".to_string(),
+            "file://LOCALHOST/tmp/My%20Files".to_string(),
+            format!("file://{}/tmp/My%20Files", gtk4::glib::host_name()),
+        ] {
+            assert_eq!(
+                local_osc7_working_directory(&uri).as_deref(),
+                Some("/tmp/My Files")
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_osc7_paths_cannot_start_a_local_shell() {
+        for uri in [
+            "file:///tmp/a%0Ab".to_string(),
+            "file:///tmp/a%E2%80%AEb".to_string(),
+            "file:///tmp/%FF".to_string(),
+            "file:///tmp/%00".to_string(),
+            "file:///tmp/%2".to_string(),
+            format!("file:///{}", "a".repeat(4097)),
+            format!("file:///{}", "%61".repeat(16384)),
+        ] {
+            assert_eq!(local_osc7_working_directory(&uri), None);
+        }
     }
 }

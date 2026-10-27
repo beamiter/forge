@@ -323,6 +323,32 @@ fn finished_content_rows(
     cursor_rows.max(text_rows).clamp(1, fallback.max(1))
 }
 
+#[cfg(test)]
+thread_local! {
+    static FIND_RENDER_TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_find_render_trace(enabled: bool) {
+    FIND_RENDER_TRACE.with(|trace| trace.set(enabled));
+}
+
+#[cfg(test)]
+pub(crate) fn trace_find_render(event: &str, terminal: &Terminal) {
+    if !FIND_RENDER_TRACE.with(std::cell::Cell::get) {
+        return;
+    }
+    let adjustment = terminal
+        .vadjustment()
+        .map(|a| (a.lower(), a.value(), a.upper(), a.page_size()));
+    eprintln!(
+        "FIND-RENDER {event} terminal={terminal:?} mapped={} selected={:?} grid={}x{} pixel={}x{} adjustment={adjustment:?}",
+        terminal.is_mapped(),
+        terminal.text_selected(vte4::Format::Text),
+        terminal.column_count(), terminal.row_count(), terminal.width(), terminal.height(),
+    );
+}
+
 /// Fit a read-only finished VTE to the rows it actually rendered.
 ///
 /// Measuring VTE's text/cursor state covers ANSI cursor movement, erases, tabs,
@@ -330,6 +356,9 @@ fn finished_content_rows(
 /// intentionally bidirectional: estimates are only capture capacity, never a
 /// minimum visible height.
 pub(crate) fn fit_finished_terminal_to_content(terminal: &Terminal) {
+    #[cfg(test)]
+    trace_find_render("fit-before", terminal);
+
     let visible_rows = terminal.row_count().max(1);
     let cols = terminal.column_count().max(1);
     let (_, cursor_row) = terminal.cursor_position();
@@ -371,9 +400,9 @@ pub(crate) fn fit_finished_terminal_to_content(terminal: &Terminal) {
     terminal.set_scrollback_lines(scrollback_rows);
     let cell_height = (terminal.char_height() as i32).max(1);
     terminal.set_height_request(finished_vte_height_px(rows, cell_height));
-    if let Some(adj) = terminal.vadjustment() {
-        adj.set_value(adj.lower());
-    }
+    anchor_terminal_top(terminal);
+    #[cfg(test)]
+    trace_find_render("fit-after", terminal);
 }
 
 /// Poll cadence and bound for the feed-applied detectors below. The cap is a
@@ -421,6 +450,11 @@ fn feed_tail_applied(terminal: &Terminal, expected_tail: Option<&str>) -> bool {
 }
 
 fn anchor_terminal_top(terminal: &Terminal) {
+    // Native find has already scrolled its confirmed match into view. A
+    // later render-settle pin must not hide that selection again.
+    if terminal.search_get_regex().is_some() && terminal.has_selection() {
+        return;
+    }
     if let Some(adj) = terminal.vadjustment() {
         adj.set_value(adj.lower());
     }
@@ -470,10 +504,18 @@ pub(crate) fn settle_finished_terminal_after_feed(
                 // snapshot. The generic fit deliberately keeps a bounded
                 // recovery ring for stale/mid-feed callers; it is safe to drop
                 // that ring only here.
+                #[cfg(test)]
+                trace_find_render("settle-before-drop-ring", &terminal);
                 terminal.set_scrollback_lines(0);
+                #[cfg(test)]
+                trace_find_render("settle-after-drop-ring", &terminal);
             }
             let terminal = terminal.clone();
-            glib::idle_add_local_once(move || anchor_terminal_top(&terminal));
+            glib::idle_add_local_once(move || {
+                anchor_terminal_top(&terminal);
+                #[cfg(test)]
+                trace_find_render("settle-final-anchor", &terminal);
+            });
         });
         glib::ControlFlow::Break
     });
@@ -583,6 +625,9 @@ pub(crate) fn apply_snapshot_theme_to_vte(terminal: &Terminal, config: &Config) 
     let mut transparent = config.background;
     transparent.set_alpha(0.0);
     terminal.set_color_cursor(Some(&transparent));
+    if terminal.has_css_class("chat-command-terminal") {
+        terminal.set_color_background(&transparent);
+    }
 }
 
 /// A read-only PTY-less VTE used as the renderer for a single finished block.
@@ -934,5 +979,44 @@ mod tests {
             finished_content_rows(Some("alpha\n\n"), 80, 2, 0.0, 20.0, 20),
             3
         );
+    }
+    #[test]
+    fn disabled_reporting_never_reaches_the_host_wheel_encoder() {
+        use jterm_core::parser::{Parser, ParserConfig, ParserEvent};
+        for stream in [
+            b"\x1b[?1000h".as_slice(),
+            b"\x1b[?1000\x00h",
+            b"\x1b[?1000\x07;1006h",
+            b"\x1b[?10\x7f00;1004h",
+            b"\x1b[?1006;1000;1004h",
+            b"\x1b[?2004;1049;1003;1006;1004h",
+        ] {
+            for enabled in [false, true] {
+                let mut parser = Parser::with_config(ParserConfig {
+                    mouse_reporting: enabled,
+                    focus_reporting: enabled,
+                });
+                let mut events = Vec::new();
+                parser.feed(stream, &mut events);
+                let mut state = MouseReporting::OFF;
+                for event in &events {
+                    if let ParserEvent::DecsetMode { mode, set } = event {
+                        state.apply_decset(*mode, *set);
+                    }
+                }
+                assert_eq!(
+                    encode_mouse_wheel(state, 1.0, 7, 9).is_some(),
+                    enabled,
+                    "stream={stream:?}"
+                );
+                if !enabled {
+                    assert!(!events
+                        .iter()
+                        .any(|event| matches!(event, ParserEvent::DecsetMode { mode: 1004, .. })));
+                    assert!(!parser.focus_events());
+                    assert_eq!(parser.mouse_mode(), MouseMode::None);
+                }
+            }
+        }
     }
 }

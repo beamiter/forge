@@ -1,6 +1,8 @@
 use gtk4::glib::prelude::ObjectExt;
 use gtk4::Notebook;
-use gtk4::{CssProvider, ScrolledWindow, SearchBar, SearchEntry, Stack, ToggleButton};
+use gtk4::{
+    Button, CssProvider, Label, ScrolledWindow, SearchBar, SearchEntry, Stack, ToggleButton,
+};
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -13,6 +15,7 @@ use crate::keybindings::KeybindingMap;
 
 mod actions;
 mod agent_panel;
+mod agent_sessions;
 mod ai_chat_store;
 mod ai_panel;
 mod bottom_bar;
@@ -28,21 +31,29 @@ mod jsh;
 mod layout;
 mod notebooks;
 mod organism;
+mod organism_vte;
 mod pane_dnd;
 mod pane_header;
 mod pane_leaf;
 mod pane_node;
 mod pane_tree_edit;
 mod panes;
+pub(crate) mod path_drop;
 mod remote_fs;
 mod search;
+mod search_preview;
 mod session;
 mod sidebar_tabs;
+#[cfg(test)]
+mod tab_geometry_tests;
 mod tab_strip;
 mod tabs;
 mod task_ops;
 mod tasks_panel;
+mod workflow_library;
 mod zoom;
+
+pub(crate) use tab_strip::install_top_tab_geometry_reveal;
 
 pub(crate) use agent_panel::{AgentHandle, AgentUiLifetime};
 pub(crate) use ai_panel::AiPanel;
@@ -56,12 +67,14 @@ pub(crate) use file_tree::{
 pub(crate) use organism::{
     pane_token, OrganismActivity, OrganismAgentSignal, OrganismCorrectionSignal, OrganismPresence,
 };
+pub(crate) use organism_vte::VteOrganismSurface;
 pub(crate) use pane_header::{PaneHeader, PANE_HEADER_CSS};
 pub(crate) use pane_leaf::PaneLeaf;
 pub(crate) use pane_node::PaneNode;
 pub(crate) use pane_tree_edit::{
-    detach_leaf_and_promote, detach_leaf_for_zoom, plan_existing_leaf_split, restore_zoomed_leaf,
-    ZoomPageSwap,
+    detach_leaf_and_promote, detach_leaf_for_zoom, plan_existing_leaf_split,
+    restore_surviving_focus, restore_zoomed_leaf, restore_zoomed_leaf_preserving_selection,
+    widget_is_within, ZoomPageSwap,
 };
 pub(crate) use remote_fs::{FsClipboard, FsExecutionOverlay, FsLocation};
 pub(crate) use task_ops::AgentTaskDomain;
@@ -255,8 +268,30 @@ pub(crate) fn tab_display_title(
     }
 }
 
+/// Accessible name and default tooltip of the top-bar Tasks button.
+pub(crate) const TASKS_BUTTON_LABEL: &str = "Toggle agent Tasks panel";
+pub(crate) const TASKS_BUTTON_TOOLTIP: &str = "Agent tasks · Toggle Tasks (Ctrl+Alt+Shift+T)";
+
+/// Tooltip and accessible name for the Tasks button. Attention is counted by
+/// the shared dashboard rule; hidden tasks never count.
+pub(crate) fn tasks_button_presentation(count: usize, summary: Option<&str>) -> (String, String) {
+    let tooltip = match summary {
+        Some(summary) if count > 0 => format!("{summary} · Toggle Tasks (Ctrl+Alt+Shift+T)"),
+        _ => TASKS_BUTTON_TOOLTIP.to_string(),
+    };
+    let label = if count > 0 {
+        format!("{TASKS_BUTTON_LABEL}, {count} need you")
+    } else {
+        TASKS_BUTTON_LABEL.to_string()
+    };
+    (tooltip, label)
+}
+
 #[derive(Clone)]
 pub(crate) struct UiState {
+    /// Navigation widgets upgrade the window controller only for a click;
+    /// they must not retain the notebook that contains themselves.
+    pub(crate) unified_navigation_owner: Rc<RefCell<std::rc::Weak<UiState>>>,
     pub(crate) window: adw::ApplicationWindow,
     /// Window-level toast host wrapping the main layout.
     pub(crate) toast_overlay: adw::ToastOverlay,
@@ -265,6 +300,9 @@ pub(crate) struct UiState {
     /// separate toast per step.
     pub(crate) opacity_toast: Rc<RefCell<Option<adw::Toast>>>,
     pub(crate) notebook: Notebook,
+    pub(crate) agent_session_tabs:
+        RefCell<HashMap<agent_sessions::SessionIdentity, gtk4::glib::WeakRef<Terminal>>>,
+    pub(crate) agent_session_library: Rc<RefCell<jterm_core::agent_sessions::SessionLibraryStore>>,
     pub(crate) tab_counter: Rc<Cell<u32>>,
     pub(crate) font_scale: Rc<Cell<f64>>,
     /// Generation token for generic debounced config writes. Sliders, paned
@@ -279,6 +317,7 @@ pub(crate) struct UiState {
     /// through in a few milliseconds. `Some` means a sweep is already queued
     /// and only needs its target updated.
     pub(crate) pending_font_scale: Rc<Cell<Option<f64>>>,
+    pub(crate) pending_chrome_font_scale: Rc<Cell<Option<f64>>>,
     pub(crate) window_opacity: Rc<Cell<f64>>,
     pub(crate) shell_argv: Rc<RefCell<Vec<String>>>,
     pub(crate) config: Rc<RefCell<Config>>,
@@ -288,6 +327,7 @@ pub(crate) struct UiState {
     pub(crate) search_status: gtk4::Label,
     pub(crate) search_debounce_source: Rc<RefCell<Option<gtk4::glib::SourceId>>>,
     pub(crate) search_generation: Rc<Cell<u64>>,
+    pub(crate) search_owner: Rc<RefCell<Option<search::SearchOwner>>>,
     pub(crate) tab_strip: gtk4::Box,
     pub(crate) sidebar: gtk4::Box,
     /// Sidebar scroll holder for the (vertical) tab strip.
@@ -377,8 +417,12 @@ pub(crate) struct UiState {
     /// Window-lifetime, memory-only search intent; never persisted in config
     /// or workspace snapshots.
     pub(crate) cross_block_search_memory: Rc<RefCell<dialogs::CrossBlockSearchMemory>>,
+    pub(crate) workflow_library:
+        jterm_core::workflows::BackgroundRefresh<Vec<crate::workflows::Workflow>>,
     pub(crate) workflows_palette_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     pub(crate) settings_dialog: Rc<RefCell<Option<adw::PreferencesDialog>>>,
+    pub(crate) organism_settings_controls:
+        Rc<RefCell<Option<Rc<dialogs::OrganismSettingsControls>>>>,
     pub(crate) debug_dashboard_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     /// The single active Shell Agent session, rendered as an inline card in
     /// its bound Block pane's conversation (not a dialog).
@@ -403,13 +447,18 @@ pub(crate) struct UiState {
     /// life simulation: one mind, one clock, however many pane bodies.
     pub(crate) organism_activity: Rc<OrganismActivity>,
     /// Focus-backed visibility arbiter: pane-local inline/sticky forms remain,
-    /// but at most one local Block pane owns the spatial live body.
+    /// but at most one local Block/Unified pane owns the spatial live body.
     pub(crate) organism_presence: Rc<OrganismPresence>,
     /// Content-free Shell Agent lifecycle phases feeding the shared mind.
     pub(crate) organism_agent: Rc<OrganismAgentSignal>,
     /// Visible top-bar control reflecting whether a Shell Agent session is
     /// currently active.
     pub(crate) agent_toggle: ToggleButton,
+    /// Top-bar Tasks button and its attention count.
+    pub(crate) tasks_button: Button,
+    pub(crate) tasks_badge: Label,
+    /// Last Tasks button state, to skip redundant widget updates.
+    pub(crate) task_badge_state: RefCell<Option<(bool, usize, Option<String>)>>,
     /// Suppresses a storm of identical persistence alerts while a continuous
     /// setting (opacity/font size) emits multiple change notifications.
     pub(crate) config_save_error_visible: Rc<Cell<bool>>,

@@ -6,6 +6,130 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- Soft-wrapped lines are painted natively in the Vim9 editor instead of
+  switching the buffer to the compatibility view: continuation rows,
+  `showbreak`, `breakindent` and `smoothscroll` partial lines keep Vim's exact
+  layout, and touchpad or wheel scrolling moves one wrapped row at a time
+  (shared core render protocol 9).
+- Closed Vim folds are painted natively in the Vim9 editor instead of
+  switching the buffer to the compatibility view: fold text and its filler use
+  Vim's `Folded` colors, rows below keep Vim's positions, and touchpad or wheel
+  scrolling moves across a fold as one smooth row. Clicks in a folded split
+  use Vim's own mouse handling (shared core render protocol 8).
+
+- Unified now has a compact, separately allocated command navigation row with
+  Live/Reading history feedback, unread completed-command counts, Previous/Next,
+  Copy current command, pane-owned Find/Browse, and Return to live. Navigation
+  uses authenticated native locations and stable retained record identities;
+  missing locations remain explicit. Native selection and shell shortcuts stay
+  intact, and the row hides while an alternate-screen application owns the grid.
+
+- Unified Find rebuilds an active query after a command completes or the terminal
+  resets. Find launched from a pane keeps that owner for Preview, stepping and
+  focus restoration, including when another split previously held input focus.
+
+- The Find bar's new Preview button searches a frozen, bounded copy of retained
+  completed-record text. Repeated matches on one line have exact Unicode-aware
+  preview ranges and forward/backward navigation. Partial/missing history is
+  explicit; limits fail closed. Preview does not replace native terminal Find.
+
+- Ctrl+wheel now independently zooms the top-bar/sidebar text group or the main
+  content group under the pointer. Both scales persist; legacy configs retain
+  their initial appearance, and fractional touchpad motion stays proportional.
+
+- Approval cards now expose read-only, paged request details from the exact frozen protocol evidence. Missing fields and display limits are explicit; stale task/request controls cannot dispatch decisions.
+
+- Rejected terminal input now explains whether the 256 KiB byte limit, a full
+  queue, or a closed connection prevented sending. Native input feedback is
+  passive and coalesced; failed Chat Send preserves an exact bounded draft with
+  an explicit Copy draft action. Rejected input is never automatically resent.
+
+- Failed and waiting task rows show a bounded reason preview without requiring
+  selection; validation failure details take priority when available.
+
+- Task cards can return to an existing Agent terminal or validation output,
+  including a pane in another tab, without creating another session.
+
+- Tasks filters show visible and search-matching counts separately, with one-click
+  filter clearing and recovery of a hidden selected task without changing selection.
+  Enter in task search opens the first matching task through ordinary selection.
+  Each status filter shows its count for the current search.
+
+- Add opt-in native Chat terminal mode (`--mode chat`, `terminal_mode = "chat"`):
+  command capsules, wide result cards, docked real shell input, running/Stop
+  controls and native TUI/passthrough recovery. The existing PTY, input, output,
+  search and history machinery is shared; defaults and other modes stay intact.
+
+
+- Long cwd and Git status labels now ellipsize within the bottom bar instead
+  of forcing an oversized window minimum. Their complete composed text stays
+  in the label and tooltip; grid, exit and tab metadata keep their sizing.
+
+- Files path dialogs scroll deep ancestor lists within compact windows while
+  keeping Open and Cancel visible. Keyboard focus reveals the chosen ancestor,
+  and manual scrolling stays where the user leaves it.
+
+- Files path-dialog breadcrumbs ellipsize long components so Open and Cancel
+  stay visible; tooltips retain the full display name and navigation uses the
+  original complete path.
+
+- Window restore preserves the original snapshot when layout bounds omit tabs
+  or splits, before saving the surviving workspace. If the recovery move fails,
+  session writes and publication pause instead of replacing the original; the
+  existing bounded recovery-copy retention policy still applies.
+
+- Block history Retry keeps failed-load state until it can reload, and repeated
+  retry failures reappear in the persistent notice. A successful repaired-file
+  reload still replays and saves; ordinary autosave errors remain deduplicated.
+
+- Unified history decoding validates every saved zone while retaining only the
+  newest 64 records, avoiding large temporary record arrays from files with
+  many tiny entries. Partial restores still preserve the original file.
+
+- Appended Pango font fallbacks no longer acquire an extra leading space in
+  their family name, so an explicit installed fallback resolves correctly when
+  the primary font is unavailable. Font styles, saved settings and CSS stacks
+  keep their existing behavior.
+
+- Unified keeps unsupported, damaged, or unreadable history files intact after
+  restore fails or only a bounded subset fits, including empty-pane close and later saves. A persistent pane
+  notice explains that saving is paused until the file is repaired or moved and
+  the pane is reopened; changed history paths require their own restore.
+
+- Session recovery keeps the selected surviving tab when earlier saved layouts
+  are rejected by restore limits. If the selected layout cannot be restored,
+  the nearest preceding survivor (or the first tab) is selected instead.
+
+- When the default JetBrainsMono Nerd Font Mono family is unavailable, terminal
+  text and Block chrome use the system Monospace family instead of a proportional
+  substitute. Installed preferred fonts, custom families/lists, and saved settings
+  are unchanged; Nerd Font icon fallback remains available.
+
+- 修复跨块文本拖选只复制最后一个 VTE 的问题：跨终端区域时由单一选区 owner 标记整区并按
+  显示顺序读取其完整保留文本，不再反复抢占 PRIMARY。单个 VTE 内仍保留原生按字选择；
+  选区以弱引用固定身份，区域卸载/内容变化后撤销，超限或失效时整次拒绝复制。
+
+- Unified 完成分区的命令/cwd 元数据新增每 pane 128 MiB 估算内存上限，与数量限制共同生效；
+  从最旧记录开始淘汰，并同步清理对应输出快照、书签和 badge，不擦除 VTE 自己的滚屏文本。
+
+- Unified 历史保存现在同时计算 cwd、JSON 转义与文件 framing；超限时优先丢弃最旧输出，
+  再淘汰最旧记录，避免写出重启后被自身大小限制拒绝的会话文件。
+
+- Block 的活动选择边缘新增常驻 Review selection 操作与数量；Close/Escape 恢复原历史操作焦点，
+  保留选择、滚动和未读状态。仅当原历史卡片已卸载时回到 live 终端；继续只复制，不回填或执行。
+
+- Block 新增只读原生审阅窗口：点击卡片元数据或选择菜单中的 Review Block / Selection，
+  查看完整保留命令、cwd、退出状态、可信时长、生命周期与截断来源。多选可逐块查看，并按
+  历史顺序预览/复制命令。窗口不回填、不执行，不改变终端大小或历史滚动锚点。
+  最多审阅 64 块、256 KiB 命令；超限明确提示且禁用整组复制，绝不静默复制部分选择。
+  复制时重新核对块 ID 与命令，拒绝已淘汰/变化的记录和隐藏控制字符，Escape 关闭后归还焦点。
+
+- Block 卡片加入常驻、可键盘访问的 Block actions 菜单，与右键共用安全动作；缩减 header
+  的隐藏工具栏占宽，保留复制输出与只回填的快捷入口。长菜单可滚动且重复激活只保留一个实例。
+  快捷按钮的键盘焦点不会因鼠标移出而被隐藏/禁用，cwd/git 省略文本增加完整 tooltip。
+  连续复制/插入的反馈现在合并为一个计时器，始终恢复原始图标和提示，不会把上一轮反馈永久留下。
+  同步修正 Block 验收清单中的多行回填、分阶段重跑和默认快捷键说明。
+
 - `jterm_core` 升级到 `fa256d6`（`Cargo.toml`、`Cargo.lock`、`deny.toml`、`flake.nix` 四处
   一起移动）。ASCII organism 的三个模块——状态归约器、持久化记忆、注意力仲裁——共约 9,000 行
   从 forge 删除，改为消费 `jterm_core::organism`、`organism_memory`、`organism_attention`；
@@ -418,6 +542,19 @@ All notable user-visible and operational changes are recorded here.
 - 终端子进程的终止与回收迁移到共享库 `jterm_core::process`（`ChildLifecycle` / `ProcessRef` / `EscalationPolicy`），删除本地的 `process_exists`、`signal_pid_and_group`、`wait_for_process_exit`、`terminate_terminal_process`。pane 现在随 widget 保存一个内核绑定的子进程句柄（Linux 上是 pidfd）而不是裸 pid，并显式记录由谁 `waitpid`：Block pane 的 PTY 由 forge 自己 fork、自己回收；常规 VTE pane 的子进程由 glib/VTE 的 child watch 回收，其生命周期只经 pidfd 发信号、绝不 `waitpid`，退出码由 `child-exited` 记账。HUP → TERM → KILL 阶梯与既有的 120ms/250ms 宽限期不变，但最后一发 KILL 改为按 PTY 会话清扫（两个 backend 都对 PTY 子进程 `setsid`）：关闭 pane 时会一并清掉 shell job control 放进别的进程组、此前只补一发进程组信号会遗漏的后台任务。常规 VTE pane 的 `child-exited` 状态现在按家族约定归一（正常退出取退出码、被信号杀取 128+信号号），与 Block pane 上报的数字一致；此前把 `waitpid` 原始状态字直接当成退出码交给远端重连逻辑（只有 0 的语义碰巧是对的）。窗口快照“属主进程是否还在”改为纯 `/proc` 探测，不再向别的 forge 窗口发信号 0。
 
 ### Fixed
+
+- Task terminal navigation owns its confirming Enter until release, preventing
+  held-key repeats from being sent into the newly focused terminal.
+
+- Disabling the ASCII companion stops Agent phases from changing its life state;
+  re-enabling it does not replay phases observed while disabled.
+
+- Incremental Block/Chat search uses the current command's live VTE range when
+  retained scrollback contains older commands. Forward and backward wrapping
+  stays within that range, and an unreadable or over-budget range is reported
+  as incomplete rather than counted from raw output that cannot be navigated.
+  Output changes and terminal resizing invalidate old live matches before
+  navigation, including the single-match shortcut, so the query can be rebuilt.
 
 - 无 shell 集成（RawFallback）的面板里，kitty 键盘协议的处理补齐了两处：远程标签页的 `ssh`
   和 `forge -e codex` 这类由程序本身充当 PTY 子进程的面板，程序推送的标志现在会真正用于编码

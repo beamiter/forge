@@ -32,6 +32,8 @@ trap 'rm -rf -- "${STAGE_DIR}"' EXIT
 install -Dm0755 "${BINARY}" "${PACKAGE_ROOT}/bin/forge"
 install -Dm0755 scripts/support-bundle.sh "${PACKAGE_ROOT}/bin/forge-support-bundle"
 install -Dm0755 packaging/install-release.sh "${PACKAGE_ROOT}/install.sh"
+install -Dm0644 scripts/install-config.sh "${PACKAGE_ROOT}/libexec/install-config.sh"
+install -Dm0644 scripts/migrate-legacy-binary.sh "${PACKAGE_ROOT}/libexec/migrate-legacy-binary.sh"
 install -Dm0755 packaging/uninstall-release.sh "${PACKAGE_ROOT}/uninstall.sh"
 install -Dm0755 scripts/uninstall.sh "${PACKAGE_ROOT}/libexec/uninstall.sh"
 install -Dm0755 scripts/install-workflow-assets.sh \

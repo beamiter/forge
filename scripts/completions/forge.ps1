@@ -7,7 +7,7 @@ Register-ArgumentCompleter -Native -CommandName forge -ScriptBlock {
     $previous = if ($words.Count -ge 2) { $words[-2] } else { '' }
 
     $values = switch ($previous) {
-        '--mode' { @('block', 'vte', 'unified'); break }
+        '--mode' { @('block', 'chat', 'vte', 'unified'); break }
         '--shell-integration' { @('bash', 'zsh', 'fish', 'pwsh'); break }
         '--generate-completion' { @('bash', 'zsh', 'fish', 'pwsh'); break }
         '--completion' { @('bash', 'zsh', 'fish', 'pwsh'); break }
@@ -15,7 +15,7 @@ Register-ArgumentCompleter -Native -CommandName forge -ScriptBlock {
             @(
                 '-h', '--help', '-V', '--version',
                 '-c', '--config', '-d', '--working-directory',
-                '-e', '--execute', '--mode', '--no-restore', '--safe-mode',
+                '-e', '--execute', '--mode', '--no-restore', '--safe-mode', '--ide',
                 '--doctor', '--json', '--check-config',
                 '--restore-config-backup', '--config-path', '--init-config',
                 '--print-default-config', '--shell-integration',

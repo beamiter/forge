@@ -25,6 +25,7 @@ type FlushFn = Box<dyn Fn(Vec<u8>)>;
 
 /// Observer for the parked/live indicator, installed by the view.
 type StateFn = Box<dyn Fn(bool)>;
+type WatchStateFn = Rc<dyn Fn(bool)>;
 
 /// Hard cap on parked bytes. A hold that accumulates more than this flushes
 /// immediately — the selection is sacrificed — so a firehose command can
@@ -82,6 +83,8 @@ pub(crate) struct SelectionFeedHold {
     /// every drag — a plain click must not flash the indicator) and `false`
     /// when the hold releases.
     state_cb: RefCell<Option<StateFn>>,
+    release_cb: RefCell<Option<Box<dyn Fn()>>>,
+    watch_cb: RefCell<Option<WatchStateFn>>,
 }
 
 impl SelectionFeedHold {
@@ -92,6 +95,8 @@ impl SelectionFeedHold {
             parked: RefCell::new(Vec::new()),
             flush_cb: RefCell::new(None),
             state_cb: RefCell::new(None),
+            release_cb: RefCell::new(None),
+            watch_cb: RefCell::new(None),
         })
     }
 
@@ -104,6 +109,22 @@ impl SelectionFeedHold {
     /// Wire the paused-output indicator. Called once by the view.
     pub(crate) fn set_state_listener(&self, listener: impl Fn(bool) + 'static) {
         *self.state_cb.borrow_mut() = Some(Box::new(listener));
+    }
+
+    pub(crate) fn set_release_listener(&self, listener: impl Fn() + 'static) {
+        *self.release_cb.borrow_mut() = Some(Box::new(listener));
+    }
+
+    /// Separate observation context from the badge and selection-release callback.
+    pub(crate) fn set_watch_listener(&self, listener: impl Fn(bool) + 'static) {
+        *self.watch_cb.borrow_mut() = Some(Rc::new(listener));
+    }
+
+    fn notify_watch(&self, held: bool) {
+        let callback = self.watch_cb.borrow().clone();
+        if let Some(callback) = callback {
+            callback(held);
+        }
     }
 
     fn notify_state(&self, parked: bool) {
@@ -146,7 +167,9 @@ impl SelectionFeedHold {
     /// Idempotent — a drag that grows into the live VTE calls this per motion.
     pub(crate) fn begin_drag(&self) {
         self.dragging.set(true);
-        self.holding.set(true);
+        if !self.holding.replace(true) {
+            self.notify_watch(true);
+        }
     }
 
     /// The drag ended. A surviving selection keeps ownership until copy,
@@ -201,13 +224,19 @@ impl SelectionFeedHold {
             return;
         }
         let parked = std::mem::take(&mut *self.parked.borrow_mut());
+        if let Some(released) = self.release_cb.borrow().as_ref() {
+            released();
+        }
         if parked.is_empty() {
+            self.notify_watch(false);
             return;
         }
         self.notify_state(false);
         if let Some(flush) = self.flush_cb.borrow().as_ref() {
             flush(parked);
         }
+        // Replay cannot become a fresh observation, including synchronous fanout.
+        self.notify_watch(false);
     }
 
     /// Run an irreversible follow-up only after parked bytes have re-entered
@@ -227,6 +256,50 @@ mod tests {
 
     use super::{commit_releases_hold, feed_hold_eligible, SelectionFeedHold, MAX_PARKED_BYTES};
     use crate::block_view::{BlockState, MouseReporting};
+
+    #[test]
+    fn watch_hold_notifies_empty_hold_and_only_restores_after_replay() {
+        let hold = SelectionFeedHold::new();
+        let states = Rc::new(RefCell::new(Vec::new()));
+        let seen = states.clone();
+        let weak = Rc::downgrade(&hold);
+        hold.set_watch_listener(move |held| {
+            seen.borrow_mut().push(held);
+            // The watch callback may safely re-enter its own listener slot.
+            assert!(weak.upgrade().unwrap().watch_cb.try_borrow_mut().is_ok());
+        });
+        let during = states.clone();
+        hold.set_flush(move |bytes| {
+            assert_eq!(bytes, b"firstsecond");
+            assert_eq!(
+                &*during.borrow(),
+                &[true],
+                "replay remains unavailable throughout fanout"
+            );
+        });
+        hold.begin_drag();
+        hold.begin_drag();
+        assert!(hold.try_buffer(b"first"));
+        assert!(hold.try_buffer(b"second"));
+        hold.flush_now();
+        assert_eq!(&*states.borrow(), &[true, false]);
+        states.borrow_mut().clear();
+        hold.begin_drag();
+        hold.flush_now();
+        assert_eq!(&*states.borrow(), &[true, false]);
+    }
+
+    #[test]
+    fn releasing_an_empty_hold_notifies_the_external_selection_owner_once() {
+        let hold = SelectionFeedHold::new();
+        let count = Rc::new(std::cell::Cell::new(0));
+        let observed = count.clone();
+        hold.set_release_listener(move || observed.set(observed.get() + 1));
+        hold.begin_drag();
+        hold.flush_now();
+        hold.flush_now();
+        assert_eq!(count.get(), 1);
+    }
 
     fn sgr_any_event() -> MouseReporting {
         let mut mouse = MouseReporting::OFF;

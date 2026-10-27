@@ -16,7 +16,7 @@ _forge()
             return
             ;;
         --mode)
-            COMPREPLY=($(compgen -W "block vte unified" -- "${current}"))
+            COMPREPLY=($(compgen -W "block chat vte unified" -- "${current}"))
             return
             ;;
         --shell-integration|--generate-completion|--completion)
@@ -32,7 +32,7 @@ _forge()
     case "${current}" in
         --mode=*)
             local value="${current#*=}"
-            COMPREPLY=($(compgen -W "block vte unified" -- "${value}"))
+            COMPREPLY=($(compgen -W "block chat vte unified" -- "${value}"))
             COMPREPLY=("${COMPREPLY[@]/#/--mode=}")
             return
             ;;
@@ -55,7 +55,7 @@ _forge()
     local options="
         -h --help -V --version
         -c --config -d --working-directory -e --execute
-        --mode --no-restore --safe-mode
+        --mode --no-restore --safe-mode --ide
         --doctor --json --check-config --restore-config-backup
         --config-path --init-config --print-default-config
         --shell-integration --generate-completion --completion

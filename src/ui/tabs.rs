@@ -20,6 +20,26 @@ use crate::terminal::{
     show_rename_dialog, show_rename_dialog_with_strip, terminal_working_directory, VteTerminalView,
 };
 
+/// A launch diagnostic is rendered through VTE too. Only the first output of
+/// an attempt which has not failed may turn its remote badge green.
+fn connect_remote_launch_status(leaf: &PaneLeaf, on_status: impl Fn(ConnStatus) + 'static) {
+    let settled = Rc::new(Cell::new(false));
+    let on_status = Rc::new(on_status);
+    if let PaneLeaf::Vte(view) = leaf {
+        let settled = settled.clone();
+        let on_status = on_status.clone();
+        view.connect_launch_failed(move |_| {
+            settled.set(true);
+            on_status(ConnStatus::Disconnected);
+        });
+    }
+    leaf.terminal().connect_contents_changed(move |_| {
+        if !settled.replace(true) {
+            on_status(ConnStatus::Connected);
+        }
+    });
+}
+
 struct TabLaunch {
     working_directory: Option<String>,
     tab_name: Option<String>,
@@ -255,6 +275,7 @@ impl UiState {
         // must still be able to reach and activate every visible tab.
         button.set_focus_on_click(false);
         button.set_focusable(true);
+        super::tab_strip::install_tab_reveal_on_map(button);
         button.update_relation(&[gtk4::accessible::Relation::LabelledBy(
             &[label.upcast_ref()],
         )]);
@@ -297,9 +318,26 @@ impl UiState {
         }
     }
 
-    fn restore_zoom_before_close(&self) {
-        if let Some(state) = self.zoom_state.borrow_mut().take() {
-            self.unzoom_pane(state);
+    pub(super) fn restore_zoom_before_close(&self, target: &gtk4::Widget) {
+        let state = {
+            let mut slot = self.zoom_state.borrow_mut();
+            let belongs_to_zoom = slot.as_ref().is_some_and(|state| {
+                widget_is_within(target, &state.swap.zoomed_page)
+                    || widget_is_within(target, &state.swap.original_page)
+            });
+            if belongs_to_zoom {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(state) = state {
+            let root = self.window.upcast_ref::<gtk4::Root>();
+            let focus = root.focus();
+            let _ = restore_zoomed_leaf_preserving_selection(&self.notebook, &state.swap);
+            restore_surviving_focus(root, focus.as_ref());
+            self.sync_tab_strip_active(None);
+            self.refresh_pane_headers();
         }
     }
 
@@ -388,7 +426,7 @@ impl UiState {
     }
 
     pub(crate) fn remove_tab_by_widget(&self, widget: &gtk4::Widget) {
-        self.restore_zoom_before_close();
+        self.restore_zoom_before_close(widget);
         let page_widget = self
             .notebook_page_for_widget(widget)
             .unwrap_or_else(|| widget.clone());
@@ -420,6 +458,9 @@ impl UiState {
         term_widget: &gtk4::Widget,
         exit_code: Option<i32>,
     ) {
+        if exit_code.is_none() && crate::vim9_ide::request_embedded_close(term_widget) {
+            return;
+        }
         let leaf_root = pane_leaf_root_of(term_widget).unwrap_or_else(|| term_widget.clone());
         if let Some(leaf) = PaneLeaf::from_widget(&leaf_root) {
             if leaf.task_role().is_some() {
@@ -437,12 +478,24 @@ impl UiState {
         // A zoom swap temporarily removes the sibling tree from the Notebook.
         // Restore it before collapsing the exited leaf; merely dropping the
         // swap would lose the still-running sibling and its PTY.
-        self.restore_zoom_before_close();
+        self.restore_zoom_before_close(&leaf_root);
+        let root = self.window.upcast_ref::<gtk4::Root>();
+        let focus = root.focus();
+        let target_was_active = self
+            .notebook_page_for_widget(&leaf_root)
+            .is_some_and(|page| {
+                self.notebook
+                    .current_page()
+                    .and_then(|index| self.notebook.nth_page(Some(index)))
+                    == Some(page)
+            });
 
         if let Some(sibling) = detach_leaf_and_promote(&self.notebook, &leaf_root) {
             let _detached = PaneLeaf::detach_from(&leaf_root);
-            if let Some(node) = PaneNode::from_widget(&sibling) {
-                node.grab_focus();
+            if !restore_surviving_focus(root, focus.as_ref()) && target_was_active {
+                if let Some(node) = PaneNode::from_widget(&sibling) {
+                    node.grab_focus();
+                }
             }
         } else {
             self.remove_tab_by_widget(&leaf_root);
@@ -458,9 +511,20 @@ impl UiState {
     }
 
     pub(crate) fn remove_tab_by_widget_internal(&self, widget: &gtk4::Widget) {
+        let root = self.window.upcast_ref::<gtk4::Root>();
+        let focus = root.focus();
+        // A close confirmation yields to the UI. The same target may have
+        // been zoomed again while it was open; include its retained siblings
+        // at commit time, before resolving the current Notebook page.
+        self.restore_zoom_before_close(widget);
         let widget = self
             .notebook_page_for_widget(widget)
             .unwrap_or_else(|| widget.clone());
+        let target_was_active = self
+            .notebook
+            .current_page()
+            .and_then(|index| self.notebook.nth_page(Some(index)))
+            == Some(widget.clone());
         let pane_leaves = PaneNode::from_widget(&widget)
             .map(|node| node.leaves())
             .unwrap_or_default();
@@ -509,69 +573,79 @@ impl UiState {
         } else {
             self.sync_tab_strip_active(None);
             self.sync_tab_bar_visibility();
-            self.focus_current_terminal();
+            if !restore_surviving_focus(root, focus.as_ref()) && target_was_active {
+                self.focus_current_terminal();
+            }
         }
     }
 
     pub(crate) fn close_focused_pane_or_tab(&self) {
-        self.restore_zoom_before_close();
         let Some(page_num) = self.notebook.current_page() else {
             return;
         };
         let Some(page_widget) = self.notebook.nth_page(Some(page_num)) else {
             return;
         };
-        if let Some(node) = PaneNode::from_widget(&page_widget) {
-            if node.is_split() {
-                if let Some(leaf) = node.active_leaf() {
-                    let leaf_root = leaf.root_widget();
-                    let pending_remote =
-                        leaf.is_remote()
-                            && tab_num_for_widget(&leaf_root).is_some_and(|tab_num| {
-                                self.tab_connections.borrow().get(&tab_num).is_some_and(
-                                    |connection| connection.status == ConnStatus::Disconnected,
-                                )
-                            });
-                    if pending_remote {
-                        if let Some(tab_num) = tab_num_for_widget(&leaf_root) {
-                            self.tab_connections.borrow_mut().remove(&tab_num);
-                            self.clear_tab_conn_status(tab_num);
-                        }
-                        // This child already emitted `exited`; killing it again
-                        // cannot drive the structural collapse callback.
-                        self.handle_terminal_exited(&leaf_root);
-                        if let Some(tab_num) = tab_num_for_widget(&leaf_root) {
-                            self.retitle_tab_from_active_leaf(tab_num);
-                        }
-                        return;
+        // Capture the intended controller before any zoom restoration can
+        // replace a Notebook page or emit focus/switch notifications.
+        let leaf = PaneNode::from_widget(&page_widget).and_then(|node| node.active_leaf());
+        let target = leaf.as_ref().map_or(page_widget, PaneLeaf::root_widget);
+        if crate::vim9_ide::request_embedded_close(&target) {
+            return;
+        }
+        self.restore_zoom_before_close(&target);
+        if let Some(leaf) = leaf {
+            let leaf_root = leaf.root_widget();
+            if leaf_root
+                .parent()
+                .is_some_and(|parent| parent.is::<gtk4::Paned>())
+            {
+                let pending_remote = leaf.is_remote()
+                    && tab_num_for_widget(&leaf_root).is_some_and(|tab_num| {
+                        self.tab_connections
+                            .borrow()
+                            .get(&tab_num)
+                            .is_some_and(|connection| connection.status == ConnStatus::Disconnected)
+                    });
+                if pending_remote {
+                    if let Some(tab_num) = tab_num_for_widget(&leaf_root) {
+                        self.tab_connections.borrow_mut().remove(&tab_num);
+                        self.clear_tab_conn_status(tab_num);
                     }
-                    if let Some(process) = leaf.foreground_process_name() {
-                        let ui_state = self.clone();
-                        glib::MainContext::default().spawn_local(async move {
-                            if Self::confirm_close_with_processes(
-                                &ui_state.window,
-                                "Close pane with running process?",
-                                "Close Pane",
-                                &process,
-                            )
-                            .await
-                            {
-                                // The process may have exited and collapsed this
-                                // leaf while the confirmation was open. Never use
-                                // its now-stale PID after it left the pane tree.
-                                if leaf.root_widget().parent().is_some() {
-                                    leaf.kill();
-                                }
-                            }
-                        });
-                    } else {
-                        leaf.kill();
+                    // This child already emitted `exited`; killing it again
+                    // cannot drive the structural collapse callback.
+                    self.handle_terminal_exited(&leaf_root);
+                    if let Some(tab_num) = tab_num_for_widget(&leaf_root) {
+                        self.retitle_tab_from_active_leaf(tab_num);
                     }
                     return;
                 }
+                if let Some(process) = leaf.foreground_process_name() {
+                    let ui_state = self.clone();
+                    glib::MainContext::default().spawn_local(async move {
+                        if Self::confirm_close_with_processes(
+                            &ui_state.window,
+                            "Close pane with running process?",
+                            "Close Pane",
+                            &process,
+                        )
+                        .await
+                        {
+                            // The process may have exited and collapsed this
+                            // leaf while the confirmation was open. Never use
+                            // its now-stale PID after it left the pane tree.
+                            if leaf.root_widget().parent().is_some() {
+                                leaf.kill();
+                            }
+                        }
+                    });
+                } else {
+                    leaf.kill();
+                }
+                return;
             }
         }
-        self.remove_current_tab();
+        self.remove_tab_by_widget(&target);
     }
 
     pub(crate) fn duplicate_current_tab(&self) {
@@ -1029,6 +1103,7 @@ impl UiState {
         context.connect_pressed(move |gesture, _, x, y| {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
             let popover = gtk4::Popover::new();
+            popover.add_css_class("terminal-context-menu");
             popover.set_parent(&button_for_context);
             popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
             popover.set_has_arrow(false);
@@ -1115,7 +1190,10 @@ impl UiState {
                 }
             });
             menu.append(&close);
-            popover.set_child(Some(&menu));
+            popover.set_child(Some(&crate::context_menu::scrolled_content(
+                &menu,
+                &button_for_context,
+            )));
             popover.connect_closed(|popover| popover.unparent());
             popover.popup();
         });
@@ -1190,6 +1268,117 @@ impl UiState {
     /// Used for one-shot helper processes such as the jsh installer: they emit
     /// no shell-integration sequences, so Block mode would have nothing to
     /// build blocks from, and the tab deserves a better name than argv[0].
+    pub(crate) fn add_agent_session_tab(&self, request: super::agent_sessions::ResumeRequest) {
+        let key = (request.provider, request.id.clone());
+        let existing = self
+            .agent_session_tabs
+            .borrow()
+            .get(&key)
+            .and_then(|terminal| terminal.upgrade());
+        if let Some(terminal) = existing {
+            let hidden_by_zoom = self
+                .zoom_state
+                .borrow()
+                .as_ref()
+                .is_some_and(|state| terminal.is_ancestor(&state.swap.original_page));
+            if hidden_by_zoom {
+                let zoom = self.zoom_state.borrow_mut().take();
+                if let Some(zoom) = zoom {
+                    self.unzoom_pane(zoom);
+                }
+            }
+            if let Some(page) = (0..self.notebook.n_pages()).find(|index| {
+                self.notebook
+                    .nth_page(Some(*index))
+                    .is_some_and(|page| terminal.is_ancestor(&page))
+            }) {
+                self.notebook.set_current_page(Some(page));
+                terminal.grab_focus();
+                let _ = self
+                    .agent_session_library
+                    .borrow_mut()
+                    .record_resumed(request.provider, &request.id);
+                let _ = request.completion.send(Ok(()));
+                return;
+            }
+        }
+        self.agent_session_tabs.borrow_mut().remove(&key);
+        let Some(plan) = request.launch.as_ref() else {
+            let _ = request.completion.send(Err(
+                "That session's terminal has closed. Check readiness and resume it again.".into(),
+            ));
+            return;
+        };
+        let launch = plan.clone();
+        let mut argv = vec![launch.program];
+        argv.extend(launch.args);
+        let library = self.agent_session_library.clone();
+        let completion = request.completion.clone();
+        let provider = request.provider;
+        let id = request.id.clone();
+        let settled = Rc::new(Cell::new(false));
+        let successful = settled.clone();
+        let terminal = self.add_tab_with_argv(TabLaunch {
+            working_directory: Some(launch.cwd.to_string_lossy().into_owned()),
+            tab_name: Some(request.title),
+            session_id: None,
+            initial_commands: crate::terminal::InitialCommands::default(),
+            argv_override: Some(argv),
+            remote: None,
+            terminal_mode: crate::config::TerminalMode::Vte,
+            task: None,
+        });
+        self.agent_session_tabs
+            .borrow_mut()
+            .insert(key.clone(), terminal.downgrade());
+        // Resolve against the newly created leaf, never whichever tab is
+        // current when an asynchronous spawn failure eventually arrives.
+        if let Some(leaf) = self
+            .notebook
+            .current_page()
+            .and_then(|index| self.notebook.nth_page(Some(index)))
+            .and_then(|page| PaneNode::from_widget(&page))
+            .and_then(|node| {
+                node.leaves()
+                    .into_iter()
+                    .find(|leaf| leaf.terminal() == &terminal)
+            })
+        {
+            if let PaneLeaf::Vte(view) = &leaf {
+                view.connect_launched(move || {
+                    if !successful.replace(true) {
+                        let _ = library.borrow_mut().record_resumed(provider, &id);
+                        let _ = completion.send(Ok(()));
+                    }
+                });
+                let root = leaf.root_widget().downgrade();
+                let owner = self.unified_navigation_owner.borrow().clone();
+                view.connect_launch_failed(move |message| {
+                    if !settled.replace(true) {
+                        let _ = request.completion.send(Err(message.to_owned()));
+                        if let (Some(ui), Some(root)) = (owner.upgrade(), root.upgrade()) {
+                            ui.handle_terminal_exited(&root);
+                        }
+                    }
+                });
+            }
+        }
+        let owner = self.unified_navigation_owner.borrow().clone();
+        terminal.connect_child_exited(move |terminal, _| {
+            if let Some(ui) = owner.upgrade() {
+                let mut sessions = ui.agent_session_tabs.borrow_mut();
+                if sessions
+                    .get(&key)
+                    .and_then(|bound| bound.upgrade())
+                    .as_ref()
+                    == Some(terminal)
+                {
+                    sessions.remove(&key);
+                }
+            }
+        });
+    }
+
     pub(crate) fn add_named_tab_with_argv(&self, tab_name: &str, argv: Vec<String>) -> Terminal {
         self.add_tab_with_argv(TabLaunch {
             working_directory: None,
@@ -1364,16 +1553,6 @@ impl UiState {
             terminal_mode,
             task: None,
         }))
-    }
-
-    /// Mark a remote tab as connected (green badge). Called on first output.
-    /// Note: this is a visual signal only — backoff reset is decided at exit
-    /// time by `spawn_at` duration, so a fast ssh error banner can't reset it.
-    fn mark_tab_connected(&self, tab_num: u32) {
-        if let Some(conn) = self.tab_connections.borrow_mut().get_mut(&tab_num) {
-            conn.status = ConnStatus::Connected;
-        }
-        self.set_tab_conn_status(tab_num, ConnStatus::Connected);
     }
 
     /// Close the tab with the given tab_num via the normal exit path.
@@ -1595,6 +1774,7 @@ impl UiState {
             .filter(|sid| jterm_core::execution_journal::is_valid_jsh_session_id(sid))
             .unwrap_or_else(generate_session_id);
 
+        let allow_local_recovery = remote.is_none() && task.is_none() && argv_override.is_none();
         let configured_shell = self.shell_argv.borrow();
         let shell_argv: &[String] = argv_override
             .as_deref()
@@ -1608,7 +1788,9 @@ impl UiState {
                 // backend differs, and it follows *this* launch's mode — which
                 // is why a remote tab (pinned to Block above) stays Block even
                 // when `terminal_mode = "unified"`.
-                crate::config::TerminalMode::Block | crate::config::TerminalMode::Unified => {
+                crate::config::TerminalMode::Block
+                | crate::config::TerminalMode::Chat
+                | crate::config::TerminalMode::Unified => {
                     let term_view = {
                         let config = self.config.borrow();
                         TermView::new(
@@ -1623,9 +1805,14 @@ impl UiState {
                     match term_view {
                         Ok(term_view) => {
                             let term_view = Rc::new(term_view);
-                            if matches!(terminal_mode, crate::config::TerminalMode::Block) {
+                            if matches!(
+                                terminal_mode,
+                                crate::config::TerminalMode::Block
+                                    | crate::config::TerminalMode::Chat
+                            ) {
                                 TermView::arm_shell_integration_notice(&term_view, shell_argv);
                             }
+                            term_view.set_menu_keybindings(self.keybinding_map.clone());
                             term_view.start_history_load();
                             let terminal = term_view.vte().clone();
                             (PaneLeaf::Block(term_view), terminal)
@@ -1671,6 +1858,12 @@ impl UiState {
                 }
             }
         };
+
+        if allow_local_recovery {
+            if let PaneLeaf::Vte(view) = &view_type {
+                view.enable_local_launch_recovery();
+            }
+        }
 
         // Commit tab identity and reconnect state only after the terminal view
         // exists. In particular, a failed Block spawn cannot consume a tab
@@ -1759,12 +1952,27 @@ impl UiState {
                 // remains governed by block_history_path; this record contains
                 // only command metadata and is safe for palette use.
                 self.connect_block_command_history(term_view);
+                self.connect_unified_navigation(term_view);
                 self.connect_block_ai_action(term_view);
                 self.connect_block_tab_attention(term_view, term_view.widget().upcast_ref());
                 self.connect_bottom_bar_block_status(term_view);
                 self.attach_ascii_organism_to_view(term_view, is_remote);
             }
             PaneLeaf::Vte(vte_view) => {
+                let ui_for_failure = UiState::clone(self);
+                let root_for_failure = vte_view.widget().downgrade();
+                vte_view.connect_launch_failed(move |message| {
+                    let Some(root) = root_for_failure.upgrade() else {
+                        return;
+                    };
+                    let Some(leaf) = PaneLeaf::from_widget(&root) else {
+                        return;
+                    };
+                    ui_for_failure.note_task_terminal_launch_failed(&leaf);
+                    ui_for_failure
+                        .toast_overlay
+                        .add_toast(adw::Toast::new(message));
+                });
                 let ui_for_exit = UiState::clone(self);
                 let root_for_exit = vte_view.widget().downgrade();
                 let terminal_for_exit = vte_view.vte().downgrade();
@@ -1801,20 +2009,27 @@ impl UiState {
             }
         }
 
-        // For remote tabs, flip the status badge to green on first output.
+        // First child output is a visual connection signal only: backoff is
+        // still reset by connection duration at exit, never by an SSH banner.
         if remote.is_some() {
             let ui_for_conn = self.clone();
-            let fired = Rc::new(Cell::new(false));
             let root_for_conn = view_type.root_widget().downgrade();
-            terminal.connect_contents_changed(move |_| {
-                if fired.get() {
+            connect_remote_launch_status(&view_type, move |status| {
+                let Some(root) = root_for_conn.upgrade() else {
                     return;
+                };
+                let current_tab_num = tab_num_for_widget(&root).unwrap_or(tab_num);
+                {
+                    let mut connections = ui_for_conn.tab_connections.borrow_mut();
+                    let Some(connection) = connections
+                        .get_mut(&current_tab_num)
+                        .filter(|connection| connection.identity == tab_num)
+                    else {
+                        return;
+                    };
+                    connection.status = status;
                 }
-                fired.set(true);
-                if let Some(root) = root_for_conn.upgrade() {
-                    let current_tab_num = tab_num_for_widget(&root).unwrap_or(tab_num);
-                    ui_for_conn.mark_tab_connected(current_tab_num);
-                }
+                ui_for_conn.set_tab_conn_status(current_tab_num, status);
             });
         }
 
@@ -2261,6 +2476,7 @@ impl UiState {
                 .collect();
 
             let popover = gtk4::Popover::new();
+            popover.add_css_class("terminal-context-menu");
             popover.set_parent(&strip_btn_for_ctx);
             popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
             popover.set_has_arrow(false);
@@ -2468,7 +2684,10 @@ impl UiState {
                 vbox.append(&item);
             }
 
-            popover.set_child(Some(&vbox));
+            popover.set_child(Some(&crate::context_menu::scrolled_content(
+                &vbox,
+                &strip_btn_for_ctx,
+            )));
 
             // Clean up the parent reference when the popover closes
             popover.connect_closed(move |p| {
@@ -2636,6 +2855,62 @@ impl UiState {
 mod tests {
     use super::*;
 
+    #[test]
+    #[ignore = "requires a GTK display"]
+    fn failed_remote_launch_diagnostics_never_mark_the_attempt_connected() {
+        gtk4::init().expect("GTK display");
+        let context = glib::MainContext::default();
+        let _guard = context.acquire().expect("own GTK main context");
+        for fail in [true, false] {
+            let argv = if fail {
+                vec!["/forge-test/nonexistent-ssh".to_string()]
+            } else {
+                vec!["/bin/sh".into(), "-c".into(), "printf remote-output".into()]
+            };
+            let view = Rc::new(VteTerminalView::new(
+                Rc::new(RefCell::new(crate::config::Config::safe_defaults())),
+                &argv,
+                Some("/tmp"),
+                None,
+                &[],
+                Vec::new(),
+                None,
+            ));
+            let leaf = PaneLeaf::Vte(view.clone());
+            let statuses = Rc::new(RefCell::new(Vec::new()));
+            let observed = statuses.clone();
+            connect_remote_launch_status(&leaf, move |status| observed.borrow_mut().push(status));
+            let output_seen = Rc::new(Cell::new(false));
+            let output_callback = output_seen.clone();
+            view.vte()
+                .connect_contents_changed(move |_| output_callback.set(true));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while (!output_seen.get() || statuses.borrow().is_empty())
+                && std::time::Instant::now() < deadline
+            {
+                context.iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert!(
+                output_seen.get(),
+                "exercise actual VTE output, including the launch diagnostic"
+            );
+            let statuses = statuses.borrow();
+            assert_eq!(statuses.len(), 1, "one outcome for this attempt");
+            if fail {
+                assert!(
+                    matches!(statuses[0], ConnStatus::Disconnected),
+                    "locally rendered launch failure is not remote connection evidence"
+                );
+            } else {
+                assert!(
+                    matches!(statuses[0], ConnStatus::Connected),
+                    "actual child output still marks the attempt connected"
+                );
+            }
+        }
+    }
+
     /// VTE's `commit` is the *input* signal: agents enable focus reporting,
     /// so a tab hooked to it went "active" the moment the user left it, while
     /// a background agent that really streamed output never marked. Tab
@@ -2704,6 +2979,7 @@ mod tests {
 
         for configured in [
             TerminalMode::Block,
+            TerminalMode::Chat,
             TerminalMode::Vte,
             TerminalMode::Unified,
         ] {

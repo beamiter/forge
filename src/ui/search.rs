@@ -2,15 +2,61 @@
 use adw::prelude::*;
 use gtk4::glib;
 use libadwaita as adw;
+use std::rc::{Rc, Weak};
 use std::time::Duration;
 use vte4::TerminalExt;
 
-use crate::block_view::{FindNavigationResult, FindProgress, FindSearchResult};
+use crate::block_view::{FindNavigationResult, FindProgress, FindSearchResult, TermView};
 
 use super::*;
 
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
 const SEARCH_QUERY_BYTE_LIMIT: usize = 8 * 1024;
+
+/// The pane that owns the installed query, independently of later focus.
+/// Neither backend may be kept alive solely by an open search bar.
+pub(crate) struct SearchOwner {
+    terminal: Option<glib::WeakRef<vte4::Terminal>>,
+    view: Option<Weak<TermView>>,
+    /// A pane-local Find button captures its owner before the entry gains
+    /// focus. Debounced edits and steps keep that owner until a page switch.
+    pinned: bool,
+}
+
+impl SearchOwner {
+    fn new(terminal: Option<&vte4::Terminal>, view: Option<&Rc<TermView>>) -> Self {
+        Self {
+            terminal: terminal.map(|terminal| terminal.downgrade()),
+            view: view.map(Rc::downgrade),
+            pinned: false,
+        }
+    }
+
+    fn matches(&self, terminal: Option<&vte4::Terminal>, view: Option<&Rc<TermView>>) -> bool {
+        let same_terminal = match (&self.terminal, terminal) {
+            (Some(previous), Some(current)) => previous.upgrade().as_ref() == Some(current),
+            (None, None) => true,
+            _ => false,
+        };
+        let same_view = match (&self.view, view) {
+            (Some(previous), Some(current)) => previous
+                .upgrade()
+                .is_some_and(|previous| Rc::ptr_eq(&previous, current)),
+            (None, None) => true,
+            _ => false,
+        };
+        same_terminal && same_view
+    }
+
+    fn clear(&self) {
+        if let Some(terminal) = self.terminal.as_ref().and_then(glib::WeakRef::upgrade) {
+            terminal.search_set_regex(None::<&vte4::Regex>, 0);
+        }
+        if let Some(view) = self.view.as_ref().and_then(Weak::upgrade) {
+            view.clear_find();
+        }
+    }
+}
 
 fn query_exceeds_byte_limit(query: &str) -> bool {
     query.len() > SEARCH_QUERY_BYTE_LIMIT
@@ -46,8 +92,55 @@ fn terminal_status_text(found: bool) -> &'static str {
 }
 
 impl UiState {
+    pub(super) fn show_search_for(&self, view: &Rc<TermView>) {
+        self.cancel_pending_search();
+        self.clear_search_owner();
+        let mut owner = SearchOwner::new(Some(view.vte()), Some(view));
+        owner.pinned = true;
+        *self.search_owner.borrow_mut() = Some(owner);
+        self.search_bar.set_search_mode(true);
+        self.search_entry.grab_focus();
+        self.search_apply();
+    }
+
+    pub(super) fn search_targets(&self) -> (Option<vte4::Terminal>, Option<Rc<TermView>>) {
+        let owner = self.search_owner.borrow();
+        if let Some(owner) = owner.as_ref().filter(|owner| owner.pinned) {
+            let view = owner
+                .view
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .filter(|view| view.widget().is_mapped());
+            // A closed/hidden captured pane must not fall back to its sibling.
+            return match view {
+                Some(view) => (Some(view.vte().clone()), Some(view)),
+                None => (None, None),
+            };
+        }
+        (self.current_terminal(), self.current_term_view())
+    }
+
     pub(crate) fn toggle_search(&self) {
         let visible = self.search_bar.is_search_mode();
+        let pinned = visible
+            && self
+                .search_owner
+                .borrow()
+                .as_ref()
+                .is_some_and(|owner| owner.pinned);
+        // Capture ownership before hiding the bar: unmapping its focused
+        // entry can let GTK choose another pane. A user who already focused
+        // something outside the bar keeps that new focus when it closes.
+        let restore_pinned = pinned
+            && self
+                .search_bar
+                .root()
+                .and_then(|root| root.focus())
+                .is_some_and(|focus| {
+                    focus == *self.search_bar.upcast_ref::<gtk4::Widget>()
+                        || focus.is_ancestor(&self.search_bar)
+                });
+        let pinned_target = restore_pinned.then(|| self.search_targets().1).flatten();
         self.search_bar.set_search_mode(!visible);
         if !visible {
             self.search_entry.grab_focus();
@@ -56,16 +149,30 @@ impl UiState {
             }
         } else {
             self.cancel_pending_search();
-            // Clear search highlight when closing
-            if let Some(term) = self.current_terminal() {
-                term.search_set_regex(None::<&vte4::Regex>, 0);
-            }
-            if let Some(term_view) = self.current_term_view() {
-                term_view.clear_find();
-            }
+            // Focus may have moved to another split since this query ran.
+            self.clear_search_owner();
             self.search_status.set_text("");
-            self.focus_current_terminal();
+            if let Some(view) = pinned_target {
+                view.grab_focus();
+            } else if !pinned {
+                self.focus_current_terminal();
+            }
         }
+    }
+
+    fn clear_search_owner(&self) {
+        let previous = self.search_owner.borrow_mut().take();
+        if let Some(previous) = previous {
+            previous.clear();
+        }
+    }
+
+    fn search_owner_is_current(&self) -> bool {
+        let (terminal, view) = self.search_targets();
+        self.search_owner
+            .borrow()
+            .as_ref()
+            .is_some_and(|owner| owner.matches(terminal.as_ref(), view.as_ref()))
     }
 
     fn cancel_pending_search(&self) {
@@ -78,6 +185,10 @@ impl UiState {
 
     pub(crate) fn schedule_search_apply(&self) {
         self.cancel_pending_search();
+        // GtkSearchEntry can deliver its delayed signal after the bar closes.
+        if !self.search_bar.is_search_mode() {
+            return;
+        }
         if self.search_entry.text().is_empty() {
             self.apply_search_now();
             return;
@@ -102,27 +213,62 @@ impl UiState {
         self.apply_search_now();
     }
 
+    /// `switch-page` runs before GtkNotebook commits `current_page`. Bind the
+    /// query to its explicit destination instead of resolving the old page.
+    pub(crate) fn search_apply_in_page(&self, page: &gtk4::Widget) {
+        self.cancel_pending_search();
+        if let Some(owner) = self.search_owner.borrow_mut().as_mut() {
+            owner.pinned = false;
+        }
+        self.apply_search_to(
+            self.terminal_in_page(page).as_ref(),
+            self.term_view_in_page(page).as_ref(),
+        );
+    }
+
     fn apply_search_now(&self) {
+        let (terminal, view) = self.search_targets();
+        self.apply_search_to(terminal.as_ref(), view.as_ref());
+    }
+
+    fn apply_search_to(&self, terminal: Option<&vte4::Terminal>, term_view: Option<&Rc<TermView>>) {
+        if !self.search_bar.is_search_mode() {
+            return;
+        }
+        let pinned = self
+            .search_owner
+            .borrow()
+            .as_ref()
+            .is_some_and(|owner| owner.pinned);
+        self.clear_search_owner();
+        let mut owner = SearchOwner::new(terminal, term_view);
+        owner.pinned = pinned;
+        *self.search_owner.borrow_mut() = Some(owner);
+        if pinned && term_view.is_none() {
+            self.search_status
+                .set_text("The search pane is no longer available");
+            return;
+        }
+        // A new query retires the live fallback before either backend can
+        // return early. Block errors/limits must never leave Enter navigating
+        // a native regex installed by an older query.
+        if let Some(term) = terminal {
+            term.search_set_regex(None::<&vte4::Regex>, 0);
+        }
         let text = self.search_entry.text();
         if text.is_empty() {
             // `search_changed` also fires when the user deletes the query.  Clear
             // both search backends here; otherwise the previous highlights stay
             // painted until the search bar itself is closed.
-            if let Some(term_view) = self.current_term_view() {
+            if let Some(term_view) = term_view {
                 term_view.clear_find();
-            }
-            if let Some(term) = self.current_terminal() {
-                term.search_set_regex(None::<&vte4::Regex>, 0);
             }
             self.search_status.set_text("");
             return;
         }
         if query_exceeds_byte_limit(&text) {
-            if let Some(term_view) = self.current_term_view() {
+            if let Some(term_view) = term_view {
                 term_view.clear_find();
-            }
-            if let Some(term) = self.current_terminal() {
-                term.search_set_regex(None::<&vte4::Regex>, 0);
             }
             self.search_status.set_text(&format!(
                 "Query too long ({} KiB limit)",
@@ -142,7 +288,7 @@ impl UiState {
 
         // Block mode: highlight every in-text match and focus the first one
         // (Warp's FindWithinBlock). Next/Prev step through them.
-        if let Some(term_view) = self.current_term_view() {
+        if let Some(term_view) = term_view {
             let result = term_view.find_in_blocks(&query, use_regex);
             match result {
                 FindSearchResult::Matches(_)
@@ -157,7 +303,7 @@ impl UiState {
 
         // Fall back to the live VTE for prompts/classic terminal panes. VTE can
         // report whether navigation found a hit, but it does not expose a count.
-        if let Some(term) = self.current_terminal() {
+        if let Some(term) = terminal {
             let pattern = if use_regex {
                 query
             } else {
@@ -173,9 +319,10 @@ impl UiState {
                     let found = term.search_find_next();
                     self.search_status.set_text(terminal_status_text(found));
                 }
-                Err(_) => self
-                    .search_status
-                    .set_text(&find_status_text(FindSearchResult::InvalidRegex)),
+                Err(_) => {
+                    self.search_status
+                        .set_text(&find_status_text(FindSearchResult::InvalidRegex));
+                }
             }
         } else {
             self.search_status
@@ -184,11 +331,14 @@ impl UiState {
     }
 
     pub(crate) fn search_next(&self) {
-        if self.search_debounce_source.borrow().is_some() {
+        if !self.search_bar.is_search_mode() {
+            return;
+        }
+        if self.search_debounce_source.borrow().is_some() || !self.search_owner_is_current() {
             self.search_apply();
             return;
         }
-        if let Some(term_view) = self.current_term_view() {
+        if let Some(term_view) = self.search_targets().1 {
             match term_view.find_next() {
                 FindNavigationResult::Progress(progress) => {
                     self.search_status.set_text(&progress_status_text(progress));
@@ -205,18 +355,21 @@ impl UiState {
                 FindNavigationResult::Inactive => {}
             }
         }
-        if let Some(term) = self.current_terminal() {
+        if let Some(term) = self.search_targets().0 {
             self.search_status
                 .set_text(terminal_status_text(term.search_find_next()));
         }
     }
 
     pub(crate) fn search_prev(&self) {
-        if self.search_debounce_source.borrow().is_some() {
+        if !self.search_bar.is_search_mode() {
+            return;
+        }
+        if self.search_debounce_source.borrow().is_some() || !self.search_owner_is_current() {
             self.search_apply();
             return;
         }
-        if let Some(term_view) = self.current_term_view() {
+        if let Some(term_view) = self.search_targets().1 {
             match term_view.find_prev() {
                 FindNavigationResult::Progress(progress) => {
                     self.search_status.set_text(&progress_status_text(progress));
@@ -230,7 +383,7 @@ impl UiState {
                 FindNavigationResult::Inactive => {}
             }
         }
-        if let Some(term) = self.current_terminal() {
+        if let Some(term) = self.search_targets().0 {
             self.search_status
                 .set_text(terminal_status_text(term.search_find_previous()));
         }

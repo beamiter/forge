@@ -394,7 +394,7 @@ fn replay_plain_ansi_bytes(bytes: &[u8]) -> ReplayOutcome {
                                 }
                                 b"1" => {
                                     if let Some(cells) = grid.rows.get_mut(row) {
-                                        let upto = col.min(cells.len());
+                                        let upto = col.saturating_add(1).min(cells.len());
                                         for c in cells.iter_mut().take(upto) {
                                             *c = ' ';
                                         }
@@ -836,11 +836,12 @@ pub(crate) fn collapse_repaint_output(input: &str, cols: usize) -> String {
                                     }
                                 }
                                 b"1" => {
-                                    if !grid.ensure_len(row, col, blank) {
+                                    let upto = col.saturating_add(1).min(width);
+                                    if !grid.ensure_len(row, upto, blank) {
                                         break;
                                     }
                                     if let Some(cells) = grid.rows.get_mut(row) {
-                                        for cell in cells.iter_mut().take(col) {
+                                        for cell in cells.iter_mut().take(upto) {
                                             *cell = fill;
                                         }
                                     }
@@ -1078,6 +1079,49 @@ mod tests {
         assert!(!ansi_bytes_have_visible_text(b"\xff\r\x1b[2K"));
         assert!(ansi_bytes_have_visible_text("\u{3000}\u{754c}".as_bytes()));
         assert!(!ansi_bytes_have_visible_text("\u{3000}\n".as_bytes()));
+    }
+
+    #[test]
+    fn erase_line_start_includes_the_cursor_column() {
+        for (input, expected) in [
+            ("abc\r\x1b[1K", " bc"),
+            ("abc\x1b[2G\x1b[1K", "  c"),
+            ("abc\x1b[3G\x1b[1K", "   "),
+            ("abc\x1b[2G\x1b[1Kz", " zc"),
+            ("abc\x1b[1Kx", "   x"),
+        ] {
+            assert_eq!(
+                strip_ansi_with_clear_detect(input),
+                (expected.to_string(), false)
+            );
+        }
+    }
+
+    #[test]
+    fn styled_erase_line_start_includes_cursor_without_exceeding_width() {
+        for (input, expected) in [
+            ("abc\r\x1b[1K", " bc"),
+            ("abc\x1b[2G\x1b[1K", "  c"),
+            ("abc\x1b[3G\x1b[1K", ""),
+            ("abc\x1b[2G\x1b[1Kz", " zc"),
+        ] {
+            assert_eq!(collapse_repaint_output(input, 80), expected);
+        }
+        assert_eq!(
+            collapse_repaint_output("abc\r\x1b[41m\x1b[1K", 3),
+            "\x1b[0;41m \x1b[0mbc"
+        );
+        assert_eq!(
+            collapse_repaint_output("\x1b[41m\x1b[999999G\x1b[1K", 3),
+            "\x1b[0;41m   \x1b[0m"
+        );
+    }
+
+    #[test]
+    fn erased_cursor_cell_cannot_keep_output_visible() {
+        assert!(!super::ansi_bytes_have_visible_text(b"x\r\x1b[1K"));
+        assert!(!super::ansi_bytes_have_visible_text(b"abc\x1b[3G\x1b[1K"));
+        assert!(super::ansi_bytes_have_visible_text(b"abc\x1b[2G\x1b[1K"));
     }
 
     #[test]

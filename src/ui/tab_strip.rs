@@ -183,12 +183,100 @@ fn widget_pinned(widget: &gtk4::Widget) -> bool {
     }
 }
 
+// Top tabs keep terminal focus on activation, so GtkViewport's scroll-to-focus
+// cannot reveal them. Request native scrolling without changing focus or gestures.
+fn reveal_strip_button(button: &ToggleButton) {
+    let Some(strip) = button
+        .parent()
+        .and_then(|parent| parent.downcast::<gtk4::Box>().ok())
+    else {
+        return;
+    };
+    if strip.orientation() != gtk4::Orientation::Horizontal {
+        return;
+    }
+    let Some(viewport) = strip
+        .parent()
+        .and_then(|parent| parent.downcast::<gtk4::Viewport>().ok())
+    else {
+        return;
+    };
+    if button.is_mapped() && viewport.is_mapped() {
+        viewport.scroll_to(button, None);
+    }
+}
+
+pub(crate) fn install_top_tab_geometry_reveal(scroll: &gtk4::ScrolledWindow) {
+    let weak_scroll = scroll.downgrade();
+    let pending = Rc::new(Cell::new(false));
+    // changed means range/page geometry changed, not value-changed: manual
+    // wheel/trackpad scrolling must not be snapped back to the active tab.
+    scroll.hadjustment().connect_changed(move |_| {
+        let Some(scroll) = weak_scroll.upgrade() else {
+            return;
+        };
+        if pending.replace(true) {
+            return;
+        }
+        let pending = pending.clone();
+        let after_first_layout = Cell::new(false);
+        scroll.add_tick_callback(move |scroll, _| {
+            if !after_first_layout.replace(true) {
+                return glib::ControlFlow::Continue;
+            }
+            pending.set(false);
+            let Some(strip) = scroll
+                .child()
+                .and_then(|child| child.downcast::<gtk4::Viewport>().ok())
+                .and_then(|viewport| viewport.child())
+                .and_then(|child| child.downcast::<gtk4::Box>().ok())
+            else {
+                return glib::ControlFlow::Break;
+            };
+            let mut child = strip.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                if let Ok(button) = widget.downcast::<ToggleButton>() {
+                    if button.is_active() {
+                        reveal_strip_button(&button);
+                        break;
+                    }
+                }
+            }
+            glib::ControlFlow::Break
+        });
+    });
+}
+
+pub(super) fn install_tab_reveal_on_map(button: &ToggleButton) {
+    // Covers new tabs and sidebar/top transfers before a selection sync has
+    // allocated geometry. Read current state, not a captured/stale tab index.
+    button.connect_map(|button| {
+        // Tick callbacks precede layout. Wait one complete frame so a newly
+        // mapped tab has its allocation, then recheck selection and parentage.
+        let after_first_layout = Cell::new(false);
+        button.add_tick_callback(move |button, _| {
+            if !button.is_active() {
+                return glib::ControlFlow::Break;
+            }
+            if !after_first_layout.replace(true) {
+                return glib::ControlFlow::Continue;
+            }
+            reveal_strip_button(button);
+            glib::ControlFlow::Break
+        });
+    });
+}
+
 pub(super) fn sync_strip_buttons_active(tab_strip: &gtk4::Box, active: u32) {
     let mut idx = 0u32;
     let mut child = tab_strip.first_child();
     while let Some(c) = child {
         if let Ok(btn) = c.clone().downcast::<ToggleButton>() {
             btn.set_active(idx == active);
+            if idx == active {
+                reveal_strip_button(&btn);
+            }
         }
         idx += 1;
         child = c.next_sibling();
@@ -733,30 +821,37 @@ impl UiState {
     }
 
     pub(crate) fn select_tab_range(&self, from_name: &str, to_name: &str) {
-        self.clear_tab_selection();
-        let mut selected = self.selected_tabs.borrow_mut();
-        let mut in_range = false;
-
-        if let Some(mut child) = self.tab_strip.first_child() {
-            loop {
-                let child_name = child.widget_name();
-                if child_name.as_str() == from_name {
-                    in_range = true;
-                }
-                if in_range {
-                    selected.push(child_name.to_string());
-                    if let Ok(btn) = child.clone().downcast::<ToggleButton>() {
-                        btn.add_css_class("tab-selected");
-                    }
-                }
-                if child_name.as_str() == to_name {
-                    in_range = false;
-                }
-                match child.next_sibling() {
-                    Some(next) => child = next,
-                    None => break,
-                }
+        let mut buttons = Vec::new();
+        let mut child = self.tab_strip.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            if let Ok(button) = widget.downcast::<ToggleButton>() {
+                buttons.push(button);
             }
+        }
+        // Resolve both stable identities before changing selection. A tab may
+        // have disappeared since the anchor was captured, and ambiguous names
+        // must never select an unrelated tail of the strip.
+        let unique_index = |name: &str| {
+            let mut matching = buttons
+                .iter()
+                .enumerate()
+                .filter(|(_, button)| button.widget_name() == name);
+            let first = matching.next()?.0;
+            matching.next().is_none().then_some(first)
+        };
+        let (Some(from), Some(to)) = (unique_index(from_name), unique_index(to_name)) else {
+            return;
+        };
+
+        self.clear_tab_selection();
+        let range = &buttons[from.min(to)..=from.max(to)];
+        *self.selected_tabs.borrow_mut() = range
+            .iter()
+            .map(|button| button.widget_name().to_string())
+            .collect();
+        for button in range {
+            button.add_css_class("tab-selected");
         }
     }
 
@@ -764,6 +859,16 @@ impl UiState {
         let selected = self.selected_tabs.borrow().clone();
         if selected.is_empty() {
             return;
+        }
+
+        // A selected zoomed page exposes only one leaf in the Notebook.
+        // Restore that target before gathering the confirmation details, so
+        // retained running siblings receive the same warning as visible panes.
+        // Unselected zooms and the captured selected-name set are untouched.
+        for tab_name in &selected {
+            if let Some(widget) = notebook_page_named(&self.notebook, tab_name) {
+                self.restore_zoom_before_close(&widget);
+            }
         }
 
         let mut running = Vec::new();
@@ -1347,5 +1452,35 @@ mod tests {
         assert!(resolved_tab_pinned(false, true, &[true, false]));
         assert!(resolved_tab_pinned(false, false, &[true, false]));
         assert!(!resolved_tab_pinned(false, false, &[false, false]));
+    }
+    #[test]
+    fn selected_close_restores_only_captured_targets_before_process_preflight() {
+        let source = include_str!("tab_strip.rs");
+        let close = source
+            .split_once("pub(crate) fn close_selected_tabs(&self)")
+            .unwrap()
+            .1
+            .split_once("pub(crate) fn move_tab_left")
+            .unwrap()
+            .0;
+        let capture = close
+            .find("let selected = self.selected_tabs.borrow().clone();")
+            .unwrap();
+        let restore = close
+            .find("self.restore_zoom_before_close(&widget);")
+            .unwrap();
+        let scan = close
+            .find("Self::running_processes_in_widget(&page_widget)")
+            .unwrap();
+        let prompt = close.find("Self::confirm_close_with_processes(").unwrap();
+        assert!(capture < restore && restore < scan && scan < prompt);
+        let preflight = &close[capture..scan];
+        assert!(preflight.contains("for tab_name in &selected"));
+        assert!(preflight.contains("notebook_page_named(&self.notebook, tab_name)"));
+        assert_eq!(close.matches("self.selected_tabs.borrow()").count(), 1);
+        let commit = close.split_once("let close_selected =").unwrap().1;
+        assert!(commit.contains("for tab_name in &selected"));
+        assert!(commit.contains("widget.widget_name().as_str() == tab_name"));
+        assert!(commit.contains("ui.remove_tab_by_widget_internal(&widget)"));
     }
 }

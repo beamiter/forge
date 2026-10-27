@@ -24,6 +24,12 @@
             pname = manifest.package.name;
             version = manifest.package.version;
             src = self;
+            # Cargo resolves the shared core relative to this application's
+            # unpacked source, preserving the same sibling layout as development.
+            postUnpack = ''
+              mkdir jterm_core
+              tar -xzf ${./packaging/jterm-core-src.tar.gz} -C jterm_core
+            '';
 
             cargoLock = {
               lockFile = ./Cargo.lock;
@@ -31,10 +37,8 @@
               # Nix needs an explicit hash per revision. Update these whenever
               # the jagent / jterm_core pins in Cargo.lock change.
               outputHashes = {
-                # 6ed0b9f037eff9359d62ed448e0d117327fabe26
-                "jagent-0.7.0" = "sha256-j5WkB+u+/IqNb4UAKvUwTkalI9KDjWZ2M4omGLsgIb4=";
-                # 33093dab3bbe620a1bd4bee7c33d6a37289f9f5f
-                "jterm_core-0.2.0" = "sha256-P9ucN+gdQyuhr8gLF/bsMvO0FA/a+WCMmfrDY239HOo=";
+                # d5492320686879c8b92106d2e31e4293ff125a5a
+                "jagent-0.7.0" = "sha256-VoockpfPMDhYutNOVaY8Rp2juKYt8dWz031PBfGUIvM=";
               };
             };
             strictDeps = true;

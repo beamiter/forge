@@ -12,7 +12,6 @@ if [[ -n "${DESTDIR}" ]]; then
 fi
 PREFIX="${HOME_DIR}/.local"
 BIN_DIR=""
-PREFIX_EXPLICIT=0
 PURGE_CONFIG=0
 DRY_RUN=0
 
@@ -22,8 +21,7 @@ Usage: uninstall.sh [options]
 
 Options:
   --prefix PATH          Runtime prefix (default: ~/.local)
-  --bin-dir PATH         Runtime binary directory (default: ~/.cargo/bin;
-                         with --prefix, defaults to PREFIX/bin)
+  --bin-dir PATH         Runtime binary directory (default: PREFIX/bin)
   --purge-config         Also remove forge config and default XDG state
   --dry-run              Print commands without changing files
   -h, --help             Show this help
@@ -143,13 +141,11 @@ while (($# > 0)); do
             (($# >= 2)) || die "--prefix requires a path"
             PREFIX="$2"
             [[ -n "${PREFIX}" ]] || die "--prefix must not be empty"
-            PREFIX_EXPLICIT=1
             shift 2
             ;;
         --prefix=*)
             PREFIX="${1#*=}"
             [[ -n "${PREFIX}" ]] || die "--prefix must not be empty"
-            PREFIX_EXPLICIT=1
             shift
             ;;
         --bin-dir)
@@ -188,11 +184,7 @@ done
 [[ -n "${HOME_DIR}" ]] || die "HOME is not set"
 validate_absolute_path "--prefix" "${PREFIX}"
 if [[ -z "${BIN_DIR}" ]]; then
-    if ((PREFIX_EXPLICIT == 1)); then
-        BIN_DIR="${PREFIX}/bin"
-    else
-        BIN_DIR="${HOME_DIR}/.cargo/bin"
-    fi
+    BIN_DIR="${PREFIX}/bin"
 fi
 validate_absolute_path "--bin-dir" "${BIN_DIR}"
 if ((DESTDIR_ACTIVE == 1)); then
@@ -213,6 +205,13 @@ if ((PURGE_CONFIG == 1)); then
     # files, preserving the existing all-or-nothing purge preflight contract.
     validate_staging_removal_target "${DESTDIR}${CONFIG_HOME}/forge"
     validate_staging_removal_target "${DESTDIR}${STATE_HOME}/forge"
+fi
+
+# Remove only the compatibility link created by the default-path migration.
+LEGACY_BINARY="${DESTDIR}${HOME_DIR}/.cargo/bin/forge"
+if [[ "${BIN_DIR}" == "${HOME_DIR}/.local/bin" && -L "${LEGACY_BINARY}" ]] \
+    && [[ "$(readlink -- "${LEGACY_BINARY}")" == "${BIN_DIR}/forge" ]]; then
+    remove_file "${LEGACY_BINARY}"
 fi
 
 remove_file "${DESTDIR}${BIN_DIR}/forge"

@@ -1,0 +1,2271 @@
+//! Native Vim9 workbench. Vim owns every editing operation and modified buffer;
+//! GTK/Pango paints the buffer from Vim's GUI RGB frame. VTE owns the real
+//! interactive PTY/input path and displays views outside the native contract.
+
+use adw::prelude::*;
+use gtk::{gdk, gio, glib};
+use gtk4 as gtk;
+use jterm_core::vim9::{
+    list_project_directory, ProjectEntry, Vim9Command, Vim9EntryRequest, Vim9Session, Vim9UiConfig,
+};
+use libadwaita as adw;
+use std::cell::{Cell, RefCell};
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::time::Duration;
+use vte4::prelude::*;
+
+#[path = "vim9_ide_buffer.rs"]
+mod native_buffer;
+#[path = "vim9_ide_navigation.rs"]
+mod navigation;
+#[path = "vim9_ide_search.rs"]
+mod project_search;
+
+// Stack itself is not a keyboard target. Restore its visible content and
+// return to the editor when that content cannot accept keyboard focus.
+fn restore_workspace_output_focus(
+    stack: &gtk::Stack,
+    output: &gtk::TextView,
+    problems: &gtk::ListBox,
+    editor: &impl IsA<gtk::Widget>,
+) {
+    let focused = if stack.visible_child_name().as_deref() == Some("output") {
+        output.grab_focus()
+    } else {
+        problems.grab_focus()
+    };
+    if !focused {
+        editor.grab_focus();
+    }
+}
+
+// The channel handshake can precede Vim's first buffer metadata.
+fn editor_state_ready(snapshot: &jterm_core::vim9::Vim9Snapshot) -> bool {
+    snapshot.connected
+        && snapshot.buffer > 0
+        && snapshot.window > 0
+        && snapshot.line > 0
+        && snapshot.column > 0
+        && !snapshot.mode.is_empty()
+}
+
+#[test]
+fn editor_readiness_requires_initial_metadata() {
+    let mut snapshot = jterm_core::vim9::Vim9Snapshot {
+        connected: true,
+        ..Default::default()
+    };
+    assert!(!editor_state_ready(&snapshot));
+    snapshot.buffer = 1;
+    snapshot.window = 1000;
+    snapshot.line = 1;
+    snapshot.column = 1;
+    snapshot.mode = "n".into();
+    assert!(editor_state_ready(&snapshot));
+    snapshot.connected = false;
+    assert!(!editor_state_ready(&snapshot));
+}
+
+fn diagnostic_shortcuts_enabled(visible: bool, mode: &str) -> bool {
+    // Terminal job/normal mode owns F8, including SimpleTerminal's popup.
+    visible && mode != "t" && !mode.starts_with("nt")
+}
+
+fn visible(text: &str) -> String {
+    jterm_core::review_input::safe_inline_display(text, 1024)
+}
+
+fn label(text: &str) -> gtk::Label {
+    let label = gtk::Label::new(Some(text));
+    label.set_xalign(0.0);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    label
+}
+
+fn button(icon: &str, title: &str) -> gtk::Button {
+    let button = gtk::Button::from_icon_name(icon);
+    button.set_tooltip_text(Some(title));
+    button.set_focus_on_click(false);
+    button.update_property(&[gtk::accessible::Property::Label(title)]);
+    button.add_css_class("flat");
+    button
+}
+
+fn scroll(child: &impl IsA<gtk::Widget>) -> gtk::ScrolledWindow {
+    let scroll = gtk::ScrolledWindow::new();
+    scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    scroll.set_hexpand(true);
+    scroll.set_vexpand(true);
+    scroll.set_child(Some(child));
+    scroll
+}
+
+fn dispatch(
+    session: &Vim9Session,
+    command: Vim9Command,
+    message: &gtk::Label,
+    editor: &vte4::Terminal,
+) {
+    match session.send(command) {
+        Ok(_) => {
+            message.set_label("");
+            editor.grab_focus();
+        }
+        Err(error) => message.set_label(&visible(&error.to_string())),
+    }
+}
+
+fn command_button(
+    session: &Vim9Session,
+    editor: &vte4::Terminal,
+    message: &gtk::Label,
+    icon: &str,
+    title: &str,
+    command: impl Fn() -> Vim9Command + 'static,
+) -> gtk::Button {
+    let button = button(icon, title);
+    let session = session.clone();
+    let editor = editor.clone();
+    let message = message.clone();
+    button.connect_clicked(move |_| dispatch(&session, command(), &message, &editor));
+    button
+}
+
+/// One bounded directory read at a time, off the GTK thread. File filtering
+/// never recursively scans a repository or follows a symlink outside its root.
+struct Browser {
+    root: PathBuf,
+    directory: RefCell<PathBuf>,
+    entries: RefCell<Vec<ProjectEntry>>,
+    shown: RefCell<Vec<(PathBuf, bool)>>,
+    busy: Cell<bool>,
+    list: gtk::ListBox,
+    query: gtk::SearchEntry,
+    location: gtk::Label,
+    up: gtk::Button,
+    message: gtk::Label,
+    session: Vim9Session,
+    editor: vte4::Terminal,
+}
+
+impl Browser {
+    fn render(&self) {
+        let selected = self.list.selected_row().and_then(|row| {
+            self.shown
+                .borrow()
+                .get(row.index() as usize)
+                .map(|entry| entry.0.clone())
+        });
+        self.list.remove_all();
+        let needle = self.query.text().to_lowercase();
+        let entries = self.entries.borrow();
+        let mut shown = self.shown.borrow_mut();
+        shown.clear();
+        for entry in entries
+            .iter()
+            .filter(|entry| entry.name.to_lowercase().contains(&needle))
+        {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 7);
+            row.set_margin_start(8);
+            row.set_margin_end(8);
+            row.set_margin_top(5);
+            row.set_margin_bottom(5);
+            row.append(&gtk::Image::from_icon_name(if entry.is_dir {
+                "folder-symbolic"
+            } else {
+                "text-x-generic-symbolic"
+            }));
+            row.append(&label(&visible(&entry.name)));
+            row.set_tooltip_text(Some(&visible(&entry.path.display().to_string())));
+            self.list.append(&row);
+            shown.push((entry.path.clone(), entry.is_dir));
+        }
+        let selected_index = shown
+            .iter()
+            .position(|entry| Some(&entry.0) == selected.as_ref())
+            .unwrap_or(0);
+        self.list
+            .select_row(self.list.row_at_index(selected_index as i32).as_ref());
+    }
+
+    fn navigate(this: &Rc<Self>, directory: PathBuf) {
+        if this.busy.replace(true) {
+            return;
+        }
+        this.list.set_sensitive(false);
+        this.up.set_sensitive(false);
+        this.location.set_label("Loading directory…");
+        let root = this.root.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = directory.canonicalize().and_then(|directory| {
+                if !directory.starts_with(&root) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "This folder leaves the project root; use Open file to choose an external file.",
+                    ));
+                }
+                let entries = list_project_directory(&directory)?;
+                Ok((directory, entries))
+            });
+            let _ = tx.send(result);
+        });
+        let weak = Rc::downgrade(this);
+        glib::timeout_add_local(Duration::from_millis(40), move || {
+            let Some(browser) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            match rx.try_recv() {
+                Ok(result) => {
+                    browser.busy.set(false);
+                    browser.list.set_sensitive(true);
+                    match result {
+                        Ok((directory, entries)) => {
+                            *browser.directory.borrow_mut() = directory;
+                            *browser.entries.borrow_mut() = entries;
+                            browser.query.set_text("");
+                            browser.render();
+                        }
+                        Err(error) => browser.message.set_label(&visible(&error.to_string())),
+                    }
+                    let directory = browser.directory.borrow();
+                    let capped = browser.entries.borrow().len() >= 1024;
+                    browser.location.set_label(&format!(
+                        "{}{}",
+                        visible(&directory.display().to_string()),
+                        if capped { " · 1,024+ entries" } else { "" }
+                    ));
+                    browser
+                        .location
+                        .set_tooltip_text(Some(&visible(&directory.display().to_string())));
+                    browser.up.set_sensitive(*directory != browser.root);
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    browser.busy.set(false);
+                    browser.list.set_sensitive(true);
+                    browser
+                        .up
+                        .set_sensitive(*browser.directory.borrow() != browser.root);
+                    browser
+                        .message
+                        .set_label("Project directory reader stopped. Use Refresh to retry.");
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    fn activate(this: &Rc<Self>, index: i32) {
+        let Some((path, directory)) = this.shown.borrow().get(index as usize).cloned() else {
+            return;
+        };
+        if directory {
+            Self::navigate(this, path);
+        } else if let Some(path) = path.to_str() {
+            dispatch(
+                &this.session,
+                Vim9Command::Open {
+                    path: path.into(),
+                    line: None,
+                    column: None,
+                },
+                &this.message,
+                &this.editor,
+            );
+        } else {
+            this.message
+                .set_label("Vim9 IDE currently requires UTF-8 file paths.");
+        }
+    }
+}
+
+fn default_build(root: &Path) -> &'static str {
+    if root.join("Cargo.toml").is_file() {
+        "cargo check --message-format=short"
+    } else if root.join("Makefile").is_file() {
+        "make"
+    } else if root.join("CMakeLists.txt").is_file() {
+        "cmake --build build"
+    } else {
+        "make"
+    }
+}
+
+fn open_error(
+    application: &gtk::Application,
+    parent: Option<&adw::ApplicationWindow>,
+    error: &str,
+) {
+    let window = adw::ApplicationWindow::builder()
+        .application(application)
+        .title("Vim9 IDE — launch error")
+        .default_width(560)
+        .default_height(240)
+        .build();
+    if let Some(parent) = parent {
+        window.set_transient_for(Some(parent));
+    }
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 16);
+    content.set_margin_start(24);
+    content.set_margin_end(24);
+    content.set_margin_top(24);
+    content.set_margin_bottom(24);
+    let heading = label("Vim9 IDE could not start");
+    heading.add_css_class("title-2");
+    let detail = label(&visible(error));
+    detail.set_wrap(true);
+    detail.set_ellipsize(gtk::pango::EllipsizeMode::None);
+    detail.set_selectable(true);
+    let close = gtk::Button::with_label("Close");
+    close.set_halign(gtk::Align::End);
+    let weak = window.downgrade();
+    close.connect_clicked(move |_| {
+        if let Some(window) = weak.upgrade() {
+            window.close();
+        }
+    });
+    content.append(&heading);
+    content.append(&detail);
+    content.append(&close);
+    window.set_content(Some(&content));
+    window.present();
+}
+
+/// Existing terminal windows explicitly quit their application on close. Give
+/// each editor its own process so that terminal teardown cannot kill unsaved
+/// buffers. The same binary's --ide path owns the native workbench below.
+pub(crate) fn launch(request: Vim9EntryRequest) -> std::io::Result<()> {
+    use std::process::Command;
+    let env = jterm_core::child_env::vte_envv_from_captured(
+        &jterm_core::child_env::ChildEnv::from_identity(),
+        &[],
+    )?;
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("--ide")
+        // The editor is another window of this application, so carry the
+        // selected config explicitly. The frozen PTY environment intentionally
+        // omits process-local --config overrides for ordinary shell children.
+        .arg("--config")
+        .arg(crate::config::config_file_path()?)
+        .arg("--working-directory")
+        .arg(request.target());
+    command.env_clear();
+    for entry in &env {
+        if let Some((name, value)) = entry.split_once('=') {
+            command.env(name, value);
+        }
+    }
+    let mut child = command.spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+/// Prepare automatic Vim entry only for local interactive shell panes. The
+/// shim preserves shell cwd/arguments and is independent of buffer rendering.
+pub(crate) fn shell_environment(argv: &[String], enabled: bool) -> Vec<(String, String)> {
+    if !enabled {
+        // A nested terminal may inherit another terminal's shim or Bash
+        // function. Explicit opt-out must also disable that inherited route.
+        return vec![("JTERM_VIM9_AUTO_GUI".into(), "0".into())];
+    }
+    if crate::host::is_flatpak() || !jterm_core::vim9::shell_argv_eligible(argv) {
+        return Vec::new();
+    }
+    let prepared = std::env::current_exe()
+        .and_then(|program| jterm_core::vim9::Vim9ShellIntegration::prepare(&program));
+    match prepared {
+        Ok(integration) => {
+            let mut env = integration.env();
+            if let Ok(path) = crate::config::config_file_path() {
+                env.push((
+                    "JTERM_VIM9_CONFIG".into(),
+                    path.to_string_lossy().into_owned(),
+                ));
+            }
+            env
+        }
+        Err(error) => {
+            log::warn!("Cannot prepare automatic GUI Vim entry: {error}");
+            Vec::new()
+        }
+    }
+}
+
+/// The managed shell keeps its original PTY while this pane hosts Vim.
+struct EmbeddedLaunch {
+    container: gtk::Box,
+    source: gtk::Widget,
+    completion: jterm_core::vim9::Vim9ShellCompletion,
+}
+
+struct EmbeddedHost {
+    container: gtk::Box,
+    source: gtk::Widget,
+    children: Vec<(gtk::Widget, bool)>,
+    controllers: Vec<(gtk::EventController, gtk::PropagationPhase)>,
+    content: RefCell<Option<glib::WeakRef<gtk::Box>>>,
+    completion: RefCell<Option<jterm_core::vim9::Vim9ShellCompletion>>,
+    finished: Cell<bool>,
+}
+
+thread_local! {
+    static EMBEDDED_EDITORS: RefCell<Vec<(glib::WeakRef<gtk::Box>, Vim9Session)>> = const { RefCell::new(Vec::new()) };
+}
+
+impl EmbeddedHost {
+    fn new(launch: EmbeddedLaunch) -> Rc<Self> {
+        let mut children = Vec::new();
+        let mut child = launch.container.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            children.push((widget.clone(), widget.is_visible()));
+        }
+        let list = launch.container.observe_controllers();
+        let controllers = (0..list.n_items())
+            .filter_map(|index| list.item(index)?.downcast::<gtk::EventController>().ok())
+            .map(|controller| {
+                let phase = controller.propagation_phase();
+                (controller, phase)
+            })
+            .collect();
+        Rc::new(Self {
+            container: launch.container,
+            source: launch.source,
+            children,
+            controllers,
+            content: RefCell::new(None),
+            completion: RefCell::new(Some(launch.completion)),
+            finished: Cell::new(false),
+        })
+    }
+    fn attach(&self, content: &gtk::Box, session: &Vim9Session) {
+        // Block-mode root key handlers belong to the waiting shell. They must
+        // not turn Vim editing keys into input for that hidden shell.
+        for (controller, _) in &self.controllers {
+            controller.set_propagation_phase(gtk::PropagationPhase::None);
+        }
+        for (child, _) in &self.children {
+            child.set_visible(false);
+        }
+        content.set_hexpand(true);
+        content.set_vexpand(true);
+        self.container.append(content);
+        *self.content.borrow_mut() = Some(content.downgrade());
+        EMBEDDED_EDITORS
+            .with_borrow_mut(|editors| editors.push((self.container.downgrade(), session.clone())));
+    }
+    fn finish(&self, status: i32) {
+        if self.finished.replace(true) {
+            return;
+        }
+        EMBEDDED_EDITORS.with_borrow_mut(|editors| {
+            editors.retain(|(container, _)| container.upgrade().as_ref() != Some(&self.container))
+        });
+        if let Some(content) = self
+            .content
+            .borrow_mut()
+            .take()
+            .and_then(|weak| weak.upgrade())
+        {
+            self.container.remove(&content);
+        }
+        for (controller, phase) in &self.controllers {
+            controller.set_propagation_phase(*phase);
+        }
+        for (child, visible) in &self.children {
+            child.set_visible(*visible);
+        }
+        self.source.grab_focus();
+        if let Some(completion) = self.completion.borrow_mut().take() {
+            completion.finish(status);
+        }
+    }
+}
+
+fn has_embedded_editor(root: &impl IsA<gtk::Widget>) -> bool {
+    EMBEDDED_EDITORS.with_borrow(|editors| {
+        editors.iter().any(|(container, _)| {
+            container.upgrade().is_some_and(|container| {
+                let widget: &gtk::Widget = container.upcast_ref();
+                let root = root.as_ref();
+                widget == root || widget.is_ancestor(root) || root.is_ancestor(widget)
+            })
+        })
+    })
+}
+
+/// The shell window captures shortcuts before the embedded content. Defer
+/// only this editor dialog chord when its registered pane owns focus. Native
+/// modal dialogs own their keys even when GTK reparents their focus outside
+/// that pane; a sibling terminal pane retains its normal palette binding.
+pub(crate) fn embedded_owns_quick_open_key(
+    window: &adw::ApplicationWindow,
+    key: gdk::Key,
+    modifiers: gdk::ModifierType,
+) -> bool {
+    if key.to_unicode().map(|key| key.to_ascii_lowercase()) != Some('p')
+        || !modifiers.contains(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK)
+        || modifiers.intersects(gdk::ModifierType::ALT_MASK | gdk::ModifierType::SUPER_MASK)
+    {
+        return false;
+    }
+    let dialog_owned = window
+        .visible_dialog()
+        .map(|dialog| navigation::owns_dialog(&dialog));
+    if dialog_owned == Some(false) {
+        return false;
+    }
+    let focus = gtk::prelude::RootExt::focus(window);
+    EMBEDDED_EDITORS.with_borrow(|editors| {
+        editors.iter().any(|(container, _)| {
+            container.upgrade().is_some_and(|container| {
+                container.is_mapped()
+                    && container.is_ancestor(window)
+                    && (dialog_owned == Some(true)
+                        || focus.as_ref().is_some_and(|focus| {
+                            focus == container.upcast_ref::<gtk::Widget>()
+                                || focus.is_ancestor(&container)
+                        }))
+            })
+        })
+    })
+}
+
+/// A mapped native modal owns its complete keyboard path, including fields
+/// whose local shortcuts must run before the shell's global capture bindings.
+pub(crate) fn native_dialog_owns_keyboard(window: &adw::ApplicationWindow) -> bool {
+    window
+        .visible_dialog()
+        .is_some_and(|dialog| dialog.is_mapped())
+}
+
+/// Parent capture handlers must let the Vim terminal own its zoom keys.
+/// A search field or sibling shell continues using its usual application route.
+pub(crate) fn embedded_owns_font_key(
+    window: &adw::ApplicationWindow,
+    key: gdk::Key,
+    modifiers: gdk::ModifierType,
+) -> bool {
+    crate::vim9_zoom::owns_keyboard(
+        native_buffer::font_zoom_key(key, modifiers).is_some(),
+        gtk::prelude::RootExt::focus(window).is_some_and(|focus| {
+            focus.is_mapped() && focus.is::<vte4::Terminal>() && has_embedded_editor(&focus)
+        }),
+    )
+}
+
+/// Wheel routing follows the native buffer's actual pointer ownership, not
+/// keyboard focus. An ancestor content-zoom controller must not swallow it.
+pub(crate) fn embedded_owns_font_scroll(root: &gtk::Widget) -> bool {
+    EMBEDDED_EDITORS.with_borrow(|editors| {
+        editors.iter().any(|(container, _)| {
+            container.upgrade().is_some_and(|container| {
+                container.is_mapped()
+                    && (container.upcast_ref::<gtk::Widget>() == root
+                        || container.is_ancestor(root))
+                    && native_buffer::contains_buffer_pointer(container.upcast_ref())
+            })
+        })
+    })
+}
+
+/// Tab/pane/window close first asks the actual Vim to quit. A modified buffer
+/// can refuse without losing either the editor or its waiting shell.
+pub(crate) fn request_embedded_close(root: &impl IsA<gtk::Widget>) -> bool {
+    EMBEDDED_EDITORS.with_borrow(|editors| {
+        let mut handled = false;
+        for (container, session) in editors {
+            if let Some(container) = container.upgrade() {
+                let widget: &gtk::Widget = container.upcast_ref();
+                let root = root.as_ref();
+                if widget == root || widget.is_ancestor(root) || root.is_ancestor(widget) {
+                    let _ = session.send(Vim9Command::Quit);
+                    handled = true;
+                }
+            }
+        }
+        handled
+    })
+}
+
+fn shell_source(
+    root: &gtk::Widget,
+    request: &jterm_core::vim9::Vim9ShellInvocation,
+) -> Option<(gtk::Box, gtk::Widget)> {
+    if let Some(leaf) = crate::ui::PaneLeaf::from_widget(root) {
+        if request.matches_pty(leaf.process_probe().0) {
+            if let Some(container) = root.downcast_ref::<gtk::Box>() {
+                return Some((container.clone(), leaf.terminal().clone().upcast()));
+            }
+        }
+    }
+    if let Some(terminal) = root.downcast_ref::<vte4::Terminal>() {
+        if terminal
+            .pty()
+            .is_some_and(|pty| request.matches_pty(pty.fd().as_raw_fd()))
+        {
+            let mut ancestor = root.parent();
+            while let Some(parent) = ancestor {
+                if let Some(container) = parent.downcast_ref::<gtk::Box>() {
+                    return Some((container.clone(), root.clone()));
+                }
+                ancestor = parent.parent();
+            }
+        }
+    }
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        if let Some(found) = shell_source(&widget, request) {
+            return Some(found);
+        }
+        child = widget.next_sibling();
+    }
+    None
+}
+
+pub(crate) fn install_shell_host(window: &adw::ApplicationWindow) {
+    let weak = window.downgrade();
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        let Some(window) = weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        let Some(application) = window.application() else {
+            return glib::ControlFlow::Break;
+        };
+        for invocation in jterm_core::vim9::take_shell_vim_requests() {
+            let destination = application.windows().into_iter().find_map(|window| {
+                let window = window.downcast::<adw::ApplicationWindow>().ok()?;
+                let (container, source) = shell_source(window.upcast_ref(), &invocation)?;
+                Some((window, container, source))
+            });
+            let Some((window, container, source)) = destination else {
+                continue;
+            };
+            if has_embedded_editor(&container) {
+                continue;
+            }
+            let config = crate::config::load_config().0.vim9;
+            open_with_config_and_exit(
+                &application,
+                Some(&window),
+                invocation.request,
+                config,
+                None,
+                Some(EmbeddedLaunch {
+                    container,
+                    source,
+                    completion: invocation.completion,
+                }),
+            );
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+/// Standalone fallback for an explicit shell CLI without a managed host.
+pub(crate) fn run_shell(request: Vim9EntryRequest, application_id: &str) -> i32 {
+    let application = adw::Application::builder()
+        .application_id(application_id)
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    let outcome = Rc::new(Cell::new(None));
+    let request = RefCell::new(Some(request));
+    let result = outcome.clone();
+    application.connect_activate(move |application| {
+        if let Some(request) = request.borrow_mut().take() {
+            let config = crate::config::load_config().0.vim9;
+            open_with_config_and_exit(
+                application.upcast_ref(),
+                None,
+                request,
+                config,
+                Some(result.clone()),
+                None,
+            );
+        } else if let Some(window) = application.active_window() {
+            window.present();
+        }
+    });
+    let _ = application.run_with_args(&["forge"]);
+    outcome.get().unwrap_or(1)
+}
+
+pub(crate) fn open(
+    application: &gtk::Application,
+    parent: Option<&adw::ApplicationWindow>,
+    request: Vim9EntryRequest,
+) {
+    let config = crate::config::load_config().0.vim9;
+    open_with_config(application, parent, request, config);
+}
+
+fn open_with_config(
+    application: &gtk::Application,
+    parent: Option<&adw::ApplicationWindow>,
+    request: Vim9EntryRequest,
+    config: Vim9UiConfig,
+) {
+    open_with_config_and_exit(application, parent, request, config, None, None);
+}
+
+fn open_with_config_and_exit(
+    application: &gtk::Application,
+    parent: Option<&adw::ApplicationWindow>,
+    request: Vim9EntryRequest,
+    config: Vim9UiConfig,
+    shell_exit: Option<Rc<Cell<Option<i32>>>>,
+    embedded: Option<EmbeddedLaunch>,
+) {
+    let embedded = embedded.map(EmbeddedHost::new);
+    let session = match Vim9Session::start(request) {
+        Ok(session) => session,
+        Err(error) => {
+            if let Some(host) = &embedded {
+                eprintln!("forge: cannot start Vim in this tab: {error}");
+                host.finish(1);
+                return;
+            }
+            if let Some(result) = &shell_exit {
+                result.set(Some(1));
+                eprintln!("forge: cannot start GUI Vim: {error}");
+                application.quit();
+            } else {
+                open_error(application, parent, &error.to_string());
+            }
+            return;
+        }
+    };
+    let mut workspace_store =
+        jterm_core::vim9::Vim9WorkspaceStateStore::new(session.root(), "forge");
+    let workspace =
+        workspace_store.restore(jterm_core::vim9::Vim9WorkspaceState::for_config(&config));
+    let workspace_store = Rc::new(RefCell::new(workspace_store));
+    let mut config = config;
+    config.project_panel = workspace.files_visible;
+    config.tool_panel = workspace.tools_visible;
+    let window = if embedded.is_some() {
+        parent
+            .expect("embedded Vim belongs to an existing window")
+            .clone()
+    } else {
+        let window = adw::ApplicationWindow::builder()
+            .application(application)
+            .title("Vim9 IDE")
+            .default_width(1240)
+            .default_height(820)
+            .build();
+        if let Some(parent) = parent {
+            window.set_transient_for(Some(parent));
+        }
+        window
+    };
+    // Toolbar entry points launch a separate --ide process. This window's
+    // lifetime therefore cannot be cut short by terminal-workspace shutdown.
+    if embedded.is_none() {
+        window.set_destroy_with_parent(false);
+    }
+
+    let editor = vte4::Terminal::new();
+    editor.set_hexpand(true);
+    editor.set_vexpand(true);
+    editor.set_mouse_autohide(true);
+    editor.set_scroll_on_keystroke(true);
+    editor.set_scrollback_lines(5000);
+    editor.set_font(Some(&gtk::pango::FontDescription::from_string(
+        "Monospace 12",
+    )));
+    editor.update_property(&[gtk::accessible::Property::Label("Vim9 editor")]);
+    let foreground = gdk::RGBA::new(0.85, 0.88, 0.93, 1.0);
+    let background = gdk::RGBA::new(0.07, 0.09, 0.12, 1.0);
+    editor.set_colors(Some(&foreground), Some(&background), &[]);
+    let native = native_buffer::NativeBuffer::new(
+        &session,
+        &editor,
+        config.native_buffer,
+        config.smooth_scroll,
+    );
+
+    // A wheel burst is coalesced until the next display frame. Stop that
+    // pending burst before a toolbar/tab action or editing key can change the
+    // buffer it belongs to; the widget must not overtake queued scroll input.
+    let interaction = gtk::EventControllerLegacy::new();
+    interaction.set_name(Some("vim9-window-scroll-stop"));
+    interaction.set_propagation_phase(gtk::PropagationPhase::Capture);
+    {
+        let surface = native.surface.downgrade();
+        interaction.connect_event(move |_, event| {
+            if matches!(
+                event.event_type(),
+                gdk::EventType::KeyPress | gdk::EventType::ButtonPress | gdk::EventType::TouchBegin
+            ) {
+                if let Some(surface) = surface.upgrade() {
+                    surface.cancel_scroll();
+                }
+            }
+            glib::Propagation::Proceed
+        });
+    }
+
+    let message = label(if config.status_bar {
+        "Starting Vim 9 and connecting the workbench…"
+    } else {
+        ""
+    });
+    // Connection errors and unsaved-close feedback must remain visible even
+    // in the minimal editor. Empty informational chrome takes no space.
+    message.set_visible(!message.text().is_empty());
+    message.connect_label_notify(|message| message.set_visible(!message.text().is_empty()));
+    message.set_margin_start(10);
+    message.set_margin_end(10);
+    message.set_margin_top(4);
+    message.set_margin_bottom(4);
+    message.set_wrap(true);
+    message.set_ellipsize(gtk::pango::EllipsizeMode::None);
+    let status = label("VIM9 · CONNECTING");
+    status.set_margin_start(10);
+    status.set_margin_end(10);
+    status.set_margin_top(6);
+    status.set_margin_bottom(6);
+    status.add_css_class("caption");
+    status.set_visible(config.status_bar);
+
+    let header = adw::HeaderBar::new();
+    let title = adw::WindowTitle::new("Vim9 IDE", &visible(&session.root().display().to_string()));
+    header.set_title_widget(Some(&title));
+    header.pack_end(&native.menu);
+    header.pack_end(&native.badge);
+    native.badge.set_visible(config.status_bar);
+    let navigate_back = command_button(
+        &session,
+        &editor,
+        &message,
+        "go-previous-symbolic",
+        "Navigate back (Alt+Left)",
+        || Vim9Command::NavigateBack,
+    );
+    let navigate_forward = command_button(
+        &session,
+        &editor,
+        &message,
+        "go-next-symbolic",
+        "Navigate forward (Alt+Right)",
+        || Vim9Command::NavigateForward,
+    );
+    navigate_back.set_sensitive(false);
+    navigate_forward.set_sensitive(false);
+    header.pack_start(&navigate_back);
+    header.pack_start(&navigate_forward);
+    let new_file = button("document-new-symbolic", "New file");
+    header.pack_start(&new_file);
+    let open_file = button("document-open-symbolic", "Open file (Ctrl+Shift+O)");
+    header.pack_start(&open_file);
+    let quick_open = button(
+        "system-search-symbolic",
+        "Quick open project file (Ctrl+Shift+P)",
+    );
+    header.pack_start(&quick_open);
+    {
+        let weak = window.downgrade();
+        let session = session.clone();
+        let editor = editor.clone();
+        let message = message.clone();
+        let index = Rc::new(RefCell::new(None));
+        quick_open.connect_clicked(move |_| {
+            let Some(window) = weak.upgrade() else { return };
+            if window.visible_dialog().is_some() {
+                return;
+            }
+            let index = index
+                .borrow_mut()
+                .get_or_insert_with(|| {
+                    Rc::new(RefCell::new(jterm_core::vim9::Vim9ProjectIndex::start(
+                        session.root(),
+                    )))
+                })
+                .clone();
+            navigation::QuickOpen::show(&window, index, &session, &editor, &message);
+        });
+    }
+    let save = command_button(
+        &session,
+        &editor,
+        &message,
+        "document-save-symbolic",
+        "Save (Ctrl+S)",
+        || Vim9Command::Save,
+    );
+    header.pack_start(&save);
+    let save_all = command_button(
+        &session,
+        &editor,
+        &message,
+        "document-save-symbolic",
+        "Save all (Ctrl+Shift+S)",
+        || Vim9Command::SaveAll,
+    );
+    save_all.set_label("Save all");
+    header.pack_start(&save_all);
+    let previous = command_button(
+        &session,
+        &editor,
+        &message,
+        "go-up-symbolic",
+        "Previous diagnostic (Shift+F8)",
+        || Vim9Command::PreviousDiagnostic,
+    );
+    let next = command_button(
+        &session,
+        &editor,
+        &message,
+        "go-down-symbolic",
+        "Next diagnostic (F8)",
+        || Vim9Command::NextDiagnostic,
+    );
+    header.pack_end(&next);
+    header.pack_end(&previous);
+
+    let tools = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    tools.set_margin_start(8);
+    tools.set_margin_end(8);
+    tools.set_margin_top(4);
+    tools.set_margin_bottom(4);
+    let search = gtk::Entry::new();
+    search.set_placeholder_text(Some("Search project text (Enter)"));
+    search.set_hexpand(true);
+    search.set_tooltip_text(Some("Search project text and populate Vim quickfix"));
+    tools.append(&search);
+    navigation::editor_escape(&search, &editor);
+    search.set_text(&workspace.search_query);
+    let search_options = project_search::SearchOptions::new();
+    search_options.restore(&workspace.search_options);
+    tools.append(&search_options.menu);
+    let run_search = button(
+        "system-search-symbolic",
+        "Search project using the selected options",
+    );
+    tools.append(&run_search);
+    {
+        let search = search.clone();
+        run_search.connect_clicked(move |_| search.emit_activate());
+    }
+    let cancel_search = command_button(
+        &session,
+        &editor,
+        &message,
+        "process-stop-symbolic",
+        "Cancel project search",
+        || Vim9Command::CancelSearch,
+    );
+    cancel_search.set_sensitive(false);
+    tools.append(&cancel_search);
+    let go_to_line = button("go-jump-symbolic", "Go to line (Ctrl+Shift+G)");
+    tools.append(&go_to_line);
+    {
+        let weak = window.downgrade();
+        let session = session.clone();
+        let editor = editor.clone();
+        let message = message.clone();
+        go_to_line.connect_clicked(move |_| {
+            if let Some(window) = weak.upgrade() {
+                if window.visible_dialog().is_none() {
+                    navigation::go_to_line(&window, &session, &editor, &message);
+                }
+            }
+        });
+    }
+    let mut language_actions = [
+        (
+            "definition",
+            "go-jump-symbolic",
+            "Go to definition",
+            Vim9Command::Definition,
+        ),
+        (
+            "hover",
+            "dialog-information-symbolic",
+            "Hover documentation",
+            Vim9Command::Hover,
+        ),
+        (
+            "references",
+            "edit-find-symbolic",
+            "Find references",
+            Vim9Command::References,
+        ),
+        (
+            "format",
+            "format-justify-fill-symbolic",
+            "Format buffer",
+            Vim9Command::Format,
+        ),
+    ]
+    .into_iter()
+    .map(|(capability, icon, tooltip, command)| {
+        let button = command_button(&session, &editor, &message, icon, tooltip, move || {
+            command.clone()
+        });
+        button.set_sensitive(false);
+        tools.append(&button);
+        (capability, button, tooltip)
+    })
+    .collect::<Vec<_>>();
+    let rename = button("document-edit-symbolic", "Rename symbol");
+    rename.set_sensitive(false);
+    tools.append(&rename);
+    language_actions.push(("rename", rename.clone(), "Rename symbol"));
+    {
+        let weak = window.downgrade();
+        let session = session.clone();
+        let message = message.clone();
+        let editor = editor.clone();
+        rename.connect_clicked(move |_| {
+            let Some(window) = weak.upgrade() else { return };
+            let dialog = adw::AlertDialog::new(Some("Rename symbol"), None);
+            dialog.add_responses(&[("cancel", "Cancel"), ("rename", "Rename")]);
+            dialog.set_default_response(Some("rename"));
+            dialog.set_close_response("cancel");
+            dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
+            let name = gtk::Entry::new();
+            name.set_placeholder_text(Some("New symbol name"));
+            name.set_activates_default(true);
+            name.set_margin_start(16);
+            name.set_margin_end(16);
+            name.set_margin_top(12);
+            name.set_margin_bottom(12);
+            dialog.set_extra_child(Some(&name));
+            let session = session.clone();
+            let message = message.clone();
+            let editor = editor.clone();
+            dialog.choose(Some(&window), None::<&gio::Cancellable>, move |response| {
+                let value = name.text().to_string();
+                if response == "rename" {
+                    dispatch(
+                        &session,
+                        Vim9Command::Rename { name: value },
+                        &message,
+                        &editor,
+                    );
+                }
+            });
+        });
+    }
+
+    let project = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    project.set_width_request(230);
+    let project_heading = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    let project_label = label("PROJECT");
+    project_label.add_css_class("heading");
+    project_label.set_hexpand(true);
+    project_heading.set_margin_start(8);
+    project_heading.set_margin_end(4);
+    project_heading.append(&project_label);
+    let up = button("go-up-symbolic", "Parent folder");
+    let refresh = button("view-refresh-symbolic", "Refresh project directory");
+    project_heading.append(&up);
+    project_heading.append(&refresh);
+    let location = label(&visible(&session.root().display().to_string()));
+    location.set_margin_start(8);
+    location.set_margin_end(8);
+    location.add_css_class("caption");
+    let query = gtk::SearchEntry::new();
+    query.set_placeholder_text(Some("Filter this folder"));
+    query.set_margin_start(6);
+    query.set_margin_end(6);
+    let files = gtk::ListBox::new();
+    files.set_selection_mode(gtk::SelectionMode::Single);
+    files.add_css_class("navigation-sidebar");
+    navigation::list_navigation(&query, &files);
+    navigation::editor_escape(&query, &editor);
+    let files_section = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    files_section.set_vexpand(true);
+    files_section.set_visible(config.project_panel);
+    files_section.append(&project_heading);
+    files_section.append(&location);
+    files_section.append(&query);
+    files_section.append(&scroll(&files));
+    project.append(&files_section);
+    let browser = Rc::new(Browser {
+        root: session.root().into(),
+        directory: RefCell::new(session.root().into()),
+        entries: RefCell::new(Vec::new()),
+        shown: RefCell::new(Vec::new()),
+        busy: Cell::new(false),
+        list: files.clone(),
+        query: query.clone(),
+        location,
+        up: up.clone(),
+        message: message.clone(),
+        session: session.clone(),
+        editor: editor.clone(),
+    });
+    let weak = Rc::downgrade(&browser);
+    files.connect_row_activated(move |_, row| {
+        if let Some(browser) = weak.upgrade() {
+            Browser::activate(&browser, row.index());
+        }
+    });
+    let weak = Rc::downgrade(&browser);
+    query.connect_search_changed(move |_| {
+        if let Some(browser) = weak.upgrade() {
+            browser.render();
+        }
+    });
+    let weak = Rc::downgrade(&browser);
+    query.connect_activate(move |_| {
+        if let Some(browser) = weak.upgrade() {
+            browser.render();
+            let index = browser.list.selected_row().map_or(0, |row| row.index());
+            Browser::activate(&browser, index);
+        }
+    });
+    let weak = Rc::downgrade(&browser);
+    up.connect_clicked(move |_| {
+        if let Some(browser) = weak.upgrade() {
+            let parent = browser.directory.borrow().parent().map(Path::to_path_buf);
+            if let Some(parent) = parent {
+                Browser::navigate(&browser, parent);
+            }
+        }
+    });
+    let weak = Rc::downgrade(&browser);
+    refresh.connect_clicked(move |_| {
+        if let Some(browser) = weak.upgrade() {
+            let directory = browser.directory.borrow().clone();
+            Browser::navigate(&browser, directory);
+        }
+    });
+
+    let buffers = gtk::ListBox::new();
+    buffers.set_selection_mode(gtk::SelectionMode::Single);
+    buffers.add_css_class("navigation-sidebar");
+    let buffer_ids: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
+    let buffer_scroll = scroll(&buffers);
+    buffer_scroll.set_vexpand(false);
+    buffer_scroll.set_height_request(160);
+    let buffers_heading = label("OPEN BUFFERS");
+    buffers_heading.add_css_class("heading");
+    buffers_heading.set_margin_start(8);
+    buffers_heading.set_margin_top(8);
+    let buffers_section = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    buffers_section.set_visible(config.buffer_tabs);
+    buffers_section.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    buffers_section.append(&buffers_heading);
+    project.append(&buffers_section);
+    let buffer_controls = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    buffer_controls.set_margin_start(4);
+    let previous_buffer = command_button(
+        &session,
+        &editor,
+        &message,
+        "go-previous-symbolic",
+        "Previous buffer (Ctrl+Shift+PageUp)",
+        || Vim9Command::PreviousBuffer,
+    );
+    let next_buffer = command_button(
+        &session,
+        &editor,
+        &message,
+        "go-next-symbolic",
+        "Next buffer (Ctrl+Shift+PageDown)",
+        || Vim9Command::NextBuffer,
+    );
+    let close_buffer = command_button(
+        &session,
+        &editor,
+        &message,
+        "window-close-symbolic",
+        "Close current buffer (Ctrl+Shift+W)",
+        || Vim9Command::CloseCurrentBuffer,
+    );
+    let split_vertical = command_button(
+        &session,
+        &editor,
+        &message,
+        "view-dual-symbolic",
+        "Split editor vertically",
+        || Vim9Command::Split { vertical: true },
+    );
+    let split_horizontal = command_button(
+        &session,
+        &editor,
+        &message,
+        "view-more-symbolic",
+        "Split editor horizontally",
+        || Vim9Command::Split { vertical: false },
+    );
+    for button in [
+        &previous_buffer,
+        &next_buffer,
+        &close_buffer,
+        &split_vertical,
+        &split_horizontal,
+    ] {
+        buffer_controls.append(button);
+    }
+    buffers_section.append(&buffer_controls);
+    buffers_section.append(&buffer_scroll);
+    project.set_visible(config.project_panel || config.buffer_tabs);
+    {
+        let session = session.clone();
+        let ids = buffer_ids.clone();
+        let message = message.clone();
+        let editor = editor.clone();
+        buffers.connect_row_activated(move |_, row| {
+            if let Some(buffer) = ids.borrow().get(row.index() as usize) {
+                dispatch(
+                    &session,
+                    Vim9Command::Buffer { buffer: *buffer },
+                    &message,
+                    &editor,
+                );
+            }
+        });
+    }
+
+    let problems = gtk::ListBox::new();
+    problems.set_selection_mode(gtk::SelectionMode::Single);
+    let diagnostic_targets = Rc::new(RefCell::new(Vec::<(String, u64, u64)>::new()));
+    let problems_title = label("PROBLEMS · 0");
+    problems_title.add_css_class("heading");
+    problems_title.set_margin_start(8);
+    problems_title.set_margin_top(8);
+    problems_title.set_margin_bottom(4);
+    let problem_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    problem_box.append(&problems_title);
+    let problems_empty = label("");
+    problems_empty.set_margin_start(12);
+    problems_empty.set_margin_end(12);
+    problems_empty.set_margin_top(12);
+    problems_empty.set_margin_bottom(12);
+    problems_empty.set_wrap(true);
+    problems_empty.add_css_class("dim-label");
+    problems_empty.set_visible(false);
+    problem_box.append(&problems_empty);
+    problem_box.append(&scroll(&problems));
+    let build_output = gtk::TextView::new();
+    build_output.set_editable(false);
+    build_output.set_cursor_visible(false);
+    build_output.set_monospace(true);
+    build_output.set_wrap_mode(gtk::WrapMode::WordChar);
+    build_output.set_left_margin(10);
+    build_output.set_right_margin(10);
+    build_output.set_top_margin(8);
+    build_output.update_property(&[gtk::accessible::Property::Label("Build output")]);
+    let output_note = label("");
+    output_note.add_css_class("caption");
+    output_note.set_margin_start(10);
+    output_note.set_margin_end(10);
+    output_note.set_margin_top(6);
+    output_note.set_visible(false);
+    let build_output_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    build_output_box.append(&output_note);
+    build_output_box.append(&scroll(&build_output));
+    let output_stack = gtk::Stack::new();
+    output_stack.add_titled(&problem_box, Some("problems"), "Problems");
+    output_stack.add_titled(&build_output_box, Some("output"), "Build output");
+    output_stack.set_vexpand(true);
+    let output_tabs = gtk::StackSwitcher::new();
+    output_tabs.set_stack(Some(&output_stack));
+    output_tabs.set_halign(gtk::Align::Start);
+    output_tabs.set_margin_start(8);
+    output_tabs.set_margin_top(4);
+    let output_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    output_box.append(&output_tabs);
+    output_box.append(&output_stack);
+    output_box.set_visible(workspace.output_visible);
+    output_stack.set_visible_child_name(if workspace.output_tab {
+        "output"
+    } else {
+        "problems"
+    });
+    let editor_split = gtk::Paned::new(gtk::Orientation::Vertical);
+    editor_split.set_start_child(Some(&native.widget));
+    editor_split.set_end_child(Some(&output_box));
+    editor_split.set_resize_start_child(true);
+    editor_split.set_shrink_start_child(false);
+    editor_split.set_resize_end_child(false);
+    editor_split.set_shrink_end_child(true);
+    editor_split.set_position(470);
+    let main_split = gtk::Paned::new(gtk::Orientation::Horizontal);
+    main_split.set_start_child(Some(&project));
+    main_split.set_end_child(Some(&editor_split));
+    main_split.set_resize_start_child(false);
+    main_split.set_shrink_start_child(true);
+    main_split.set_resize_end_child(true);
+    main_split.set_shrink_end_child(false);
+    main_split.set_position(i32::from(workspace.project_width.unwrap_or(260)));
+    main_split.set_vexpand(true);
+    let toggle_project = button("view-sidebar-symbolic", "Show or hide project panel");
+    {
+        let project = project.clone();
+        let files_section = files_section.clone();
+        let buffers_section = buffers_section.clone();
+        let browser = browser.clone();
+        let editor = editor.clone();
+        toggle_project.connect_clicked(move |_| {
+            let show = !files_section.is_visible();
+            files_section.set_visible(show);
+            project.set_visible(show || buffers_section.is_visible());
+            if show && browser.entries.borrow().is_empty() {
+                let directory = browser.directory.borrow().clone();
+                Browser::navigate(&browser, directory);
+            }
+            editor.grab_focus();
+        });
+    }
+    header.pack_end(&toggle_project);
+    let toggle_output = button("view-list-symbolic", "Show or hide output panel");
+    {
+        let output_box = output_box.clone();
+        let editor = editor.clone();
+        toggle_output.connect_clicked(move |_| {
+            output_box.set_visible(!output_box.is_visible());
+            editor.grab_focus();
+        });
+    }
+    header.pack_end(&toggle_output);
+    {
+        let session = session.clone();
+        let targets = diagnostic_targets.clone();
+        let message = message.clone();
+        let editor = editor.clone();
+        problems.connect_row_activated(move |_, row| {
+            if let Some((path, line, column)) = targets.borrow().get(row.index() as usize).cloned()
+            {
+                dispatch(
+                    &session,
+                    Vim9Command::Open {
+                        path,
+                        line: Some(line.max(1)),
+                        column: Some(column.max(1)),
+                    },
+                    &message,
+                    &editor,
+                );
+            }
+        });
+    }
+
+    let build_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    build_bar.set_margin_start(8);
+    build_bar.set_margin_end(8);
+    build_bar.set_margin_top(5);
+    build_bar.set_margin_bottom(5);
+    let build_command = gtk::Entry::new();
+    build_command.set_hexpand(true);
+    build_command.set_text(default_build(session.root()));
+    build_command.set_placeholder_text(Some("Build command"));
+    build_command.set_tooltip_text(Some(
+        "Shell command run in this project only when you press Build or F5",
+    ));
+    let build = gtk::Button::with_label("Build · F5");
+    build.set_tooltip_text(Some(
+        "Run the visible command using files already saved on disk",
+    ));
+    let save_and_build = gtk::Button::with_label("Save all + Build");
+    save_and_build.set_tooltip_text(Some(
+        "Save every modified buffer, then build only if all saves succeed",
+    ));
+    let cancel_build = command_button(
+        &session,
+        &editor,
+        &message,
+        "process-stop-symbolic",
+        "Cancel build",
+        || Vim9Command::CancelBuild,
+    );
+    cancel_build.set_sensitive(false);
+    let build_state = label("Ready");
+    build_state.set_width_chars(18);
+    build_bar.append(&label("BUILD"));
+    build_bar.append(&build_command);
+    build_bar.append(&build);
+    build_bar.append(&save_and_build);
+    build_bar.append(&cancel_build);
+    build_bar.append(&build_state);
+    {
+        let session = session.clone();
+        let command = build_command.clone();
+        let message = message.clone();
+        let editor = editor.clone();
+        let output_stack = output_stack.clone();
+        let output_box = output_box.clone();
+        build.connect_clicked(move |_| {
+            output_box.set_visible(true);
+            output_stack.set_visible_child_name("output");
+            dispatch(
+                &session,
+                Vim9Command::Build {
+                    command: command.text().into(),
+                },
+                &message,
+                &editor,
+            );
+        });
+    }
+    {
+        let session = session.clone();
+        let command = build_command.clone();
+        let message = message.clone();
+        let editor = editor.clone();
+        let output_stack = output_stack.clone();
+        let output_box = output_box.clone();
+        save_and_build.connect_clicked(move |_| {
+            output_box.set_visible(true);
+            output_stack.set_visible_child_name("output");
+            dispatch(
+                &session,
+                Vim9Command::SaveAndBuild {
+                    command: command.text().into(),
+                },
+                &message,
+                &editor,
+            );
+        });
+    }
+    navigation::editor_escape(&build_command, &editor);
+    {
+        let build = build.clone();
+        build_command.connect_activate(move |_| {
+            build.emit_clicked();
+        });
+    }
+    {
+        let session = session.clone();
+        let message = message.clone();
+        let editor = editor.clone();
+        let output_stack = output_stack.clone();
+        let output_box = output_box.clone();
+        let search_options = search_options.clone();
+        search.connect_activate(move |entry| {
+            output_box.set_visible(true);
+            output_stack.set_visible_child_name("problems");
+            dispatch(
+                &session,
+                Vim9Command::SearchWithOptions {
+                    query: entry.text().into(),
+                    options: search_options.options(),
+                },
+                &message,
+                &editor,
+            )
+        });
+    }
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    content.add_controller(interaction);
+    if embedded.is_some() {
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+    }
+    content.append(&header);
+    tools.set_visible(config.tool_panel);
+    build_bar.set_visible(config.tool_panel);
+    for button in [
+        &navigate_back,
+        &navigate_forward,
+        &new_file,
+        &open_file,
+        &quick_open,
+        &save,
+        &save_all,
+        &previous,
+        &next,
+        &toggle_project,
+        &toggle_output,
+    ] {
+        button.set_visible(config.toolbar);
+    }
+    let tools_separator = gtk::Separator::new(gtk::Orientation::Horizontal);
+    tools_separator.set_visible(config.tool_panel);
+    let build_separator = gtk::Separator::new(gtk::Orientation::Horizontal);
+    build_separator.set_visible(config.tool_panel);
+    content.append(&tools);
+    content.append(&tools_separator);
+    content.append(&main_split);
+    content.append(&build_separator);
+    content.append(&build_bar);
+    let search_feedback = label("");
+    search_feedback.set_margin_start(10);
+    search_feedback.set_margin_end(10);
+    search_feedback.set_wrap(true);
+    search_feedback.add_css_class("caption");
+    search_feedback.set_visible(false);
+    content.append(&search_feedback);
+    content.append(&message);
+    content.append(&status);
+    if let Some(host) = &embedded {
+        host.attach(&content, &session);
+    } else {
+        window.set_content(Some(&content));
+    }
+
+    {
+        let weak = window.downgrade();
+        let session = session.clone();
+        let message = message.clone();
+        let editor = editor.clone();
+        new_file.connect_clicked(move |_| {
+            let Some(window) = weak.upgrade() else { return };
+            let chooser = gtk::FileDialog::builder()
+                .title("Choose a name for the new Vim file")
+                .initial_folder(&gio::File::for_path(session.root()))
+                .initial_name("untitled.txt")
+                .modal(true)
+                .build();
+            let session = session.clone();
+            let message = message.clone();
+            let editor = editor.clone();
+            chooser.save(
+                Some(&window),
+                None::<&gio::Cancellable>,
+                move |result| match result {
+                    Ok(file) => {
+                        if let Some(path) = file
+                            .path()
+                            .and_then(|path| path.to_str().map(str::to_owned))
+                        {
+                            dispatch(
+                                &session,
+                                Vim9Command::Open {
+                                    path,
+                                    line: None,
+                                    column: None,
+                                },
+                                &message,
+                                &editor,
+                            );
+                        } else {
+                            message
+                                .set_label("Choose a local UTF-8 filename for this Vim9 project.");
+                        }
+                    }
+                    Err(error)
+                        if error.matches(gtk::DialogError::Dismissed)
+                            || error.matches(gtk::DialogError::Cancelled) => {}
+                    Err(error) => message.set_label(&visible(&error.to_string())),
+                },
+            );
+        });
+    }
+
+    {
+        let weak = window.downgrade();
+        let session = session.clone();
+        let message = message.clone();
+        let editor = editor.clone();
+        open_file.connect_clicked(move |_| {
+            let Some(window) = weak.upgrade() else { return };
+            let chooser = gtk::FileDialog::builder()
+                .title("Open file in Vim9")
+                .initial_folder(&gio::File::for_path(session.root()))
+                .modal(true)
+                .build();
+            let session = session.clone();
+            let message = message.clone();
+            let editor = editor.clone();
+            chooser.open(
+                Some(&window),
+                None::<&gio::Cancellable>,
+                move |result| match result {
+                    Ok(file) => {
+                        if let Some(path) = file.path() {
+                            if let Some(path) = path.to_str() {
+                                dispatch(
+                                    &session,
+                                    Vim9Command::Open {
+                                        path: path.into(),
+                                        line: None,
+                                        column: None,
+                                    },
+                                    &message,
+                                    &editor,
+                                );
+                            } else {
+                                message.set_label("Vim9 IDE currently requires UTF-8 file paths.");
+                            }
+                        } else {
+                            message.set_label("Choose a local file for this Vim9 project.");
+                        }
+                    }
+                    Err(error)
+                        if error.matches(gtk::DialogError::Dismissed)
+                            || error.matches(gtk::DialogError::Cancelled) => {}
+                    Err(error) => message.set_label(&visible(&error.to_string())),
+                },
+            );
+        });
+    }
+
+    // Editor-specific shortcuts live only on this window. All other keys,
+    // including Escape/Ctrl+[ and insert-mode input, pass directly to Vim.
+    let keys = gtk::EventControllerKey::new();
+    keys.set_name(Some("vim9-workbench-shortcuts"));
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    {
+        let session = session.clone();
+        let message = message.clone();
+        let editor = editor.clone();
+        let quick_open = quick_open.clone();
+        let go_to_line = go_to_line.clone();
+        let search = search.clone();
+        let build_command = build_command.clone();
+        let open_file = open_file.clone();
+        let build = build.clone();
+        let close_buffer = close_buffer.clone();
+        let native_surface = native.surface.clone();
+        let weak = window.downgrade();
+        keys.connect_key_pressed(move |_, key, _, modifiers| {
+            // Composition keys belong to the native input method until its
+            // preedit is committed or cancelled, including Escape and Enter.
+            if native_surface.is_preediting() {
+                return glib::Propagation::Proceed;
+            }
+            // Let the active native dialog own its text and shortcut handling.
+            if weak.upgrade().is_some_and(|window| {
+                window.visible_dialog().is_some() || navigation::native_text_has_focus(&window)
+            }) {
+                return glib::Propagation::Proceed;
+            }
+            let ctrl = modifiers.contains(gdk::ModifierType::CONTROL_MASK);
+            let shift = modifiers.contains(gdk::ModifierType::SHIFT_MASK);
+            let alt =
+                modifiers.intersects(gdk::ModifierType::ALT_MASK | gdk::ModifierType::SUPER_MASK);
+            // Navigation history belongs to the Vim grid. In particular,
+            // Alt+Left in a native field or an options popover remains native.
+            if (key == gdk::Key::Left || key == gdk::Key::Right)
+                && modifiers.contains(gdk::ModifierType::ALT_MASK)
+                && !modifiers.intersects(
+                    gdk::ModifierType::CONTROL_MASK
+                        | gdk::ModifierType::SHIFT_MASK
+                        | gdk::ModifierType::SUPER_MASK
+                        | gdk::ModifierType::META_MASK
+                        | gdk::ModifierType::HYPER_MASK,
+                )
+                && editor.has_focus()
+                && config.toolbar
+            {
+                dispatch(
+                    &session,
+                    if key == gdk::Key::Left {
+                        Vim9Command::NavigateBack
+                    } else {
+                        Vim9Command::NavigateForward
+                    },
+                    &message,
+                    &editor,
+                );
+                return glib::Propagation::Stop;
+            }
+            // Quick open presents a dialog even without toolbar chrome.
+            // Other hidden controls never focus an invisible native field;
+            // saving remains an editor action.
+            let command = match key.to_unicode().map(|value| value.to_ascii_lowercase()) {
+                Some('s') if ctrl && !alt => Some(if shift {
+                    Vim9Command::SaveAll
+                } else {
+                    Vim9Command::Save
+                }),
+                Some('p') if ctrl && shift && !alt => {
+                    if quick_open.is_sensitive() {
+                        quick_open.emit_clicked();
+                    }
+                    return glib::Propagation::Stop;
+                }
+                Some('g') if ctrl && shift && !alt && (config.toolbar || config.tool_panel) => {
+                    if go_to_line.is_sensitive() {
+                        go_to_line.emit_clicked();
+                    }
+                    return glib::Propagation::Stop;
+                }
+                Some('f') if ctrl && shift && !alt && config.tool_panel => {
+                    search.grab_focus();
+                    search.select_region(0, -1);
+                    return glib::Propagation::Stop;
+                }
+                Some('b') if ctrl && shift && !alt && config.tool_panel => {
+                    build_command.grab_focus();
+                    build_command.select_region(0, -1);
+                    return glib::Propagation::Stop;
+                }
+                Some('w') if ctrl && shift && !alt && config.buffer_tabs => {
+                    if close_buffer.is_sensitive() {
+                        close_buffer.emit_clicked();
+                    }
+                    return glib::Propagation::Stop;
+                }
+                Some('o') if ctrl && shift && !alt && config.toolbar => {
+                    open_file.emit_clicked();
+                    return glib::Propagation::Stop;
+                }
+                _ if key == gdk::Key::F5 && !ctrl && !alt && !shift && config.tool_panel => {
+                    if build.is_sensitive() {
+                        build.emit_clicked();
+                    }
+                    return glib::Propagation::Stop;
+                }
+                _ if key == gdk::Key::F8
+                    && !ctrl
+                    && !alt
+                    && diagnostic_shortcuts_enabled(
+                        config.tool_panel,
+                        &session.snapshot().mode,
+                    ) =>
+                {
+                    Some(if shift {
+                        Vim9Command::PreviousDiagnostic
+                    } else {
+                        Vim9Command::NextDiagnostic
+                    })
+                }
+                _ if key == gdk::Key::Page_Up && ctrl && shift && !alt && config.buffer_tabs => {
+                    Some(Vim9Command::PreviousBuffer)
+                }
+                _ if key == gdk::Key::Page_Down && ctrl && shift && !alt && config.buffer_tabs => {
+                    Some(Vim9Command::NextBuffer)
+                }
+                _ => None,
+            };
+            if let Some(command) = command {
+                dispatch(&session, command, &message, &editor);
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+    }
+    if embedded.is_some() {
+        content.add_controller(keys);
+    } else {
+        window.add_controller(keys);
+    }
+
+    let destroy_session = session.clone();
+    if embedded.is_some() {
+        content.connect_destroy(move |_| destroy_session.revoke());
+    } else {
+        window.connect_destroy(move |_| destroy_session.revoke());
+    }
+    let child_finished = Rc::new(Cell::new(false));
+    let closing = Rc::new(Cell::new(false));
+    {
+        let finished = child_finished.clone();
+        let closing = closing.clone();
+        let session = session.clone();
+        let editor = editor.clone();
+        let message = message.clone();
+        if embedded.is_none() {
+            window.connect_close_request(move |_| {
+            if finished.get() { return glib::Propagation::Proceed; }
+            closing.set(true);
+            dispatch(&session, Vim9Command::Quit, &message, &editor);
+            message.set_label("Close requested. Vim keeps modified buffers open: save them, or use :qa! in Vim to discard them explicitly.");
+            glib::Propagation::Stop
+        });
+        }
+    }
+    {
+        let finished = child_finished.clone();
+        let closing = closing.clone();
+        let weak = window.downgrade();
+        let message = message.clone();
+        let exited_session = session.clone();
+        let shell_exit = shell_exit.clone();
+        let embedded = embedded.clone();
+        editor.connect_child_exited(move |_, status| {
+            let Some(code) = jterm_core::process::exit_code_from_wait_status(status) else {
+                return;
+            };
+            exited_session.revoke();
+            finished.set(true);
+            if let Some(host) = &embedded {
+                host.finish(code);
+                return;
+            }
+            if let Some(result) = &shell_exit {
+                result.set(Some(code));
+            }
+            if shell_exit.is_some() || closing.get() || status == 0 {
+                if let Some(window) = weak.upgrade() {
+                    window.close();
+                }
+            } else {
+                message.set_label(&format!(
+                    "Vim exited (status {status}). You can close this window and reopen Vim9 IDE."
+                ));
+            }
+        });
+    }
+
+    let launch = session.launch();
+    let mut argv = vec![launch.program.clone()];
+    argv.extend(launch.args.clone());
+    let extra = launch
+        .env
+        .iter()
+        .filter_map(|item| item.split_once('='))
+        .collect::<Vec<_>>();
+    let env = match jterm_core::child_env::vte_envv_from_captured(
+        &jterm_core::child_env::ChildEnv::from_identity(),
+        &extra,
+    ) {
+        Ok(env) => env,
+        Err(error) => {
+            session.revoke();
+            child_finished.set(true);
+            if let Some(host) = &embedded {
+                host.finish(1);
+                return;
+            }
+            if let Some(result) = &shell_exit {
+                result.set(Some(1));
+                eprintln!("forge: cannot prepare Vim environment: {error}");
+                window.close();
+                return;
+            }
+            message.set_label(&format!(
+                "Cannot prepare Vim environment: {}",
+                visible(&error.to_string())
+            ));
+            window.present();
+            return;
+        }
+    };
+    let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
+    let env = env.iter().map(String::as_str).collect::<Vec<_>>();
+    let flags = glib::SpawnFlags::SEARCH_PATH
+        | glib::SpawnFlags::from_bits_retain(jterm_core::child_env::VTE_SPAWN_NO_PARENT_ENVV_BITS);
+    {
+        let finished = child_finished.clone();
+        let message = message.clone();
+        let failed_session = session.clone();
+        let shell_exit = shell_exit.clone();
+        let weak_window = window.downgrade();
+        let embedded = embedded.clone();
+        editor.spawn_async(
+            vte4::PtyFlags::DEFAULT,
+            launch.cwd.to_str(),
+            &argv,
+            &env,
+            flags,
+            || {},
+            15_000,
+            None::<&gio::Cancellable>,
+            move |result| {
+                if let Err(error) = result {
+                    failed_session.revoke();
+                    finished.set(true);
+                    if let Some(host) = &embedded {
+                        host.finish(1);
+                        return;
+                    }
+                    if let Some(result) = &shell_exit {
+                        result.set(Some(1));
+                        eprintln!("forge: cannot start Vim: {error}");
+                        if let Some(window) = weak_window.upgrade() {
+                            window.close();
+                        }
+                        return;
+                    }
+                    message.set_label(&format!(
+                        "Cannot start Vim: {}",
+                        visible(&error.to_string())
+                    ));
+                }
+            },
+        );
+    }
+
+    if config.project_panel {
+        Browser::navigate(&browser, session.root().into());
+    }
+    let weak_window = window.downgrade();
+    let mut old_buffers = Vec::new();
+    let mut old_diagnostics = Vec::new();
+    let mut old_output = Vec::new();
+    let mut last_error = None;
+    let mut was_connected = false;
+    let connected_controls = [
+        new_file,
+        open_file,
+        quick_open,
+        go_to_line,
+        save,
+        save_all,
+        previous,
+        next,
+        previous_buffer,
+        next_buffer,
+        close_buffer,
+        split_vertical,
+        split_horizontal,
+        run_search,
+    ];
+    for button in &connected_controls {
+        button.set_sensitive(false);
+    }
+    // The poll owns the store until this workbench closes; Drop flushes the
+    // last pending data-only state even for embedded editors.
+    let mut workspace_focus_pending = Some(workspace.focus);
+    let mut workspace_height_pending = workspace.output_height;
+    let poll_editor = editor.clone();
+    let embedded_poll = embedded.clone();
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        if embedded_poll
+            .as_ref()
+            .is_some_and(|host| host.finished.get())
+        {
+            return glib::ControlFlow::Break;
+        }
+        let Some(window) = weak_window.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        // Keep the directory browser alive only as long as this workbench.
+        let _ = &browser;
+        let snapshot = session.snapshot();
+        let connected = snapshot.connected && !child_finished.get();
+        let ready = editor_state_ready(&snapshot) && !child_finished.get();
+        if ready {
+            if let Some(height) = workspace_height_pending.take() {
+                editor_split.set_position((editor_split.height() - i32::from(height)).max(80));
+            }
+            if let Some(focus) = workspace_focus_pending.take() {
+                use jterm_core::vim9::Vim9WorkbenchFocus;
+                match focus {
+                    Vim9WorkbenchFocus::Search if tools.is_visible() => {
+                        search.grab_focus();
+                    }
+                    Vim9WorkbenchFocus::Build if build_bar.is_visible() => {
+                        build_command.grab_focus();
+                    }
+                    Vim9WorkbenchFocus::Files if files_section.is_visible() => {
+                        files.grab_focus();
+                    }
+                    Vim9WorkbenchFocus::Output if output_box.is_visible() => {
+                        restore_workspace_output_focus(
+                            &output_stack,
+                            &build_output,
+                            &problems,
+                            &poll_editor,
+                        );
+                    }
+                    _ => {
+                        poll_editor.grab_focus();
+                    }
+                }
+            }
+            let focus = gtk::prelude::GtkWindowExt::focus(&window);
+            let contains = |widget: &gtk::Widget| {
+                focus
+                    .as_ref()
+                    .is_some_and(|focused| focused == widget || focused.is_ancestor(widget))
+            };
+            use jterm_core::vim9::{Vim9WorkbenchFocus, Vim9WorkspaceState};
+            let focus = if contains(search.upcast_ref()) {
+                Vim9WorkbenchFocus::Search
+            } else if contains(build_command.upcast_ref()) {
+                Vim9WorkbenchFocus::Build
+            } else if contains(files_section.upcast_ref()) {
+                Vim9WorkbenchFocus::Files
+            } else if contains(output_box.upcast_ref()) {
+                Vim9WorkbenchFocus::Output
+            } else {
+                Vim9WorkbenchFocus::Editor
+            };
+            workspace_store.borrow_mut().remember(Vim9WorkspaceState {
+                search_query: search.text().into(),
+                search_options: search_options.options(),
+                files_visible: files_section.is_visible(),
+                tools_visible: tools.is_visible(),
+                output_visible: output_box.is_visible(),
+                output_tab: output_stack.visible_child_name().as_deref() == Some("output"),
+                project_width: u16::try_from(main_split.position()).ok(),
+                output_height: u16::try_from(output_box.height())
+                    .ok()
+                    .filter(|height| *height > 0),
+                focus,
+            });
+        }
+
+        for button in &connected_controls {
+            button.set_sensitive(ready);
+        }
+        search.set_sensitive(ready);
+        search_options.menu.set_sensitive(ready);
+        cancel_search.set_sensitive(ready && snapshot.search.running);
+        navigate_back.set_sensitive(ready && snapshot.navigation.can_go_back);
+        navigate_forward.set_sensitive(ready && snapshot.navigation.can_go_forward);
+        build.set_sensitive(ready && !snapshot.build.running);
+        save_and_build.set_sensitive(ready && !snapshot.build.running);
+        cancel_build.set_sensitive(ready && snapshot.build.running);
+        for (capability, button, tooltip) in &language_actions {
+            let supported = snapshot
+                .capabilities
+                .iter()
+                .any(|available| available == capability);
+            button.set_sensitive(ready && supported);
+            if supported {
+                button.set_tooltip_text(Some(tooltip));
+            } else {
+                button.set_tooltip_text(Some(
+                    "Requires a configured Vim language server plugin providing this action",
+                ));
+            }
+        }
+        if connected && !was_connected {
+            if closing.get() {
+                dispatch(&session, Vim9Command::Quit, &message, &poll_editor);
+            } else {
+                message.set_label(if config.status_bar {
+                    "Vim9 connected · your Vim configuration and native keybindings are active."
+                } else {
+                    ""
+                });
+            }
+        }
+        was_connected = connected;
+        let file = if snapshot.file.is_empty() {
+            "[No Name]"
+        } else {
+            &snapshot.file
+        };
+        let modified = if snapshot.modified { " ●" } else { "" };
+        let workbench = snapshot.workbench.status_text();
+        let workbench = if workbench.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", visible(&workbench))
+        };
+        status.set_label(&format!(
+            "{} · {}{} · Ln {}/{}, Col {} · {} · {} · {} windows · {}{} buffers · {}{}",
+            visible(&snapshot.mode).to_uppercase(),
+            visible(file),
+            modified,
+            snapshot.line,
+            snapshot.line_count,
+            snapshot.column,
+            if snapshot.filetype.is_empty() {
+                "plain text".into()
+            } else {
+                visible(&snapshot.filetype)
+            },
+            if snapshot.encoding.is_empty() {
+                "UTF-8".into()
+            } else {
+                visible(&snapshot.encoding)
+            },
+            snapshot.window_count,
+            snapshot.buffers.len(),
+            if snapshot.buffers_truncated { "+" } else { "" },
+            if connected && snapshot.waiting_for_input {
+                "SAVE WAITING FOR VIM INPUT"
+            } else if connected {
+                "CONNECTED"
+            } else {
+                "DISCONNECTED"
+            },
+            workbench
+        ));
+        title.set_title(&format!(
+            "{}{} — Vim9 IDE",
+            visible(
+                Path::new(file)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(file)
+            ),
+            modified
+        ));
+        if embedded_poll.is_none() {
+            window.set_title(Some(&format!("{}{} — Vim9 IDE", visible(file), modified)));
+        }
+        if snapshot.error != last_error {
+            if let Some(error) = &snapshot.error {
+                message.set_label(&visible(error));
+            }
+            last_error = snapshot.error.clone();
+        }
+        search_feedback.set_label(&project_search::feedback(&snapshot.search));
+        search_feedback.set_visible(config.tool_panel && !snapshot.search.query.is_empty());
+        build_state.set_label(&if snapshot.build.running {
+            "Running…".into()
+        } else if snapshot.build.cancelled {
+            "Cancelled".into()
+        } else if let Some(code) = snapshot.build.exit_code {
+            format!("Exited: {code}")
+        } else {
+            "Ready".into()
+        });
+        output_note.set_label(&format!(
+            "Showing the latest output · {} output lines omitted",
+            snapshot.build.truncated
+        ));
+        output_note.set_visible(snapshot.build.truncated > 0);
+        if snapshot.build.output != old_output {
+            build_output
+                .buffer()
+                .set_text(&jterm_core::review_input::safe_multiline_display(
+                    &snapshot.build.output.join("\n"),
+                    128 * 1024,
+                ));
+            old_output = snapshot.build.output.clone();
+        }
+        buffers_heading.set_label(&format!(
+            "OPEN BUFFERS · {}{}",
+            snapshot.buffers.len(),
+            if snapshot.buffers_truncated { "+" } else { "" }
+        ));
+        let buffer_rows = snapshot
+            .buffers
+            .iter()
+            .map(|b| (b.id, b.name.clone(), b.modified, b.current))
+            .collect::<Vec<_>>();
+        if buffer_rows != old_buffers {
+            let reveal_current = old_buffers.iter().find(|row| row.3).map(|row| row.0)
+                != buffer_rows.iter().find(|row| row.3).map(|row| row.0);
+            buffers.remove_all();
+            buffer_ids.borrow_mut().clear();
+            let labels = crate::vim9_buffer_labels::vim9_buffer_labels(&snapshot.buffers);
+            for (buffer, caption) in snapshot.buffers.iter().zip(labels) {
+                let name = if buffer.name.is_empty() {
+                    "[No Name]"
+                } else {
+                    &buffer.name
+                };
+                let row = label(&format!(
+                    "{}{} {}",
+                    if buffer.current { "▸" } else { " " },
+                    if buffer.modified { "●" } else { " " },
+                    visible(&caption)
+                ));
+                row.set_margin_start(8);
+                row.set_margin_end(8);
+                row.set_margin_top(5);
+                row.set_margin_bottom(5);
+                row.set_tooltip_text(Some(&format!("{}\nMiddle-click to close", visible(name))));
+                // Keep the buffer identity captured by this row: a metadata
+                // refresh must never redirect a middle-click to another file.
+                let close = gtk::GestureClick::new();
+                close.set_button(2);
+                close.set_propagation_phase(gtk::PropagationPhase::Capture);
+                let close_session = session.clone();
+                let close_message = message.clone();
+                let close_editor = poll_editor.clone();
+                let buffer_id = buffer.id;
+                close.connect_pressed(move |gesture, _, _, _| {
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                    dispatch(
+                        &close_session,
+                        Vim9Command::CloseBuffer { buffer: buffer_id },
+                        &close_message,
+                        &close_editor,
+                    );
+                });
+                row.add_controller(close);
+                buffers.append(&row);
+                if buffer.current {
+                    if let Some(list_row) = row.parent().and_downcast::<gtk::ListBoxRow>() {
+                        buffers.select_row(Some(&list_row));
+                        if !reveal_current {
+                            buffer_ids.borrow_mut().push(buffer.id);
+                            continue;
+                        }
+                        let scroll = buffer_scroll.downgrade();
+                        let list = buffers.downgrade();
+                        // Newly inserted rows have no allocation yet. Reveal
+                        // after layout, preserving scroll for ordinary updates.
+                        list_row.add_tick_callback(move |row, _| {
+                            let (Some(scroll), Some(list)) = (scroll.upgrade(), list.upgrade())
+                            else {
+                                return glib::ControlFlow::Break;
+                            };
+                            if let Some(bounds) = row.compute_bounds(&list) {
+                                if bounds.height() <= 0.0 {
+                                    return glib::ControlFlow::Continue;
+                                }
+                                let adjustment = scroll.vadjustment();
+                                let top = f64::from(bounds.y());
+                                let bottom = top + f64::from(bounds.height());
+                                if top < adjustment.value() {
+                                    adjustment.set_value(top);
+                                } else if bottom > adjustment.value() + adjustment.page_size() {
+                                    adjustment.set_value(bottom - adjustment.page_size());
+                                }
+                            }
+                            glib::ControlFlow::Break
+                        });
+                    }
+                }
+                buffer_ids.borrow_mut().push(buffer.id);
+            }
+            old_buffers = buffer_rows;
+        }
+        let diagnostic_rows = snapshot
+            .diagnostics
+            .iter()
+            .map(|d| {
+                (
+                    d.filename.clone(),
+                    d.line,
+                    d.column,
+                    d.text.clone(),
+                    d.kind.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        problems_title.set_label(&format!(
+            "PROBLEMS · {}{} · Quickfix: {}",
+            snapshot.diagnostics.len(),
+            if snapshot.diagnostics_truncated {
+                "+"
+            } else {
+                ""
+            },
+            match snapshot.quickfix.source.as_str() {
+                "search" => "Search",
+                "build" => "Build",
+                _ => "Vim",
+            }
+        ));
+        problems_title.set_tooltip_text(Some(&format!(
+            "{} · quickfix item {} of {}. Vim may also supply location-list or language-server diagnostics.",
+            visible(&snapshot.quickfix.title),
+            snapshot.quickfix.index,
+            snapshot.quickfix.count
+        )));
+        let empty = project_search::empty_results(&snapshot);
+        problems_empty.set_visible(empty.is_some());
+        if let Some(empty) = empty {
+            problems_empty.set_label(&empty);
+        }
+        if diagnostic_rows != old_diagnostics {
+            problems.remove_all();
+            diagnostic_targets.borrow_mut().clear();
+            for diagnostic in &snapshot.diagnostics {
+                let row = project_search::diagnostic_row(&snapshot.root, diagnostic);
+                problems.append(&row);
+                diagnostic_targets.borrow_mut().push((
+                    diagnostic.filename.clone(),
+                    diagnostic.line,
+                    diagnostic.column,
+                ));
+            }
+            old_diagnostics = diagnostic_rows;
+        }
+        glib::ControlFlow::Continue
+    });
+    // The poll owns the browser until this workbench is destroyed.
+    window.present();
+    editor.grab_focus();
+}
+
+#[cfg(test)]
+#[path = "vim9_ide_native_tests.rs"]
+mod native_tests;

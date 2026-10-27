@@ -16,7 +16,7 @@ use crate::parser::{
     ColorKind, CommandMeta, KeyboardProtocolQuery, KittyKeyboardOp, Parser, ParserConfig,
     ParserEvent,
 };
-use crate::pty::{OwnedPty, PtyForeground};
+use crate::pty::{OwnedPty, PtyForeground, PtyForegroundToken};
 use crate::terminal::{apply_terminal_theme, focus_terminal};
 use bounded_bytes::BoundedByteRing;
 pub(crate) use jterm_core::block_contract::{
@@ -30,24 +30,42 @@ use jterm_core::pty_input::{self, Paste, PasteModes, PastePolicy, UnbracketedMul
 use jterm_core::terminal_report::{classify_terminal_report, TerminalReport};
 use jterm_core::wheel::WheelAccumulator;
 
+mod activity_knowledge;
 mod alt_screen;
 mod ansi;
 mod blocks;
 mod bounded_bytes;
+mod chat;
 mod click_cursor;
 mod cross_selection;
 mod css;
 mod export;
 mod find;
+mod fold_preview;
 mod history;
+mod ime_gate;
+mod input_feedback;
 mod kitty_graphics;
 mod onboarding;
 #[allow(dead_code)]
 mod palette;
+mod paste_feedback;
+mod prepared_search;
+mod review;
 mod scroll;
+pub(crate) mod search_preview;
+mod selection_folding;
 mod selection_hold;
+pub(crate) use selection_folding::FoldSelectionResult;
+pub(crate) mod shortcut_hints;
+pub(crate) mod watch_batch;
+pub(crate) mod watch_reader;
+use watch_reader::WatchReader;
 mod unified_chrome;
 mod unified_images;
+mod unified_navigation;
+#[cfg(test)]
+mod unified_navigation_tests;
 mod zone_history;
 pub(crate) use alt_screen::*;
 pub(crate) use ansi::*;
@@ -573,9 +591,9 @@ pub(crate) const SLOW_BLOCK_THRESHOLD_MS: u64 = 1_000;
 
 /// A card's virtualization height for the folded state it is in.
 ///
-/// A folded card shows its header and command and nothing else, so its
-/// contribution to the document is the same as a command with no output. The
-/// estimator's own convention for that is zero output rows.
+/// A folded card retains a compact summary and one preview line when it has
+/// output. Reserve two rows for that reveal target; an empty card retains the
+/// estimator's ordinary zero-output convention.
 fn collapsed_aware_block_height(
     config: &Config,
     data: &BlockData,
@@ -588,7 +606,12 @@ fn collapsed_aware_block_height(
         fallback_cols
     };
     if collapsed {
-        estimated_finished_block_height_for_rows(config, &data.cmd, 0, cols)
+        estimated_finished_block_height_for_rows(
+            config,
+            &data.cmd,
+            if data.output.is_empty() { 0 } else { 2 },
+            cols,
+        )
     } else {
         estimated_finished_block_height_for_text(config, &data.cmd, &data.output, cols)
     }
@@ -2265,6 +2288,17 @@ impl BookmarkState {
         now_bookmarked
     }
 
+    /// Merge restored membership without resurrecting bookmarks for evicted cards.
+    fn restore_retained(&mut self, saved: HashSet<u64>, retained: &HashSet<u64>) {
+        let mut changed = false;
+        for id in saved.into_iter().filter(|id| retained.contains(id)) {
+            changed |= self.ids.insert(id);
+        }
+        if changed {
+            self.bump_revision();
+        }
+    }
+
     fn remove(&mut self, id: u64) -> bool {
         let removed = self.ids.remove(&id);
         if removed {
@@ -2305,6 +2339,48 @@ fn prune_retired_bookmarks(bookmarks: &mut BookmarkState, retired_ids: &[u64]) -
     bookmarks.remove_all(retired_ids.iter().copied())
 }
 
+/// UI state owned by the last nonempty Clear, kept in the shared removal slot.
+#[derive(Default)]
+struct ClearedBlocksStash {
+    blocks: Vec<BlockData>,
+    bookmarks: HashSet<u64>,
+    selected_ids: HashSet<u64>,
+    active_id: Option<u64>,
+    anchor_id: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UndoClearResult {
+    Restored(usize),
+    Empty,
+    Fullscreen,
+    AtCapacity,
+}
+
+/// Repair selection edges after a capacity-limited Undo drops older selected
+/// blocks. A valid post-clear edge wins, then a retained stashed edge; if both
+/// disappeared, use the newest selected block in terminal order and keep the
+/// anchor synchronized so a non-empty selection never has no active edge.
+fn restored_selection_edges(
+    ordered_ids: &[u64],
+    selected: &HashSet<u64>,
+    current_active: Option<u64>,
+    current_anchor: Option<u64>,
+    stashed_active: Option<u64>,
+    stashed_anchor: Option<u64>,
+) -> (Option<u64>, Option<u64>) {
+    let retained = |id: u64| selected.contains(&id);
+    let active = current_active
+        .filter(|id| retained(*id))
+        .or_else(|| stashed_active.filter(|id| retained(*id)))
+        .or_else(|| ordered_ids.iter().rev().copied().find(|id| retained(*id)));
+    let anchor = current_anchor
+        .filter(|id| retained(*id))
+        .or_else(|| stashed_anchor.filter(|id| retained(*id)))
+        .or(active);
+    (active, anchor)
+}
+
 /// What the last removal took, and therefore how Undo has to put it back.
 ///
 /// Clear-all removes a prefix (everything), so restoring is a prepend and the
@@ -2313,15 +2389,45 @@ fn prune_retired_bookmarks(bookmarks: &mut BookmarkState, retired_ids: &[u64]) -
 /// belongs — document order is id order, since ids are minted monotonically and
 /// restored history is renumbered into the same sequence.
 enum RemovedBlocks {
-    Cleared(Vec<BlockData>),
+    Cleared(ClearedBlocksStash),
     Deleted(Vec<BlockData>),
 }
 
 impl RemovedBlocks {
     fn len(&self) -> usize {
         match self {
-            Self::Cleared(blocks) | Self::Deleted(blocks) => blocks.len(),
+            Self::Cleared(stash) => stash.blocks.len(),
+            Self::Deleted(blocks) => blocks.len(),
         }
+    }
+
+    fn replace_if_nonempty(slot: &mut Option<Self>, next: Self) -> usize {
+        let count = next.len();
+        if count > 0 {
+            *slot = Some(next);
+        }
+        count
+    }
+
+    /// A refused Clear undo must not consume the shared removal slot. Delete
+    /// keeps its existing insertion-and-retention behavior even at capacity.
+    fn take_for_restore(
+        slot: &mut Option<Self>,
+        fullscreen: bool,
+        clear_capacity: usize,
+    ) -> Result<Self, UndoClearResult> {
+        if fullscreen {
+            return Err(UndoClearResult::Fullscreen);
+        }
+        match slot.as_ref() {
+            None => return Err(UndoClearResult::Empty),
+            Some(removed) if removed.len() == 0 => return Err(UndoClearResult::Empty),
+            Some(Self::Cleared(_)) if clear_capacity == 0 => {
+                return Err(UndoClearResult::AtCapacity);
+            }
+            _ => {}
+        }
+        Ok(slot.take().expect("checked removal slot"))
     }
 }
 
@@ -2344,6 +2450,33 @@ fn prepend_in_order<T>(current: &mut VecDeque<T>, older: Vec<T>) {
     for item in older.into_iter().rev() {
         current.push_front(item);
     }
+}
+
+/// Positions of bookmarked cards that exist in the current filtered document.
+fn visible_marked_positions(cards: impl IntoIterator<Item = (bool, bool)>) -> Vec<usize> {
+    cards
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, (marked, filtered))| (marked && !filtered).then_some(index))
+        .collect()
+}
+
+/// Preserve Delete's next-then-previous choice while skipping filtered cards.
+fn visible_neighbor_after_removal(
+    cards: impl IntoIterator<Item = (u64, bool)>,
+    removed_position: usize,
+) -> Option<u64> {
+    let mut previous = None;
+    for (position, (id, filtered)) in cards.into_iter().enumerate() {
+        if filtered {
+            continue;
+        }
+        if position >= removed_position {
+            return Some(id);
+        }
+        previous = Some(id);
+    }
+    previous
 }
 
 /// Step through sorted marked block indices, wrapping at both ends.
@@ -2444,6 +2577,33 @@ fn historical_rerun_paste(command: &str) -> Option<Paste> {
 
 fn historical_command_is_rerunnable(command: &str) -> bool {
     historical_rerun_paste(command).is_some()
+}
+
+/// A rendered capture can be replayable text without being what the shell ran.
+/// Every historical execution entry point must re-read the current record and
+/// pass it through this gate before the prompt-verification boundary. The card
+/// id and text must both match; missing or replaced records never grant replay.
+fn historical_rerun_disabled_reason(
+    block_id: u64,
+    command: &str,
+    record: Option<&BlockData>,
+) -> Option<&'static str> {
+    let Some(record) = record else {
+        return Some("The command record is unavailable; recall the capture to review it");
+    };
+    if record.id != block_id || record.cmd != command || record.is_background() {
+        return Some("The command record changed; review the current capture first");
+    }
+    if record.command_truncated {
+        return Some("The command report was shortened; recall the capture to review it");
+    }
+    if !record.command_exact {
+        return Some("Command text is unverified; recall the capture to review it");
+    }
+    if !historical_command_is_rerunnable(command) {
+        return Some("The recorded command cannot be re-run exactly");
+    }
+    None
 }
 
 /// Whether a history command may enter the shared two-phase verified-submission
@@ -2662,9 +2822,10 @@ fn ansi256_to_rgb(idx: u8, palette: &[RGBA; 16]) -> (u8, u8, u8) {
         }
         16..=231 => {
             let idx = idx - 16;
-            let r = (idx / 36) * 51;
-            let g = ((idx % 36) / 6) * 51;
-            let b = (idx % 6) * 51;
+            let levels = [0, 95, 135, 175, 215, 255];
+            let r = levels[usize::from(idx / 36)];
+            let g = levels[usize::from((idx % 36) / 6)];
+            let b = levels[usize::from(idx % 6)];
             (r, g, b)
         }
         232..=255 => {
@@ -2802,6 +2963,11 @@ fn apply_dynamic_colors_to_finished(block: &FinishedBlock, dynamic: DynamicColor
             vte.set_color_background(&bg);
         }
     }
+    if block.command_vte.has_css_class("chat-command-terminal") {
+        block
+            .command_vte
+            .set_color_background(&RGBA::new(0.0, 0.0, 0.0, 0.0));
+    }
 }
 
 /// The queries libvte answers on its own once the bytes reach it.
@@ -2887,7 +3053,7 @@ fn kitty_key_for(keyval: gtk4::gdk::Key, base: Option<char>) -> KittyKey {
         Key::BackSpace => KittyKey::Backspace,
         Key::space | Key::KP_Space => KittyKey::Space,
         _ => match base {
-            Some(ch) if !ch.is_control() => KittyKey::Unicode(ch),
+            Some(ch) if !ch.is_control() => kitty_keyboard::unicode_key(ch, keyval.to_unicode()),
             _ => KittyKey::Functional,
         },
     }
@@ -3091,6 +3257,7 @@ enum SelectionAction {
 enum SelectionActionRefusal {
     Prompt(CommandPromptStatus),
     UnsafeRecall,
+    CommandProvenance(&'static str),
     NotRunnable,
     PromptChanged,
 }
@@ -3108,6 +3275,7 @@ fn selection_refusal_hint(action: SelectionAction, refusal: SelectionActionRefus
         | SelectionActionRefusal::PromptChanged => "Prompt changed",
         SelectionActionRefusal::Prompt(status) => status.short_label(),
         SelectionActionRefusal::UnsafeRecall => "Selection cannot be recalled safely",
+        SelectionActionRefusal::CommandProvenance(reason) => reason,
         SelectionActionRefusal::NotRunnable => "Select one runnable command",
     };
     format!("Esc cancel  ·  {reason}  ·  {consequence}")
@@ -3201,7 +3369,9 @@ fn sync_finished_block_selection(
     let active_command_is_rerunnable = active
         .and_then(|id| finished.iter().find(|block| block.id == id))
         .is_some_and(|block| {
-            !block.is_background && historical_command_is_rerunnable(&block.cmd_text)
+            !block.is_background
+                && block.command_replay_is_exact.get()
+                && historical_command_is_rerunnable(&block.cmd_text)
         });
     let hint = finished_selection_hint(selected.len(), can_recall, active_command_is_rerunnable);
     for block in finished {
@@ -3227,6 +3397,16 @@ fn sync_finished_block_selection(
             block.selection_hint_steady.borrow_mut().clear();
         }
         block.selection_hint.set_visible(is_active);
+        block.review_selection.set_visible(is_active && is_selected);
+        block
+            .review_selection
+            .set_label(&format!("Review selection ({})", selected.len()));
+        block
+            .review_selection
+            .update_property(&[gtk4::accessible::Property::Label(&format!(
+                "Review {} selected blocks",
+                selected.len()
+            ))]);
         if is_active {
             block.widget().add_css_class("block-selection-active");
             blocks::reveal_block_actions(&block.action_box, true);
@@ -3362,6 +3542,29 @@ fn selected_id_range(ids: &[u64], anchor: u64, target: u64) -> Vec<u64> {
     ids[start..=end].to_vec()
 }
 
+/// Plan a range only through cards present in the filtered document. A stale
+/// target refuses the transition without clearing the prior selection; a stale
+/// anchor starts a fresh range at the visible target.
+fn selected_visible_id_range(
+    cards: impl IntoIterator<Item = (u64, bool)>,
+    anchor: u64,
+    target: u64,
+) -> Option<(u64, Vec<u64>)> {
+    let visible: Vec<u64> = cards
+        .into_iter()
+        .filter_map(|(id, filtered)| (!filtered).then_some(id))
+        .collect();
+    if !visible.contains(&target) {
+        return None;
+    }
+    let anchor = if visible.contains(&anchor) {
+        anchor
+    } else {
+        target
+    };
+    Some((anchor, selected_id_range(&visible, anchor, target)))
+}
+
 fn select_finished_block_range(
     finished: &[FinishedBlock],
     selected_block_ids: &SelectedBlockIds,
@@ -3373,8 +3576,15 @@ fn select_finished_block_range(
         .get()
         .or_else(|| selected_block_id.get())
         .unwrap_or(target);
-    let ordered_ids: Vec<u64> = finished.iter().map(|block| block.id).collect();
-    let range = selected_id_range(&ordered_ids, anchor, target);
+    let Some((anchor, range)) = selected_visible_id_range(
+        finished
+            .iter()
+            .map(|block| (block.id, block.is_filtered_out())),
+        anchor,
+        target,
+    ) else {
+        return;
+    };
     {
         let mut selected = selected_block_ids.borrow_mut();
         selected.clear();
@@ -3762,6 +3972,7 @@ fn evict_finished_block_prefix(
     block_list: &gtk4::Box,
     widget_pool: &Rc<RefCell<WidgetPool>>,
     refs: BlockRemovalRefs<'_>,
+    scroll_controller: &ScrollDebouncer,
 ) -> usize {
     let evicted: Vec<_> = {
         let mut finished = finished_blocks.borrow_mut();
@@ -3772,6 +3983,17 @@ fn evict_finished_block_prefix(
         return 0;
     }
 
+    let rebase = evicted
+        .iter()
+        .find(|block| block.widget().is_visible())
+        .and_then(|first| {
+            let last = evicted.last()?;
+            scroll::PrefixRebase::capture(
+                first.widget().upcast_ref(),
+                last.widget().upcast_ref(),
+                scroll_controller,
+            )
+        });
     let evicted_count = evicted.len();
     let evicted_ids: Vec<_> = evicted.iter().map(|block| block.id).collect();
     let evicted_id_set: HashSet<_> = evicted_ids.iter().copied().collect();
@@ -3799,6 +4021,9 @@ fn evict_finished_block_prefix(
         let widget = oldest.widget().clone();
         block_list.remove(&widget);
         recycle_finished_block_outer(widget_pool, widget);
+    }
+    if let Some(rebase) = rebase {
+        rebase.apply();
     }
     evicted_count
 }
@@ -3865,14 +4090,12 @@ fn remove_finished_block(
         refs.selection.anchor,
         block_id,
     );
-    finished
-        .get(removed_pos)
-        .or_else(|| {
-            removed_pos
-                .checked_sub(1)
-                .and_then(|previous| finished.get(previous))
-        })
-        .map(|block| block.id)
+    visible_neighbor_after_removal(
+        finished
+            .iter()
+            .map(|block| (block.id, block.is_filtered_out())),
+        removed_pos,
+    )
 }
 
 /// Whether a press at (`x`, `y`) in `card`'s coordinates lands on a button
@@ -4016,6 +4239,7 @@ impl BlockBackend {
     fn install_finished_block_context_menu(
         &self,
         finished_widget: gtk4::Box,
+        more_button: &gtk4::Button,
         block_id: u64,
         long_output: bool,
     ) {
@@ -4041,6 +4265,58 @@ impl BlockBackend {
         let ask_ai_cbs_for_menu = self.ask_ai_cbs.clone();
         let fix_block_cbs_for_menu = self.fix_block_with_agent_cbs.clone();
         let current_cwd_for_menu = self.current_cwd_for_menu.clone();
+        let menu_keybindings = self.menu_keybindings.clone();
+
+        // Read-only inspection is shared by the persistent header and menu.
+        // Keep only weak native window/card references; no history/VTE copies.
+        finished_widget.set_focusable(true);
+        let review_slot = Rc::new(RefCell::new(glib::WeakRef::<gtk4::Window>::new()));
+        let open_review: Rc<dyn Fn()> = {
+            let slot = review_slot.clone();
+            let card = finished_widget.downgrade();
+            let finished = finished_blocks_for_menu.clone();
+            let records = self.block_data_for_cb.clone();
+            let selected = selected_ids_for_menu.clone();
+            let active = selected_for_menu.clone();
+            let anchor = anchor_for_menu.clone();
+            let live = vte_for_copy.clone();
+            Rc::new(move || {
+                if let Some(window) = slot.borrow().upgrade() {
+                    window.present();
+                    return;
+                }
+                let (Some(card), Some(finished), Some(live)) =
+                    (card.upgrade(), finished.upgrade(), live.upgrade())
+                else {
+                    return;
+                };
+                if !records.borrow().iter().any(|record| record.id == block_id) {
+                    return;
+                }
+                activate_finished_block_selection(
+                    &finished.borrow(),
+                    &selected,
+                    &active,
+                    &anchor,
+                    block_id,
+                );
+                if let Some(window) = review::open(
+                    card.upcast_ref(),
+                    records.clone(),
+                    &selected.borrow(),
+                    block_id,
+                    &live,
+                ) {
+                    *slot.borrow_mut() = window.downgrade();
+                    let slot = slot.clone();
+                    window.connect_close_request(move |_| {
+                        slot.borrow_mut().set(None);
+                        glib::Propagation::Proceed
+                    });
+                }
+            })
+        };
+        let review_from_menu = open_review.clone();
 
         let right_click = gtk4::GestureClick::new();
         right_click.set_button(3);
@@ -4049,7 +4325,8 @@ impl BlockBackend {
         let long_output_for_menu = long_output;
         let block_data_for_export = self.block_data_for_cb.clone();
         let block_scroll_for_menu = self.block_scroll_rc.downgrade();
-        right_click.connect_pressed(move |gesture, _n_press, x, y| {
+        let open_popover = Rc::new(RefCell::new(glib::WeakRef::<gtk4::Popover>::new()));
+        let open_menu: Rc<dyn Fn(f64, f64)> = Rc::new(move |x, y| {
             let Some(finished_blocks) = finished_blocks_for_menu.upgrade() else {
                 return;
             };
@@ -4059,7 +4336,21 @@ impl BlockBackend {
             let Some(finished_widget) = finished_widget_for_menu.upgrade() else {
                 return;
             };
-            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            if !finished_blocks
+                .borrow()
+                .iter()
+                .any(|block| block.id == block_id && block.widget() == &finished_widget)
+                || !block_data_for_export
+                    .borrow()
+                    .iter()
+                    .any(|block| block.id == block_id)
+            {
+                return;
+            }
+            if let Some(popover) = open_popover.borrow().upgrade() {
+                popover.popup();
+                return;
+            }
             {
                 let finished = finished_blocks.borrow();
                 clear_vte_text_selections(&finished, &vte_for_copy);
@@ -4073,6 +4364,7 @@ impl BlockBackend {
             }
 
             let popover = gtk4::Popover::new();
+            *open_popover.borrow_mut() = popover.downgrade();
             popover.set_parent(&finished_widget);
             popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
             popover.set_has_arrow(false);
@@ -4091,6 +4383,17 @@ impl BlockBackend {
                 btn
             };
 
+            {
+                let item = make_item("Review Block / Selection");
+                let popover = popover.downgrade();
+                let review = review_from_menu.clone();
+                item.connect_clicked(move |_| {
+                    popdown_if_alive(&popover);
+                    review();
+                });
+                vbox.append(&item);
+            }
+
             let selected_count = selected_ids_for_menu.borrow().len();
             let has_selected_commands = {
                 let selected = selected_ids_for_menu.borrow();
@@ -4100,8 +4403,24 @@ impl BlockBackend {
                     .any(|block| selected.contains(&block.id) && !block.cmd.trim().is_empty())
             };
 
+            let selected_commands_are_exact = {
+                let selected = selected_ids_for_menu.borrow();
+                let data = block_data_for_export.borrow();
+                !selected.is_empty()
+                    && selected.iter().all(|id| {
+                        data.iter()
+                            .find(|block| block.id == *id)
+                            .is_some_and(|block| {
+                                block.command_exact
+                                    && !block.command_truncated
+                                    && !block.is_background()
+                            })
+                    })
+            };
             if has_selected_commands {
-                let item = make_item(if selected_count > 1 {
+                let item = make_item(if !selected_commands_are_exact {
+                    "Copy Captured Text"
+                } else if selected_count > 1 {
                     "Copy Commands"
                 } else {
                     "Copy Command"
@@ -4278,9 +4597,23 @@ impl BlockBackend {
                                 }
                             }
                         };
+                        let data = block_data_for_retry.borrow();
+                        let record = data.iter().find(|block| block.id == block_id);
+                        let guard_refusal = guard_refusal.or_else(|| {
+                            historical_rerun_disabled_reason(
+                                block_id,
+                                &clicked_cmd_for_retry,
+                                record,
+                            )
+                        });
                         let submitted = guard_refusal.is_none()
-                            && verified_submission_for_retry
-                                .try_submit_historical_rerun(&clicked_cmd_for_retry, suggestion);
+                            && verified_submission_for_retry.try_submit_historical_rerun(
+                                block_id,
+                                &clicked_cmd_for_retry,
+                                record,
+                                suggestion,
+                            );
+                        drop(data);
                         if submitted {
                             clear_finished_block_selection(
                                 &finished,
@@ -4391,10 +4724,10 @@ impl BlockBackend {
             }
 
             if has_selected_commands {
-                let item = make_item(if selected_count > 1 {
-                    "Insert Commands at Prompt"
+                let item = make_item(if selected_commands_are_exact {
+                    command_reuse_menu_label(selected_count)
                 } else {
-                    "Insert Command at Prompt"
+                    "Insert Captured Text for Review"
                 });
                 let popover_c = popover.downgrade();
                 let finished_for_rerun = finished_blocks_for_menu.clone();
@@ -4421,7 +4754,7 @@ impl BlockBackend {
                         && verified_submission_for_menu.can_recall_command(suggestion),
                 );
                 item.set_tooltip_text(Some(
-                    "Inserts only at a visibly empty, verified shell prompt",
+                    "Fill prompt without running; requires a visibly empty, verified shell prompt",
                 ));
                 item.connect_clicked(move |_| {
                     popdown_if_alive(&popover_c);
@@ -4470,6 +4803,7 @@ impl BlockBackend {
                 let config_for_run = config_for_menu.clone();
                 let active_for_run = active_for_rerun_menu.clone();
                 let error_bell_for_run = vte_for_copy.downgrade();
+                let block_data_for_run = block_data_for_export.clone();
                 let command = finished_blocks_for_menu.upgrade().and_then(|finished| {
                     finished
                         .borrow()
@@ -4482,13 +4816,19 @@ impl BlockBackend {
                 {
                     let suggestion =
                         click_cursor::suggestion_rgb(&config_for_menu.borrow().palette);
+                    let data = block_data_for_export.borrow();
+                    let record = data.iter().find(|block| block.id == block_id);
+                    let provenance_refusal =
+                        historical_rerun_disabled_reason(block_id, &command, record);
                     item.set_sensitive(
                         verified_submission_for_menu
-                            .can_submit_historical_rerun(&command, suggestion),
+                            .can_submit_historical_rerun(block_id, &command, record, suggestion),
                     );
-                    item.set_tooltip_text(Some(
-                        "Runs this command again only at a verified empty shell prompt",
-                    ));
+                    let explanation = provenance_refusal
+                        .unwrap_or("Runs this command again only at a verified empty shell prompt");
+                    item.set_tooltip_text(Some(explanation));
+                    item.update_property(&[gtk4::accessible::Property::Description(explanation)]);
+                    drop(data);
                     item.connect_clicked(move |_| {
                         popdown_if_alive(&popover_c);
                         let Some(finished_for_run) = finished_for_run.upgrade() else {
@@ -4504,8 +4844,13 @@ impl BlockBackend {
                         };
                         let suggestion =
                             click_cursor::suggestion_rgb(&config_for_run.borrow().palette);
+                        let data = block_data_for_run.borrow();
+                        let record = data.iter().find(|block| block.id == block_id);
+                        let provenance_refusal =
+                            historical_rerun_disabled_reason(block_id, &command, record);
                         let submitted = verified_submission_for_run
-                            .try_submit_historical_rerun(&command, suggestion);
+                            .try_submit_historical_rerun(block_id, &command, record, suggestion);
+                        drop(data);
                         if submitted {
                             clear_finished_block_selection(
                                 &finished,
@@ -4516,8 +4861,24 @@ impl BlockBackend {
                             if let Some(active_for_run) = active_for_run.upgrade() {
                                 active_for_run.borrow().grab_focus();
                             }
-                        } else if let Some(vte) = error_bell_for_run.upgrade() {
-                            vte.error_bell();
+                        } else {
+                            let refusal = provenance_refusal.map_or_else(
+                                || {
+                                    SelectionActionRefusal::Prompt(
+                                        verified_submission_for_run
+                                            .historical_rerun_refusal_status(suggestion),
+                                    )
+                                },
+                                SelectionActionRefusal::CommandProvenance,
+                            );
+                            flash_finished_selection_refusal(
+                                &finished,
+                                selected_for_run.get(),
+                                selection_refusal_hint(SelectionAction::Run, refusal),
+                            );
+                            if let Some(vte) = error_bell_for_run.upgrade() {
+                                vte.error_bell();
+                            }
                         }
                     });
                     vbox.append(&item);
@@ -4559,6 +4920,58 @@ impl BlockBackend {
                     }
                 });
                 vbox.append(&item);
+            }
+            if finished_blocks
+                .borrow()
+                .iter()
+                .any(|block| block.id == block_id && block.can_collapse)
+            {
+                let collapsed = finished_blocks
+                    .borrow()
+                    .iter()
+                    .find(|block| block.id == block_id)
+                    .is_some_and(FinishedBlock::is_collapsed);
+                let item = make_item(if collapsed {
+                    "Show Output"
+                } else {
+                    "Hide Output"
+                });
+                shortcut_hints::decorate(
+                    &item,
+                    &menu_keybindings,
+                    crate::keybindings::Action::ToggleBlockCollapsed,
+                );
+                let popover_c = popover.downgrade();
+                let finished = finished_blocks_for_menu.clone();
+                item.connect_clicked(move |_| {
+                    popdown_if_alive(&popover_c);
+                    if let Some(finished) = finished.upgrade() {
+                        if let Some(block) = finished.borrow().iter().find(|b| b.id == block_id) {
+                            block.set_collapsed(!block.is_collapsed());
+                        }
+                    }
+                });
+                vbox.append(&item);
+            }
+            if let Some(block) = finished_blocks.borrow().iter().find(|b| b.id == block_id) {
+                if block.expand_btn.is_visible() {
+                    let item = make_item(
+                        block
+                            .expand_btn
+                            .tooltip_text()
+                            .as_deref()
+                            .unwrap_or("Expand block"),
+                    );
+                    let expand = block.expand_btn.downgrade();
+                    let popover_c = popover.downgrade();
+                    item.connect_clicked(move |_| {
+                        popdown_if_alive(&popover_c);
+                        if let Some(expand) = expand.upgrade() {
+                            expand.emit_clicked();
+                        }
+                    });
+                    vbox.append(&item);
+                }
             }
             {
                 let item = make_item("Toggle Output Filter");
@@ -4681,13 +5094,49 @@ impl BlockBackend {
                 vbox.append(&item);
             }
 
-            popover.set_child(Some(&vbox));
+            // Long action lists must remain usable on short windows and
+            // enlarged fonts; scrolling never changes the terminal geometry.
+            let menu_scroll = gtk4::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk4::PolicyType::Never)
+                .vscrollbar_policy(gtk4::PolicyType::Automatic)
+                .propagate_natural_height(true)
+                .max_content_height(420)
+                .child(&vbox)
+                .build();
+            popover.set_child(Some(&menu_scroll));
+            let slot = open_popover.clone();
             popover.connect_closed(move |p| {
+                slot.borrow_mut().set(None);
                 p.unparent();
             });
             popover.popup();
         });
+        let open_from_pointer = open_menu.clone();
+        right_click.connect_pressed(move |gesture, _, x, y| {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            open_from_pointer(x, y);
+        });
         finished_widget.add_controller(right_click);
+
+        // This action group belongs to the card, so restored and undo-created
+        // cards get exactly the same menu and execution gates as new ones.
+        let actions = gtk4::gio::SimpleActionGroup::new();
+        let show_menu = gtk4::gio::SimpleAction::new("show-menu", None);
+        let card = finished_widget.downgrade();
+        show_menu.connect_activate(move |_, _| {
+            if let Some(card) = card.upgrade() {
+                open_menu(f64::from(card.width().saturating_sub(24)), 24.0);
+            }
+        });
+        let inspect = gtk4::gio::SimpleAction::new("review", None);
+        inspect.connect_activate(move |_, _| open_review());
+        actions.add_action(&inspect);
+        actions.add_action(&show_menu);
+        finished_widget.insert_action_group("block", Some(&actions));
+        // Local ownership avoids unresolved ancestor action lookup on cards
+        // added to an already mapped pane. Both use the same checked opener.
+        more_button.insert_action_group("block", Some(&actions));
+        more_button.set_action_name(Some("block.show-menu"));
     }
 }
 
@@ -4866,6 +5315,12 @@ struct CompletedCommandRecord {
 }
 
 impl CompletedCommandRecord {
+    fn estimated_retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.cmd.capacity())
+            .saturating_add(self.cwd.as_ref().map_or(0, String::capacity))
+    }
+
     fn lifecycle_health(&self) -> BlockLifecycleHealth {
         assess_lifecycle(self.start_mark_seen, self.completion_provenance)
     }
@@ -5005,10 +5460,24 @@ pub(crate) struct CommandFinishedEvent {
 
 type CommandStartedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(CommandStartedEvent)>>>>;
 type CommandFinishedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(CommandFinishedEvent)>>>>;
+type PromptEvidenceInvalidatedCallbacks = Rc<RefCell<Vec<Rc<dyn Fn()>>>>;
 type HumanInputCallbacks = Rc<RefCell<Vec<Box<dyn Fn(HumanInputKind)>>>>;
 type AltScreenCallbacks = Rc<RefCell<Vec<Box<dyn Fn(AltScreenTransition)>>>>;
 type AskAiCallbacks =
     Rc<RefCell<Vec<Box<dyn Fn(crate::ai::BlockContext, crate::ai::BlockAiIntent)>>>>;
+
+/// Preserve structured capture loss, independently of words in the output.
+/// These three card notices specifically mean bytes or rows were not retained;
+/// unrelated diagnostics must not turn complete output into a truncated sample.
+fn output_evidence_is_truncated(source: &str, sample: &str, notice: Option<&str>) -> bool {
+    source != sample
+        || matches!(
+            notice,
+            Some(FINISHED_OUTPUT_NOT_RETAINED)
+                | Some(FINISHED_OUTPUT_TEXT_TRUNCATED)
+                | Some(FINISHED_OUTPUT_PARTLY_RETAINED)
+        )
+}
 
 fn block_context_for_id(
     finished: &[FinishedBlock],
@@ -5185,6 +5654,7 @@ impl SubmissionSurface for VteSubmissionSurface {
 /// files, hooks and key bindings remain part of the trusted shell boundary.
 #[derive(Clone)]
 struct VerifiedSubmissionCtx {
+    input_feedback: Rc<input_feedback::InputFeedback>,
     /// The live surface the inserted command must render on, behind the
     /// query-only [`SubmissionSurface`] seam.
     surface: Rc<dyn SubmissionSurface>,
@@ -5212,11 +5682,53 @@ struct VerifiedSubmissionCtx {
     pending_agent_generation: Rc<Cell<Option<u64>>>,
     agent_execution_lost_callbacks: AgentExecutionLostCallbacks,
     agent_execution_supported: Rc<Cell<bool>>,
+    prompt_evidence_invalidated: PromptEvidenceInvalidatedCallbacks,
 }
 
 type VerifiedSubmissionCompletion = Box<dyn FnOnce(Result<(), String>)>;
 
 impl VerifiedSubmissionCtx {
+    fn notify_prompt_evidence_invalidated(&self) {
+        let callbacks = self.prompt_evidence_invalidated.borrow().clone();
+        for callback in callbacks {
+            callback();
+        }
+    }
+
+    fn organism_activity_knowledge(
+        &self,
+        fullscreen: bool,
+        active_agent: bool,
+        suggestion_rgb: [u8; 3],
+    ) -> jterm_core::organism_live::LiveActivityKnowledge {
+        let state = self.bstate.get();
+        let typed_shadow_empty = self.typed_cmd.borrow().is_empty();
+        let reviewed_submission_pending = self.submission_pending.get()
+            || self.pending_typeahead.get()
+            || self.source_id.borrow().is_some()
+            || self.completion.borrow().is_some()
+            || self.external_submission.borrow().is_some()
+            || self.external_submission_generation.get().is_some();
+        let agent_execution_pending = active_agent || self.pending_agent_generation.get().is_some();
+        // Reuse the strict existing PromptEnd/cursor/suffix proof. The current
+        // Forge suffix reader ignores color and rejects all non-CR/LF text.
+        // Every field borrow above has ended before these native reads.
+        let prompt_verified_empty = !fullscreen
+            && state == BlockState::AwaitingCommand
+            && typed_shadow_empty
+            && !reviewed_submission_pending
+            && !agent_execution_pending
+            && self.history_editor_is_ready(suggestion_rgb)
+            && self.pty.foreground_owner() == PtyForeground::Shell;
+        activity_knowledge::activity_knowledge(activity_knowledge::ActivityFacts {
+            state,
+            prompt_verified_empty,
+            typed_shadow_empty,
+            reviewed_submission_pending,
+            agent_execution_pending,
+        })
+    }
+
     fn current_anchor(&self) -> (i64, i64) {
         // Through the surface's own policy, never `rebase_prompt_anchor`
         // directly: this pane may not be a Block pane.
@@ -5287,8 +5799,10 @@ impl VerifiedSubmissionCtx {
         if let Err(error) = self.pty.write_bytes(&paste.bytes) {
             self.pty
                 .report_write_error("could not queue recalled command", error);
+            self.input_feedback.rejected(error, None);
             return false;
         }
+        self.input_feedback.accepted();
         *self.typed_cmd.borrow_mut() = paste.echo_text;
         // `Ctrl+U` is conventional, not a portable whole-buffer replacement;
         // keep the shadow below exact-command authority after insertion.
@@ -5297,6 +5811,7 @@ impl VerifiedSubmissionCtx {
         self.pty_synced.set(true);
         self.accepted_input_generation
             .set(self.accepted_input_generation.get().wrapping_add(1));
+        self.notify_prompt_evidence_invalidated();
         true
     }
 
@@ -5340,8 +5855,15 @@ impl VerifiedSubmissionCtx {
     /// synchronously proven empty. The shared submission path then inserts the
     /// command without Enter, verifies its exact stable render, and admits CR
     /// in phase two; history provenance never weakens that race boundary.
-    fn historical_rerun_is_ready(&self, command: &str, suggestion_rgb: [u8; 3]) -> bool {
-        if !self.history_editor_is_ready(suggestion_rgb)
+    fn historical_rerun_is_ready(
+        &self,
+        block_id: u64,
+        command: &str,
+        record: Option<&BlockData>,
+        suggestion_rgb: [u8; 3],
+    ) -> bool {
+        if historical_rerun_disabled_reason(block_id, command, record).is_some()
+            || !self.history_editor_is_ready(suggestion_rgb)
             || self.pty.foreground_owner() != PtyForeground::Shell
         {
             return false;
@@ -5362,8 +5884,14 @@ impl VerifiedSubmissionCtx {
         true
     }
 
-    fn can_submit_historical_rerun(&self, command: &str, suggestion_rgb: [u8; 3]) -> bool {
-        self.historical_rerun_is_ready(command, suggestion_rgb)
+    fn can_submit_historical_rerun(
+        &self,
+        block_id: u64,
+        command: &str,
+        record: Option<&BlockData>,
+        suggestion_rgb: [u8; 3],
+    ) -> bool {
+        self.historical_rerun_is_ready(block_id, command, record, suggestion_rgb)
     }
 
     /// Best user-facing explanation after the strict history re-run boundary
@@ -5410,8 +5938,14 @@ impl VerifiedSubmissionCtx {
         }
     }
 
-    fn try_submit_historical_rerun(&self, command: &str, suggestion_rgb: [u8; 3]) -> bool {
-        if !self.historical_rerun_is_ready(command, suggestion_rgb) {
+    fn try_submit_historical_rerun(
+        &self,
+        block_id: u64,
+        command: &str,
+        record: Option<&BlockData>,
+        suggestion_rgb: [u8; 3],
+    ) -> bool {
+        if !self.historical_rerun_is_ready(block_id, command, record, suggestion_rgb) {
             return false;
         }
         // Re-use the reviewed two-phase boundary: insert without Enter, wait
@@ -5613,11 +6147,13 @@ impl VerifiedSubmissionCtx {
             glib::ControlFlow::Break
         });
         *self.source_id.borrow_mut() = Some(source_id);
+        self.notify_prompt_evidence_invalidated();
         Ok(())
     }
 }
 
 pub struct TermView {
+    menu_keybindings: shortcut_hints::MenuKeybindings,
     root: gtk4::Box,
     /// Status strip above the block list, shown only while this pane's tab
     /// is split.
@@ -5631,10 +6167,14 @@ pub struct TermView {
     /// document cannot scroll to a mounted card; empty and hidden otherwise.
     notice_dock: gtk4::Box,
     jump_fab: gtk4::Button,
+    unified_navigation: Option<Rc<unified_navigation::NavigationBar>>,
     unread_count: Rc<Cell<u32>>,
     /// The single persistent live VTE (anvil model): prompt + typing + output all
     /// render here natively; finished commands snapshot into styled blocks above.
     active_vte: Terminal,
+    /// Existing native contents clock, shared with prompt/layout observation.
+    /// Search reads it; selection and scrolling never advance it.
+    contents_generation: Rc<Cell<u64>>,
     active: Rc<RefCell<ActiveBlock>>,
     bstate: Rc<Cell<BlockState>>,
     /// Keystroke shadow used only as a fallback command capture. The authoritative
@@ -5699,6 +6239,7 @@ pub struct TermView {
     /// updates and tab activation. Sharing it prevents activation from racing a
     /// still-running output/layout pin.
     scroll_debouncer: ScrollDebouncer,
+    input_feedback: Rc<input_feedback::InputFeedback>,
     pty: Rc<OwnedPty>,
     pty_synced: Rc<Cell<bool>>,
     cwd_callbacks: StrCallbacks,
@@ -5707,6 +6248,7 @@ pub struct TermView {
     bell_callbacks: VoidCallbacks,
     title_callbacks: StrCallbacks,
     activity_callbacks: VoidCallbacks,
+    watch_reader: Rc<WatchReader>,
     human_input_callbacks: HumanInputCallbacks,
     alt_screen_callbacks: AltScreenCallbacks,
     mouse_reporting_mode: Rc<Cell<MouseReporting>>,
@@ -5744,7 +6286,7 @@ pub struct TermView {
     /// `selected_block_id` — which only ever holds an id that passes the
     /// finished-block lookup — stays `None` for the pane's whole life. Holds
     /// the record this view last navigated to, so next/previous can advance.
-    navigated_record_id: Cell<Option<u64>>,
+    navigated_record_id: Rc<Cell<Option<u64>>>,
     selection_anchor_id: Rc<Cell<Option<u64>>>,
     bookmarks: SharedBookmarks,
     /// Shared backend-neutral transition. It validates/synchronizes Block card
@@ -5754,6 +6296,8 @@ pub struct TermView {
     /// cursor into it, so Ctrl+F highlights all hits and Next/Prev step through
     /// them (Warp's FindWithinBlock). Tags are stripped on close via clear_find.
     find_state: Rc<RefCell<FindState>>,
+    /// One compiled cross-block query reused by scan slices and refreshes.
+    prepared_search: RefCell<prepared_search::PreparedSearch>,
     current_cwd: Rc<RefCell<String>>,
     /// The tab's persistent session id (window snapshot `sid`). Keys the
     /// per-tab block-history file so concurrent tabs never overwrite each
@@ -5768,6 +6312,11 @@ pub struct TermView {
     persist_history_on_drop: Cell<bool>,
     /// Main-thread poll applying a completed history load to GTK widgets.
     history_load_poll_id: RefCell<Option<glib::SourceId>>,
+    /// Sticky Retry ReloadFirst: after the async reload reaches Loaded (or an
+    /// early sync restore path finishes), enqueue a labeled save so live blocks
+    /// are not left unsaved while the bar hides optimistically. Cleared on
+    /// Failed / discarded / sync enqueue refusal.
+    retry_save_after_history_load: Cell<bool>,
     /// Slot of the settling resize tick installed on `active_vte`, shared with
     /// the arming closure so a geometry signal installs at most one tick and
     /// the tick clears the slot when it stands down. Removed on Drop —
@@ -6152,6 +6701,15 @@ impl<'a> BackendRecordRef<'a> {
         match self {
             Self::Block(record) => record.duration_ms,
             Self::Metadata { record, .. } => record.duration_ms,
+        }
+    }
+
+    /// Working directory the record ran in. Both backing record types carry
+    /// it; the cross-block palette reads it for an optional outcome suffix.
+    fn cwd(self) -> Option<&'a str> {
+        match self {
+            Self::Block(record) => record.cwd.as_deref(),
+            Self::Metadata { record, .. } => record.cwd.as_deref(),
         }
     }
 
@@ -6612,6 +7170,11 @@ trait RenderBackend {
     fn can_scroll_to_record(&self, _block_id: u64) -> bool {
         false
     }
+    /// Authenticated head in the native adjustment's coordinate system.
+    /// Used only for explicit viewport-relative Unified navigation.
+    fn record_scroll_value(&self, _block_id: u64) -> Option<f64> {
+        None
+    }
     /// Resolve every currently reachable cross-block-search target in one
     /// pass. The default preserves the per-target proof used by backends with
     /// indexed lookup; widget-backed implementations should override this to
@@ -6675,7 +7238,14 @@ trait RenderBackend {
     /// Those cards are indistinguishable from freshly finished ones to the
     /// user, so every card-level action must reach them too. Backends without a
     /// card menu keep the default no-op.
-    fn install_block_context_menu(&self, _widget: &gtk4::Box, _block_id: u64, _long_output: bool) {}
+    fn install_block_context_menu(
+        &self,
+        _widget: &gtk4::Box,
+        _more: &gtk4::Button,
+        _block_id: u64,
+        _long_output: bool,
+    ) {
+    }
     /// Handle keyboard line scrolling on a backend-owned surface. Returning
     /// true means the outer Block scroller must not also move.
     fn scroll_surface_lines(&self, _lines: i32) -> bool {
@@ -6962,6 +7532,15 @@ fn schedule_anchor_settle_on(
     *tick_slot.borrow_mut() = Some(tick_id);
 }
 
+/// Review opens a separate confirmation step; recall only fills the prompt.
+fn command_reuse_menu_label(selected_count: usize) -> &'static str {
+    if selected_count > 1 {
+        "Recall commands"
+    } else {
+        "Recall command"
+    }
+}
+
 /// The GTK/VTE implementation of [`RenderBackend`] for Block mode: owns the
 /// widget-owning handles the reader lifecycle drives. Shared-`Rc` fields keep
 /// the `_rc`/`_for_cb` names of the former [`ReaderCtx`] fields they moved
@@ -6969,6 +7548,7 @@ fn schedule_anchor_settle_on(
 /// `ReaderCtx` holds — finished-block actions and the context menu rebind
 /// them when the user re-runs a command from history.
 struct BlockBackend {
+    menu_keybindings: shortcut_hints::MenuKeybindings,
     active_rc: Rc<RefCell<ActiveBlock>>,
     /// The live VTE — every byte is fed here; alt-screen toggles feed it 1049h/l.
     active_vte: Terminal,
@@ -7111,6 +7691,7 @@ struct ReaderCtx {
     remote_session_cbs: StrCallbacks,
     exited_cbs: IntCallbacks,
     activity_cbs: VoidCallbacks,
+    watch_reader: Rc<WatchReader>,
     alt_screen_cbs: AltScreenCallbacks,
     mouse_reporting_rc: Rc<Cell<MouseReporting>>,
     /// See [`LiveInputModes`].
@@ -7188,6 +7769,8 @@ impl ReaderCtx {
         if !std::mem::take(&mut self.engine.borrow_mut().command_finished_event_pending) {
             return None;
         }
+        self.watch_reader
+            .command_finished(std::time::Instant::now());
         Some(CommandFinishedEvent {
             // Keep the engine/UI display copy intact until finalization. Anvil
             // can legitimately resume CollectingOutput after a provisional
@@ -7256,6 +7839,7 @@ impl ReaderCtx {
     }
 
     fn on_hard_reset(&self) {
+        self.watch_reader.reset(std::time::Instant::now());
         self.reset_kitty_keyboard();
         self.live_input_modes_rc.set(LiveInputModes::default());
         self.forget_unanswered_cpr_later();
@@ -7349,6 +7933,7 @@ impl ReaderCtx {
             // Only unwind the frontend ownership/chrome half of alt-screen.
             self.backend.exit_fullscreen();
             self.backend.exit_alt_screen_chrome();
+            self.watch_reader.set_alt(false, std::time::Instant::now());
             emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
             self.backend.layout_active_surface();
         }
@@ -7363,6 +7948,8 @@ impl ReaderCtx {
         self.mouse_reporting_rc.set(MouseReporting::OFF);
         self.live_reporting_modes_set.set(false);
         self.dynamic_colors_rc.set(DynamicColors::default());
+        self.verified_submission
+            .notify_prompt_evidence_invalidated();
     }
 
     fn on_decset_mode(&self, mode: u32, set: bool) {
@@ -7478,6 +8065,9 @@ impl ReaderCtx {
                 {
                     self.live_raw_output_rc.borrow_mut().append(bytes);
                 }
+                if !bytes.is_empty() {
+                    self.watch_reader.note_output();
+                }
                 emit_activity(&self.activity_cbs);
                 true
             }
@@ -7488,6 +8078,9 @@ impl ReaderCtx {
                 // claude fullscreen tab is working. A full-screen
                 // app repaints at frame rate, so report it at most
                 // once per interval.
+                if !bytes.is_empty() {
+                    self.watch_reader.note_output();
+                }
                 let now = std::time::Instant::now();
                 if alt_screen_activity_due(self.alt_screen_activity_at.get(), now) {
                     self.alt_screen_activity_at.set(Some(now));
@@ -7529,6 +8122,8 @@ impl ReaderCtx {
             if !prompt_boundary_infers_command_end(state, foreground_owner) {
                 return;
             }
+            self.watch_reader
+                .command_finished(std::time::Instant::now());
             take_agent_execution_as_lost(
                 &self.active_agent_generation_rc,
                 &self.agent_execution_lost_cbs,
@@ -7557,6 +8152,7 @@ impl ReaderCtx {
                 }
                 self.backend.exit_fullscreen();
                 self.backend.exit_alt_screen_chrome();
+                self.watch_reader.set_alt(false, std::time::Instant::now());
                 emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
                 self.backend.layout_active_surface();
             }
@@ -7681,6 +8277,8 @@ impl ReaderCtx {
                     self.backend.reset_kitty_pipeline();
                     self.bstate_rc.set(BlockState::CollectingPrompt);
                     self.engine.borrow_mut().prompt_buf.clear();
+                    self.verified_submission
+                        .notify_prompt_evidence_invalidated();
                     self.backend.mark_scroll_dirty();
                     return;
                 }
@@ -7850,6 +8448,14 @@ impl ReaderCtx {
                 }
                 resolved => resolved,
             };
+            #[cfg(test)]
+            chat_shell_tests::metadata_observe(|| {
+                serde_json::json!({
+                    "phase":"record", "execution_id":command_meta.id, "block_id":record.id,
+                    "command":record.cmd, "command_source":format!("{:?}", record.command_source),
+                    "completion_provenance":format!("{:?}", record.completion_provenance),
+                })
+            });
             self.backend.finalize_block(&record, &payload);
             // DECISION: the block-finished fan-out is engine policy and now
             // runs AFTER the whole backend finalize. Pre-split it ran
@@ -7900,6 +8506,8 @@ impl ReaderCtx {
         }
         self.bstate_rc.set(BlockState::CollectingPrompt);
         self.engine.borrow_mut().prompt_buf.clear();
+        self.verified_submission
+            .notify_prompt_evidence_invalidated();
         // Reassert the stable viewport grid before the shell
         // renders the next prompt.
         self.backend.sync_geometry_to_pty();
@@ -8178,6 +8786,14 @@ impl ReaderCtx {
         // The exactness provenance rides the same accepted-C authority as the
         // resolved text: only this site may mark a command shell-reported.
         self.engine.borrow_mut().pending_command_source = command_source;
+        #[cfg(test)]
+        chat_shell_tests::metadata_observe(|| {
+            serde_json::json!({
+                "phase":"start", "execution_id":meta.id, "parsed_command":meta.command,
+                "resolved_command":submitted_command, "command_source":format!("{command_source:?}"),
+                "block_id":command_zone_id,
+            })
+        });
         self.submission_pending_rc.set(false);
         self.engine.borrow_mut().vte_typed_cmd = submitted_command.clone();
         *self.running_cmd_rc.borrow_mut() = submitted_command.clone();
@@ -8192,6 +8808,7 @@ impl ReaderCtx {
                 cwd: command_cwd,
             },
         );
+        self.watch_reader.command_started(std::time::Instant::now());
         // Match anvil's block-mode runtime model: keep the
         // active VTE as the live surface while the command
         // runs, then snapshot it into a finished block on the
@@ -8228,19 +8845,36 @@ impl ReaderCtx {
             .borrow()
             .pending_command_meta
             .command_end_correlation(meta);
+        // Nested and foreign-foreground marks have already been handled.
+        // Only ordinary commands with two explicit shell IDs gain this guard;
+        // missing IDs and Agent lost/correlation handling retain their policy.
+        if self.active_agent_generation_rc.get().is_none() {
+            let engine = self.engine.borrow();
+            if matches!(
+                (engine.pending_command_meta.id.as_deref(), meta.id.as_deref()),
+                (Some(start), Some(end)) if start != end
+            ) {
+                return;
+            }
+        }
         match decide_agent_command_end(
             self.active_agent_generation_rc.get().is_some(),
             foreground_owner,
             self.pending_typeahead_rc.get(),
             id_correlation,
         ) {
-            AgentCommandEndDecision::Accept => {}
+            AgentCommandEndDecision::Accept => {
+                self.watch_reader
+                    .command_finished(std::time::Instant::now());
+            }
             AgentCommandEndDecision::IgnoreUntilShellOwnsForeground => {
                 // A foreground job can print D as ordinary
                 // output. Wait for the shell's real marker.
                 return;
             }
             AgentCommandEndDecision::AcceptWithoutAgentCorrelation => {
+                self.watch_reader
+                    .command_finished(std::time::Instant::now());
                 take_agent_execution_as_lost(
                     &self.active_agent_generation_rc,
                     &self.agent_execution_lost_cbs,
@@ -8288,6 +8922,7 @@ impl ReaderCtx {
             }
             self.backend.exit_fullscreen();
             self.backend.exit_alt_screen_chrome();
+            self.watch_reader.set_alt(false, std::time::Instant::now());
             emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
             self.backend.layout_active_surface();
         }
@@ -8310,6 +8945,13 @@ impl ReaderCtx {
             engine.pending_command_meta.duration_ms = duration_ms;
             (engine.pending_command_meta.cwd.clone(), duration_ms)
         };
+        #[cfg(test)]
+        chat_shell_tests::metadata_observe(|| {
+            serde_json::json!({
+                "phase":"end", "execution_id":meta.id, "exit_code":exit,
+                "correlation":format!("{id_correlation:?}"),
+            })
+        });
         let command_finished = self.take_command_finished_event(
             command_cwd,
             exit,
@@ -8332,6 +8974,7 @@ impl ReaderCtx {
         ) {
             return;
         }
+        self.watch_reader.set_alt(true, std::time::Instant::now());
         self.engine.borrow_mut().prev_state = from_state;
         self.bstate_rc.set(BlockState::AltScreen);
         self.kitty_keyboard_rc.borrow_mut().enter_alt_screen();
@@ -8378,6 +9021,7 @@ impl ReaderCtx {
         }
         self.backend.exit_fullscreen();
         self.backend.exit_alt_screen_chrome();
+        self.watch_reader.set_alt(false, std::time::Instant::now());
         emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
         self.engine.borrow_mut().osc133_depth = 0;
         self.engine.borrow_mut().pending_completion_provenance = CompletionProvenance::Unknown;
@@ -8464,7 +9108,7 @@ impl ReaderCtx {
         let asked = queries.get();
         // Only the thread that owns the main context can schedule; a test
         // thread that cannot simply keeps the ledger, which is the safe side.
-        if glib::MainContext::default().acquire().is_ok() {
+        if let Ok(_guard) = glib::MainContext::default().acquire() {
             glib::timeout_add_local_once(CPR_ANSWER_GRACE, move || {
                 if cpr_forget_applies(asked, queries.get()) {
                     ledger.set(0);
@@ -8790,6 +9434,121 @@ fn notification_allowed(last: Option<std::time::Instant>, now: std::time::Instan
     last.is_none_or(|prev| now.duration_since(prev) >= NOTIFICATION_MIN_INTERVAL)
 }
 
+/// Signal subscriptions exist only until this one deferred focus request is
+/// consumed. Neither the idle nor the observers keep a pane/window alive.
+struct DeferredLiveFocus {
+    target: glib::WeakRef<Terminal>,
+    window: glib::WeakRef<gtk4::Window>,
+    initial_owner: glib::WeakRef<gtk4::Widget>,
+    superseded: Rc<Cell<bool>>,
+    focus_changed: Option<glib::SignalHandlerId>,
+    root_changed: Option<glib::SignalHandlerId>,
+}
+
+impl Drop for DeferredLiveFocus {
+    fn drop(&mut self) {
+        if let (Some(window), Some(handler)) = (self.window.upgrade(), self.focus_changed.take()) {
+            window.disconnect(handler);
+        }
+        if let (Some(target), Some(handler)) = (self.target.upgrade(), self.root_changed.take()) {
+            target.disconnect(handler);
+        }
+    }
+}
+
+impl DeferredLiveFocus {
+    fn new(target: &Terminal) -> Option<Self> {
+        if !target.has_focus() || !target.is_mapped() {
+            return None;
+        }
+        Self::capture(target, target.upcast_ref())
+    }
+
+    /// Clipboard requests may originate on this pane's completed history or
+    /// its child menu. An unrelated search entry/pane grants no focus authority.
+    fn for_paste(target: &Terminal, pane: &gtk4::Box) -> Option<Self> {
+        let window = target.root().and_downcast::<gtk4::Window>()?;
+        let owner = GtkWindowExt::focus(&window)?;
+        if !target.is_mapped()
+            || (owner != *pane.upcast_ref::<gtk4::Widget>() && !owner.is_ancestor(pane))
+        {
+            return None;
+        }
+        Self::capture(target, &owner)
+    }
+
+    fn capture(target: &Terminal, owner: &gtk4::Widget) -> Option<Self> {
+        let window = target.root().and_downcast::<gtk4::Window>()?;
+        let initial_owner = owner.downgrade();
+        let superseded = Rc::new(Cell::new(false));
+        let initial_owner_weak = initial_owner.clone();
+        let invalidated = superseded.clone();
+        let focus_changed = window.connect_focus_widget_notify(move |window| {
+            if let Some(owner) = GtkWindowExt::focus(window) {
+                if initial_owner_weak.upgrade().as_ref() != Some(&owner) {
+                    invalidated.set(true);
+                }
+            }
+        });
+        let window_weak = window.downgrade();
+        let invalidated = superseded.clone();
+        let root_changed = target.connect_root_notify(move |target| {
+            if let Some(root) = target.root() {
+                if window_weak
+                    .upgrade()
+                    .as_ref()
+                    .map(|window| window.upcast_ref())
+                    != Some(&root)
+                {
+                    invalidated.set(true);
+                }
+            }
+        });
+        Some(Self {
+            target: target.downgrade(),
+            window: window.downgrade(),
+            initial_owner,
+            superseded,
+            focus_changed: Some(focus_changed),
+            root_changed: Some(root_changed),
+        })
+    }
+
+    fn defer(self) {
+        glib::idle_add_local_once(move || {
+            if self.superseded.get() {
+                return;
+            }
+            let (Some(target), Some(window)) = (self.target.upgrade(), self.window.upgrade())
+            else {
+                return;
+            };
+            if !target.is_mapped()
+                || !window.is_mapped()
+                || target.root().as_ref() != Some(window.upcast_ref())
+                || GtkWindowExt::focus(&window)
+                    .is_some_and(|owner| self.initial_owner.upgrade().as_ref() != Some(&owner))
+            {
+                return;
+            }
+            target.grab_focus();
+        });
+    }
+}
+
+/// Restore only this live surface's existing ownership. GTK may temporarily
+/// clear focus while remapping it, so checking `has_focus` again at idle loses
+/// legitimate restoration. Conversely, checking only at scheduling time lets
+/// a prompt/alt-exit steal a newer pane, find, or history focus. Observe every
+/// intervening owner: even an owner that disappears before idle retires this
+/// request. A temporary unroot/remap in the same window remains eligible;
+/// moving to another root, staying hidden, or disposal does not.
+pub(crate) fn restore_live_focus_deferred(target: &Terminal) {
+    if let Some(request) = DeferredLiveFocus::new(target) {
+        request.defer();
+    }
+}
+
 /// The GTK/VTE rendering seam. Bodies moved verbatim from the former
 /// `ReaderCtx` handler statements and `render_finalized_block`; the free
 /// helper functions they wrap stay module-level because non-reader paths
@@ -8799,8 +9558,14 @@ impl RenderBackend for BlockBackend {
         self.active_vte.feed(bytes);
     }
 
-    fn install_block_context_menu(&self, widget: &gtk4::Box, block_id: u64, long_output: bool) {
-        self.install_finished_block_context_menu(widget.clone(), block_id, long_output);
+    fn install_block_context_menu(
+        &self,
+        widget: &gtk4::Box,
+        more: &gtk4::Button,
+        block_id: u64,
+        long_output: bool,
+    ) {
+        self.install_finished_block_context_menu(widget.clone(), more, block_id, long_output);
     }
 
     fn reset_active_surface(&self, preserve_scrollback: bool) {
@@ -8813,13 +9578,7 @@ impl RenderBackend for BlockBackend {
     /// output, or the find box — was interrupted whenever any other pane's
     /// shell reached a prompt.
     fn focus_live_deferred(&self) {
-        if !self.active_vte.has_focus() {
-            return;
-        }
-        let active_for_focus = self.active_rc.clone();
-        glib::idle_add_local_once(move || {
-            active_for_focus.borrow().grab_focus();
-        });
+        restore_live_focus_deferred(&self.active_vte);
     }
 
     fn sync_geometry_to_pty(&self) {
@@ -9019,7 +9778,11 @@ impl RenderBackend for BlockBackend {
     }
 
     fn debug_name(&self) -> &'static str {
-        "block"
+        if self.block_list_rc.has_css_class("chat-transcript") {
+            "chat"
+        } else {
+            "block"
+        }
     }
 
     fn mark_scroll_dirty(&self) {
@@ -9258,6 +10021,13 @@ impl RenderBackend for BlockBackend {
             };
             estimated_finished_block_height_for_rows(&config, cmd, estimator_rows, cols)
         };
+        let estimated_height = estimated_height.saturating_add(
+            if self.block_list_rc.has_css_class("chat-transcript") && !record.is_background {
+                chat::COMMAND_GAP_PX
+            } else {
+                0
+            },
+        );
         let block_data = BlockData {
             id: block_id,
             prompt: prompt.to_owned(),
@@ -9327,6 +10097,7 @@ impl RenderBackend for BlockBackend {
                 visible_indices: &self.visible_indices_rc,
                 failure_marker_redraw: self.failure_marker_redraw.as_ref(),
             },
+            &self.scroll_debouncer,
         );
         mutate_block_data_and_redraw(
             &self.block_data_for_cb,
@@ -9365,11 +10136,19 @@ impl RenderBackend for BlockBackend {
             recycled,
             FinishedBlockPrecomputed {
                 output_rows: Some(output_rows),
+                output_preview: Some(fold_preview::from_output(output_with_ansi)),
             },
         );
+        if self.block_list_rc.has_css_class("chat-transcript") {
+            finished.set_chat_layout();
+        }
         finished.set_lifecycle(
             record.lifecycle_health(),
             record.lifecycle_notice().as_deref(),
+        );
+        finished.set_command_provenance(
+            record.command_source == CommandTextSource::ShellReported,
+            record.command_source == CommandTextSource::ScreenAfterTruncation,
         );
         finished.set_output_notice(payload.output_notice());
         // A block finishing after an app recolored the
@@ -9463,6 +10242,7 @@ impl RenderBackend for BlockBackend {
         // Right-click context menu.
         self.install_finished_block_context_menu(
             finished_widget,
+            &finished_clone.more_btn,
             finished_clone.id,
             finished_clone.long_output,
         );
@@ -9502,6 +10282,7 @@ impl RenderBackend for BlockBackend {
                 visible_indices: &self.visible_indices_rc,
                 failure_marker_redraw: self.failure_marker_redraw.as_ref(),
             },
+            &self.scroll_debouncer,
         );
 
         let preserve = self.config_for_cb.borrow().preserve_live_scrollback;
@@ -9736,6 +10517,9 @@ struct ZoneOutputSnapshot {
 /// snapshot bytes without touching the record they belonged to.
 struct UnifiedZoneStore {
     records: VecDeque<CompletedCommandRecord>,
+    /// Metadata has its own byte bound; a large configured count must not
+    /// allow long commands/directories to grow memory without a byte ceiling.
+    record_bytes: usize,
     snapshots: std::collections::HashMap<u64, ZoneOutputSnapshot>,
     /// Running total of the retained snapshots' `plain` byte lengths, the
     /// quantity [`MAX_TOTAL_SNAPSHOT_BYTES`] bounds.
@@ -9746,9 +10530,28 @@ impl UnifiedZoneStore {
     fn new() -> Self {
         Self {
             records: VecDeque::new(),
+            record_bytes: 0,
             snapshots: std::collections::HashMap::new(),
             snapshot_bytes: 0,
         }
+    }
+
+    /// Bound candidate count before cloning. A pane can retain substantially
+    /// more live metadata than the restart document needs.
+    fn replay_snapshot(
+        &self,
+        max_zones: usize,
+        max_bytes: usize,
+    ) -> Vec<zone_history::PersistedZone> {
+        let persisted = self
+            .records
+            .iter()
+            .rev()
+            .take(max_zones)
+            .rev()
+            .map(|record| zone_history::PersistedZone::from_live(record, self.snapshot(record.id)))
+            .collect();
+        zone_history::bound_persisted_zones(persisted, max_zones, max_bytes)
     }
 
     fn snapshot(&self, id: u64) -> Option<&ZoneOutputSnapshot> {
@@ -9822,35 +10625,44 @@ fn prepare_inline_notice_for_mount(
     true
 }
 
-/// Append a completed record to the Unified zone table, dropping the oldest
-/// entries past
-/// `max_zones`.
-///
-/// The bound is deliberately the same `max_visible_blocks` knob Block-mode
-/// retention uses: a zone is much smaller than a finished block, so this is
-/// conservative, but until 1b decides what a zone must outlive (the VTE's own
-/// scrollback trim, most likely) an unbounded table would be the only
-/// unbounded allocation this mode adds. A drained record takes its snapshot
-/// with it. Pure so the retention rule is testable without a surface.
+/// Retain Unified metadata under both the configured count and the same
+/// estimated byte ceiling as completed Block history. Unified still owns no
+/// card widgets: only its command/directory metadata is charged here; output
+/// snapshots retain their independent 4 MiB cap. Retiring a record removes its
+/// matching snapshot, and callers retire bookmarks/chrome by the returned IDs.
 fn record_unified_zone(
     zones: &mut UnifiedZoneStore,
     record: CompletedCommandRecord,
     max_zones: usize,
 ) -> Vec<u64> {
+    record_unified_zone_with_budget(zones, record, max_zones, MAX_COMPLETED_BLOCK_RETAINED_BYTES)
+}
+
+fn record_unified_zone_with_budget(
+    zones: &mut UnifiedZoneStore,
+    record: CompletedCommandRecord,
+    max_zones: usize,
+    max_bytes: usize,
+) -> Vec<u64> {
+    zones.record_bytes = zones
+        .record_bytes
+        .saturating_add(record.estimated_retained_bytes());
     zones.records.push_back(record);
     let max = max_zones.max(1);
-    if zones.records.len() > max {
-        let drained: Vec<u64> = zones
-            .records
-            .drain(..zones.records.len() - max)
-            .map(|record| record.id)
-            .collect();
-        for id in &drained {
-            zones.remove_snapshot(*id);
-        }
-        return drained;
+    let mut retired = Vec::new();
+    // As in Block retention, preserve the newest record even when a
+    // degenerate budget cannot fit it. Valid production records are much
+    // smaller than the byte cap; a tiny test/configuration must not erase the
+    // command that just finished.
+    while zones.records.len() > 1 && (zones.records.len() > max || zones.record_bytes > max_bytes) {
+        let record = zones.records.pop_front().expect("nonempty record history");
+        zones.record_bytes = zones
+            .record_bytes
+            .saturating_sub(record.estimated_retained_bytes());
+        zones.remove_snapshot(record.id);
+        retired.push(record.id);
     }
-    Vec::new()
+    retired
 }
 
 /// The sole Unified live-feed wrapper, also captured by the prompt-settling
@@ -9917,6 +10729,10 @@ struct UnifiedBackend {
     /// bounded output snapshot captured at finalize; the terminal text
     /// remains on `vte`, so no finished widget is mounted.
     zones: Rc<RefCell<UnifiedZoneStore>>,
+    navigation: Rc<unified_navigation::NavigationBar>,
+    user_scrolled_up: Rc<Cell<bool>>,
+    unread_count: Rc<Cell<u32>>,
+    navigated_record_id: Rc<Cell<Option<u64>>>,
     /// Pane-local runtime bookmark state shared with TermView and the picker.
     /// Only record-table retirement prunes ids; snapshot/chrome eviction does not.
     bookmarks: SharedBookmarks,
@@ -9991,7 +10807,7 @@ impl RenderBackend for UnifiedBackend {
         // ring, so a reset cannot resurrect anything through them.
         self.zone_marker.borrow_mut().close_zone(None);
         self.chrome.clear_authority();
-        find::clear_find_state(self.find_state_for_cb.as_ref(), &self.vte);
+        find::invalidate_live_find_state(self.find_state_for_cb.as_ref(), &self.vte);
         self.kitty_assembler.borrow_mut().reset();
         self.kitty_pending_admission.borrow_mut().take();
         self.image_layer.hard_reset();
@@ -10019,15 +10835,7 @@ impl RenderBackend for UnifiedBackend {
     /// Same pane-focus invariant as the block backend: a background pane must
     /// not pull focus back to its live surface just because a prompt arrived.
     fn focus_live_deferred(&self) {
-        if !self.vte.has_focus() {
-            return;
-        }
-        let vte = self.vte.downgrade();
-        glib::idle_add_local_once(move || {
-            if let Some(vte) = vte.upgrade() {
-                vte.grab_focus();
-            }
-        });
+        restore_live_focus_deferred(&self.vte);
     }
 
     fn sync_geometry_to_pty(&self) {
@@ -10077,6 +10885,10 @@ impl RenderBackend for UnifiedBackend {
         self.chrome
             .proven_zone_scroll_value(&self.vte, block_id)
             .is_some()
+    }
+
+    fn record_scroll_value(&self, block_id: u64) -> Option<f64> {
+        self.chrome.proven_zone_scroll_value(&self.vte, block_id)
     }
 
     fn completed_search_surfaces(
@@ -10197,15 +11009,7 @@ impl RenderBackend for UnifiedBackend {
         max_zones: usize,
         max_bytes: usize,
     ) -> Option<Vec<zone_history::PersistedZone>> {
-        let zones = self.zones.borrow();
-        let persisted = zones
-            .records
-            .iter()
-            .map(|record| zone_history::PersistedZone::from_live(record, zones.snapshot(record.id)))
-            .collect();
-        Some(zone_history::bound_persisted_zones(
-            persisted, max_zones, max_bytes,
-        ))
+        Some(self.zones.borrow().replay_snapshot(max_zones, max_bytes))
     }
 
     fn replay_zone_snapshot(&self, zones: Vec<zone_history::PersistedZone>) -> usize {
@@ -10305,7 +11109,7 @@ impl RenderBackend for UnifiedBackend {
     fn reset_scroll_lock(&self) {}
 
     fn user_scrolled_up(&self) -> bool {
-        false
+        self.user_scrolled_up.get()
     }
 
     /// Record the zone with a bounded output snapshot and paint nothing.
@@ -10320,7 +11124,7 @@ impl RenderBackend for UnifiedBackend {
         record: &CompletedCommandRecord,
         payload: &dyn BlockRenderPayloadAccessor,
     ) {
-        find::clear_find_state(self.find_state_for_cb.as_ref(), &self.vte);
+        find::invalidate_live_find_state(self.find_state_for_cb.as_ref(), &self.vte);
         let max_zones = self.config_for_cb.borrow().max_visible_blocks as usize;
         // The engine keeps the raw ring alive through the whole finalize
         // fan-out, so this bounded read still sees the command's bytes.
@@ -10345,6 +11149,11 @@ impl RenderBackend for UnifiedBackend {
                 is_background: record.is_background,
                 lifecycle_health: record.lifecycle_health(),
             });
+        if !record.is_background && self.user_scrolled_up.get() && !self.navigation.is_suspended() {
+            self.unread_count
+                .set(self.unread_count.get().saturating_add(1));
+        }
+        self.navigation.schedule_refresh();
         log::debug!(
             "unified zone {} recorded: exit={:?} duration_ms={:?} background={} zones={}",
             record.id,
@@ -10370,6 +11179,8 @@ impl RenderBackend for UnifiedBackend {
     /// the alt-screen override alone would restore the pre-TUI coordinates
     /// synchronously on rmcup, before the heartbeat has remeasured.
     fn enter_alt_screen_chrome(&self) {
+        self.navigation.set_suspended(true);
+        self.navigated_record_id.set(None);
         self.chrome.set_alt_screen(true);
         self.image_layer.set_alt_screen(true);
         let active = self.active_rc.borrow();
@@ -10385,6 +11196,7 @@ impl RenderBackend for UnifiedBackend {
         self.chrome.set_alt_screen(false);
         self.image_layer.set_alt_screen(false);
         self.active_rc.borrow().set_live_organism_alt_screen(false);
+        self.navigation.set_suspended(false);
     }
 
     /// No-op: "give the viewport to the alt-screen app" is already the
@@ -10530,6 +11342,51 @@ impl RenderBackend for UnifiedBackend {
 }
 
 impl ReaderCtx {
+    /// Exactly one source sequence per nonempty real PTY read, before parking.
+    fn process_fresh_read(&self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let origin = self.watch_reader.fresh_origin(std::time::Instant::now());
+        if self.selection_feed_hold.try_buffer(data) {
+            return;
+        }
+        self.process_watch_input(data, origin);
+    }
+
+    fn process_watch_input(&self, data: &[u8], origin: Option<watch_batch::ReaderBatchOrigin>) {
+        self.watch_reader
+            .begin_dispatch(origin, std::time::Instant::now());
+        let mut events = self.event_buf.borrow_mut();
+        events.clear();
+        self.parser.borrow_mut().feed(data, &mut events);
+        coalesce_bytes_events(&mut events);
+        for event in events.iter() {
+            self.handle_event(event);
+        }
+        drop(events);
+        self.watch_reader.end_dispatch(std::time::Instant::now());
+    }
+
+    fn install_watch_hold(self: &Rc<Self>) {
+        // Fresh identity is issued at the real reader, never by this replay sink.
+        let weak = Rc::downgrade(self);
+        self.selection_feed_hold.set_flush(move |bytes| {
+            if let Some(ctx) = weak.upgrade() {
+                ctx.process_watch_input(
+                    &bytes,
+                    Some(watch_batch::ReaderBatchOrigin::BufferedReplay),
+                );
+            }
+        });
+        let weak = Rc::downgrade(&self.watch_reader);
+        self.selection_feed_hold.set_watch_listener(move |held| {
+            if let Some(watch) = weak.upgrade() {
+                watch.set_held(held, std::time::Instant::now());
+            }
+        });
+    }
+
     /// `live_vte` is passed in rather than read back off the backend:
     /// `ReaderCtx` itself no longer names widget types, and the selection
     /// hold's VTE hooks are wiring, not lifecycle dispatch.
@@ -10545,55 +11402,19 @@ impl ReaderCtx {
 
         let ctx = Rc::new(self);
 
-        // The whole per-chunk pipeline (parser → state machine → live-VTE
-        // feed) behind one re-callable handle, so the selection feed-hold can
-        // replay parked chunks through the exact path it intercepted them from.
-        let process_chunk: Rc<RefCell<dyn FnMut(Vec<u8>)>> = Rc::new(RefCell::new({
-            let ctx = ctx.clone();
-            move |data: Vec<u8>| {
-                let mut events = ctx.event_buf.borrow_mut();
-                events.clear();
-                ctx.parser.borrow_mut().feed(&data, &mut events);
-                // Fold runs of consecutive `Bytes` events into one so the live
-                // VTE feed, autoscroll mark-dirty, and raw-output append happen
-                // once per stretch instead of once per parser chunk. Boundary
-                // events (PromptStart/End, AltScreen*, CommandStart/End) still
-                // run their synchronous mark_dirty between stretches, keeping
-                // the scroll-invariant from [[scroll_synchronous_autoscroll]].
-                coalesce_bytes_events(&mut events);
-
-                for event in events.iter() {
-                    ctx.handle_event(event);
-                }
-            }
-        }));
-
-        // Parked chunks flow back through the pipeline on flush. Weak: the
-        // strong owner is the reader callback below, whose lifetime is the
-        // PTY's — after teardown a late grace-timer flush must not revive it.
-        ctx.selection_feed_hold.set_flush({
-            let process = Rc::downgrade(&process_chunk);
-            move |bytes: Vec<u8>| {
-                if let Some(process) = process.upgrade() {
-                    (process.borrow_mut())(bytes);
-                }
-            }
-        });
-
-        let hold_for_reader = ctx.selection_feed_hold.clone();
-        let hold_for_exit = ctx.selection_feed_hold.clone();
-        let exited_cbs = ctx.exited_cbs.clone();
+        ctx.install_watch_hold();
+        let exit_ctx = ctx.clone();
         pty.start_reader(
             move |data: Vec<u8>| {
-                if hold_for_reader.try_buffer(&data) {
-                    return;
-                }
-                (process_chunk.borrow_mut())(data);
+                ctx.process_fresh_read(&data);
             },
             move |exit_code| {
-                hold_for_exit.flush_then(|| {
+                exit_ctx.selection_feed_hold.flush_then(|| {
+                    exit_ctx
+                        .watch_reader
+                        .source_ended(std::time::Instant::now());
                     log::debug!("Shell exited with code {}", exit_code);
-                    for cb in exited_cbs.borrow().iter() {
+                    for cb in exit_ctx.exited_cbs.borrow().iter() {
                         cb(exit_code);
                     }
                 });
@@ -10637,6 +11458,8 @@ fn sync_active_to_pty(
 /// real grid wins.
 struct PtyWinsize {
     sent: Cell<(u16, u16)>,
+    resize_attempt: Cell<((u16, u16), u8)>,
+    resize_retry_pending: Cell<bool>,
     /// Bumped only when a publish really changed the size: the PromptEnd
     /// anchor reads any bump as "the prompt was reflowed by a resize".
     generation: Rc<Cell<u64>>,
@@ -10652,6 +11475,8 @@ impl PtyWinsize {
     fn new(generation: Rc<Cell<u64>>) -> Self {
         Self {
             sent: Cell::new((0, 0)),
+            resize_attempt: Cell::new(((0, 0), 0)),
+            resize_retry_pending: Cell::new(false),
             generation,
             arm: RefCell::new(None),
             #[cfg(test)]
@@ -10659,41 +11484,66 @@ impl PtyWinsize {
         }
     }
 
-    /// Tell the child `sample` unless it already has it. Returns whether the
-    /// PTY was resized.
+    /// Tell the child `sample` unless it already has it. Only successful
+    /// syscalls advance the size/generation used by replay and prompt anchors.
     fn publish(&self, pty: &OwnedPty, sample: (u16, u16)) -> bool {
-        #[cfg(test)]
-        if self.frozen.get() {
-            return false;
-        }
-        let Some((cols, rows)) = winsize_to_publish(self.sent.get(), sample) else {
-            return false;
-        };
-        self.sent.set((cols, rows));
-        self.generation.set(self.generation.get().wrapping_add(1));
-        pty.resize(cols, rows);
-        true
+        self.apply(pty, sample, false)
     }
 
-    /// A state transition's push: issue `TIOCSWINSZ` even when forge's own
-    /// record already says `sample`. Something else may have changed the
-    /// tty's winsize through the slave (`stty cols 60`, `resize`, a program
-    /// that crashed mid-resize), and PromptStart/CommandStart are where the
-    /// real grid is reasserted. The kernel sends no SIGWINCH for an unchanged
-    /// size, so the repeat is free; only a real change bumps the generation.
+    /// Reassert after a state transition even when our last successful size
+    /// matches: a slave-side program may have changed it in the meantime.
     fn reassert(&self, pty: &OwnedPty, sample: (u16, u16)) -> bool {
+        self.apply(pty, sample, true)
+    }
+
+    fn apply(&self, pty: &OwnedPty, sample: (u16, u16), force: bool) -> bool {
         #[cfg(test)]
         if self.frozen.get() {
             return false;
         }
         if sample.0 == 0 || sample.1 == 0 {
+            self.resize_retry_pending.set(false);
             return false;
         }
-        if self.publish(pty, sample) {
-            return true;
+        let (previous, attempts) = self.resize_attempt.get();
+        let attempts = if previous == sample { attempts } else { 0 };
+        // A fresh absolute size replaces failed intent; there is no queued
+        // stale size. Each size gets at most three attempts, one per dispatch.
+        // The settle tick retries on later frames, never in an ioctl loop.
+        self.resize_attempt.set((sample, attempts));
+        if attempts >= 3 {
+            self.resize_retry_pending.set(false);
+            return false;
         }
-        pty.resize(sample.0, sample.1);
-        false
+        let changed = winsize_to_publish(self.sent.get(), sample).is_some();
+        if !changed && !force && !self.resize_retry_pending.get() {
+            return false;
+        }
+        match pty.resize(sample.0, sample.1) {
+            Ok(()) => {
+                self.resize_attempt.set((sample, 0));
+                self.resize_retry_pending.set(false);
+                if changed {
+                    self.sent.set(sample);
+                    self.generation.set(self.generation.get().wrapping_add(1));
+                }
+                changed
+            }
+            Err(error) => {
+                pty.report_resize_error(&error);
+                let retryable = matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                );
+                let attempts = if retryable { attempts + 1 } else { 3 };
+                self.resize_attempt.set((sample, attempts));
+                self.resize_retry_pending.set(retryable && attempts < 3);
+                if self.resize_retry_pending.get() {
+                    self.arm_settle();
+                }
+                false
+            }
+        }
     }
 
     /// The `(cols, rows)` the child was last told — the geometry its absolute
@@ -10759,9 +11609,20 @@ fn pty_grid_size(vte: &Terminal, scroll: &ScrolledWindow) -> (u16, u16) {
     (cols, rows)
 }
 
+/// Both resize change detection and PTY rows use the same viewport source.
+/// Chat's scroller stays mapped in passthrough/fullscreen; its dock can change
+/// the history page size independently of the actual terminal canvas.
+fn viewport_height_px(vte: &Terminal, scroll: &ScrolledWindow) -> i32 {
+    if vte.has_css_class("chat-live-terminal") {
+        chat::viewport_height_for(vte).unwrap_or_else(|| scroll.vadjustment().page_size() as i32)
+    } else {
+        scroll.vadjustment().page_size() as i32
+    }
+}
+
 fn viewport_rows_for(vte: &Terminal, scroll: &ScrolledWindow) -> Option<i64> {
     let cell_h = (vte.char_height() as i32).max(1);
-    let page = scroll.vadjustment().page_size() as i32;
+    let page = viewport_height_px(vte, scroll);
     if page <= 1 {
         return None;
     }
@@ -10773,7 +11634,7 @@ fn viewport_rows_for(vte: &Terminal, scroll: &ScrolledWindow) -> Option<i64> {
             .as_ref()
             .is_some_and(|holder| holder.has_css_class(class))
     });
-    let usable = (page - chrome).max(cell_h);
+    let usable = (page - chrome - blocks::terminal_vertical_insets(vte)).max(cell_h);
     Some(((usable / cell_h).max(1)) as i64)
 }
 
@@ -10886,9 +11747,12 @@ fn high_water_under_full_grid(state: BlockState, previous: i64, viewport_rows: i
 /// during the prompt phase (what this used to do) put the origin at the end of
 /// the echoed command line, so however many rows the prompt occupied above it
 /// were never counted and sat below the card's edge — exactly where an inline
-/// TUI such as codex or kimi draws its composer. Latch the LOWEST row instead.
+/// TUI such as codex or kimi draws its composer. A minimum cursor sample is
+/// only provisional: VTE may paint the whole prompt before the first sample.
+/// `displayed_live_origin` independently recovers the actual screen origin
+/// once output exists, including coalesced multiline/wrapped SSH prompts.
 ///
-/// Every reading here comes from `cursor_position()`, so they share one
+/// Every ring reading here uses absolute text/cursor rows, sharing one
 /// coordinate system by construction. Nothing else does: the live adjustment
 /// is ring-relative and stops tracking the cursor past the scrollback limit,
 /// and a literal zero is wrong too, because `vte.reset()` does not rewind
@@ -10909,6 +11773,19 @@ fn live_content_extent(
         origin.set(Some(latched_live_origin(origin.get(), cursor_row)));
         return None;
     }
+    // Prompt bytes and CommandStart can be coalesced into one VTE frame.
+    // In that case the earliest cursor sample is already at the END of the
+    // wrapped command, not at screen row zero. Recover the displayed origin
+    // independently before measuring cursor travel from it. No OSC lifecycle
+    // boundary or adjustment coordinate is involved in this measurement.
+    if origin.get().is_none_or(|row| {
+        live_content_extent_for(row, cursor_high.get().max(cursor_row), vte.row_count())
+            < vte.row_count()
+    }) {
+        if let Some(displayed_origin) = displayed_live_origin(vte) {
+            origin.set(Some(displayed_origin));
+        }
+    }
     let Some(origin_row) = origin.get() else {
         // Output beat every layout pass, so there is no origin to measure
         // against yet. Adopt this cursor and report the sample as provisional,
@@ -10922,8 +11799,45 @@ fn live_content_extent(
     Some(live_content_extent_for(origin_row, high, vte.row_count()))
 }
 
-/// The origin a prompt-phase sample leaves behind: the LOWEST cursor row seen
-/// since `reset_active`, which is the first row the prompt drew on.
+/// Recover the absolute ring row displayed at screen row zero without mixing
+/// VTE's rebased adjustment with its absolute cursor. The viewport snapshot
+/// identifies the last drawn screen row; a bounded ring probe identifies that
+/// same last drawn row in absolute coordinates. The cursor can be above a
+/// footer or below the last text on an empty input line, so probe both sides.
+/// This is only needed while the running card is shorter than the viewport.
+fn displayed_live_origin(vte: &Terminal) -> Option<i64> {
+    // The snapshot is the user's displayed viewport, but the cursor belongs
+    // to the active screen. Never combine them while the user reads history.
+    if vte
+        .vadjustment()
+        .is_some_and(|adj| adj.value() + adj.page_size() + 0.5 < adj.upper())
+    {
+        return None;
+    }
+    let text = vte.text_format(vte4::Format::Text)?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    let rows = vte.row_count().max(1);
+    let drawn = drawn_rows_in_displayed_text(&text, rows);
+    let cursor = vte.cursor_position().1;
+    let cols = vte.column_count().max(1);
+    for row in (cursor.saturating_sub(rows - 1)..=cursor.saturating_add(rows - 1)).rev() {
+        let (line, _) = vte.text_range_format(vte4::Format::Text, row, 0, row, cols - 1);
+        if line.is_some_and(|line| !line.trim().is_empty()) {
+            return Some(displayed_origin_from_last_text(row, drawn));
+        }
+    }
+    None
+}
+
+fn displayed_origin_from_last_text(last_ring_row: i64, drawn_rows: i64) -> i64 {
+    last_ring_row.saturating_sub(drawn_rows.saturating_sub(1))
+}
+
+/// The provisional origin left by samples before output starts: the lowest
+/// cursor row observed since reset. It need not be the first prompt row when
+/// VTE paints several rows before layout; displayed evidence repairs it.
 fn latched_live_origin(previous: Option<i64>, cursor_row: i64) -> i64 {
     previous.map_or(cursor_row, |row| row.min(cursor_row))
 }
@@ -11273,7 +12187,11 @@ impl BlockDocumentIndex {
 
 /// The lowest set bit of a Fenwick node index, which is the span it covers.
 const fn lowest_set_bit(node: usize) -> usize {
-    node & node.wrapping_neg()
+    if node == 0 {
+        0
+    } else {
+        1usize << node.trailing_zeros()
+    }
 }
 
 /// Reference implementation of [`BlockDocumentIndex::viewport_state`]: the
@@ -11472,6 +12390,8 @@ trait VirtualizableCard {
     fn set_virtualized_preserving_height(&self, virtualized: bool) -> i32;
     /// The height the toolkit is giving this card right now.
     fn allocated_height(&self) -> i32;
+    /// Keep a rendered card's cache current for allocation-preserving transitions.
+    fn remember_allocated_height(&self, height: i32);
 }
 
 impl VirtualizableCard for FinishedBlock {
@@ -11491,6 +12411,10 @@ impl VirtualizableCard for FinishedBlock {
 
     fn allocated_height(&self) -> i32 {
         self.widget().height()
+    }
+
+    fn remember_allocated_height(&self, height: i32) {
+        FinishedBlock::remember_allocated_height(self, height);
     }
 }
 
@@ -11598,6 +12522,7 @@ fn apply_visible_indices_with_measurement<C: VirtualizableCard>(
             // on screen.
             let allocated = block.allocated_height();
             if allocated > 1 {
+                block.remember_allocated_height(allocated);
                 if let Some(data) = block_data.get_mut(i) {
                     data.estimated_height = allocated;
                     index.set_height(i, allocated);
@@ -12053,6 +12978,8 @@ enum LiveCommitRoute {
     KittyEncoded,
     /// Written as the user's input, joined with a held ESC if there was one.
     Typed,
+    /// This human-input write was not admitted. Routing is not acceptance.
+    Rejected,
 }
 
 /// Forwards what the live VTE commits to the PTY, with the bookkeeping each
@@ -12079,6 +13006,7 @@ enum LiveCommitRoute {
 /// press, so all three write through the same accounting.
 #[derive(Clone)]
 struct LiveCommitSink {
+    input_feedback: Rc<input_feedback::InputFeedback>,
     pty: Rc<OwnedPty>,
     bstate: Rc<Cell<BlockState>>,
     typed_cmd: Rc<RefCell<String>>,
@@ -12105,13 +13033,103 @@ struct LiveCommitSink {
     cpr_outstanding: Rc<Cell<u32>>,
 }
 
+/// One human Chat activation is one native Enter. A PS2 continuation may
+/// retain submission_pending until its eventual OSC C; it must remain editable.
+#[cfg(test)]
+fn submit_chat_enter(sink: &LiveCommitSink, integrated: bool) -> bool {
+    submit_chat_enter_for_target(sink, integrated, sink.pty.shell_foreground_token(), || true)
+}
+
+fn submit_chat_enter_for_target(
+    sink: &LiveCommitSink,
+    integrated: bool,
+    target: Option<PtyForegroundToken>,
+    validate_origin: impl FnOnce() -> bool,
+) -> bool {
+    let eligible = || {
+        chat::surface(sink.bstate.get(), integrated).allows_submit_affordance()
+            && sink.pty_child_is_shell
+            && sink.kitty_flags.get() == 0
+            && !sink.alt_escape.get().is_holding()
+    };
+    if !eligible() {
+        return false;
+    }
+    if let Err(error) = sink
+        .pty
+        .try_write_control(b'\r', target, || eligible() && validate_origin())
+    {
+        sink.pty
+            .report_write_error("could not immediately send Enter; use keyboard", error);
+        let draft = sink.typed_cmd.borrow();
+        sink.input_feedback.rejected(
+            error,
+            (sink.typed_cmd_fidelity.get() == TypedShadowFidelity::ExactOpen)
+                .then_some(draft.as_str()),
+        );
+        return false;
+    }
+    sink.input_feedback.accepted();
+    // Same native Enter accounting, but only after the kernel accepted the
+    // whole byte. A held Alt chord or extended key protocol is never split.
+    sink.account_typed(
+        b"\r",
+        sink.bstate.get(),
+        jterm_core::pty_input::admitted_input(b"\r", false),
+    )
+}
+
+fn admit_chat_stop_input(
+    pty: &OwnedPty,
+    target: Option<PtyForegroundToken>,
+    validate: impl FnOnce() -> bool,
+    human_input: &HumanInputCallbacks,
+    feedback: &Rc<input_feedback::InputFeedback>,
+) -> bool {
+    match pty.try_write_control(3, target, validate) {
+        Ok(()) => {
+            feedback.accepted();
+            emit_accepted_input(human_input, InputOrigin::StickyStop);
+            true
+        }
+        Err(error) => {
+            pty.report_write_error("could not immediately interrupt; use keyboard", error);
+            feedback.rejected(error, None);
+            false
+        }
+    }
+}
+
+/// One interrupt admission path for the existing sticky action and Chat's
+/// generation-bound controls. A refusal never emits an accepted-input event.
+fn admit_stop_input(
+    pty: &OwnedPty,
+    human_input: &HumanInputCallbacks,
+    feedback: &Rc<input_feedback::InputFeedback>,
+) -> bool {
+    match pty.write_bytes(b"\x03") {
+        Ok(()) => {
+            feedback.accepted();
+            emit_accepted_input(human_input, InputOrigin::StickyStop);
+            true
+        }
+        Err(error) => {
+            pty.report_write_error("could not queue interrupt", error);
+            feedback.rejected(error, None);
+            false
+        }
+    }
+}
+
 impl LiveCommitSink {
     fn on_commit(&self, text: &str) -> LiveCommitRoute {
         let block_state = self.bstate.get();
         if let Some(report) =
             classify_terminal_report(text.as_bytes(), self.cpr_outstanding.get() > 0)
         {
-            if report == TerminalReport::CursorPosition {
+            // DECXCPR answers CSI ?6n, which never entered the plain CPR ledger.
+            // Settling it here would make the next ordinary answer look typed.
+            if report == TerminalReport::CursorPosition && !text.starts_with("\x1b[?") {
                 self.cpr_outstanding
                     .set(self.cpr_outstanding.get().saturating_sub(1));
             }
@@ -12147,8 +13165,11 @@ impl LiveCommitSink {
                         if let Some(encoded) =
                             kitty_keyboard::rewrite_commit(key, mods, &bytes, flags)
                         {
-                            self.write_rewritten(&encoded);
-                            return LiveCommitRoute::KittyEncoded;
+                            return if self.write_rewritten(&encoded) {
+                                LiveCommitRoute::KittyEncoded
+                            } else {
+                                LiveCommitRoute::Rejected
+                            };
                         }
                     }
                     KittyGate::ForgetStale => {
@@ -12160,8 +13181,11 @@ impl LiveCommitSink {
             }
         }
         // ONE write, so an Alt chord's ESC and key reach the reader together.
-        self.write_typed(&bytes, block_state);
-        LiveCommitRoute::Typed
+        if self.write_typed(&bytes, block_state) {
+            LiveCommitRoute::Typed
+        } else {
+            LiveCommitRoute::Rejected
+        }
     }
 
     /// The idle safety flush armed on a hold. Both halves of a chord commit
@@ -12217,32 +13241,47 @@ impl LiveCommitSink {
         }
     }
 
-    fn write_rewritten(&self, encoded: &[u8]) {
+    fn write_rewritten(&self, encoded: &[u8]) -> bool {
         if let Err(error) = self.pty.write_bytes(encoded) {
             self.pty
                 .report_write_error("could not queue terminal input", error);
+            self.input_feedback.rejected(error, None);
+            false
         } else {
+            self.input_feedback.accepted();
             self.accepted_input_generation
                 .set(self.accepted_input_generation.get().wrapping_add(1));
             emit_accepted_input(&self.human_input, InputOrigin::VteCommit);
+            true
         }
     }
 
-    fn write_typed(&self, bytes: &[u8], block_state: BlockState) {
-        let awaiting_command = block_state == BlockState::AwaitingCommand;
-        let previous_fidelity = self.typed_cmd_fidelity.get();
-        let previous_submission_pending = self.submission_pending.get();
+    fn write_typed(&self, bytes: &[u8], block_state: BlockState) -> bool {
         let admitted = match self.pty.write_bytes_admitted(bytes) {
             Ok(admitted) => admitted,
             Err(error) => {
                 self.pty
                     .report_write_error("could not queue terminal input", error);
-                return;
+                self.input_feedback.rejected(error, None);
+                return false;
             }
         };
+        self.input_feedback.accepted();
+        self.account_typed(bytes, block_state, admitted)
+    }
+
+    fn account_typed(
+        &self,
+        bytes: &[u8],
+        block_state: BlockState,
+        admitted: jterm_core::pty_input::AdmittedInput,
+    ) -> bool {
         if admitted.wire_bytes == 0 {
-            return;
+            return false;
         }
+        let awaiting_command = block_state == BlockState::AwaitingCommand;
+        let previous_fidelity = self.typed_cmd_fidelity.get();
+        let previous_submission_pending = self.submission_pending.get();
 
         if awaiting_command && admitted.taints_editor() {
             self.idle_input_dirty.set(true);
@@ -12301,6 +13340,7 @@ impl LiveCommitSink {
                 );
             }
         }
+        true
     }
 }
 
@@ -12611,12 +13651,17 @@ impl KeyCtx {
                 let target = {
                     let selected = selected_block_ids_for_key.borrow();
                     lone_rerunnable_selection(&finished, &selected, selected_block_id_for_key.get())
-                        .map(|block| block.cmd_text.clone())
+                        .map(|block| (block.id, block.cmd_text.clone()))
                 };
-                let refusal = if let Some(command) = target {
+                let refusal = if let Some((block_id, command)) = target {
                     let suggestion = click_cursor::suggestion_rgb(&config_for_key.borrow().palette);
+                    let data = block_data_for_key.borrow();
+                    let record = data.iter().find(|block| block.id == block_id);
+                    let provenance_refusal =
+                        historical_rerun_disabled_reason(block_id, &command, record);
                     let submitted = verified_submission_for_key
-                        .try_submit_historical_rerun(&command, suggestion);
+                        .try_submit_historical_rerun(block_id, &command, record, suggestion);
+                    drop(data);
                     if submitted {
                         clear_finished_block_selection(
                             &finished,
@@ -12627,8 +13672,14 @@ impl KeyCtx {
                         active_vte_for_key.grab_focus();
                         return glib::Propagation::Stop;
                     }
-                    SelectionActionRefusal::Prompt(
-                        verified_submission_for_key.historical_rerun_refusal_status(suggestion),
+                    provenance_refusal.map_or_else(
+                        || {
+                            SelectionActionRefusal::Prompt(
+                                verified_submission_for_key
+                                    .historical_rerun_refusal_status(suggestion),
+                            )
+                        },
+                        SelectionActionRefusal::CommandProvenance,
                     )
                 } else {
                     SelectionActionRefusal::NotRunnable
@@ -12845,12 +13896,11 @@ impl KeyCtx {
                     drop(finished);
                     return decline(controller);
                 }
-                let marked_idx: Vec<usize> = finished
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, b)| marks.contains(b.id))
-                    .map(|(i, _)| i)
-                    .collect();
+                let marked_idx: Vec<usize> = visible_marked_positions(
+                    finished
+                        .iter()
+                        .map(|block| (marks.contains(block.id), block.is_filtered_out())),
+                );
                 if marked_idx.is_empty() {
                     drop(marks);
                     drop(finished);
@@ -12916,11 +13966,12 @@ enum PasteRefusal {
     /// changed.
     TooLarge(String),
     /// The PTY refused the write (already logged); the shadow was restored.
-    Write,
+    Write(crate::pty::PtyWriteError),
 }
 
 /// The pane state a paste reads and updates. See [`TermView::paste_text`].
 struct PasteSink {
+    notify: Rc<dyn Fn(&str)>,
     pty: Rc<OwnedPty>,
     bracketed_paste: Rc<Cell<bool>>,
     bstate: Rc<Cell<BlockState>>,
@@ -12935,14 +13986,14 @@ struct PasteSink {
     selected_block_ids: SelectedBlockIds,
     selected_block_id: Rc<Cell<Option<u64>>>,
     selection_anchor_id: Rc<Cell<Option<u64>>>,
-    active: Rc<RefCell<ActiveBlock>>,
     selection_feed_hold: Rc<SelectionFeedHold>,
     human_input_callbacks: HumanInputCallbacks,
 }
 
 impl PasteSink {
-    fn paste(&self, text: &str) -> Result<(), PasteRefusal> {
+    fn paste(&self, text: &str) -> Result<bool, PasteRefusal> {
         let PasteSink {
+            notify,
             pty,
             bracketed_paste,
             bstate,
@@ -12957,12 +14008,11 @@ impl PasteSink {
             selected_block_ids,
             selected_block_id,
             selection_anchor_id,
-            active,
             selection_feed_hold,
             human_input_callbacks,
         } = self;
         if text.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
         let bracketed_paste = bracketed_paste.get();
@@ -12972,7 +14022,8 @@ impl PasteSink {
 
         let paste = build_clipboard_paste(text, bracketed_paste);
         if paste.is_empty() {
-            return Ok(());
+            paste_feedback::report(&**notify, paste.risk.truncated_to_first_line, false);
+            return Ok(false);
         }
         if paste.risk.had_embedded_paste_marker {
             // The clipboard tried to close the paste frame early so its
@@ -13014,7 +14065,7 @@ impl PasteSink {
             pty_synced.set(previous_pty_synced);
             idle_input_dirty.set(previous_idle_dirty);
             pty.report_write_error("could not queue clipboard paste", error);
-            return Err(PasteRefusal::Write);
+            return Err(PasteRefusal::Write(error));
         }
         if input_is_typeahead_for_existing_submission(
             block_state,
@@ -13038,7 +14089,28 @@ impl PasteSink {
                 selection_anchor_id,
             );
         }
-        active.borrow().grab_focus();
+        paste_feedback::report(&**notify, paste.risk.truncated_to_first_line, true);
+        Ok(true)
+    }
+}
+
+/// Captured before clipboard I/O; focus authority cannot be recreated from a
+/// completion-time snapshot after the user has chosen another input owner.
+struct ClipboardPasteRequest {
+    sink: PasteSink,
+    focus: Option<DeferredLiveFocus>,
+}
+
+impl ClipboardPasteRequest {
+    fn complete(self, text: Option<&str>) -> Result<(), PasteRefusal> {
+        let Some(text) = text else {
+            return Ok(());
+        };
+        if self.sink.paste(text)? {
+            if let Some(focus) = self.focus {
+                focus.defer();
+            }
+        }
         Ok(())
     }
 }
@@ -13165,7 +14237,11 @@ impl TermView {
         // documented `[[ $TERM_PROGRAM == forge ]] && source ...` rc gate reads)
         // and the `LESS=R` pager default come from `child_env` inside the PTY
         // spawner, so the fork site and the Flatpak host bridge cannot drift.
-        let mut env_extra: Vec<(&str, &str)> = Vec::new();
+        let vim_environment = crate::vim9_ide::shell_environment(shell_argv, config.vim9.auto_gui);
+        let mut env_extra: Vec<(&str, &str)> = vim_environment
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
         let session_id_owned = session_id.map(str::to_owned);
         if let Some(ref sid) = session_id_owned {
             if is_jsh {
@@ -13189,12 +14265,22 @@ impl TermView {
         // must consume and close its private fd, then echo OSC 7771 with this
         // exact token before reviewed commands may be executed.
         let agent_execution_supported = Rc::new(Cell::new(false));
+        ime_gate::install();
         // ── Build widget tree ──────────────────────────────────────────────
         let root = gtk4::Box::new(Orientation::Vertical, 0);
         root.set_hexpand(true);
         root.set_vexpand(true);
         root.set_focusable(true);
         root.add_css_class("term-view-root");
+        let chat_mode = matches!(mode, crate::config::TerminalMode::Chat);
+        if chat_mode {
+            // Only Chat opts into the nonblocking immediate-action boundary.
+            // Failure leaves its buttons fail-closed and native keys usable.
+            if let Err(error) = pty.enable_immediate_controls() {
+                log::warn!("Chat buttons unavailable; use native keyboard: {error}");
+            }
+            root.add_css_class("term-chat-root");
+        }
         // Stays hidden until this pane's tab is split.
         let pane_header = crate::ui::PaneHeader::new();
         root.append(pane_header.widget());
@@ -13203,6 +14289,9 @@ impl TermView {
         let block_list = gtk4::Box::new(Orientation::Vertical, 0);
         block_list.set_vexpand(true);
         block_list.add_css_class("block-list");
+        if chat_mode {
+            block_list.add_css_class("chat-transcript");
+        }
 
         let block_scroll = ScrolledWindow::new();
         block_scroll.set_hexpand(true);
@@ -13232,6 +14321,10 @@ impl TermView {
             live_raw_output.clone(),
         )));
         let active_vte = active.borrow().active_vte.clone();
+        let input_feedback = input_feedback::InputFeedback::new(&active_vte);
+        if chat_mode {
+            active_vte.add_css_class("chat-live-terminal");
+        }
 
         // Unified mode: same widget tree, same live VTE, no block chrome. The
         // holder wears `block-fullscreen` for its whole life — the CSS rule
@@ -13245,6 +14338,12 @@ impl TermView {
         // constructor — that mode has no `TermView` at all — and is treated as
         // Block if it somehow does.
         let unified = mode.is_unified();
+        let unified_navigation = unified.then(unified_navigation::NavigationBar::new);
+        if let Some(navigation) = &unified_navigation {
+            // A permanent compact row in the normal document; it never
+            // covers terminal text and leaves the grid on AltScreen entry.
+            root.append(&navigation.root);
+        }
         // Allocated in both modes (an empty store costs nothing) so the reader
         // wiring below stays a single expression; only a Unified pane hands it
         // to a backend.
@@ -13323,6 +14422,13 @@ impl TermView {
         )]);
         sticky_stop_btn.add_css_class("sticky-header-control");
         sticky_stop_btn.add_css_class("flat");
+        if chat_mode {
+            sticky_stop_btn.add_css_class("chat-sticky-stop");
+            sticky_stop_btn.add_css_class("chat-command-control");
+            sticky_stop_btn.set_tooltip_text(Some(
+                "Interrupt immediately when idle; if unavailable, use Ctrl+C on the keyboard",
+            ));
+        }
         sticky_stop_btn.set_focusable(true);
         sticky_stop_btn.set_focus_on_click(false);
         sticky_stop_btn.set_visible(false);
@@ -13397,7 +14503,17 @@ impl TermView {
             &scroll_overlay,
             matches!(mode, crate::config::TerminalMode::Block),
         );
-        root.append(&scroll_overlay);
+        let chat_presentation = if chat_mode {
+            Some(Rc::new(chat::ChatPresentation::new(
+                &root,
+                &scroll_overlay,
+                &active.borrow(),
+                config.block_compact,
+            )))
+        } else {
+            root.append(&scroll_overlay);
+            None
+        };
 
         // Cards dock BELOW the surface as a sibling that takes space, not as
         // an overlay: the row an overlay would cover is the prompt the user is
@@ -13467,11 +14583,15 @@ impl TermView {
         // marks our own adjustment writes so the value_changed detector doesn't
         // mistake them for a user drag.
         let user_scrolled_up: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let navigated_record_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
         let programmatic_scroll: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let scroll_debouncer = ScrollDebouncer::with_scroll_lock(
             user_scrolled_up.clone(),
             programmatic_scroll.clone(),
         );
+        if !unified {
+            scroll_debouncer.install(&block_scroll, &block_list);
+        }
 
         let block_data_rc: Rc<RefCell<VecDeque<BlockData>>> =
             Rc::new(RefCell::new(VecDeque::new()));
@@ -13577,7 +14697,9 @@ impl TermView {
                     vte.set_size(cols, viewport_rows);
                     last_size_target.set(target);
                 }
-                holder.set_height_request((viewport_rows as i32) * cell_h);
+                holder.set_height_request(
+                    (viewport_rows as i32) * cell_h + blocks::terminal_vertical_insets(&vte),
+                );
                 // Unified has one surface and one height; the clip is a no-op
                 // here, but the terminal still needs its size request or the
                 // Fixed would allocate it its bare minimum.
@@ -13593,6 +14715,8 @@ impl TermView {
         // full live VTE. PTY rows are NOT taken from this visual height; see
         // `pty_grid_size`, which always reports the full viewport to the child.
         let block_layout_active_surface: Rc<dyn Fn()> = {
+            let chat_presentation = chat_presentation.clone();
+            let integration = ftcs_seen.clone();
             let holder = active.borrow().widget().downgrade();
             let vte = active_vte.downgrade();
             let scroll = block_scroll.downgrade();
@@ -13639,6 +14763,23 @@ impl TermView {
                 let Some(active_block) = active_for_layout.upgrade() else {
                     return;
                 };
+                // Resolve once so docking and the row budget agree throughout
+                // an already confirmed shell prompt's SIGWINCH redraw.
+                let chat_surface = chat_presentation
+                    .as_ref()
+                    .map(|chat| chat.presentation_surface(bstate.get(), integration.get()));
+                let holder = if let Some(chat) = &chat_presentation {
+                    let Ok(live) = active_block.try_borrow() else {
+                        return;
+                    };
+                    chat.set_compact(live.widget().has_css_class("block-compact"));
+                    chat.sync(
+                        &live,
+                        chat_surface.expect("Chat presentation has a surface"),
+                    )
+                } else {
+                    holder
+                };
                 let cell_h = (vte.char_height() as i32).max(1);
                 let Some(viewport_rows) = viewport_rows_for(&vte, &scroll) else {
                     return;
@@ -13669,7 +14810,14 @@ impl TermView {
                 // addressing (`top`, `watch`, a plain `clear`) still has every
                 // row it expects to draw into — and so does a shell drawing a
                 // completion menu at the prompt.
-                let target_rows = if idle && !prompt_at_grid_top {
+                let chat_passthrough = matches!(
+                    chat_surface,
+                    Some(
+                        jterm_core::chat_mode::ChatSurface::Passthrough
+                            | jterm_core::chat_mode::ChatSurface::Fullscreen
+                    )
+                );
+                let target_rows = if idle && !prompt_at_grid_top && !chat_passthrough {
                     compact_card_rows(input_rows, 1, viewport_rows)
                 } else {
                     viewport_rows
@@ -13678,98 +14826,115 @@ impl TermView {
                 // output so far, so the blocks above stay on screen and the
                 // history pans up a row at a time instead of being shoved off
                 // by a page-tall reservation the command may never fill.
-                let visible_rows = match state {
-                    // With the previous command's scrollback kept, growing the
-                    // grid to the viewport bottom-aligns the ring: the prompt,
-                    // and everything the command draws after it, sits in the
-                    // grid's LAST rows while the card clips its first ones. A
-                    // card sized by cursor travel would show the previous
-                    // command's lines and hide the new output — and an inline
-                    // TUI parked at the bottom (codex) would never appear. The
-                    // whole grid is the card instead, as the CHANGELOG promises
-                    // for this mode.
-                    BlockState::CollectingOutput | BlockState::PostCommand
-                        if preserve_scrollback == Some(true) =>
-                    {
-                        let (visible_rows, high_water) =
-                            preserved_scrollback_running_rows(viewport_rows);
-                        live_rows_high_water.set(high_water);
-                        visible_rows
-                    }
-                    // Back from the alternate screen, but VTE has not processed
-                    // the switch yet: its cursor is still the alternate
-                    // screen's, and measuring it would latch that row as the
-                    // card's extent for the rest of the command. Keep the card
-                    // as it was until `contents-changed` says VTE caught up.
-                    BlockState::CollectingOutput | BlockState::PostCommand
-                        if alt_leave_pending.get() =>
-                    {
-                        live_visible_rows(live_rows_high_water.get(), viewport_rows)
-                    }
-                    BlockState::CollectingOutput | BlockState::PostCommand => {
-                        let output_started = !live_raw_output_for_layout.borrow().is_empty();
-                        let (visible_rows, next_high_water) = live_visible_rows_for_measurement(
-                            live_content_extent(
-                                &vte,
-                                &live_cursor_origin,
-                                &live_cursor_high,
-                                output_started,
-                            ),
-                            output_started,
-                            live_force_full_for_layout.get(),
-                            live_rows_high_water.get(),
-                            viewport_rows,
-                        );
-                        // Rows below the cursor-derived extent that already hold
-                        // text belong to the card too (see `lowest_drawn_screen_row`).
-                        let (visible_rows, next_high_water) = match live_cursor_origin.get() {
-                            Some(origin) if output_started && next_high_water < viewport_rows => {
-                                match lowest_drawn_screen_row(
+                let visible_rows = if chat_passthrough {
+                    viewport_rows
+                } else {
+                    match state {
+                        // With the previous command's scrollback kept, growing the
+                        // grid to the viewport bottom-aligns the ring: the prompt,
+                        // and everything the command draws after it, sits in the
+                        // grid's LAST rows while the card clips its first ones. A
+                        // card sized by cursor travel would show the previous
+                        // command's lines and hide the new output — and an inline
+                        // TUI parked at the bottom (codex) would never appear. The
+                        // whole grid is the card instead, as the CHANGELOG promises
+                        // for this mode.
+                        BlockState::CollectingOutput | BlockState::PostCommand
+                            if preserve_scrollback == Some(true) =>
+                        {
+                            let (visible_rows, high_water) =
+                                preserved_scrollback_running_rows(viewport_rows);
+                            live_rows_high_water.set(high_water);
+                            visible_rows
+                        }
+                        // Back from the alternate screen, but VTE has not processed
+                        // the switch yet: its cursor is still the alternate
+                        // screen's, and measuring it would latch that row as the
+                        // card's extent for the rest of the command. Keep the card
+                        // as it was until `contents-changed` says VTE caught up.
+                        BlockState::CollectingOutput | BlockState::PostCommand
+                            if alt_leave_pending.get() =>
+                        {
+                            live_visible_rows(live_rows_high_water.get(), viewport_rows)
+                        }
+                        BlockState::CollectingOutput | BlockState::PostCommand => {
+                            let output_started = !live_raw_output_for_layout.borrow().is_empty();
+                            // Once any content (including a footer below the
+                            // cursor) filled the card, no origin recovery or
+                            // text probing can make it more visible.
+                            let measured = if live_rows_high_water.get() >= viewport_rows {
+                                Some(viewport_rows)
+                            } else {
+                                live_content_extent(
                                     &vte,
-                                    origin,
-                                    next_high_water,
-                                    viewport_rows,
-                                ) {
-                                    Some(lowest) => {
-                                        let high_water = next_high_water.max(lowest + 1);
-                                        (live_visible_rows(high_water, viewport_rows), high_water)
+                                    &live_cursor_origin,
+                                    &live_cursor_high,
+                                    output_started,
+                                )
+                            };
+                            let (visible_rows, next_high_water) = live_visible_rows_for_measurement(
+                                measured,
+                                output_started,
+                                live_force_full_for_layout.get(),
+                                live_rows_high_water.get(),
+                                viewport_rows,
+                            );
+                            // Rows below the cursor-derived extent that already hold
+                            // text belong to the card too (see `lowest_drawn_screen_row`).
+                            let (visible_rows, next_high_water) = match live_cursor_origin.get() {
+                                Some(origin)
+                                    if output_started && next_high_water < viewport_rows =>
+                                {
+                                    match lowest_drawn_screen_row(
+                                        &vte,
+                                        origin,
+                                        next_high_water,
+                                        viewport_rows,
+                                    ) {
+                                        Some(lowest) => {
+                                            let high_water = next_high_water.max(lowest + 1);
+                                            (
+                                                live_visible_rows(high_water, viewport_rows),
+                                                high_water,
+                                            )
+                                        }
+                                        None => (visible_rows, next_high_water),
                                     }
-                                    None => (visible_rows, next_high_water),
                                 }
-                            }
-                            _ => (visible_rows, next_high_water),
-                        };
-                        live_rows_high_water.set(next_high_water);
-                        visible_rows
-                    }
-                    // A screen application and the no-integration fallback
-                    // own the whole grid while they run.
-                    BlockState::AltScreen | BlockState::RawFallback => {
-                        live_rows_high_water.set(high_water_under_full_grid(
-                            state,
-                            live_rows_high_water.get(),
-                            viewport_rows,
-                        ));
-                        target_rows
-                    }
-                    _ => {
-                        // Between prompts the live cell collapses to fit the
-                        // typed command (warp-style compact input) — but the
-                        // shell owns more of the screen than the command line
-                        // whenever it draws below the input: a completion menu,
-                        // an AI explanation, a two-line prompt. The card grows
-                        // to cover that and shrinks again when it closes.
-                        let drawn = if prompt_at_grid_top {
-                            prompt_area_rows(&vte)
-                        } else {
-                            1
-                        };
-                        let rows = compact_card_rows(input_rows, drawn, viewport_rows);
-                        // Preserve the compact input height across
-                        // CommandStart. Until output begins, VTE's cursor and
-                        // adjustment may belong to different grid generations.
-                        live_rows_high_water.set(rows);
-                        rows
+                                _ => (visible_rows, next_high_water),
+                            };
+                            live_rows_high_water.set(next_high_water);
+                            visible_rows
+                        }
+                        // A screen application and the no-integration fallback
+                        // own the whole grid while they run.
+                        BlockState::AltScreen | BlockState::RawFallback => {
+                            live_rows_high_water.set(high_water_under_full_grid(
+                                state,
+                                live_rows_high_water.get(),
+                                viewport_rows,
+                            ));
+                            target_rows
+                        }
+                        _ => {
+                            // Between prompts the live cell collapses to fit the
+                            // typed command (warp-style compact input) — but the
+                            // shell owns more of the screen than the command line
+                            // whenever it draws below the input: a completion menu,
+                            // an AI explanation, a two-line prompt. The card grows
+                            // to cover that and shrinks again when it closes.
+                            let drawn = if prompt_at_grid_top {
+                                prompt_area_rows(&vte)
+                            } else {
+                                1
+                            };
+                            let rows = compact_card_rows(input_rows, drawn, viewport_rows);
+                            // Preserve the compact input height across
+                            // CommandStart. Until output begins, VTE's cursor and
+                            // adjustment may belong to different grid generations.
+                            live_rows_high_water.set(rows);
+                            rows
+                        }
                     }
                 };
                 let target = (cols, target_rows);
@@ -13777,7 +14942,9 @@ impl TermView {
                     vte.set_size(cols, target_rows);
                     last_size_target.set(target);
                 }
-                holder.set_height_request((visible_rows as i32) * cell_h);
+                holder.set_height_request(
+                    (visible_rows as i32) * cell_h + blocks::terminal_vertical_insets(&vte),
+                );
                 if let Ok(live) = active_block.try_borrow() {
                     live.set_live_geometry(cell_h, target_rows, visible_rows);
                 };
@@ -13894,6 +15061,14 @@ impl TermView {
         let alt_screen_callbacks: AltScreenCallbacks = Rc::new(RefCell::new(vec![]));
         let command_started_callbacks: CommandStartedCallbacks = Rc::new(RefCell::new(vec![]));
         let command_finished_callbacks: CommandFinishedCallbacks = Rc::new(RefCell::new(vec![]));
+        if let Some(chat) = &chat_presentation {
+            let chat = chat.clone();
+            command_started_callbacks
+                .borrow_mut()
+                .push(Box::new(move |event| {
+                    chat.set_running_command(&event.command);
+                }));
+        }
         let block_finished_callbacks: BlockFinishedCallbacks = Rc::new(RefCell::new(vec![]));
         let ask_ai_callbacks: AskAiCallbacks = Rc::new(RefCell::new(vec![]));
         let fix_block_with_agent_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
@@ -13901,6 +15076,7 @@ impl TermView {
             Rc::new(RefCell::new(vec![]));
         let pty_synced: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let verified_submission = VerifiedSubmissionCtx {
+            input_feedback: input_feedback.clone(),
             surface: Rc::new(VteSubmissionSurface {
                 vte: active_vte.clone(),
                 // Same bit that selects the render backend below, so this
@@ -13929,6 +15105,7 @@ impl TermView {
             pending_agent_generation: pending_verified_agent_generation,
             agent_execution_lost_callbacks: agent_execution_lost_callbacks.clone(),
             agent_execution_supported: agent_execution_supported.clone(),
+            prompt_evidence_invalidated: Rc::new(RefCell::new(Vec::new())),
         };
         let mouse_reporting_mode: Rc<Cell<MouseReporting>> =
             Rc::new(Cell::new(MouseReporting::OFF));
@@ -14005,6 +15182,7 @@ impl TermView {
         // the pointer. Shared by the PTY reader (parking/replay) and the
         // cross-selection gestures (drag lifecycle).
         let selection_feed_hold = SelectionFeedHold::new();
+        let watch_reader = Rc::new(WatchReader::default());
         // Frozen output with no explanation reads as a hang. A small badge
         // appears only once bytes are actually parked (a plain click on the
         // live surface must not flash it) and disappears on flush.
@@ -14042,6 +15220,7 @@ impl TermView {
             last_visible: 0,
         }));
         let current_cwd: Rc<RefCell<String>> = Rc::new(RefCell::new(cwd.unwrap_or("").to_string()));
+        let menu_keybindings = shortcut_hints::MenuKeybindings::default();
 
         // CWD updates come from VTE's native OSC 7 signal (the parser passes
         // OSC 7 through unchanged, see parser.rs). Title updates likewise come
@@ -14322,6 +15501,10 @@ impl TermView {
                     prompt_anchor_tick_id_rc: prompt_anchor_tick_id.clone(),
                     find_state_for_cb: find_state.clone(),
                     zones: unified_records.clone(),
+                    navigation: unified_navigation.clone().expect("Unified navigation row"),
+                    user_scrolled_up: user_scrolled_up.clone(),
+                    unread_count: unread_count.clone(),
+                    navigated_record_id: navigated_record_id.clone(),
                     bookmarks: block_bookmarks.clone(),
                     zone_marker,
                     chrome,
@@ -14364,6 +15547,7 @@ impl TermView {
                     ask_ai_cbs: ask_ai_callbacks.clone(),
                     fix_block_with_agent_cbs: fix_block_with_agent_callbacks.clone(),
                     current_cwd_for_menu: current_cwd.clone(),
+                    menu_keybindings: menu_keybindings.clone(),
                     prompt_anchor_tick_id_rc: prompt_anchor_tick_id.clone(),
                     bracketed_paste_rc: bracketed_paste_rc.clone(),
                     verified_submission_for_rerun: verified_submission.clone(),
@@ -14431,6 +15615,7 @@ impl TermView {
                 remote_session_cbs: remote_session_callbacks.clone(),
                 exited_cbs,
                 activity_cbs,
+                watch_reader: watch_reader.clone(),
                 alt_screen_cbs,
                 mouse_reporting_rc,
                 live_input_modes_rc: live_input_modes.clone(),
@@ -14472,7 +15657,7 @@ impl TermView {
         // the invariant that matters: whether the live holder still intersects
         // the viewport. Once its top moves below the viewport, the user is reading
         // history and follow mode must stop. Sample on idle after layout settles.
-        {
+        if !unified {
             let user_scrolled = user_scrolled_up.clone();
             let fab = jump_fab.downgrade();
             let unread = unread_count.clone();
@@ -14541,7 +15726,13 @@ impl TermView {
                         let vp_h = scroll.height() as f64;
                         let at_bottom = holder
                             .compute_bounds(&scroll)
-                            .map(|b| (b.y() as f64) < vp_h - 4.0)
+                            .map(|b| {
+                                if holder.has_css_class("chat-live-anchor") {
+                                    chat::docked_anchor_visible(b.y() as f64, vp_h)
+                                } else {
+                                    (b.y() as f64) < vp_h - 4.0
+                                }
+                            })
                             .unwrap_or(true);
                         // Keep an intent recorded above while the view is
                         // still off the bottom; the FAB stays geometric.
@@ -14562,40 +15753,19 @@ impl TermView {
         }
 
         // ── Unified scroll-position detector ──────────────────────────────
-        // The outer scroller holds one full-viewport surface, so its
-        // adjustment never moves and the detector above never fires. Reading
-        // history here means scrolling the VTE's own adjustment, which is what
-        // must drive the same flag: the sticky running header and the jump FAB
-        // both key off it, and both were unreachable in this mode without it.
-        if unified {
-            let user_scrolled = user_scrolled_up.clone();
-            let fab = jump_fab.downgrade();
-            let unread = unread_count.clone();
-            let fullscreen = fullscreen.clone();
-            if let Some(adjustment) = active_vte.vadjustment() {
-                adjustment.connect_value_changed(move |adj| {
-                    let Some(fab) = fab.upgrade() else {
-                        return;
-                    };
-                    if fullscreen.get() {
-                        user_scrolled.set(false);
-                        unread.set(0);
-                        fab.set_visible(false);
-                        return;
-                    }
-                    // One row of slack: a partially scrolled last row still
-                    // counts as following the bottom.
-                    let at_bottom = adj.value() >= adj.upper() - adj.page_size() - 1.0;
-                    user_scrolled.set(!at_bottom);
-                    if at_bottom {
-                        unread.set(0);
-                        fab.set_visible(false);
-                    } else {
-                        set_jump_fab_label(&fab, unread.get());
-                        fab.set_visible(true);
-                    }
-                });
-            }
+        // The outer Block scroller cannot describe the persistent terminal's
+        // viewport. Native value and range changes exclusively own Unified's
+        // reading state; the separate navigation row replaces the jump FAB.
+        if let Some(navigation) = &unified_navigation {
+            navigation.observe(unified_navigation::NavigationBindings {
+                terminal: active_vte.clone(),
+                fullscreen: fullscreen.clone(),
+                reading: user_scrolled_up.clone(),
+                unread: unread_count.clone(),
+                cursor: navigated_record_id.clone(),
+                programmatic: programmatic_scroll.clone(),
+                records: unified_records.clone(),
+            });
         }
 
         // ── Recompute the live grid on viewport resize ────────────────────
@@ -14635,11 +15805,11 @@ impl TermView {
         // ── Jump-to-bottom FAB click: return to the live prompt ───────────
         {
             let scroll = block_scroll.clone();
-            let programmatic = programmatic_scroll.clone();
             let user_scrolled = user_scrolled_up.clone();
             let unread = unread_count.clone();
             let vte_for_fab = active_vte.downgrade();
             let root_for_fab = root.downgrade();
+            let debouncer = scroll_debouncer.clone();
             jump_fab.connect_clicked(move |button| {
                 // Read before the button hides: hiding a focused widget moves
                 // focus to wherever GTK finds next, possibly outside the pane.
@@ -14651,11 +15821,8 @@ impl TermView {
                         focus_terminal(&vte);
                     }
                 }
-                // Returning to the live prompt is not a single set_value: blocks
-                // below the viewport are virtualized to 0 height, so `upper` only
-                // grows as they scroll into view. One jump lands partway; we have
-                // to re-apply `upper - page` across idle passes until `upper` stops
-                // growing (true bottom reached) or we hit a small iteration cap.
+                // Virtualized blocks can grow after the synchronous jump, so
+                // the shared frame-spaced controller finishes settling below.
                 user_scrolled.set(false);
                 unread.set(0);
                 button.set_visible(false);
@@ -14664,52 +15831,19 @@ impl TermView {
                 if let Some(adj) = vte_for_fab.upgrade().and_then(|vte| vte.vadjustment()) {
                     adj.set_value((adj.upper() - adj.page_size()).max(adj.lower()));
                 }
-                let adj = scroll.vadjustment();
-                programmatic.set(true);
-                adj.set_value((adj.upper() - adj.page_size()).max(adj.lower()));
-                programmatic.set(false);
 
-                let scroll = scroll.clone();
-                let programmatic = programmatic.clone();
-                let tries = Rc::new(Cell::new(0u8));
-                let stable_turns = Rc::new(Cell::new(0u8));
-                let last_target = Rc::new(Cell::new(None::<f64>));
-                glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
-                    // Run on successive frames so virtualized blocks have time to
-                    // remap and grow `upper`. Position stability alone is not
-                    // enough: the current target can be reached before the true
-                    // bottom geometry has appeared.
-                    tries.set(tries.get().saturating_add(1));
-                    let adj = scroll.vadjustment();
-                    let target = (adj.upper() - adj.page_size()).max(adj.lower());
-                    programmatic.set(true);
-                    adj.set_value(target);
-                    programmatic.set(false);
-
-                    let target_is_stable = last_target
-                        .get()
-                        .is_some_and(|previous| (previous - target).abs() < 1.0);
-                    last_target.set(Some(target));
-                    if target_is_stable && (adj.value() - target).abs() < 1.0 {
-                        stable_turns.set(stable_turns.get().saturating_add(1));
-                    } else {
-                        stable_turns.set(0);
-                    }
-
-                    if stable_turns.get() >= 2 || tries.get() >= 12 {
-                        glib::ControlFlow::Break
-                    } else {
-                        glib::ControlFlow::Continue
-                    }
-                });
+                // Share the output/layout settling controller. Its single source
+                // coalesces repeated clicks and yields to newer reading intent.
+                debouncer.pin_to_bottom_deferred(&scroll);
             });
         }
 
         // ── Sticky command header ────────────────────────────────────────
         // Running commands keep their status header; oversized finished blocks
         // pin their command after the original header scrolls above the viewport.
-        {
+        if chat_presentation.is_none() {
             let pty_for_stop = pty.clone();
+            let feedback_for_stop = input_feedback.clone();
             let hold_for_stop = selection_feed_hold.clone();
             let human_input_for_stop = human_input_callbacks.clone();
             let root_for_stop = root.downgrade();
@@ -14718,11 +15852,7 @@ impl TermView {
                 // Resume a parked feed first so the ^C echo and the command's
                 // shutdown output are visible immediately.
                 hold_for_stop.flush_now();
-                if let Err(error) = pty_for_stop.write_bytes(b"\x03") {
-                    pty_for_stop.report_write_error("could not queue interrupt", error);
-                } else {
-                    emit_accepted_input(&human_input_for_stop, InputOrigin::StickyStop);
-                }
+                admit_stop_input(&pty_for_stop, &human_input_for_stop, &feedback_for_stop);
                 // The next key belongs to the program (or the prompt it
                 // returns to), not to a second activation of Stop.
                 if root_for_stop
@@ -14736,6 +15866,10 @@ impl TermView {
             });
         }
         let sticky_timer_id = {
+            let chat_presentation = chat_presentation.clone();
+            let chat_bstate = bstate.clone();
+            let chat_pty = pty.clone();
+            let chat_integration = ftcs_seen.clone();
             let sticky = sticky_bar.clone();
             let sticky_label = sticky_label.clone();
             let sticky_jump_bottom = sticky_jump_bottom_btn.clone();
@@ -14780,6 +15914,19 @@ impl TermView {
                         .map(|elapsed| elapsed.as_secs())
                         .unwrap_or(0)
                 });
+                if let Some(chat) = &chat_presentation {
+                    chat.update_status(
+                        running_secs,
+                        chat::surface(chat_bstate.get(), chat_integration.get())
+                            .allows_submit_affordance()
+                            && pty_child_is_shell
+                            && chat_pty.foreground_owner() == PtyForeground::Shell
+                            && kitty_flags_for_sticky.get() == 0,
+                        (kitty_flags_for_sticky.get() == 0)
+                            .then(|| chat_pty.foreground_token())
+                            .flatten(),
+                    );
+                }
                 let following = !user_scrolled.get();
                 // Only a pill that is due needs the geometry: where the live
                 // card starts against where the pill would end.
@@ -14919,6 +16066,7 @@ impl TermView {
         // The same signal also carries libvte's own reports and the two halves
         // of an Alt chord; `LiveCommitSink` tells them apart.
         let live_commit = LiveCommitSink {
+            input_feedback: input_feedback.clone(),
             pty: pty.clone(),
             bstate: bstate.clone(),
             typed_cmd: typed_cmd.clone(),
@@ -14952,6 +16100,108 @@ impl TermView {
             });
         }
 
+        if let Some(chat) = &chat_presentation {
+            if let Some(button) = chat.submit_button() {
+                let notify = paste_feedback::notifier(&active_vte);
+                let integrated = ftcs_seen.clone();
+                let sink = live_commit.clone();
+                let hold = selection_feed_hold.clone();
+                let vte = active_vte.downgrade();
+                let prompt_generation = prompt_anchor_generation.clone();
+                let origin = {
+                    let sink = sink.clone();
+                    let integrated = integrated.clone();
+                    let prompt_generation = prompt_generation.clone();
+                    move || {
+                        if ime_gate::blocked()
+                            || !chat::surface(sink.bstate.get(), integrated.get())
+                                .allows_submit_affordance()
+                            || !sink.pty_child_is_shell
+                        {
+                            return None;
+                        }
+                        sink.pty
+                            .shell_foreground_token()
+                            .map(|foreground| (prompt_generation.get(), foreground))
+                    }
+                };
+                chat::bind_control(&button, origin, move |target| {
+                    if ime_gate::blocked() {
+                        notify(ime_gate::notice());
+                        return;
+                    }
+                    // A native activation may finish after another prompt has
+                    // replaced the represented one. Keep the original prompt
+                    // generation and foreground through held replay + syscall.
+                    hold.flush_now();
+                    let submitted = target.is_some_and(|(generation, foreground)| {
+                        submit_chat_enter_for_target(
+                            &sink,
+                            integrated.get(),
+                            Some(foreground),
+                            || !ime_gate::blocked() && prompt_generation.get() == generation,
+                        )
+                    });
+                    if let Some(vte) = vte.upgrade() {
+                        if !submitted {
+                            vte.error_bell();
+                        }
+                        focus_terminal(&vte);
+                    }
+                });
+            }
+            // Every Stop in a Chat pane is bound to the represented command,
+            // including the existing sticky header while reading old output.
+            for button in chat
+                .stop_button()
+                .into_iter()
+                .chain([sticky_stop_btn.clone()])
+            {
+                let state = bstate.clone();
+                let integrated = ftcs_seen.clone();
+                let hold = selection_feed_hold.clone();
+                let current = chat.clone();
+                let pty = pty.clone();
+                let human_input = human_input_callbacks.clone();
+                let kitty = kitty_flags.clone();
+                let alt = alt_escape.clone();
+                let root = root.downgrade();
+                let vte = active_vte.downgrade();
+                let feedback = input_feedback.clone();
+                chat.bind_stop(&button, move |target| {
+                    let is_current = || {
+                        current.stop_target_is_current(target)
+                            && kitty.get() == 0
+                            && !alt.get().is_holding()
+                            && chat::surface(state.get(), integrated.get())
+                                == jterm_core::chat_mode::ChatSurface::Running
+                    };
+                    let admitted = if is_current() {
+                        hold.flush_now();
+                        // Identity and real foreground are checked again
+                        // inside the writer gate at the one-byte syscall.
+                        admit_chat_stop_input(
+                            &pty,
+                            target.map(|target| target.foreground),
+                            is_current,
+                            &human_input,
+                            &feedback,
+                        )
+                    } else {
+                        false
+                    };
+                    if let Some(vte) = vte.upgrade() {
+                        if !admitted {
+                            vte.error_bell();
+                        }
+                        if root.upgrade().is_some_and(|root| focus_is_within(&root)) {
+                            focus_terminal(&vte);
+                        }
+                    }
+                });
+            }
+        }
+
         // While a normal command is running, the active VTE is still the live
         // terminal surface. Let it own printable keys, Enter, Backspace, control
         // sequences, and IME preedit/commit. This root capture handler is only a
@@ -14959,6 +16209,7 @@ impl TermView {
         // GTK's input method context and break CJK composition.
         {
             let pty_for_root_key = pty.clone();
+            let feedback_for_root_key = input_feedback.clone();
             let bstate_for_root_key = bstate.clone();
             let kitty_flags_for_root_key = kitty_flags.clone();
             let human_input_for_root_key = human_input_callbacks.clone();
@@ -14985,7 +16236,9 @@ impl TermView {
                         if let Err(error) = pty_for_root_key.write_bytes(&bytes) {
                             pty_for_root_key
                                 .report_write_error("could not queue process-control key", error);
+                            feedback_for_root_key.rejected(error, None);
                         } else {
+                            feedback_for_root_key.accepted();
                             emit_accepted_input(
                                 &human_input_for_root_key,
                                 InputOrigin::RunningControl,
@@ -15217,6 +16470,7 @@ impl TermView {
             let mouse_mode_for_scroll = mouse_reporting_mode.clone();
             let scroll_enabled = config.scroll_reporting_enabled;
             let pty_for_scroll = pty.clone();
+            let feedback_for_scroll = input_feedback.clone();
             let pointer_for_scroll = pointer_cell.clone();
             let bstate_for_scroll = bstate.clone();
             let input_modes_for_scroll = live_input_modes.clone();
@@ -15250,6 +16504,9 @@ impl TermView {
                     wheel_accumulator.set(WheelAccumulator::new());
                 });
             }
+            if !unified {
+                scroll_debouncer.watch_gesture(&scroll_ctrl, &block_scroll);
+            }
             scroll_ctrl.connect_scroll(move |controller, _dx, dy| {
                 let surface_unit = scroll_unit_is_surface(controller);
                 let fullscreen = fullscreen_for_scroll.get();
@@ -15275,17 +16532,23 @@ impl TermView {
                         // VTE's `commit`, and the pointer-motion reports that
                         // do no longer count as input.
                         hold_for_scroll.flush_then(|| match pty_for_scroll.write_bytes(&bytes) {
-                            Ok(()) => record_protocol_reply_input(
-                                bstate_for_scroll.get(),
-                                &fidelity_for_scroll,
-                                &dirty_for_scroll,
-                                &synced_for_scroll,
-                                &submitted_for_scroll,
-                                &typeahead_for_scroll,
-                                &input_generation_for_scroll,
-                            ),
-                            Err(error) => pty_for_scroll
-                                .report_write_error("could not queue mouse-wheel input", error),
+                            Ok(()) => {
+                                feedback_for_scroll.accepted();
+                                record_protocol_reply_input(
+                                    bstate_for_scroll.get(),
+                                    &fidelity_for_scroll,
+                                    &dirty_for_scroll,
+                                    &synced_for_scroll,
+                                    &submitted_for_scroll,
+                                    &typeahead_for_scroll,
+                                    &input_generation_for_scroll,
+                                );
+                            }
+                            Err(error) => {
+                                pty_for_scroll
+                                    .report_write_error("could not queue mouse-wheel input", error);
+                                feedback_for_scroll.rejected(error, None);
+                            }
                         });
                     }
                     return glib::Propagation::Stop;
@@ -15311,19 +16574,25 @@ impl TermView {
                     let bytes = alternate_scroll_arrows(notches, rows, modes.app_cursor_keys);
                     if !bytes.is_empty() {
                         hold_for_scroll.flush_then(|| match pty_for_scroll.write_bytes(&bytes) {
-                            Ok(()) => record_protocol_reply_input(
-                                bstate_for_scroll.get(),
-                                &fidelity_for_scroll,
-                                &dirty_for_scroll,
-                                &synced_for_scroll,
-                                &submitted_for_scroll,
-                                &typeahead_for_scroll,
-                                &input_generation_for_scroll,
-                            ),
-                            Err(error) => pty_for_scroll.report_write_error(
-                                "could not queue alternate-scroll input",
-                                error,
-                            ),
+                            Ok(()) => {
+                                feedback_for_scroll.accepted();
+                                record_protocol_reply_input(
+                                    bstate_for_scroll.get(),
+                                    &fidelity_for_scroll,
+                                    &dirty_for_scroll,
+                                    &synced_for_scroll,
+                                    &submitted_for_scroll,
+                                    &typeahead_for_scroll,
+                                    &input_generation_for_scroll,
+                                );
+                            }
+                            Err(error) => {
+                                pty_for_scroll.report_write_error(
+                                    "could not queue alternate-scroll input",
+                                    error,
+                                );
+                                feedback_for_scroll.rejected(error, None);
+                            }
                         });
                     }
                     return glib::Propagation::Stop;
@@ -15331,16 +16600,22 @@ impl TermView {
                 // While a command streams, its scrollback is a first-class
                 // reading surface: the wheel scrolls the live VTE itself and
                 // hands off to the outer history only at the buffer's edge.
-                let steps = wheel_steps(dy, surface_unit);
                 if matches!(
                     bstate_for_scroll.get(),
                     BlockState::CollectingOutput
                         | BlockState::PostCommand
                         | BlockState::RawFallback
                 ) {
-                    if let Some(adj) = vte_for_scroll.upgrade().and_then(|vte| vte.vadjustment()) {
-                        if scroll_adjustment_by_wheel(&adj, steps) {
-                            return glib::Propagation::Stop;
+                    if let Some(vte) = vte_for_scroll.upgrade() {
+                        if let Some(adj) = vte.vadjustment() {
+                            if scroll_adjustment_by_input(
+                                &adj,
+                                dy,
+                                surface_unit,
+                                vte.char_height() as f64,
+                            ) {
+                                return glib::Propagation::Stop;
+                            }
                         }
                     }
                 }
@@ -15351,8 +16626,7 @@ impl TermView {
                 let Some(outer) = outer_for_scroll.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
-                forward_outer_scroll(&outer, steps);
-                debouncer_for_scroll.record_wheel_intent(&outer);
+                debouncer_for_scroll.scroll_wheel(&outer, dy, surface_unit);
                 glib::Propagation::Stop
             });
             active_vte.add_controller(scroll_ctrl);
@@ -15368,28 +16642,42 @@ impl TermView {
             let vte_for_scrollbar = active_vte.downgrade();
             let outer_for_scrollbar = block_scroll.downgrade();
             let debouncer_for_scrollbar = scroll_debouncer.clone();
+            if !unified {
+                scroll_debouncer.watch_gesture(&scrollbar_scroll, &block_scroll);
+            }
             scrollbar_scroll.connect_scroll(move |controller, _dx, dy| {
-                let steps = wheel_steps(dy, scroll_unit_is_surface(controller));
-                if let Some(adj) = vte_for_scrollbar
-                    .upgrade()
-                    .and_then(|vte| vte.vadjustment())
-                {
-                    if scroll_adjustment_by_wheel(&adj, steps) {
-                        return glib::Propagation::Stop;
+                if let Some(vte) = vte_for_scrollbar.upgrade() {
+                    if let Some(adj) = vte.vadjustment() {
+                        if scroll_adjustment_by_input(
+                            &adj,
+                            dy,
+                            scroll_unit_is_surface(controller),
+                            vte.char_height() as f64,
+                        ) {
+                            return glib::Propagation::Stop;
+                        }
                     }
                 }
                 let Some(outer) = outer_for_scrollbar.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
-                forward_outer_scroll(&outer, steps);
-                debouncer_for_scrollbar.record_wheel_intent(&outer);
+                debouncer_for_scrollbar.scroll_wheel(
+                    &outer,
+                    dy,
+                    scroll_unit_is_surface(controller),
+                );
                 glib::Propagation::Stop
             });
             live_scrollbar.add_controller(scrollbar_scroll);
         }
 
+        let selection_root: &gtk4::Widget = if chat_mode {
+            root.upcast_ref()
+        } else {
+            block_scroll.upcast_ref()
+        };
         let cross_selection = CrossSelection::install(
-            &block_scroll,
+            selection_root,
             finished_blocks_rc.clone(),
             active_vte.clone(),
             selected_block_ids.clone(),
@@ -15401,6 +16689,7 @@ impl TermView {
         );
 
         let term_view = TermView {
+            input_feedback,
             root,
             pane_header,
             block_scroll,
@@ -15408,8 +16697,10 @@ impl TermView {
             block_onboarding,
             notice_dock,
             jump_fab: jump_fab.clone(),
+            unified_navigation,
             unread_count: unread_count.clone(),
             active_vte,
+            contents_generation,
             active,
             bstate,
             typed_cmd,
@@ -15440,6 +16731,7 @@ impl TermView {
             bell_callbacks,
             title_callbacks,
             activity_callbacks,
+            watch_reader,
             human_input_callbacks,
             alt_screen_callbacks,
             mouse_reporting_mode,
@@ -15457,16 +16749,19 @@ impl TermView {
             visible_indices,
             selected_block_ids,
             selected_block_id,
-            navigated_record_id: Cell::new(None),
+            navigated_record_id,
             selection_anchor_id,
             bookmarks: block_bookmarks,
             toggle_bookmark,
             find_state,
+            prepared_search: RefCell::new(prepared_search::PreparedSearch::default()),
             current_cwd: current_cwd.clone(),
+            menu_keybindings,
             session_id: session_id_owned,
             history_load: Arc::new(history::HistoryLoadShared::default()),
             persist_history_on_drop: Cell::new(true),
             history_load_poll_id: RefCell::new(None),
+            retry_save_after_history_load: Cell::new(false),
             resize_tick_id: Rc::new(RefCell::new(None)),
             sticky_timer_id: RefCell::new(Some(sticky_timer_id)),
             sticky_organism_slot,
@@ -15612,7 +16907,7 @@ impl TermView {
         }
 
         // ── Resize handler: sync PTY cols/rows when widget allocation changes ──
-        term_view.install_resize_tick();
+        term_view.install_resize_tick(chat_presentation.as_deref());
 
         Ok(term_view)
     }
@@ -15629,7 +16924,7 @@ impl TermView {
     /// pixels nor the grid moved. Every poll reads absolute geometry, so a
     /// change that lands while the tick is dormant is picked up whole by the
     /// next armed poll — nothing accumulates.
-    fn install_resize_tick(&self) {
+    fn install_resize_tick(&self, chat: Option<&chat::ChatPresentation>) {
         let pty_for_resize = self.pty.clone();
         let winsize_for_resize = Rc::downgrade(&self.pty_winsize);
         let scroll_for_resize = self.block_scroll.downgrade();
@@ -15677,10 +16972,7 @@ impl TermView {
                 // last frame allocated so the grid — and therefore the winsize
                 // read below — follows the window.
                 if let Some(clip) = clip_for_resize.upgrade() {
-                    let pane = (
-                        clip.width(),
-                        scroll_for_resize.vadjustment().page_size() as i32,
-                    );
+                    let pane = (clip.width(), viewport_height_px(vte, &scroll_for_resize));
                     if pane != last_pane.get() && pane.0 > 0 {
                         last_pane.set(pane);
                         settling = true;
@@ -15690,7 +16982,9 @@ impl TermView {
                     }
                 }
                 if let Some(winsize) = winsize_for_tick.upgrade() {
-                    if winsize.publish(&pty_for_resize, pty_grid_size(vte, &scroll_for_resize)) {
+                    if winsize.publish(&pty_for_resize, pty_grid_size(vte, &scroll_for_resize))
+                        || winsize.resize_retry_pending.get()
+                    {
                         settling = true;
                     }
                 }
@@ -15733,6 +17027,14 @@ impl TermView {
         {
             let arm = arm.clone();
             self.block_scroll.connect_map(move |_| arm());
+        }
+        if let Some(chat) = chat {
+            chat.connect_resize(arm.clone());
+            // Docking or pane reparenting can remap the live clip without a
+            // history page-size change. Observe its new allocation through the
+            // same weakly owned, self-terminating settle callback.
+            let arm = arm.clone();
+            self.active.borrow().live_clip().connect_map(move |_| arm());
         }
         // And from every synchronous publish (`sync_active_to_pty`): the grid
         // it read may still be waiting for an allocation — the alt-screen
@@ -15826,6 +17128,16 @@ impl TermView {
         }
     }
 
+    /// Reading a running block's scrollback gives the one companion a compact
+    /// home in the sticky header, never a second body beside the live surface.
+    pub(crate) fn organism_uses_running_header(&self) -> bool {
+        self.user_scrolled_up.get()
+            && self
+                .sticky_organism_slot
+                .parent()
+                .is_some_and(|header| header.is_mapped())
+    }
+
     /// Attach a separate compact avatar to the sticky running-command header.
     /// Its slot is shown only when that header represents a running command,
     /// never for a pinned finished block.
@@ -15876,6 +17188,10 @@ impl TermView {
         }
         self.accepted_input_generation
             .set(self.accepted_input_generation.get().wrapping_add(1));
+        if block_state == BlockState::AwaitingCommand && !data.is_empty() {
+            self.verified_submission
+                .notify_prompt_evidence_invalidated();
+        }
         // `write_input` is the shared Agent/correction/palette boundary.  Feed
         // it through the origin gate so future callback refactors cannot make
         // accepted programmatic bytes look like human attention.
@@ -15990,6 +17306,9 @@ impl TermView {
     /// from happening again. Safe on a pooled widget: `WidgetPool::release`
     /// strips the previous card's controllers before the box is reused.
     fn mount_rebuilt_block(&self, finished: &FinishedBlock) {
+        if self.root.has_css_class("term-chat-root") {
+            finished.set_chat_layout();
+        }
         // A card rebuilt into a narrowed stream is tested once, here, rather
         // than by rescanning the document on the next visibility pass.
         if let Some(kind) = self.block_filter.get() {
@@ -16013,6 +17332,7 @@ impl TermView {
         );
         self.render_backend.install_block_context_menu(
             finished.widget(),
+            &finished.more_btn,
             finished.id,
             finished.long_output,
         );
@@ -16219,6 +17539,7 @@ impl TermView {
             }
             DockMount::Refuse => unreachable!("refused before density normalization"),
         }
+        self.block_onboarding.observe_inline_notice(widget);
         self.block_list.queue_allocate();
         self.scroll_debouncer
             .pin_to_bottom_deferred(&self.block_scroll);
@@ -16297,6 +17618,25 @@ impl TermView {
         self.verified_submission
             .surface
             .prompt_anchor(self.prompt_end_pos.get(), self.prompt_anchor_rows.get())
+    }
+
+    pub(crate) fn organism_activity_knowledge(
+        &self,
+    ) -> jterm_core::organism_live::LiveActivityKnowledge {
+        let suggestion = click_cursor::suggestion_rgb(&self.config.borrow().palette);
+        self.verified_submission.organism_activity_knowledge(
+            self.fullscreen.get(),
+            self.active_agent_generation.get().is_some(),
+            suggestion,
+        )
+    }
+
+    /// Content-free, constant-time lifecycle boundary for passive UI. Unknown
+    /// or running activity is conservative; only a settled prompt is idle.
+    pub(crate) fn organism_activity_settled(&self) -> bool {
+        !self.fullscreen.get()
+            && self.bstate.get() == BlockState::AwaitingCommand
+            && self.pty.foreground_owner() == PtyForeground::Shell
     }
 
     /// Review-gated commands may only be inserted or submitted into a clean,
@@ -16534,6 +17874,7 @@ impl TermView {
     /// own it.
     fn paste_sink(&self) -> PasteSink {
         PasteSink {
+            notify: paste_feedback::notifier(&self.active_vte),
             pty: self.pty.clone(),
             bracketed_paste: self.bracketed_paste.clone(),
             bstate: self.bstate.clone(),
@@ -16548,31 +17889,50 @@ impl TermView {
             selected_block_ids: self.selected_block_ids.clone(),
             selected_block_id: self.selected_block_id.clone(),
             selection_anchor_id: self.selection_anchor_id.clone(),
-            active: self.active.clone(),
             selection_feed_hold: self.selection_feed_hold.clone(),
             human_input_callbacks: self.human_input_callbacks.clone(),
         }
     }
 
+    fn clipboard_paste_request(&self) -> ClipboardPasteRequest {
+        ClipboardPasteRequest {
+            sink: self.paste_sink(),
+            focus: DeferredLiveFocus::for_paste(&self.active_vte, &self.root),
+        }
+    }
+
     pub fn paste_from_clipboard(&self) {
         let clipboard = self.active_vte.clipboard();
-        let sink = self.paste_sink();
+        let request = self.clipboard_paste_request();
+        let feedback = self.input_feedback.clone();
         let active_vte = self.active_vte.downgrade();
         clipboard.read_text_async(None::<&gtk4::gio::Cancellable>, move |result| {
             let Ok(Some(text)) = result else {
                 return;
             };
-            if let Err(PasteRefusal::TooLarge(error)) = sink.paste(text.as_str()) {
-                log::warn!("refused oversized clipboard paste: {error}");
-                if let Some(active_vte) = active_vte.upgrade() {
-                    show_clipboard_failure(
-                        &active_vte,
-                        "Paste failed",
-                        &format!("{error}. Nothing was pasted."),
-                    );
+            match request.complete(Some(text.as_str())) {
+                Ok(()) => feedback.accepted(),
+                Err(PasteRefusal::TooLarge(error)) => {
+                    log::warn!("refused oversized clipboard paste: {error}");
+                    if let Some(active_vte) = active_vte.upgrade().filter(|vte| vte.is_mapped()) {
+                        show_clipboard_failure(
+                            &active_vte,
+                            "Paste failed",
+                            &format!("{error}. Nothing was pasted. The source remains on your clipboard."),
+                        );
+                    }
                 }
+                Err(PasteRefusal::Write(error)) => feedback.rejected(error, None),
             }
         });
+    }
+
+    /// Snapshot the input/prompt evidence owned by an explicit file-drop intent.
+    pub(crate) fn path_drop_generation(&self) -> (u64, u64) {
+        (
+            self.accepted_input_generation.get(),
+            self.verified_submission.prompt_anchor_generation.get(),
+        )
     }
 
     /// Paste `text` exactly as Ctrl+Shift+V pastes the clipboard: through the
@@ -16583,9 +17943,14 @@ impl TermView {
     /// than a burst of keystrokes.
     pub(crate) fn paste_text(&self, text: &str) -> Result<(), String> {
         match self.paste_sink().paste(text) {
-            Ok(()) => Ok(()),
+            Ok(admitted) => {
+                if admitted {
+                    self.active.borrow().grab_focus();
+                }
+                Ok(())
+            }
             Err(PasteRefusal::TooLarge(error)) => Err(error),
-            Err(PasteRefusal::Write) => Err("the terminal did not accept the input".to_string()),
+            Err(PasteRefusal::Write(error)) => Err(error.to_string()),
         }
     }
 
@@ -16607,6 +17972,25 @@ impl TermView {
 
     pub fn connect_title_changed<F: Fn(&str) + 'static>(&self, f: F) {
         self.title_callbacks.borrow_mut().push(Box::new(f));
+    }
+
+    /// Loss of an established prompt proof, not human or output activity.
+    pub(crate) fn connect_prompt_evidence_invalidated<F: Fn() + 'static>(&self, f: F) {
+        self.verified_submission
+            .prompt_evidence_invalidated
+            .borrow_mut()
+            .push(Rc::new(f));
+    }
+
+    pub(crate) fn connect_watch_observation(
+        &self,
+        listener: impl Fn(&watch_reader::ReaderWatchEvent) + 'static,
+    ) {
+        self.watch_reader.connect(listener);
+    }
+
+    pub(crate) fn watch_observation_snapshot(&self) -> watch_reader::ReaderSnapshot {
+        self.watch_reader.snapshot()
     }
 
     pub fn connect_activity<F: Fn() + 'static>(&self, f: F) {
@@ -16716,6 +18100,10 @@ impl TermView {
     /// all twelve retries before GTK produced another allocation, so a newly
     /// selected tab sometimes stopped above its bottom input block.
     pub(crate) fn reveal_live_input(&self) {
+        if self.unified_navigation.is_some() {
+            self.reveal_unified_live_input();
+            return;
+        }
         reveal_live_input_now(
             &self.scroll_debouncer,
             &self.unread_count,
@@ -16737,9 +18125,9 @@ impl TermView {
             return;
         }
         // Ctrl+Up enters anvil/Warp-style block selection at the newest block.
-        {
+        let moved_selection = {
             let finished = self.finished_blocks.borrow();
-            if (lines < 0 || self.selected_block_id.get().is_some())
+            (lines < 0 || self.selected_block_id.get().is_some())
                 && move_finished_block_selection(
                     &finished,
                     &self.selected_block_ids,
@@ -16748,10 +18136,12 @@ impl TermView {
                     &self.block_scroll,
                     lines.signum(),
                 )
-            {
-                self.cross_selection.clear_all();
-                return;
-            }
+        };
+        if moved_selection {
+            // Resuming a text-selection hold can finalize/evict commands.
+            // No history borrow may survive across that replay boundary.
+            self.cross_selection.clear_all();
+            return;
         }
 
         let adj = self.block_scroll.vadjustment();
@@ -16774,28 +18164,70 @@ impl TermView {
     /// keeps the space the output used to take and the scrollbar lies. One
     /// layout pass at the end, not one per card.
     pub fn set_all_blocks_collapsed(&self, collapsed: bool) -> usize {
+        self.apply_blocks_collapsed(collapsed, None)
+    }
+
+    /// Fold or unfold only the explicit selected finished cards. No selection
+    /// means no action; stale identities refuse the whole batch. The selection,
+    /// keyboard owner and live shell are never changed by this operation.
+    pub(crate) fn set_selected_blocks_collapsed(&self, collapsed: bool) -> FoldSelectionResult {
+        if self.fullscreen.get()
+            || self.bstate.get() == BlockState::AltScreen
+            || !self.render_backend.supports_block_mutation()
+        {
+            return FoldSelectionResult::Unavailable;
+        }
+        let plan = {
+            let selected = self.selected_block_ids.borrow();
+            let finished = self.finished_blocks.borrow();
+            selection_folding::selected_indices(finished.iter().map(|card| card.id), &selected)
+        };
+        let indices = match plan {
+            Ok(indices) => indices,
+            Err(result) => return result,
+        };
+        match self.apply_blocks_collapsed(collapsed, Some(&indices)) {
+            0 => FoldSelectionResult::NoChange,
+            count => FoldSelectionResult::Changed(count),
+        }
+    }
+
+    /// Apply one synchronous batch and update virtualization once. Indices are
+    /// validated against the complete selected identity set before entry.
+    fn apply_blocks_collapsed(&self, collapsed: bool, indices: Option<&[usize]>) -> usize {
         if self.fullscreen.get() || !self.render_backend.supports_block_mutation() {
             return 0;
         }
         let moved = {
             let finished = self.finished_blocks.borrow();
+            let all_indices;
+            let indices = match indices {
+                Some(indices) => indices,
+                None => {
+                    all_indices = (0..finished.len()).collect::<Vec<_>>();
+                    &all_indices
+                }
+            };
             let config = self.config.borrow();
             let fallback_cols = self.active.borrow().grid_cols() as i64;
             let mut block_data = self.block_data.borrow_mut();
             let mut document_index = self.block_document_index.borrow_mut();
             let mut moved = 0usize;
-            for (index, card) in finished.iter().enumerate() {
+            for &index in indices {
+                let card = &finished[index];
                 if !card.set_collapsed(collapsed) {
                     continue;
                 }
                 moved += 1;
                 document_index.mark_stale();
                 if let Some(data) = block_data.get_mut(index) {
-                    data.estimated_height = if card.is_filtered_out() {
-                        0
-                    } else {
-                        collapsed_aware_block_height(&config, data, collapsed, fallback_cols)
-                    };
+                    let height = card.set_placeholder_height(collapsed_aware_block_height(
+                        &config,
+                        data,
+                        collapsed,
+                        fallback_cols,
+                    ));
+                    data.estimated_height = if card.is_filtered_out() { 0 } else { height };
                 }
             }
             moved
@@ -16803,7 +18235,7 @@ impl TermView {
         if moved > 0 {
             (self.failure_marker_redraw)();
             self.update_viewport();
-            self.update_block_visibility();
+            self.update_block_visibility_preserving_heights();
             self.block_list.queue_allocate();
         }
         moved
@@ -16815,17 +18247,30 @@ impl TermView {
         if self.fullscreen.get() || !self.render_backend.supports_block_mutation() {
             return false;
         }
-        let moved = {
+        let target = {
             let finished = self.finished_blocks.borrow();
-            let selected = self.selected_block_id.get();
-            let Some(index) = selected
+            self.selected_block_id
+                .get()
                 .and_then(|id| finished.iter().position(|card| card.id == id))
                 .or_else(|| finished.iter().rposition(|card| !card.is_filtered_out()))
-            else {
+                .map(|index| (finished[index].id, !finished[index].is_collapsed()))
+        };
+        target.is_some_and(|(id, collapsed)| self.set_block_collapsed(id, collapsed))
+    }
+
+    /// Change one exact card without moving keyboard focus or block selection.
+    /// Find uses this instead of the selected-card action so its entry remains
+    /// active and a vanished target cannot unfold an unrelated newest card.
+    fn set_block_collapsed(&self, block_id: u64, collapsed: bool) -> bool {
+        if self.fullscreen.get() || !self.render_backend.supports_block_mutation() {
+            return false;
+        }
+        let moved = {
+            let finished = self.finished_blocks.borrow();
+            let Some(index) = finished.iter().position(|card| card.id == block_id) else {
                 return false;
             };
             let card = &finished[index];
-            let collapsed = !card.is_collapsed();
             if !card.set_collapsed(collapsed) {
                 return false;
             }
@@ -16834,18 +18279,20 @@ impl TermView {
             let mut block_data = self.block_data.borrow_mut();
             self.block_document_index.borrow_mut().mark_stale();
             if let Some(data) = block_data.get_mut(index) {
-                data.estimated_height = if card.is_filtered_out() {
-                    0
-                } else {
-                    collapsed_aware_block_height(&config, data, collapsed, fallback_cols)
-                };
+                let height = card.set_placeholder_height(collapsed_aware_block_height(
+                    &config,
+                    data,
+                    collapsed,
+                    fallback_cols,
+                ));
+                data.estimated_height = if card.is_filtered_out() { 0 } else { height };
             }
             true
         };
         if moved {
             (self.failure_marker_redraw)();
             self.update_viewport();
-            self.update_block_visibility();
+            self.update_block_visibility_preserving_heights();
             self.block_list.queue_allocate();
         }
         moved
@@ -16857,6 +18304,10 @@ impl TermView {
             return;
         }
         self.cross_selection.clear_all();
+        // Parked output may have entered an alt-screen program during replay.
+        if self.fullscreen.get() {
+            return;
+        }
         let finished = self.finished_blocks.borrow();
         // Only what the pane is showing: "select all" of a narrowed stream means
         // the cards on screen, not the ones the filter hid — and the range's two
@@ -16921,6 +18372,9 @@ impl TermView {
             log::debug!("render backend has no mutable Block document to clear");
             return 0;
         }
+        // Retire the cross-card drag before widgets leave the document. This
+        // also releases held PTY output before we snapshot the removal.
+        self.cross_selection.clear_all();
         // A background load that completes after Clear must not resurrect the
         // just-deleted history, and its shutdown merge must not prepend it to
         // the empty replacement snapshot.
@@ -16946,7 +18400,13 @@ impl TermView {
             self.failure_marker_redraw.as_ref(),
             |blocks| blocks.drain(..).collect(),
         );
-        let cleared_count = self.stash_removed_blocks(RemovedBlocks::Cleared(cleared));
+        let cleared_count = self.stash_removed_blocks(RemovedBlocks::Cleared(ClearedBlocksStash {
+            blocks: cleared,
+            bookmarks: self.bookmarks.borrow().iter().copied().collect(),
+            selected_ids: self.selected_block_ids.borrow().clone(),
+            active_id: self.selected_block_id.get(),
+            anchor_id: self.selection_anchor_id.get(),
+        }));
         self.bookmarks.borrow_mut().clear();
         self.visible_indices.borrow_mut().clear();
         self.selected_block_ids.borrow_mut().clear();
@@ -17017,6 +18477,7 @@ impl TermView {
                     block.lifecycle_health(),
                     block.lifecycle_notice().as_deref(),
                 );
+                finished.set_command_provenance(block.command_exact, block.command_truncated);
                 finished.set_output_notice(
                     block.output_notice.as_deref().and_then(known_output_notice),
                 );
@@ -17035,10 +18496,11 @@ impl TermView {
                             .clone()
                             .upcast::<gtk4::Widget>()
                     });
+                // Decorate before map-time native command measurement.
+                self.mount_rebuilt_block(&finished);
                 finished
                     .widget()
                     .insert_before(&self.block_list, Some(&sibling));
-                self.mount_rebuilt_block(&finished);
                 self.finished_blocks.borrow_mut().insert(position, finished);
                 let mut block = block;
                 block.estimated_height = estimated_finished_block_height_for_text(
@@ -17046,6 +18508,13 @@ impl TermView {
                     &block.cmd,
                     &block.output,
                     cols,
+                )
+                .saturating_add(
+                    if self.root.has_css_class("term-chat-root") && !block.is_background() {
+                        chat::COMMAND_GAP_PX
+                    } else {
+                        0
+                    },
                 );
                 mutate_block_data_and_redraw(
                     &self.block_data,
@@ -17079,6 +18548,7 @@ impl TermView {
                 visible_indices: &self.visible_indices,
                 failure_marker_redraw: self.failure_marker_redraw.as_ref(),
             },
+            &self.scroll_debouncer,
         );
 
         self.visible_indices.borrow_mut().clear();
@@ -17101,39 +18571,68 @@ impl TermView {
     /// An empty removal leaves the previous entry alone, so a no-op Clear on an
     /// already-empty pane cannot silently discard a real undo.
     fn stash_removed_blocks(&self, removed: RemovedBlocks) -> usize {
-        let count = removed.len();
-        if count > 0 {
-            *self.removed_blocks.borrow_mut() = Some(removed);
-        }
-        count
+        RemovedBlocks::replace_if_nonempty(&mut self.removed_blocks.borrow_mut(), removed)
     }
 
-    /// Put the most recent removal back — a Clear generation or a Delete,
-    /// whichever happened last. The slot is intentionally single-level.
+    /// Compatibility count for callers that do not display refusal reasons.
     pub fn undo_clear_blocks(&self) -> usize {
-        // Alt-screen applications own the pane. Refusing must leave the stash
-        // intact so Undo still works after the application exits.
-        if self.fullscreen.get() {
-            return 0;
+        match self.undo_clear_blocks_result() {
+            UndoClearResult::Restored(count) => count,
+            _ => 0,
         }
-        let removed = self.removed_blocks.borrow_mut().take();
-        let mut restored = match removed {
-            Some(RemovedBlocks::Cleared(blocks)) => blocks,
-            Some(RemovedBlocks::Deleted(blocks)) => return self.restore_deleted_blocks(blocks),
-            None => return 0,
-        };
-        if restored.is_empty() {
-            return 0;
-        }
-        // Undo inserts restored cards and may evict a live prefix. Invalidate
-        // index-based search metadata before either structural change.
-        self.clear_find();
+    }
 
+    /// Restore the most recent Clear or Delete without consuming a refused undo.
+    pub(crate) fn undo_clear_blocks_result(&self) -> UndoClearResult {
+        if self.fullscreen.get() {
+            return UndoClearResult::Fullscreen;
+        }
+        if !self.supports_block_mutation() {
+            return UndoClearResult::Empty;
+        }
         let max_blocks = self.config.borrow().max_visible_blocks as usize;
         let retention_plan = {
+            let removed = self.removed_blocks.borrow();
+            let restored = match removed.as_ref() {
+                Some(RemovedBlocks::Cleared(stash)) => stash.blocks.as_slice(),
+                _ => &[],
+            };
             let finished = self.finished_blocks.borrow();
-            plan_completed_block_retention_with_restored(&restored, &finished, max_blocks)
+            plan_completed_block_retention_with_restored(restored, &finished, max_blocks)
         };
+        let clear_capacity = {
+            let removed = self.removed_blocks.borrow();
+            match removed.as_ref() {
+                Some(RemovedBlocks::Cleared(stash)) if max_blocks > 0 => stash
+                    .blocks
+                    .len()
+                    .saturating_sub(retention_plan.evict_prefix),
+                _ => 0,
+            }
+        };
+        let removed = match RemovedBlocks::take_for_restore(
+            &mut self.removed_blocks.borrow_mut(),
+            self.fullscreen.get(),
+            clear_capacity,
+        ) {
+            Ok(removed) => removed,
+            Err(result) => return result,
+        };
+        let ClearedBlocksStash {
+            blocks: mut restored,
+            bookmarks,
+            selected_ids,
+            active_id,
+            anchor_id,
+        } = match removed {
+            RemovedBlocks::Cleared(stash) => stash,
+            RemovedBlocks::Deleted(blocks) => {
+                return UndoClearResult::Restored(self.restore_deleted_blocks(blocks));
+            }
+        };
+        // Invalidate index-based search metadata before structural changes.
+        self.clear_find();
+
         log_completed_block_retention("restoring cleared blocks", retention_plan);
         let restored_evictions = retention_plan.evict_prefix.min(restored.len());
         restored.drain(..restored_evictions);
@@ -17156,6 +18655,7 @@ impl TermView {
                 visible_indices: &self.visible_indices,
                 failure_marker_redraw: self.failure_marker_redraw.as_ref(),
             },
+            &self.scroll_debouncer,
         );
 
         let fallback_cols = self.active.borrow().grid_cols() as i64;
@@ -17172,6 +18672,13 @@ impl TermView {
                     &block.cmd,
                     &block.output,
                     cols,
+                )
+                .saturating_add(
+                    if self.root.has_css_class("term-chat-root") && !block.is_background() {
+                        chat::COMMAND_GAP_PX
+                    } else {
+                        0
+                    },
                 );
             }
         }
@@ -17215,18 +18722,30 @@ impl TermView {
                     block.lifecycle_health(),
                     block.lifecycle_notice().as_deref(),
                 );
+                finished.set_command_provenance(block.command_exact, block.command_truncated);
                 finished.set_output_notice(
                     block.output_notice.as_deref().and_then(known_output_notice),
                 );
+                // Bookmark revisions notify pickers, not card chrome. Rebuilt
+                // widgets need their star and CSS restored explicitly.
+                let bookmarked = bookmarks.contains(&block.id);
+                finished.bookmark_star.set_visible(bookmarked);
+                if bookmarked {
+                    finished.widget().add_css_class("block-bookmarked");
+                } else {
+                    finished.widget().remove_css_class("block-bookmarked");
+                }
                 apply_dynamic_colors_to_finished(&finished, self.dynamic_colors.get());
+                // Decorate before map-time native command measurement.
+                self.mount_rebuilt_block(&finished);
                 finished
                     .widget()
                     .insert_before(&self.block_list, Some(&sibling));
-                self.mount_rebuilt_block(&finished);
                 restored_widgets.push(finished);
             }
         }
 
+        let restored_ids: HashSet<u64> = restored.iter().map(|block| block.id).collect();
         let restored_len = restored.len();
         mutate_block_data_and_redraw(
             &self.block_data,
@@ -17243,6 +18762,45 @@ impl TermView {
             .map(|index| index.saturating_add(restored_len))
             .collect();
         *self.visible_indices.borrow_mut() = shifted;
+
+        let ordered_ids: Vec<u64> = self
+            .finished_blocks
+            .borrow()
+            .iter()
+            .map(|block| block.id)
+            .collect();
+        let all_ids: HashSet<u64> = ordered_ids.iter().copied().collect();
+        self.bookmarks
+            .borrow_mut()
+            .restore_retained(bookmarks, &restored_ids);
+        {
+            let mut selected = self.selected_block_ids.borrow_mut();
+            selected.retain(|id| all_ids.contains(id));
+            selected.extend(
+                selected_ids
+                    .into_iter()
+                    .filter(|id| restored_ids.contains(id)),
+            );
+            let (next_active, next_anchor) = restored_selection_edges(
+                &ordered_ids,
+                &selected,
+                self.selected_block_id.get(),
+                self.selection_anchor_id.get(),
+                active_id,
+                anchor_id,
+            );
+            self.selected_block_id.set(next_active);
+            self.selection_anchor_id.set(next_anchor);
+        }
+        {
+            let finished = self.finished_blocks.borrow();
+            sync_finished_block_selection(
+                &finished,
+                &self.selected_block_ids,
+                &self.selected_block_id,
+            );
+        }
+
         if let Some(kind) = self.block_filter.get() {
             let _ = self.apply_block_filter(kind);
         } else {
@@ -17256,7 +18814,7 @@ impl TermView {
         if let Err(err) = self.save_history() {
             log::warn!("save restored block history: {err}");
         }
-        restored_len
+        UndoClearResult::Restored(restored_len)
     }
 
     /// Whether a card belongs in the stream under `kind`.
@@ -17403,7 +18961,7 @@ impl TermView {
         if let Some((idx, _)) = finished
             .iter()
             .enumerate()
-            .find(|(_, block)| bookmarks.contains(block.id))
+            .find(|(_, block)| !block.is_filtered_out() && bookmarks.contains(block.id))
         {
             drop(bookmarks);
             drop(finished);
@@ -17417,12 +18975,11 @@ impl TermView {
         if bookmarks.is_empty() {
             return;
         }
-        let marked: Vec<usize> = finished
-            .iter()
-            .enumerate()
-            .filter(|(_, block)| bookmarks.contains(block.id))
-            .map(|(idx, _)| idx)
-            .collect();
+        let marked: Vec<usize> = visible_marked_positions(
+            finished
+                .iter()
+                .map(|block| (bookmarks.contains(block.id), block.is_filtered_out())),
+        );
         if marked.is_empty() {
             return;
         }
@@ -17463,6 +19020,7 @@ impl TermView {
 
     /// Apply updated theme colors to the block widgets and the live VTE.
     pub fn apply_theme(&self) {
+        self.dynamic_colors.set(Default::default());
         let config = self.config.borrow();
         apply_terminal_theme(&self.active_vte, &config);
         for block in self.finished_blocks.borrow().iter() {
@@ -17680,9 +19238,25 @@ impl TermView {
     }
 
     pub fn scroll_to_block(&self, block_index: usize) {
+        if self.fullscreen.get() {
+            return;
+        }
+        let Some(target_id) = self
+            .finished_blocks
+            .borrow()
+            .get(block_index)
+            .map(|block| block.id)
+        else {
+            return;
+        };
+        self.cross_selection.clear_all();
+        if self.fullscreen.get() {
+            return;
+        }
         let finished = self.finished_blocks.borrow();
-        if let Some(block) = finished.get(block_index) {
-            self.cross_selection.clear_all();
+        // Replay may evict an earlier block and shift every index. Keep the
+        // requested identity, or decline when it is no longer retained.
+        if let Some(block) = finished.iter().find(|block| block.id == target_id) {
             replace_finished_block_selection(
                 &finished,
                 &self.selected_block_ids,
@@ -17774,10 +19348,15 @@ impl TermView {
         let data = self.block_data.borrow();
         let bd = data.iter().find(|b| b.id == id);
 
-        let output_total_bytes = block.with_stripped_output(|s| s.len());
-        let output =
-            block.with_stripped_output(|s| crate::ai::truncate_for_context(s, lines_per_side));
-        let output_truncated = output.contains("lines elided") || output.contains("bytes elided");
+        let (output, output_truncated, output_total_bytes) = block.with_stripped_output(|source| {
+            let output = crate::ai::truncate_for_context(source, lines_per_side);
+            let truncated = output_evidence_is_truncated(
+                source,
+                &output,
+                bd.and_then(|block| block.output_notice.as_deref()),
+            );
+            (output, truncated, source.len())
+        });
         let to_time = |ms: Option<u64>| {
             ms.map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms))
         };
@@ -17819,8 +19398,79 @@ pub struct BlockAgentEvidence {
     pub(crate) finished_at: Option<std::time::SystemTime>,
 }
 
+/// Nonexecuting PTY fixture shared with the organism's display regressions.
+#[cfg(test)]
+pub(crate) fn organism_settings_test_view() -> Rc<TermView> {
+    let view: Rc<TermView> = TermView::new_with_spawner(
+        &crate::config::Config::safe_defaults(),
+        &crate::config::TerminalMode::Block,
+        &["sh".to_string()],
+        None,
+        None,
+        &[],
+        |_argv, _cwd, _env, _token| {
+            crate::pty::OwnedPty::for_tests(crate::pty::PtyForeground::Shell)
+        },
+    )
+    .expect("nonexecuting organism test PTY")
+    .into();
+    view.bstate.set(BlockState::AwaitingCommand);
+    view.block_onboarding.history_resolved(false);
+    view
+}
+
+// The inert display fixture has no shell. Seed an explicit clean PromptEnd
+// witness against its native surface; ReaderHarness tests actual A/B/C/RIS.
+#[cfg(test)]
+pub(crate) fn organism_settings_test_clean_prompt(view: &TermView) {
+    let ctx = &view.verified_submission;
+    ctx.bstate.set(BlockState::AwaitingCommand);
+    ctx.typed_cmd.borrow_mut().clear();
+    ctx.typed_cmd_fidelity.set(TypedShadowFidelity::Inexact);
+    ctx.idle_input_dirty.set(false);
+    ctx.pty_synced.set(false);
+    ctx.submission_pending.set(false);
+    ctx.pending_typeahead.set(false);
+    ctx.prompt_end_pos.set(ctx.surface.cursor_position());
+    ctx.prompt_anchor_rows.set(view.active_vte.row_count());
+    ctx.prompt_anchor_ready.set(true);
+    assert_eq!(
+        view.organism_activity_knowledge(),
+        jterm_core::organism_live::LiveActivityKnowledge::KnownIdle
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn organism_settings_test_running(view: &TermView, running: bool) {
+    view.bstate.set(if running {
+        BlockState::CollectingOutput
+    } else {
+        BlockState::AwaitingCommand
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn organism_settings_test_onboarding(view: &TermView) -> bool {
+    view.block_onboarding.is_visible()
+}
+
+#[cfg(test)]
+pub(crate) fn organism_settings_test_first_command(view: &TermView) {
+    view.block_onboarding.human_input_observed();
+    view.block_onboarding.finished_block_observed();
+}
+
+#[cfg(test)]
+pub(crate) fn organism_settings_test_pty_bytes(view: &TermView) -> Vec<u8> {
+    view.pty
+        .drain_test_slave(std::time::Duration::from_millis(40))
+}
+
 #[cfg(test)]
 mod tests {
+    include!("selection_folding_tests.rs");
+    include!("ime_tests.rs");
+    include!("paste_focus_tests.rs");
     use super::{
         accept_agent_integration_token, anchor_tick_exit, apply_visible_indices,
         apply_vte_commit_to_shadow, approved_command_submission_payload,
@@ -18159,6 +19809,190 @@ mod tests {
         // A lower sample still wins while the prompt is drawing.
         assert_eq!(super::latched_live_origin(Some(5), 3), 3);
         assert_eq!(super::latched_live_origin(None, 7), 7);
+    }
+
+    #[test]
+    fn late_ssh_command_origin_is_recovered_from_displayed_rows() {
+        // An entire two-line prompt and wrapped command can paint before the
+        // first cursor sample. The old origin (5002) clips two rows forever.
+        let origin = super::displayed_origin_from_last_text(5009, 10);
+        assert_eq!(origin, 5000);
+        assert_eq!(live_content_extent_for(5002, 5010, 32), 9);
+        assert_eq!(live_content_extent_for(origin, 5010, 32), 11);
+        // A one-line prompt, a cursor above a footer, and a long-lived ring.
+        assert_eq!(super::displayed_origin_from_last_text(200_005, 6), 200_000);
+        assert_eq!(super::displayed_origin_from_last_text(5000, 1), 5000);
+        assert_eq!(live_content_extent_for(origin, 5003, 32), 4);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn ssh_remote_prompt_cursor_stays_inside_live_clip_without_clear() {
+        use gtk4 as gtk;
+        use gtk4::prelude::*;
+        use std::time::{Duration, Instant};
+        use vte4::prelude::*;
+        gtk::init().expect("gtk init");
+        let settle = || {
+            let context = gtk::glib::MainContext::default();
+            let deadline = Instant::now() + Duration::from_millis(250);
+            while Instant::now() < deadline {
+                while context.iteration(false) {}
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        for mode in [
+            crate::config::TerminalMode::Block,
+            crate::config::TerminalMode::Chat,
+        ] {
+            for (wrapped, integrated) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let view = super::TermView::new_with_spawner(
+                    &Config::safe_defaults(),
+                    &mode,
+                    &["sh".to_string()],
+                    None,
+                    None,
+                    &[],
+                    |_argv, _cwd, _env, _token| {
+                        crate::pty::OwnedPty::for_tests(PtyForeground::Shell)
+                    },
+                )
+                .expect("nonexecuting SSH fixture PTY");
+                let window = gtk::Window::builder()
+                    .default_width(900)
+                    .default_height(900)
+                    .child(&view.widget())
+                    .build();
+                window.present();
+                settle();
+                view.pty
+                    .write_test_slave(b"\x1b]133;A\x07$ \x1b]133;B\x07history\r\n\x1b]133;C\x07");
+                settle();
+                view.pty
+                    .write_test_slave("old history\r\n".repeat(120).as_bytes());
+                settle();
+                view.pty.write_test_slave(b"\x1b]133;D;0\x07");
+                settle();
+                let local_prompt = if integrated {
+                    "local@host ~\r\n> "
+                } else {
+                    "$ "
+                };
+                view.pty.write_test_slave(
+                    format!("\x1b]133;A\x07{local_prompt}\x1b]133;B\x07").as_bytes(),
+                );
+                settle();
+                assert_eq!(view.bstate.get(), BlockState::AwaitingCommand);
+                assert!(
+                    view.active_vte.cursor_position().1 > view.active_vte.row_count(),
+                    "prewarm must advance absolute ring coordinates beyond one grid"
+                );
+                let history_cards = view.finished_blocks.borrow().len();
+                assert_eq!(
+                    history_cards, 1,
+                    "prewarm finalized exactly one prior command"
+                );
+                let command = if wrapped {
+                    format!(
+                        "ssh root@{}",
+                        "h".repeat(view.active_vte.column_count() as usize + 20)
+                    )
+                } else {
+                    "command ssh remote".to_string()
+                };
+                // Accept the local command while its shell owns the PTY,
+                // then deliver a complete remote prompt in one write.
+                let start = if integrated { "\x1b]133;A\x07" } else { "" };
+                let end = if integrated { "\x1b]133;B\x07" } else { "" };
+                view.pty
+                    .write_test_slave(format!("{command}\r\n\x1b]133;C\x07").as_bytes());
+                settle();
+                view.pty.set_test_foreground(PtyForeground::Other);
+                view.pty.write_test_slave(format!(
+                    "jsh: bringing jsh for this session\r\nbash: warning: setlocale\r\nwarning two\r\nwarning three\r\n{start}root@remote ~\r\n> {end}"
+                ).as_bytes());
+                settle();
+                assert_eq!(view.bstate.get(), BlockState::CollectingOutput);
+                let winsize = view.pty.test_slave_winsize();
+                let replies = Rc::new(RefCell::new(Vec::<String>::new()));
+                let captured = replies.clone();
+                let signal = view.active_vte.connect_commit(move |_, text, _| {
+                    captured.borrow_mut().push(text.to_string());
+                });
+                let assert_cursor_visible = || {
+                    replies.borrow_mut().clear();
+                    // Ask VTE itself for the screen-relative cursor. This
+                    // bypasses our parser's CPR implementation and avoids
+                    // using the very origin calculation being tested.
+                    view.active_vte.feed(b"\x1b[6n");
+                    settle();
+                    let row = replies
+                        .borrow()
+                        .iter()
+                        .find_map(|reply| {
+                            reply
+                                .strip_prefix("\x1b[")?
+                                .strip_suffix('R')?
+                                .split_once(';')?
+                                .0
+                                .parse::<i64>()
+                                .ok()
+                        })
+                        .expect("native VTE cursor-position response");
+                    let clip = view.active.borrow().live_clip();
+                    let offset = view
+                        .active_vte
+                        .compute_point(&clip, &gtk::graphene::Point::new(0.0, 0.0))
+                        .expect("terminal is inside live clip");
+                    // GTK4 compute_point maps the content origin, already
+                    // accounting for CSS padding/border. VTE 0.76's default
+                    // Start alignment adds no internal top offset (vte.cc,
+                    // widget_size_allocate / widget_snapshot). Its Scrollable
+                    // interface has no get_border implementation to query.
+                    assert_eq!(view.active_vte.yalign(), vte4::Align::Start);
+                    let bottom =
+                        f64::from(offset.y()) + (row * view.active_vte.char_height()) as f64;
+                    assert!(
+                        row < view.active_vte.row_count(),
+                        "fixture must exercise a compact card: row={row}, grid={}",
+                        view.active_vte.row_count()
+                    );
+                    assert!(bottom <= f64::from(clip.height()),
+                        "{mode:?} wrapped={wrapped} integrated={integrated}: cursor bottom {bottom} exceeds clip {}; row={row}, grid={}, offset={}, alignment=Start, cell_height={}, terminal_height={}, css_insets={}",
+                        clip.height(), view.active_vte.row_count(), offset.y(), view.active_vte.char_height(), view.active_vte.height(), super::blocks::terminal_vertical_insets(&view.active_vte));
+                    assert_eq!(view.bstate.get(), BlockState::CollectingOutput);
+                    assert_eq!(view.finished_blocks.borrow().len(), history_cards);
+                    assert_eq!(view.pty.test_slave_winsize(), winsize);
+                    assert_eq!(view.active_vte.row_count(), i64::from(winsize.1));
+                };
+                assert_cursor_visible();
+                for _ in 0..2 {
+                    view.pty.write_test_slave(
+                        format!(
+                            "\r\n{}{start}root@remote ~\r\n> {end}",
+                            if integrated {
+                                "\x1b]133;C\x07\x1b]133;D;0\x07"
+                            } else {
+                                ""
+                            }
+                        )
+                        .as_bytes(),
+                    );
+                    settle();
+                    assert_cursor_visible();
+                }
+                // A blank input row must count even though text measurement
+                // alone ends on the preceding prompt-header line.
+                view.pty.write_test_slave(b"\r\nroot@remote ~\r\n");
+                settle();
+                assert_cursor_visible();
+                view.active_vte.disconnect(signal);
+                window.close();
+                settle();
+            }
+        }
     }
 
     #[test]
@@ -19064,6 +20898,7 @@ mod tests {
             None,
             80,
         );
+        card.set_command_provenance(true, false);
         let selected = Rc::new(RefCell::new(HashSet::from([91])));
         let active = Rc::new(Cell::new(Some(91)));
         super::sync_finished_block_selection(std::slice::from_ref(&card), &selected, &active);
@@ -19465,6 +21300,16 @@ mod tests {
 
         gtk4::init().expect("gtk init");
         let config = crate::config::Config::safe_defaults();
+        let view = super::TermView::new_with_spawner(
+            &config,
+            &crate::config::TerminalMode::Block,
+            &["sh".to_string()],
+            None,
+            None,
+            &[],
+            |_argv, _cwd, _env, _token| crate::pty::OwnedPty::for_tests(PtyForeground::Other),
+        )
+        .expect("a Block pane over a test PTY");
         let card = super::FinishedBlock::new(
             3,
             "$ ",
@@ -19478,6 +21323,9 @@ mod tests {
             None,
             80,
         );
+        // A constructed card has no pane-bound actions yet. Use the same
+        // wiring as restored cards so More is sensitive to normal GTK picks.
+        view.mount_rebuilt_block(&card);
         let window = gtk4::Window::builder()
             .default_width(700)
             .default_height(300)
@@ -19512,7 +21360,14 @@ mod tests {
                 .any(|button| button.has_css_class("block-collapse-btn")),
             "the collapse chevron is on screen"
         );
+        assert!(
+            buttons
+                .iter()
+                .any(|button| button.has_css_class("block-more-btn")),
+            "the permanent More action is on screen"
+        );
         for button in &buttons {
+            assert!(button.is_sensitive(), "{:?}", button.css_classes());
             let bounds = button.compute_bounds(&card_widget).expect("laid out");
             let (x, y) = (
                 (bounds.x() + bounds.width() / 2.0) as f64,
@@ -19591,6 +21446,204 @@ mod tests {
         expected.extend_from_slice(b"\x1b[201~");
         assert_eq!(view.pty.drain_test_slave(PTY_REPLY_WAIT), expected);
         assert_eq!(view.selected_block_id.get(), None, "the selection ended");
+        window.close();
+    }
+
+    /// A deterministic stalled-stat substitute uses the production admission,
+    /// main-loop poller, destination proof, paste encoder and real kernel PTYs.
+    /// It does not mount FUSE/NFS or claim to interrupt a kernel stat.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn slow_file_drop_keeps_gtk_responsive_and_discards_stale_delivery() {
+        use crate::image_drop::PathValidation;
+        use crate::ui::path_drop::{DropDestination, DropIntent};
+        use gtk4::prelude::*;
+        use std::time::{Duration, Instant};
+        gtk4::init().expect("gtk init");
+        let make_view = || {
+            super::TermView::new_with_spawner(
+                &crate::config::Config::safe_defaults(),
+                &crate::config::TerminalMode::Block,
+                &["sh".into()],
+                None,
+                None,
+                &[],
+                |_argv, _cwd, _env, _token| crate::pty::OwnedPty::for_tests(PtyForeground::Other),
+            )
+            .unwrap()
+        };
+        let a = Rc::new(make_view());
+        let b = Rc::new(make_view());
+        let c = Rc::new(make_view());
+        let leaf_a = crate::ui::PaneLeaf::Block(a.clone());
+        let leaf_b = crate::ui::PaneLeaf::Block(b.clone());
+        let leaf_c = crate::ui::PaneLeaf::Block(c.clone());
+        leaf_a.attach_to(&a.widget());
+        leaf_a.set_session_id("drop-a");
+        leaf_b.attach_to(&b.widget());
+        leaf_b.set_session_id("drop-b");
+        leaf_c.attach_to(&c.widget());
+        leaf_c.set_session_id("drop-c");
+        let split_page = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        split_page.append(&a.widget());
+        split_page.append(&c.widget());
+        let in_pane_find = gtk4::SearchEntry::new();
+        a.root.append(&in_pane_find);
+        let notebook = gtk4::Notebook::new();
+        notebook.append_page(&split_page, None::<&gtk4::Widget>);
+        notebook.append_page(&b.widget(), None::<&gtk4::Widget>);
+        let window = gtk4::Window::builder()
+            .default_width(700)
+            .default_height(400)
+            .child(&notebook)
+            .build();
+        window.present();
+        let pump = |duration: Duration| {
+            let main = gtk4::glib::MainContext::default();
+            let end = Instant::now() + duration;
+            while Instant::now() < end {
+                while main.pending() {
+                    main.iteration(false);
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        notebook.set_current_page(Some(0));
+        leaf_a.grab_focus();
+        pump(Duration::from_millis(200));
+        for view in [&a, &b, &c] {
+            view.pty.write_test_slave(
+                b"\x1b]133;A\x07$ \x1b]133;B\x07codex\r\n\x1b]133;C\x07\x1b[?2004h> ",
+            );
+        }
+        pump(Duration::from_millis(200));
+        for view in [&a, &b, &c] {
+            view.pty.drain_test_slave(Duration::from_millis(10));
+        }
+        let intent = DropIntent::install(&leaf_a);
+        let epoch = Rc::new(Cell::new(0_u64));
+        let epoch_for_switch = epoch.clone();
+        notebook.connect_switch_page(move |_, _, _| {
+            epoch_for_switch.set(epoch_for_switch.get().wrapping_add(1))
+        });
+        let reports = Rc::new(RefCell::new(Vec::<String>::new()));
+        let start = |delay: Duration, timeout: Duration| {
+            let destination =
+                DropDestination::capture(&leaf_a, &notebook, epoch.clone(), &intent).unwrap();
+            let (entered, receiver) = std::sync::mpsc::channel();
+            let job =
+                PathValidation::start_for_test(vec!["/tmp/a b's".into()], timeout, move |_| {
+                    entered.send(()).unwrap();
+                    std::thread::sleep(delay);
+                    true
+                })
+                .unwrap();
+            let reports = reports.clone();
+            destination.wait(job, move |error| {
+                reports.borrow_mut().push(error.to_owned())
+            });
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        };
+        // Keep the real main context turning while existence is held for 2s.
+        let ticks = Rc::new(Cell::new(0));
+        let tick_count = ticks.clone();
+        let ticker = gtk4::glib::timeout_add_local(Duration::from_millis(10), move || {
+            tick_count.set(tick_count.get() + 1);
+            gtk4::glib::ControlFlow::Continue
+        });
+        start(Duration::from_secs(2), Duration::from_secs(3));
+        let responsive = Instant::now();
+        a.write_input(b"typed-a").unwrap();
+        assert_eq!(
+            a.pty.drain_test_slave(Duration::from_millis(100)),
+            b"typed-a"
+        );
+        notebook.set_current_page(Some(1));
+        leaf_b.grab_focus();
+        pump(Duration::from_millis(100));
+        assert_eq!(notebook.current_page(), Some(1));
+        b.write_input(b"typed-b").unwrap();
+        assert_eq!(
+            b.pty.drain_test_slave(Duration::from_millis(100)),
+            b"typed-b"
+        );
+        assert!(
+            responsive.elapsed() < Duration::from_secs(1),
+            "GTK/input did not wait for the 2s check"
+        );
+        // A -> B -> A still invalidates the original intent, even with the same
+        // target/session/process restored before the worker replies.
+        notebook.set_current_page(Some(0));
+        leaf_a.grab_focus();
+        pump(Duration::from_millis(2100));
+        assert!(ticks.get() > 20);
+        assert!(a.pty.drain_test_slave(Duration::from_millis(20)).is_empty());
+        assert!(b.pty.drain_test_slave(Duration::from_millis(20)).is_empty());
+        // A current destination receives exactly the existing bracketed paste,
+        // with a trailing space and no Enter.
+        leaf_c.grab_focus();
+        pump(Duration::from_millis(30));
+        assert!(leaf_c.owns_widget(&window.upcast_ref::<gtk4::Root>().focus().unwrap()));
+        // The explicit drop focuses a previously unfocused split leaf now;
+        // the asynchronous completion must not mistake this for later intent.
+        start(Duration::from_millis(60), Duration::from_secs(1));
+        pump(Duration::from_millis(150));
+        let payload = format!("{} ", jterm_core::process::shell_single_quote("/tmp/a b's"));
+        let expected = format!("\x1b[200~{payload}\x1b[201~").into_bytes();
+        assert_eq!(a.pty.drain_test_slave(Duration::from_millis(100)), expected);
+        // A mouse-only focus change within the same pane is new intent too:
+        // the root remains focused, but the delayed paste must not steal focus
+        // from a search entry (or a finished-block VTE) back to live input.
+        start(Duration::from_millis(100), Duration::from_secs(1));
+        assert!(in_pane_find.grab_focus());
+        let search_focus = window.upcast_ref::<gtk4::Root>().focus();
+        pump(Duration::from_millis(150));
+        assert_eq!(window.upcast_ref::<gtk4::Root>().focus(), search_focus);
+        assert!(a.pty.drain_test_slave(Duration::from_millis(20)).is_empty());
+        // Leaving and returning to the exact live VTE is still a new intent.
+        start(Duration::from_millis(100), Duration::from_secs(1));
+        assert!(in_pane_find.grab_focus());
+        leaf_a.grab_focus();
+        pump(Duration::from_millis(150));
+        assert_eq!(
+            window.upcast_ref::<gtk4::Root>().focus().as_ref(),
+            Some(leaf_a.terminal().upcast_ref::<gtk4::Widget>())
+        );
+        assert!(a.pty.drain_test_slave(Duration::from_millis(20)).is_empty());
+        // Typing on the same pane invalidates its captured input generation,
+        // even without a tab or focus change.
+        start(Duration::from_millis(100), Duration::from_secs(1));
+        a.write_input(b"new-input").unwrap();
+        pump(Duration::from_millis(150));
+        assert_eq!(
+            a.pty.drain_test_slave(Duration::from_millis(100)),
+            b"new-input"
+        );
+        // Explicit cancellation and expiry cannot deliver late success.
+        start(Duration::from_millis(100), Duration::from_secs(1));
+        intent.invalidate();
+        pump(Duration::from_millis(150));
+        assert!(a.pty.drain_test_slave(Duration::from_millis(20)).is_empty());
+        start(Duration::from_millis(100), Duration::from_millis(30));
+        pump(Duration::from_millis(150));
+        assert!(reports
+            .borrow()
+            .iter()
+            .any(|text| text.contains("timed out")));
+        assert!(a.pty.drain_test_slave(Duration::from_millis(20)).is_empty());
+        // Closing/detaching the pane, then reusing its session string elsewhere,
+        // must not retarget a late result or retain the removed pane owner.
+        start(Duration::from_millis(100), Duration::from_secs(1));
+        notebook.remove_page(Some(0));
+        crate::ui::PaneLeaf::detach_from(&a.widget());
+        leaf_b.set_session_id("drop-a");
+        leaf_b.grab_focus();
+        pump(Duration::from_millis(150));
+        assert!(a.pty.drain_test_slave(Duration::from_millis(20)).is_empty());
+        assert!(b.pty.drain_test_slave(Duration::from_millis(20)).is_empty());
+        ticker.remove();
+        crate::ui::PaneLeaf::detach_from(&b.widget());
+        crate::ui::PaneLeaf::detach_from(&c.widget());
         window.close();
     }
 
@@ -19830,6 +21883,685 @@ mod tests {
         window.close();
     }
 
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn block_navigation_releases_feed_without_a_history_borrow() {
+        use gtk4::prelude::*;
+        gtk4::init().unwrap();
+        let config = crate::config::Config::safe_defaults();
+        let view = Rc::new(
+            super::TermView::new_with_spawner(
+                &config,
+                &crate::config::TerminalMode::Block,
+                &["sh".into()],
+                None,
+                None,
+                &[],
+                |_argv, _cwd, _env, _token| crate::pty::OwnedPty::for_tests(PtyForeground::Other),
+            )
+            .unwrap(),
+        );
+        let window = gtk4::Window::builder()
+            .default_width(700)
+            .default_height(400)
+            .child(&view.widget())
+            .build();
+        window.present();
+        let settle = || {
+            for _ in 0..20 {
+                for _ in 0..64 {
+                    if !gtk4::glib::MainContext::default().iteration(false) {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        settle();
+        view.pty
+            .write_test_slave(b"\x1b]133;A\x07$ \x1b]133;B\x07printf ok\r\n\x1b]133;C\x07ok\r\n");
+        settle();
+        view.pty.set_test_foreground(PtyForeground::Shell);
+        view.pty
+            .write_test_slave(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        settle();
+        assert_eq!(view.finished_blocks.borrow().len(), 1);
+        let history = view.finished_blocks.clone();
+        let writable = Rc::new(RefCell::new(Vec::new()));
+        let observed = writable.clone();
+        view.selection_feed_hold.set_flush(move |_| {
+            // The real replay path can finalize a command and mutate this
+            // history; check availability without panicking across GTK.
+            observed.borrow_mut().push(history.try_borrow_mut().is_ok());
+        });
+        for by_index in [false, true] {
+            view.selection_feed_hold.begin_drag();
+            assert!(view.selection_feed_hold.try_buffer(b"parked completion"));
+            view.selection_feed_hold.end_drag(true);
+            if by_index {
+                view.scroll_to_block(0);
+            } else {
+                view.scroll_lines(-1);
+            }
+            settle();
+        }
+        assert_eq!(&*writable.borrow(), &[true, true], "production navigation must release history borrows before replay can finalize or evict a block");
+        for _ in 0..2 {
+            view.pty.write_test_slave(b"printf next\r\n\x1b]133;C;cmdline_url=printf%20next\x07next\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+            settle();
+        }
+        assert_eq!(view.finished_blocks.borrow().len(), 3);
+        let oldest_id = view.finished_blocks.borrow()[0].id;
+        let target_id = view.finished_blocks.borrow()[1].id;
+        let weak_view = Rc::downgrade(&view);
+        view.selection_feed_hold.set_flush(move |_| {
+            weak_view.upgrade().unwrap().delete_block_by_id(oldest_id);
+        });
+        view.selection_feed_hold.begin_drag();
+        assert!(view.selection_feed_hold.try_buffer(b"retire older command"));
+        view.selection_feed_hold.end_drag(true);
+        view.scroll_to_block(1);
+        assert_eq!(
+            view.selected_block_id.get(),
+            Some(target_id),
+            "replay must not shift the requested navigation identity"
+        );
+        let survivor_id = view.finished_blocks.borrow()[1].id;
+        let weak_view = Rc::downgrade(&view);
+        view.selection_feed_hold.set_flush(move |_| {
+            weak_view.upgrade().unwrap().delete_block_by_id(target_id);
+        });
+        view.selection_feed_hold.begin_drag();
+        assert!(view
+            .selection_feed_hold
+            .try_buffer(b"retire target command"));
+        view.selection_feed_hold.end_drag(true);
+        view.scroll_to_block(0);
+        assert_ne!(
+            view.selected_block_id.get(),
+            Some(survivor_id),
+            "a retired target must not redirect navigation to its replacement index"
+        );
+        let fullscreen = view.fullscreen.clone();
+        view.selection_feed_hold
+            .set_flush(move |_| fullscreen.set(true));
+        view.selection_feed_hold.begin_drag();
+        assert!(view.selection_feed_hold.try_buffer(b"enter full screen"));
+        view.selection_feed_hold.end_drag(true);
+        view.select_all_blocks();
+        assert!(
+            view.selected_block_ids.borrow().is_empty(),
+            "replayed alt-screen ownership must block hidden history selection"
+        );
+        view.fullscreen.set(false);
+        window.close();
+        settle();
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn persistent_block_actions_reopen_without_duplicates_or_pty_input() {
+        use gtk4::prelude::*;
+        gtk4::init().expect("gtk init");
+        let config = crate::config::Config::safe_defaults();
+        let view = super::TermView::new_with_spawner(
+            &config,
+            &crate::config::TerminalMode::Block,
+            &["sh".to_string()],
+            None,
+            None,
+            &[],
+            |_argv, _cwd, _env, _token| crate::pty::OwnedPty::for_tests(PtyForeground::Other),
+        )
+        .expect("a Block pane over a test PTY");
+        let window = gtk4::Window::builder()
+            .default_width(700)
+            .default_height(400)
+            .child(&view.widget())
+            .build();
+        window.present();
+        let settle = || {
+            let context = gtk4::glib::MainContext::default();
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_millis(200) {
+                while context.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        settle();
+        view.pty
+            .write_test_slave(b"\x1b]133;A\x07$ \x1b]133;B\x07printf ok\r\n\x1b]133;C\x07ok\r\n");
+        settle();
+        view.pty.set_test_foreground(PtyForeground::Shell);
+        view.pty
+            .write_test_slave(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        settle();
+        view.pty
+            .drain_test_slave(std::time::Duration::from_millis(10));
+        let popovers = |card: &gtk4::Box| {
+            let mut result = Vec::new();
+            let mut child = card.first_child();
+            while let Some(widget) = child {
+                if let Ok(popover) = widget.clone().downcast::<gtk4::Popover>() {
+                    result.push(popover);
+                }
+                child = widget.next_sibling();
+            }
+            result
+        };
+        for restored in [false, true] {
+            if restored {
+                assert_eq!(view.undo_clear_blocks(), 1);
+                settle();
+                view.pty
+                    .drain_test_slave(std::time::Duration::from_millis(10));
+            }
+            let card = view
+                .finished_blocks
+                .borrow()
+                .last()
+                .unwrap()
+                .widget()
+                .clone();
+            // Exercise the actual descendant Actionable on a card created
+            // inside an already mapped pane, not just the card action muxer.
+            // Rooting a standalone card after installing its group can hide a
+            // broken late-binding chain through the intermediate containers.
+            view.scroll_to_block(0);
+            settle();
+            let header = view
+                .finished_blocks
+                .borrow()
+                .last()
+                .unwrap()
+                .header_row
+                .clone();
+            let mut child = header.first_child();
+            let mut more = None;
+            while let Some(widget) = child {
+                if widget.has_css_class("block-more-btn") {
+                    more = widget.clone().downcast::<gtk4::Button>().ok();
+                }
+                child = widget.next_sibling();
+            }
+            let more = more.expect("persistent More button");
+            assert!(more.is_mapped(), "More is mapped: restored={restored}");
+            assert!(
+                more.get_sensitive() && more.is_sensitive(),
+                "More action is enabled: restored={restored} own={} effective={} header={} action={:?}",
+                more.get_sensitive(), more.is_sensitive(), header.is_sensitive(), more.action_name()
+            );
+            assert!(more.grab_focus(), "More accepts keyboard focus");
+            assert_eq!(
+                gtk4::prelude::GtkWindowExt::focus(&window),
+                Some(more.clone().upcast()),
+            );
+            let selected = view.selected_block_ids.borrow().clone();
+            more.emit_clicked();
+            settle();
+            assert_eq!(*view.selected_block_ids.borrow(), selected);
+            assert_eq!(popovers(&card).len(), 1);
+            more.emit_clicked();
+            settle();
+            assert_eq!(
+                popovers(&card).len(),
+                1,
+                "native activation reuses the menu"
+            );
+            popovers(&card)[0].popdown();
+            settle();
+            assert!(popovers(&card).is_empty());
+
+            // Retain separate direct action coverage for non-button callers.
+            card.activate_action("block.show-menu", None)
+                .expect("installed action");
+            settle();
+            assert_eq!(popovers(&card).len(), 1);
+            let first = popovers(&card).pop().unwrap();
+            let scroll = first
+                .child()
+                .unwrap()
+                .downcast::<gtk4::ScrolledWindow>()
+                .unwrap();
+            assert_eq!(scroll.max_content_height(), 420);
+            card.activate_action("block.show-menu", None).unwrap();
+            settle();
+            assert_eq!(popovers(&card), vec![first.clone()]);
+            first.popdown();
+            settle();
+            assert!(popovers(&card).is_empty());
+            card.activate_action("block.show-menu", None).unwrap();
+            settle();
+            assert_eq!(popovers(&card).len(), 1);
+            popovers(&card)[0].popdown();
+            settle();
+            assert_eq!(view.clear_blocks(), 1);
+            settle();
+            more.emit_clicked();
+            // The pool explicitly removes the outer card's action group.
+            assert!(card.activate_action("block.show-menu", None).is_err());
+            // A retained button still owns its local group; its live-identity
+            // guard must refuse to reopen the retired card through either path.
+            more.activate_action("block.show-menu", None)
+                .expect("retained button still owns the guarded action");
+            settle();
+            assert!(popovers(&card).is_empty(), "retired card cannot reopen");
+            assert!(
+                view.pty
+                    .drain_test_slave(std::time::Duration::from_millis(10))
+                    .is_empty(),
+                "opening and closing a block menu must never send terminal input"
+            );
+        }
+        window.close();
+    }
+
+    /// Exercise the actual action group installed by BlockBackend, over a real
+    /// VTE/test PTY. Pure inspector fixtures cannot catch missing production
+    /// action wiring or accidental input/focus/geometry regressions.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn block_review_production_actions_are_read_only_responsive_and_revalidated() {
+        use gtk4::prelude::*;
+        gtk4::init().expect("gtk init");
+        let config = crate::config::Config::safe_defaults();
+        let view = super::TermView::new_with_spawner(
+            &config,
+            &crate::config::TerminalMode::Block,
+            &["sh".into()],
+            None,
+            None,
+            &[],
+            |_argv, _cwd, _env, _token| crate::pty::OwnedPty::for_tests(PtyForeground::Other),
+        )
+        .unwrap();
+        let owner = gtk4::Window::builder()
+            .default_width(900)
+            .default_height(720)
+            .child(&view.widget())
+            .build();
+        owner.present();
+        let settle = || {
+            let context = gtk4::glib::MainContext::default();
+            let started = std::time::Instant::now();
+            while started.elapsed() < std::time::Duration::from_millis(180) {
+                while context.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        fn descendants(widget: &gtk4::Widget) -> Vec<gtk4::Widget> {
+            let mut all = vec![widget.clone()];
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                child = current.next_sibling();
+                all.extend(descendants(&current));
+            }
+            all
+        }
+        let inspectors = || {
+            gtk4::Window::list_toplevels()
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<gtk4::Window>().ok())
+                .filter(|window| window.has_css_class("block-review-window") && window.is_visible())
+                .collect::<Vec<_>>()
+        };
+        settle();
+        for command in ["printf '你好🌿'", "cargo test --all-features", "true"] {
+            let encoded: String = command.bytes().map(|byte| format!("%{byte:02X}")).collect();
+            view.pty.write_test_slave(
+                format!("\x1b]133;A\x07$ \x1b]133;B\x07{command}\r\n\x1b]133;C;cmdline_url={encoded}\x07").as_bytes(),
+            );
+            settle();
+            if command == "true" {
+                view.pty
+                    .write_test_slave(b"\x1b_Ga=T,f=32,s=1,v=1,i=42,c=2,r=1,q=2;AP8A/w==\x1b\\");
+                settle();
+            }
+            view.pty.set_test_foreground(PtyForeground::Shell);
+            view.pty
+                .write_test_slave(b"\x1b]133;D\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+            settle();
+        }
+        assert_eq!(view.block_data.borrow().len(), 3);
+        {
+            let mut blocks = view.block_data.borrow_mut();
+            blocks[0].cwd = Some("/workspace/研究/long project directory".into());
+            blocks[1].exit_code = Some(7);
+            blocks[1].command_truncated = true;
+            blocks[1].output_notice = Some("Earlier output not retained".into());
+        }
+        let ids: HashSet<_> = view
+            .block_data
+            .borrow()
+            .iter()
+            .map(|record| record.id)
+            .collect();
+        *view.selected_block_ids.borrow_mut() = ids;
+        let card = view
+            .finished_blocks
+            .borrow()
+            .last()
+            .unwrap()
+            .widget()
+            .clone();
+        // Busy and dirty input does not prevent observation. No insertion or
+        // execution capability is available to this inspector at all.
+        view.pty.set_test_foreground(PtyForeground::Other);
+        view.pty
+            .drain_test_slave(std::time::Duration::from_millis(10));
+        view.pending_typeahead.set(true);
+        assert!(
+            descendants(
+                view.finished_blocks
+                    .borrow()
+                    .last()
+                    .unwrap()
+                    .widget()
+                    .upcast_ref()
+            )
+            .iter()
+            .any(|widget| widget.is::<gtk4::Picture>()),
+            "the fixture includes an image-only card"
+        );
+        let selected_id = view.finished_blocks.borrow().last().unwrap().id;
+        view.selected_block_id.set(Some(selected_id));
+        super::sync_finished_block_selection(
+            &view.finished_blocks.borrow(),
+            &view.selected_block_ids,
+            &view.selected_block_id,
+        );
+        let shelf = view
+            .finished_blocks
+            .borrow()
+            .last()
+            .unwrap()
+            .review_selection
+            .clone();
+        assert!(shelf.is_visible());
+        assert_eq!(shelf.label().as_deref(), Some("Review selection (3)"));
+        assert_eq!(
+            view.finished_blocks
+                .borrow()
+                .iter()
+                .filter(|block| block.review_selection.is_visible())
+                .count(),
+            1
+        );
+        assert!(shelf.is_sensitive(), "selection review action is enabled");
+        assert!(shelf.grab_focus(), "selection review is keyboard reachable");
+        settle();
+        let capture_owner = |name: &str| {
+            if let Ok(directory) = std::env::var("FORGE_REVIEW_SCREENSHOT_DIR") {
+                let paintable = gtk4::WidgetPaintable::new(Some(&owner));
+                let snapshot = gtk4::Snapshot::new();
+                paintable.snapshot(&snapshot, owner.width() as f64, owner.height() as f64);
+                owner
+                    .renderer()
+                    .unwrap()
+                    .render_texture(snapshot.to_node().unwrap(), None)
+                    .save_to_png(std::path::Path::new(&directory).join(name))
+                    .unwrap();
+            }
+        };
+        capture_owner("forge-selection-shelf-wide.png");
+        owner.set_default_size(360, 720);
+        settle();
+        assert!(shelf.width() <= owner.width());
+        capture_owner("forge-selection-shelf-narrow.png");
+        owner.set_default_size(900, 720);
+        settle();
+        view.unread_count.set(7);
+        let winsize = view.pty.test_slave_winsize();
+        let scroll = view.block_scroll.vadjustment().value();
+        shelf.emit_clicked();
+        settle();
+        assert_eq!(inspectors().len(), 1);
+        let review = inspectors().pop().unwrap();
+        card.activate_action("block.review", None).unwrap();
+        settle();
+        assert_eq!(inspectors().as_slice(), std::slice::from_ref(&review));
+        assert!(review.is_modal());
+        let widgets = descendants(review.upcast_ref());
+        let texts: Vec<_> = widgets
+            .iter()
+            .filter_map(|widget| widget.clone().downcast::<gtk4::TextView>().ok())
+            .collect();
+        assert_eq!(texts.len(), 2);
+        assert!(texts.iter().all(|text| !text.is_editable()));
+        let picker = widgets
+            .iter()
+            .find_map(|widget| widget.clone().downcast::<gtk4::DropDown>().ok())
+            .unwrap();
+        assert_eq!(picker.model().unwrap().n_items(), 3);
+        picker.set_selected(1);
+        settle();
+        assert!(texts.iter().any(|text| {
+            let buffer = text.buffer();
+            buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                .contains("Truncated command report")
+        }));
+        let screenshot = |name: &str| {
+            if let Ok(directory) = std::env::var("FORGE_REVIEW_SCREENSHOT_DIR") {
+                let paintable = gtk4::WidgetPaintable::new(Some(&review));
+                let snapshot = gtk4::Snapshot::new();
+                paintable.snapshot(&snapshot, review.width() as f64, review.height() as f64);
+                let node = snapshot.to_node().expect("rendered review");
+                let renderer = review.renderer().expect("native renderer");
+                renderer
+                    .render_texture(&node, None)
+                    .save_to_png(std::path::Path::new(&directory).join(name))
+                    .unwrap();
+            }
+        };
+        screenshot("forge-block-review-wide.png");
+        picker.set_selected(0);
+        settle();
+        screenshot("forge-block-review-unicode.png");
+        picker.set_selected(1);
+        review.set_default_size(360, 520);
+        settle();
+        assert!(
+            review.width() <= 400,
+            "narrow inspector: {}",
+            review.width()
+        );
+        screenshot("forge-block-review-narrow.png");
+        let stack = widgets
+            .iter()
+            .find_map(|widget| widget.clone().downcast::<gtk4::Stack>().ok())
+            .unwrap();
+        stack.set_visible_child_name("commands");
+        settle();
+        screenshot("forge-command-order-narrow.png");
+        let copy = widgets
+            .iter()
+            .find_map(|widget| {
+                widget
+                    .clone()
+                    .downcast::<gtk4::Button>()
+                    .ok()
+                    .filter(|button| button.label().as_deref() == Some("Copy commands"))
+            })
+            .unwrap();
+        assert!(copy.is_sensitive());
+        copy.emit_clicked();
+        settle();
+        let clipboard = gtk4::glib::MainContext::default()
+            .block_on(copy.clipboard().read_text_future())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            clipboard,
+            "printf '你好🌿'\ncargo test --all-features\ntrue"
+        );
+        // An evicted identity never silently becomes a copy of a smaller range.
+        let evicted = view.block_data.borrow_mut().pop_front().unwrap();
+        copy.emit_clicked();
+        assert!(!copy.is_sensitive());
+        assert!(descendants(review.upcast_ref()).iter().any(|widget| widget
+            .clone()
+            .downcast::<gtk4::Label>()
+            .ok()
+            .is_some_and(|label| label.text().contains("no longer retained"))));
+        assert_eq!(view.pty.test_slave_winsize(), winsize);
+        assert_eq!(view.block_scroll.vadjustment().value(), scroll);
+        assert!(view
+            .pty
+            .drain_test_slave(std::time::Duration::from_millis(10))
+            .is_empty());
+        assert!(
+            view.pending_typeahead.get(),
+            "review leaves a dirty/busy prompt unchanged"
+        );
+        view.block_data.borrow_mut().push_front(evicted);
+        // Emit through the production key controller, including Escape focus return.
+        let controllers = review.observe_controllers();
+        for index in 0..controllers.n_items() {
+            if let Some(keys) = controllers
+                .item(index)
+                .and_downcast::<gtk4::EventControllerKey>()
+            {
+                keys.emit_by_name::<bool>(
+                    "key-pressed",
+                    &[
+                        &gtk4::gdk::Key::Escape,
+                        &0u32,
+                        &gtk4::gdk::ModifierType::empty(),
+                    ],
+                );
+            }
+        }
+        settle();
+        assert!(inspectors().is_empty());
+        assert!(
+            shelf.has_focus(),
+            "Escape restores the invoking selection action"
+        );
+        assert_eq!(view.block_scroll.vadjustment().value(), scroll);
+        assert_eq!(view.unread_count.get(), 7);
+        assert_eq!(view.selected_block_ids.borrow().len(), 3);
+        card.activate_action("block.review", None).unwrap();
+        settle();
+        assert_eq!(inspectors().len(), 1);
+        let close = descendants(inspectors()[0].upcast_ref())
+            .into_iter()
+            .find_map(|widget| {
+                widget
+                    .downcast::<gtk4::Button>()
+                    .ok()
+                    .filter(|button| button.label().as_deref() == Some("Close"))
+            })
+            .unwrap();
+        close.emit_clicked();
+        settle();
+        assert!(shelf.has_focus(), "Close also restores the invoking action");
+        assert_eq!(view.unread_count.get(), 7);
+        assert!(view
+            .pty
+            .drain_test_slave(std::time::Duration::from_millis(10))
+            .is_empty());
+        view.pending_typeahead.set(false);
+        let selected_before_clear = view.selected_block_ids.borrow().clone();
+        let active_before_clear = view.selected_block_id.get();
+        let anchor_before_clear = view.selection_anchor_id.get();
+        let bookmarked_id = view.finished_blocks.borrow()[0].id;
+        if !view.bookmarks.borrow().contains(bookmarked_id) {
+            view.bookmarks.borrow_mut().toggle(bookmarked_id);
+        }
+        assert_eq!(view.clear_blocks(), 3);
+        assert_eq!(
+            view.clear_blocks(),
+            0,
+            "empty Clear preserves the undo level"
+        );
+        view.fullscreen.set(true);
+        assert_eq!(
+            view.undo_clear_blocks_result(),
+            super::UndoClearResult::Fullscreen
+        );
+        view.fullscreen.set(false);
+        let limit = view.config.borrow().max_visible_blocks;
+        view.config.borrow_mut().max_visible_blocks = 0;
+        assert_eq!(
+            view.undo_clear_blocks_result(),
+            super::UndoClearResult::AtCapacity
+        );
+        view.config.borrow_mut().max_visible_blocks = limit;
+        assert_eq!(view.undo_clear_blocks(), 3);
+        assert_eq!(*view.selected_block_ids.borrow(), selected_before_clear);
+        assert_eq!(view.selected_block_id.get(), active_before_clear);
+        assert_eq!(view.selection_anchor_id.get(), anchor_before_clear);
+        assert!(view.bookmarks.borrow().contains(bookmarked_id));
+        {
+            let finished = view.finished_blocks.borrow();
+            let bookmarked = finished
+                .iter()
+                .find(|card| card.id == bookmarked_id)
+                .unwrap();
+            assert!(bookmarked.bookmark_star.is_visible());
+            assert!(bookmarked.widget().has_css_class("block-bookmarked"));
+            for card in finished
+                .iter()
+                .filter(|card| !view.bookmarks.borrow().contains(card.id))
+            {
+                assert!(!card.bookmark_star.is_visible());
+                assert!(!card.widget().has_css_class("block-bookmarked"));
+            }
+        }
+        settle();
+        let restored = view
+            .finished_blocks
+            .borrow()
+            .last()
+            .unwrap()
+            .widget()
+            .clone();
+        restored.activate_action("block.review", None).unwrap();
+        settle();
+        assert_eq!(
+            inspectors().len(),
+            1,
+            "restored cards get the production review action"
+        );
+        // New completions are not inserted into the review snapshot and do
+        // not steal the reading position or reset unread state.
+        let review = inspectors()[0].clone();
+        let picker = descendants(review.upcast_ref())
+            .into_iter()
+            .find_map(|widget| widget.downcast::<gtk4::DropDown>().ok())
+            .unwrap();
+        let reviewed_count = picker.model().unwrap().n_items();
+        view.user_scrolled_up.set(true);
+        view.unread_count.set(9);
+        let reading_position = view.block_scroll.vadjustment().value();
+        view.pty.set_test_foreground(PtyForeground::Shell);
+        view.pty.write_test_slave(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07true\r\n\x1b]133;C;cmdline_url=true\x07",
+        );
+        settle();
+        view.pty
+            .write_test_slave(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        settle();
+        assert_eq!(view.block_data.borrow().len(), 4);
+        assert_eq!(picker.model().unwrap().n_items(), reviewed_count);
+        assert_eq!(view.unread_count.get(), 10);
+        assert_eq!(view.block_scroll.vadjustment().value(), reading_position);
+        // Eviction/unmount while reading must not hold or focus old history.
+        assert_eq!(view.clear_blocks(), 4);
+        inspectors()[0].close();
+        settle();
+        assert!(
+            view.active_vte.has_focus(),
+            "unmounted history uses live fallback"
+        );
+        assert!(view
+            .pty
+            .drain_test_slave(std::time::Duration::from_millis(10))
+            .is_empty());
+        owner.close();
+    }
+
     /// End to end on a real pane: output the line replay cuts short puts the
     /// notice on the card — saying the END was lost, not the beginning — and
     /// into the block's data, so an undo or a history reload keeps it.
@@ -19900,13 +22632,16 @@ mod tests {
             assert!(block.output.starts_with("start"));
             assert_eq!(
                 block.output_notice.as_deref(),
-                Some("Output text truncated")
+                Some(super::FINISHED_OUTPUT_TEXT_TRUNCATED)
             );
         }
         let cards = view.finished_blocks.borrow();
         let card = cards.last().expect("a finished card");
         assert!(card.output_notice.is_visible());
-        assert_eq!(card.output_notice.text(), "Output text truncated");
+        assert_eq!(
+            card.output_notice.text(),
+            super::FINISHED_OUTPUT_TEXT_TRUNCATED
+        );
         drop(cards);
         window.close();
     }
@@ -20184,6 +22919,142 @@ mod tests {
         record_unified_zone(&mut zones, record(4, "fourth"), 0);
         assert_eq!(zones.records.len(), 1);
         assert_eq!(zones.records[0].id, 4);
+    }
+
+    #[test]
+    fn unified_restart_snapshot_keeps_newest_record_and_output_identity() {
+        let mut zones = UnifiedZoneStore::new();
+        for id in 1..=5 {
+            record_unified_zone(
+                &mut zones,
+                CompletedCommandRecord {
+                    id,
+                    cmd: format!("command-{id}"),
+                    exit_code: Some(id as i32),
+                    start_time_ms: None,
+                    end_time_ms: None,
+                    duration_ms: None,
+                    cwd: None,
+                    is_background: false,
+                    completion_provenance: super::CompletionProvenance::ShellReported,
+                    command_source: super::CommandTextSource::ShellReported,
+                    start_mark_seen: true,
+                },
+                5,
+            );
+            zones.insert_snapshot(
+                id,
+                ZoneOutputSnapshot {
+                    plain: format!("output-{id}"),
+                    truncated: false,
+                },
+            );
+        }
+        let snapshot = zones.replay_snapshot(2, 4096);
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|zone| zone.cmd.as_str())
+                .collect::<Vec<_>>(),
+            ["command-4", "command-5"]
+        );
+        assert_eq!(snapshot[0].output.as_deref(), Some("output-4"));
+        assert_eq!(snapshot[1].output.as_deref(), Some("output-5"));
+        assert_eq!(snapshot[1].exit_code, Some(5));
+        assert!(zones.replay_snapshot(0, 4096).is_empty());
+        assert!(zones.replay_snapshot(2, 0).is_empty());
+        assert_eq!(zones.records.len(), 5, "saving never mutates live history");
+        assert_eq!(zones.snapshots.len(), 5);
+    }
+
+    #[test]
+    fn unified_metadata_byte_budget_retires_identity_and_snapshot_together() {
+        let record = |id| CompletedCommandRecord {
+            id,
+            cmd: format!("command-{id}"),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: Some("/tmp/example".into()),
+            is_background: false,
+            completion_provenance: super::CompletionProvenance::ShellReported,
+            command_source: super::CommandTextSource::ShellReported,
+            start_mark_seen: true,
+        };
+        let mut zones = UnifiedZoneStore::new();
+        let budget = record(1).estimated_retained_bytes() * 2;
+        for id in 1..=2 {
+            assert!(
+                super::record_unified_zone_with_budget(&mut zones, record(id), 1000, budget)
+                    .is_empty()
+            );
+            zones.insert_snapshot(
+                id,
+                ZoneOutputSnapshot {
+                    plain: format!("output-{id}"),
+                    truncated: false,
+                },
+            );
+        }
+        let retired = super::record_unified_zone_with_budget(&mut zones, record(3), 1000, budget);
+        assert_eq!(retired, [1]);
+        assert_eq!(
+            zones
+                .records
+                .iter()
+                .map(|record| record.id)
+                .collect::<Vec<_>>(),
+            [2, 3]
+        );
+        assert!(zones.snapshot(1).is_none());
+        assert_eq!(zones.snapshot(2).unwrap().plain, "output-2");
+        assert_eq!(zones.snapshot_bytes, "output-2".len());
+        assert_eq!(
+            zones.record_bytes,
+            zones
+                .records
+                .iter()
+                .map(CompletedCommandRecord::estimated_retained_bytes)
+                .sum::<usize>()
+        );
+        assert!(zones.record_bytes <= budget);
+        let retired = super::record_unified_zone_with_budget(&mut zones, record(4), 0, 0);
+        assert_eq!(retired, [2, 3]);
+        assert_eq!(
+            zones.records[0].id, 4,
+            "the newest command survives a degenerate budget"
+        );
+        assert_eq!(
+            zones.record_bytes,
+            zones.records[0].estimated_retained_bytes()
+        );
+        assert_eq!(zones.snapshot_bytes, 0);
+    }
+
+    #[test]
+    fn unified_metadata_budget_accounts_for_reserved_string_capacity() {
+        let mut record = CompletedCommandRecord {
+            id: 1,
+            cmd: String::with_capacity(4096),
+            exit_code: None,
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: Some(String::with_capacity(2048)),
+            is_background: false,
+            completion_provenance: super::CompletionProvenance::Unknown,
+            command_source: super::CommandTextSource::Screen,
+            start_mark_seen: false,
+        };
+        record.cmd.push('x');
+        record.cwd.as_mut().unwrap().push('/');
+        assert_eq!(
+            record.estimated_retained_bytes(),
+            std::mem::size_of::<CompletedCommandRecord>()
+                + record.cmd.capacity()
+                + record.cwd.as_ref().unwrap().capacity()
+        );
     }
 
     #[test]
@@ -20556,18 +23427,18 @@ mod tests {
         for flags in [(true, false, false), (false, false, true)] {
             assert_eq!(
                 super::finished_output_notice(flags.0, flags.1, flags.2),
-                Some("Earlier output not retained"),
+                Some(super::FINISHED_OUTPUT_NOT_RETAINED),
                 "{flags:?}"
             );
         }
         // The line replay keeps the head and loses the END.
         assert_eq!(
             super::finished_output_notice(false, true, false),
-            Some("Output text truncated")
+            Some(super::FINISHED_OUTPUT_TEXT_TRUNCATED)
         );
         assert_eq!(
             super::finished_output_notice(true, true, false),
-            Some("Output only partly retained")
+            Some(super::FINISHED_OUTPUT_PARTLY_RETAINED)
         );
         for notice in [
             super::FINISHED_OUTPUT_NOT_RETAINED,
@@ -20595,7 +23466,7 @@ mod tests {
         );
         assert_eq!(
             payload.materialize().output_notice(),
-            Some("Earlier output not retained")
+            Some(super::FINISHED_OUTPUT_NOT_RETAINED)
         );
     }
 
@@ -22797,6 +25668,36 @@ mod tests {
     }
 
     #[test]
+    fn kitty_layout_shifted_keys_keep_exact_text_for_commit_rewriting() {
+        use super::{kitty_key_for, kitty_keyboard, KittyKey, KittyModifiers};
+        use gtk4::gdk::Key;
+        let mods = KittyModifiers {
+            shift: true,
+            alt: true,
+            ..KittyModifiers::default()
+        };
+        for (keyval, base, text) in [
+            (Key::exclam, '1', '!'),
+            (Key::quotedbl, '2', '"'),
+            (Key::colon, ';', ':'),
+            (Key::numerosign, 'ж', '№'),
+        ] {
+            let key = kitty_key_for(keyval, Some(base));
+            assert_eq!(key, KittyKey::UnicodeWithText { base, text });
+            assert_eq!(
+                kitty_keyboard::rewrite_commit(key, mods, format!("\x1b{text}").as_bytes(), 1),
+                kitty_keyboard::encode_key(KittyKey::Unicode(base), mods, 1)
+            );
+            assert_eq!(kitty_keyboard::rewrite_commit(key, mods, b"paste", 1), None);
+        }
+        assert_eq!(kitty_key_for(Key::A, Some('a')), KittyKey::Unicode('a'));
+        assert_eq!(
+            kitty_key_for(Key::Cyrillic_ZHE, Some('ж')),
+            KittyKey::Unicode('ж')
+        );
+    }
+
+    #[test]
     fn kitty_key_mapping_names_the_keys_the_protocol_treats_specially() {
         use super::{base_unicode_for, kitty_control_bytes, kitty_key_for, KittyKey};
         use gtk4::gdk::Key;
@@ -22907,6 +25808,130 @@ mod tests {
             command_truncated: false,
             output_notice: None,
         }
+    }
+
+    #[test]
+    fn clear_undo_preserves_state_and_refused_or_empty_removals() {
+        use super::{ClearedBlocksStash, RemovedBlocks, UndoClearResult};
+        let mut block = block_with_height(10);
+        block.id = 11;
+        let mut slot = None;
+        assert_eq!(
+            RemovedBlocks::replace_if_nonempty(
+                &mut slot,
+                RemovedBlocks::Cleared(ClearedBlocksStash {
+                    blocks: vec![block],
+                    bookmarks: HashSet::from([11]),
+                    selected_ids: HashSet::from([11]),
+                    active_id: Some(11),
+                    anchor_id: Some(11),
+                }),
+            ),
+            1
+        );
+        assert_eq!(
+            RemovedBlocks::replace_if_nonempty(
+                &mut slot,
+                RemovedBlocks::Cleared(ClearedBlocksStash::default()),
+            ),
+            0
+        );
+        assert!(matches!(
+            RemovedBlocks::take_for_restore(&mut slot, true, 1),
+            Err(UndoClearResult::Fullscreen)
+        ));
+        assert!(matches!(
+            RemovedBlocks::take_for_restore(&mut slot, false, 0),
+            Err(UndoClearResult::AtCapacity)
+        ));
+        let RemovedBlocks::Cleared(stash) =
+            RemovedBlocks::take_for_restore(&mut slot, false, 1).unwrap()
+        else {
+            panic!("Clear must keep its kind and UI state");
+        };
+        assert_eq!(stash.blocks[0].id, 11);
+        assert_eq!(stash.bookmarks, HashSet::from([11]));
+        assert_eq!(stash.selected_ids, HashSet::from([11]));
+        assert_eq!(stash.active_id, Some(11));
+        assert_eq!(stash.anchor_id, Some(11));
+        assert!(slot.is_none());
+        assert!(matches!(
+            RemovedBlocks::take_for_restore(&mut slot, false, 1),
+            Err(UndoClearResult::Empty)
+        ));
+    }
+
+    #[test]
+    fn delete_undo_still_replaces_clear_and_restores_at_clear_capacity() {
+        use super::{ClearedBlocksStash, RemovedBlocks, UndoClearResult};
+        let mut slot = Some(RemovedBlocks::Cleared(ClearedBlocksStash {
+            blocks: vec![block_with_height(10)],
+            ..ClearedBlocksStash::default()
+        }));
+        assert_eq!(
+            RemovedBlocks::replace_if_nonempty(
+                &mut slot,
+                RemovedBlocks::Deleted(vec![block_with_height(20)]),
+            ),
+            1
+        );
+        assert!(matches!(
+            RemovedBlocks::take_for_restore(&mut slot, true, 0),
+            Err(UndoClearResult::Fullscreen)
+        ));
+        assert!(matches!(
+            RemovedBlocks::take_for_restore(&mut slot, false, 0),
+            Ok(RemovedBlocks::Deleted(_))
+        ));
+        assert!(slot.is_none());
+    }
+
+    #[test]
+    fn restored_bookmarks_merge_new_state_and_exclude_evicted_cards() {
+        let mut bookmarks = super::BookmarkState::default();
+        bookmarks.toggle(40);
+        let revision = bookmarks.revision();
+        bookmarks.restore_retained(HashSet::from([10, 20, 30]), &HashSet::from([20, 30]));
+        assert_eq!(bookmarks.ids, HashSet::from([20, 30, 40]));
+        assert_eq!(bookmarks.revision(), revision + 1);
+        bookmarks.restore_retained(HashSet::from([10, 20]), &HashSet::from([20, 30]));
+        assert_eq!(
+            bookmarks.revision(),
+            revision + 1,
+            "unchanged membership is quiet"
+        );
+    }
+
+    #[test]
+    fn restored_selection_keeps_new_edges_and_repairs_evicted_old_edges() {
+        let ordered = [20, 30, 40];
+        let selected = HashSet::from([20, 30, 40]);
+        assert_eq!(
+            super::restored_selection_edges(
+                &ordered,
+                &selected,
+                Some(40),
+                Some(40),
+                Some(20),
+                Some(30),
+            ),
+            (Some(40), Some(40))
+        );
+        assert_eq!(
+            super::restored_selection_edges(&ordered, &selected, None, None, Some(10), Some(10),),
+            (Some(40), Some(40))
+        );
+        assert_eq!(
+            super::restored_selection_edges(
+                &ordered,
+                &HashSet::new(),
+                None,
+                None,
+                Some(10),
+                Some(10),
+            ),
+            (None, None)
+        );
     }
 
     #[test]
@@ -23437,6 +26462,39 @@ mod tests {
                 self.rendered_height
             }
         }
+
+        fn remember_allocated_height(&self, height: i32) {
+            self.placeholder.set(height);
+        }
+    }
+
+    #[test]
+    fn rendered_measurements_survive_allocation_preserving_parking() {
+        let cards = vec![FakeCard::rendered(180), FakeCard::rendered(240)];
+        cards[0].placeholder.set(20);
+        cards[1].placeholder.set(30);
+        let mut blocks = VecDeque::from([block_with_height(20), block_with_height(30)]);
+        let mut index = document_index_of(&blocks);
+        let mut visible = std::collections::HashSet::from([0, 1]);
+        super::apply_visible_indices(
+            &cards,
+            &mut blocks,
+            &mut index,
+            &mut visible,
+            std::collections::HashSet::from([0, 1]),
+        );
+        assert_eq!(cards[0].placeholder.get(), 180);
+        assert_eq!(cards[1].placeholder.get(), 240);
+        super::apply_visible_indices_preserving_heights(
+            &cards,
+            &mut blocks,
+            &mut index,
+            &mut visible,
+            std::collections::HashSet::from([1]),
+        );
+        assert_eq!(blocks[0].estimated_height, 180);
+        assert_eq!(blocks[1].estimated_height, 240);
+        assert!(cards[0].is_virtualized());
     }
 
     /// Toggling a pane filter re-measures every card and re-resolves the
@@ -24188,10 +27246,10 @@ mod tests {
 
     #[test]
     fn csi_erase_line_from_start() {
-        // CSI 1K: erase from start to cursor (fills with spaces)
+        // CSI 1K: erase from start through cursor, inclusive (fills with spaces)
         assert_eq!(
             strip_ansi_with_clear_detect("abcdef\r\u{1b}[3C\u{1b}[1K"),
-            ("   def".to_string(), false)
+            ("    ef".to_string(), false)
         );
     }
 
@@ -25696,7 +28754,7 @@ mod tests {
     /// A `ReaderCtx` wired to [`RecordingBackend`], a bare-`openpty` PTY and
     /// real engine state, plus the observable fan-outs the lifecycle drives.
     struct ReaderHarness {
-        ctx: ReaderCtx,
+        ctx: Rc<ReaderCtx>,
         backend: Rc<RecordingBackend>,
         surface: Rc<RecordingSurface>,
         pty: Rc<crate::pty::OwnedPty>,
@@ -25870,6 +28928,7 @@ mod tests {
             }
 
             let verified_submission = VerifiedSubmissionCtx {
+                input_feedback: super::input_feedback::InputFeedback::detached(),
                 surface: surface.clone(),
                 bstate: bstate.clone(),
                 pty: pty.clone(),
@@ -25893,6 +28952,7 @@ mod tests {
                 pending_agent_generation: Rc::new(Cell::new(None)),
                 agent_execution_lost_callbacks: agent_execution_lost_cbs.clone(),
                 agent_execution_supported: agent_execution_supported.clone(),
+                prompt_evidence_invalidated: Rc::new(RefCell::new(Vec::new())),
             };
 
             let ctx = ReaderCtx {
@@ -25947,6 +29007,7 @@ mod tests {
                 remote_session_cbs: Rc::new(RefCell::new(Vec::new())),
                 exited_cbs: Rc::new(RefCell::new(Vec::new())),
                 activity_cbs: Rc::new(RefCell::new(Vec::new())),
+                watch_reader: Rc::new(super::WatchReader::default()),
                 alt_screen_cbs,
                 mouse_reporting_rc: Rc::new(Cell::new(MouseReporting::OFF)),
                 live_input_modes_rc: Rc::new(Cell::new(super::LiveInputModes::default())),
@@ -25979,6 +29040,8 @@ mod tests {
                 selection_feed_hold: SelectionFeedHold::new(),
             };
 
+            let ctx = Rc::new(ctx);
+            ctx.install_watch_hold();
             Self {
                 ctx,
                 backend,
@@ -26018,13 +29081,9 @@ mod tests {
             }
         }
 
+        /// Exercise the exact production read/hold/parser/coalescer path.
         fn feed_raw(&self, bytes: &[u8]) {
-            let mut events = Vec::new();
-            self.ctx.parser.borrow_mut().feed(bytes, &mut events);
-            coalesce_bytes_events(&mut events);
-            for event in &events {
-                self.ctx.handle_event(event);
-            }
+            self.ctx.process_fresh_read(bytes);
         }
 
         /// The running command's engine-owned raw-output ring.
@@ -26086,6 +29145,481 @@ mod tests {
 
     fn bytes(text: &str) -> ParserEvent {
         ParserEvent::Bytes(text.as_bytes().to_vec())
+    }
+
+    fn assert_session_parity_finalization(
+        completed_zone_ids: &[u64],
+        finalized_ids: &[u64],
+        at_final_prompt: bool,
+        context: &str,
+    ) {
+        let unique: std::collections::HashSet<_> = finalized_ids.iter().collect();
+        assert_eq!(
+            unique.len(),
+            finalized_ids.len(),
+            "{context}: duplicate finalization"
+        );
+        assert!(
+            finalized_ids.len() <= completed_zone_ids.len(),
+            "{context}: finalization without accepted completion"
+        );
+        assert_eq!(
+            finalized_ids,
+            &completed_zone_ids[..finalized_ids.len()],
+            "{context}: finalization belongs to a different completion zone"
+        );
+        if at_final_prompt {
+            assert_eq!(
+                finalized_ids.len(),
+                completed_zone_ids.len(),
+                "{context}: final prompt must finalize every completed zone"
+            );
+        }
+    }
+
+    // Shared raw-byte corpus through the production reader/parser/lifecycle owner.
+    // RecordingBackend observes engine effects; this is not native GTK/VTE proof.
+    fn assert_session_parity_fixture(fixture_id: &str) {
+        use jterm_core::chat_mode::ChatSurface;
+        use jterm_core::session_parity::{chunks, fixtures, Completion, CHUNKINGS};
+
+        let fixture = fixtures().into_iter().find(|f| f.id == fixture_id).unwrap();
+        for chunking in CHUNKINGS {
+            let harness = ReaderHarness::new();
+            let identity = || harness.ctx.engine.borrow().pending_command_meta.id.clone();
+            let mut completed = Vec::new();
+            let mut completed_zone_ids = Vec::new();
+            for (step_index, step) in fixture.steps.iter().enumerate() {
+                for chunk in chunks(step.pty.as_bytes(), chunking) {
+                    // Correlate an actual completion fan-out with the owner's
+                    // identity immediately before this read, never the fixture ID.
+                    let before_id = identity();
+                    let before_count = harness.commands_finished.borrow().len();
+                    let before_zone = harness
+                        .ctx
+                        .engine
+                        .borrow()
+                        .pending_zone
+                        .map(|zone| zone.id());
+                    harness.feed_raw(chunk);
+                    for event in harness.commands_finished.borrow().iter().skip(before_count) {
+                        completed_zone_ids
+                            .push(before_zone.expect("completion retains its original zone"));
+                        completed.push(Completion {
+                            id: before_id
+                                .clone()
+                                .expect("completed execution has an observed start ID"),
+                            command: event.command.clone(),
+                            exit_code: event.exit_code,
+                        });
+                    }
+                }
+                // D emits completion before the next A finalizes the card.
+                // Compare actual backend calls with the zones observed at that
+                // completion, and require all of them at the final prompt.
+                let context = format!(
+                    "fixture={} step={} chunking={chunking:?}",
+                    fixture.id, step_index
+                );
+                assert_session_parity_finalization(
+                    &completed_zone_ids,
+                    &harness.backend.finalized_ids.borrow(),
+                    step_index + 1 == fixture.steps.len() && step.expected.surface == "prompt",
+                    &context,
+                );
+                let surface =
+                    super::chat::surface(harness.bstate.get(), harness.ctx.ftcs_seen_rc.get());
+                let running_id = matches!(surface, ChatSurface::Running | ChatSurface::Fullscreen)
+                    .then(identity)
+                    .flatten();
+                let surface_name = match surface {
+                    ChatSurface::Prompt => "prompt",
+                    ChatSurface::Running => "running",
+                    ChatSurface::Passthrough => "passthrough",
+                    ChatSurface::Fullscreen => "fullscreen",
+                };
+                // This recording seam has no terminal emulator. In particular,
+                // expected.draft_text requires a real native renderer; do not
+                // pretend manually seeded grid rows verify terminal editing.
+                assert_eq!(
+                    (surface_name, &completed, &running_id),
+                    (
+                        step.expected.surface.as_str(),
+                        &step.expected.completed,
+                        &step.expected.running_id
+                    ),
+                    "fixture={} step={} chunking={:?}",
+                    fixture.id,
+                    step_index,
+                    chunking
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn session_parity_late_end_does_not_close_new_execution() {
+        use jterm_core::session_parity::{chunks, CHUNKINGS};
+        for chunking in CHUNKINGS {
+            let harness = ReaderHarness::new();
+            let feed = |bytes: &[u8]| {
+                for chunk in chunks(bytes, chunking) {
+                    harness.feed_raw(chunk);
+                }
+            };
+            feed(b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b]133;C;id=old;cmdline_url=old\x07\x1b]133;D;0;id=old\x07");
+            feed(b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b]133;C;id=new;cmdline_url=new\x07");
+            feed(b"\x1b]133;D;9;id=old\x07");
+            assert_eq!(harness.bstate.get(), BlockState::CollectingOutput);
+            assert_eq!(harness.commands_finished.borrow().len(), 1);
+            feed(b"\x1b]133;D;7;id=new\x07\x1b]133;D;7;id=new\x07");
+            assert_eq!(harness.commands_finished.borrow().len(), 2);
+            assert_eq!(harness.commands_finished.borrow()[1].command, "new");
+            assert_eq!(harness.commands_finished.borrow()[1].exit_code, Some(7));
+        }
+    }
+
+    #[test]
+    fn session_parity_missing_ids_retain_legacy_completion() {
+        use jterm_core::session_parity::{chunks, CHUNKINGS};
+        for chunking in CHUNKINGS {
+            for (start, end) in [
+                (
+                    "\x1b]133;C;cmdline_url=legacy\x07",
+                    "\x1b]133;D;3;id=end-only\x07",
+                ),
+                (
+                    "\x1b]133;C;id=start-only;cmdline_url=legacy\x07",
+                    "\x1b]133;D;3\x07",
+                ),
+            ] {
+                let harness = ReaderHarness::new();
+                let bytes = format!("\x1b]133;A\x07$ \x1b]133;B\x07{start}{end}");
+                for chunk in chunks(bytes.as_bytes(), chunking) {
+                    harness.feed_raw(chunk);
+                }
+                assert_eq!(harness.bstate.get(), BlockState::PostCommand);
+                assert_eq!(harness.commands_finished.borrow().len(), 1);
+                assert_eq!(harness.commands_finished.borrow()[0].exit_code, Some(3));
+            }
+        }
+    }
+
+    #[test]
+    fn session_parity_mismatched_end_recovers_at_shell_prompt() {
+        use jterm_core::session_parity::{chunks, CHUNKINGS};
+        for chunking in CHUNKINGS {
+            let harness = ReaderHarness::new();
+            let feed = |bytes: &[u8]| {
+                for chunk in chunks(bytes, chunking) {
+                    harness.feed_raw(chunk);
+                }
+            };
+            feed(b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b]133;C;id=running;cmdline_url=lost-end\x07\x1b]133;D;9;id=unrelated\x07");
+            assert!(harness.commands_finished.borrow().is_empty());
+            feed(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+            assert_eq!(harness.bstate.get(), BlockState::AwaitingCommand);
+            let completed = harness.commands_finished.borrow();
+            assert_eq!(completed.len(), 1);
+            assert_eq!(completed[0].exit_code, None);
+            assert_eq!(
+                completed[0].completion_provenance,
+                super::CompletionProvenance::BoundaryInferred
+            );
+        }
+    }
+
+    #[test]
+    fn session_parity_agent_mismatch_keeps_immediate_lost_cleanup() {
+        use jterm_core::session_parity::{chunks, CHUNKINGS};
+        for chunking in CHUNKINGS {
+            let harness = ReaderHarness::new();
+            let feed = |bytes: &[u8]| {
+                for chunk in chunks(bytes, chunking) {
+                    harness.feed_raw(chunk);
+                }
+            };
+            feed(b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b]133;C;id=agent-start;cmdline_url=agent\x07");
+            harness.ctx.active_agent_generation_rc.set(Some(59));
+            feed(b"\x1b]133;D;9;id=unrelated\x07");
+            assert_eq!(harness.bstate.get(), BlockState::PostCommand);
+            assert_eq!(harness.commands_finished.borrow().len(), 1);
+            assert_eq!(harness.commands_finished.borrow()[0].exit_code, Some(9));
+            assert!(harness.ctx.active_agent_generation_rc.get().is_none());
+            assert_eq!(harness.agent_lost.borrow().len(), 1);
+            feed(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+            assert_eq!(harness.agent_lost.borrow().len(), 1);
+        }
+    }
+
+    #[test]
+    fn session_parity_nested_identity_preserves_outer_execution() {
+        use jterm_core::session_parity::{chunks, CHUNKINGS};
+        for chunking in CHUNKINGS {
+            let harness = ReaderHarness::new();
+            let feed = |bytes: &[u8]| {
+                for chunk in chunks(bytes, chunking) {
+                    harness.feed_raw(chunk);
+                }
+            };
+            feed(
+                b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b]133;C;id=outer;cmdline_url=printf%20outer\x07",
+            );
+            feed(b"\x1b]133;C;id=inner\x07\x1b]133;D;9;id=inner\x07");
+            assert_eq!(harness.bstate.get(), BlockState::CollectingOutput);
+            assert!(harness.commands_finished.borrow().is_empty());
+            feed(b"\x1b]133;D;0;id=outer\x07\x1b]133;D;0;id=outer\x07");
+            let completed = harness.commands_finished.borrow();
+            assert_eq!(completed.len(), 1);
+            assert_eq!(completed[0].command, "printf outer");
+            assert_eq!(completed[0].exit_code, Some(0));
+        }
+    }
+
+    #[test]
+    fn session_parity_draft_history_utf8() {
+        assert_session_parity_fixture("draft_history_utf8");
+    }
+
+    #[test]
+    fn session_parity_exact_success() {
+        assert_session_parity_fixture("exact_success");
+    }
+
+    #[test]
+    fn session_parity_exact_nonzero() {
+        assert_session_parity_fixture("exact_nonzero");
+    }
+
+    #[test]
+    fn session_parity_unknown_exit() {
+        assert_session_parity_fixture("unknown_exit");
+    }
+
+    #[test]
+    fn session_parity_interrupt() {
+        assert_session_parity_fixture("interrupt");
+    }
+
+    #[test]
+    fn session_parity_alternate_screen() {
+        assert_session_parity_fixture("alternate_screen");
+    }
+
+    #[test]
+    fn session_parity_no_integration() {
+        assert_session_parity_fixture("no_integration");
+    }
+
+    #[test]
+    fn session_parity_identity_dedup() {
+        assert_session_parity_fixture("identity_dedup");
+    }
+
+    #[test]
+    fn reader_watch_real_read_coalesces_parser_stretches_and_empty_reads() {
+        use super::watch_batch::{BatchDisposition, BatchFact};
+        use super::watch_reader::ReaderWatchFact;
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let log = events.clone();
+        harness
+            .ctx
+            .watch_reader
+            .connect(move |event| log.borrow_mut().push(event.clone()));
+        harness.feed_raw(b"");
+        harness.feed_raw(b"\x1b]133;C\x07left\x1b]0;title\x07middle\x1b[?2004hfinally");
+        assert_eq!(harness.commands_started.borrow().len(), 1);
+        let events = events.borrow();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.fact == ReaderWatchFact::TrustedStart)
+                .count(),
+            1
+        );
+        let outputs: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e.fact, ReaderWatchFact::Output(_)))
+            .collect();
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(
+            outputs[0].fact,
+            ReaderWatchFact::Output(BatchFact {
+                sequence: 0,
+                disposition: BatchDisposition::Accepted,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn reader_watch_real_selection_hold_replays_without_new_start_or_pulse() {
+        use super::watch_batch::{BatchDisposition, BatchFact};
+        use super::watch_reader::ReaderWatchFact;
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let log = events.clone();
+        harness
+            .ctx
+            .watch_reader
+            .connect(move |event| log.borrow_mut().push(event.clone()));
+        harness.ctx.selection_feed_hold.begin_drag();
+        assert!(!harness.ctx.watch_reader.snapshot().available);
+        harness.feed_raw(b"\x1b]133;C\x07first");
+        harness.feed_raw(b"second\x1b]133;D;0\x07");
+        assert!(harness.commands_started.borrow().is_empty());
+        harness.ctx.selection_feed_hold.flush_now();
+        assert_eq!(harness.commands_started.borrow().len(), 1);
+        assert_eq!(harness.commands_finished.borrow().len(), 1);
+        assert_eq!(harness.ctx.watch_reader.snapshot().identity, None);
+        assert!(harness.ctx.watch_reader.snapshot().available);
+        assert!(events
+            .borrow()
+            .iter()
+            .all(|e| e.fact == ReaderWatchFact::Reconcile));
+        harness.feed_raw(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07new");
+        assert!(matches!(
+            events.borrow().last().unwrap().fact,
+            ReaderWatchFact::Output(BatchFact {
+                sequence: 2,
+                disposition: BatchDisposition::Accepted,
+                ..
+            })
+        ));
+        let before = harness.ctx.watch_reader.snapshot();
+        harness.ctx.selection_feed_hold.begin_drag();
+        harness.ctx.selection_feed_hold.flush_now();
+        let after = harness.ctx.watch_reader.snapshot();
+        assert!(after.available);
+        assert_ne!(
+            before.identity, after.identity,
+            "even an empty hold retires the previous observation context"
+        );
+    }
+
+    #[test]
+    fn reader_watch_mixed_identity_quarantines_old_output_and_ris_retires() {
+        use super::watch_batch::{BatchDisposition, BatchFact};
+        use super::watch_reader::ReaderWatchFact;
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        harness.feed_raw(b"\x1b]133;C\x07");
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let log = events.clone();
+        harness
+            .ctx
+            .watch_reader
+            .connect(move |event| log.borrow_mut().push(event.clone()));
+        harness.feed_raw(b"old\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
+        assert_eq!(harness.commands_started.borrow().len(), 2);
+        assert!(matches!(
+            events.borrow().last().unwrap().fact,
+            ReaderWatchFact::Output(BatchFact {
+                disposition: BatchDisposition::Quarantined,
+                ..
+            })
+        ));
+        harness.backend.marker_trace.borrow_mut().clear();
+        harness.feed_raw(b"\x1bc");
+        assert_eq!(
+            harness.backend.marker_trace.borrow().as_slice(),
+            &[MarkerTrace::HardReset, MarkerTrace::Feed(b"\x1bc".to_vec())],
+            "real parser dispatch resets before feeding the original RIS exactly once"
+        );
+        assert_eq!(harness.ctx.watch_reader.snapshot().identity, None);
+        // Forge dispatches HardReset before the following Bytes(ESC c).
+        // That original Idle byte path selects RawFallback after the reset;
+        // Watch must remain retired across both events in the same read.
+        assert_eq!(harness.bstate.get(), BlockState::RawFallback);
+    }
+
+    #[test]
+    fn reader_watch_foreground_nested_and_meta_gates_preserve_rejected_identity() {
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        harness.feed_raw(b"\x1b]133;C\x07");
+        let original = harness.ctx.watch_reader.snapshot();
+        harness.pty.set_test_foreground(PtyForeground::Other);
+        harness.feed_raw(b"\x1b]133;C\x07\x1b]133;D;7\x07\x1b]133;A\x07");
+        assert_eq!(harness.ctx.watch_reader.snapshot(), original);
+        harness.pty.set_test_foreground(PtyForeground::Shell);
+        harness.feed_raw(b"\x1b]133;C\x07\x1b]133;D;7\x07");
+        assert_eq!(harness.ctx.watch_reader.snapshot(), original);
+        assert!(harness.commands_finished.borrow().is_empty());
+        harness.ctx.active_agent_generation_rc.set(Some(41));
+        harness.ctx.engine.borrow_mut().pending_command_meta.id = Some("original".into());
+        harness.pty.set_test_foreground(PtyForeground::Other);
+        harness.feed(ParserEvent::CommandEnd {
+            exit: Some(0),
+            meta: CommandMeta {
+                id: Some("other".into()),
+                ..CommandMeta::default()
+            },
+        });
+        assert_eq!(harness.ctx.watch_reader.snapshot(), original);
+        let watch = harness.ctx.watch_reader.clone();
+        harness
+            .ctx
+            .agent_execution_lost_cbs
+            .borrow_mut()
+            .push(Box::new(move |_, _| {
+                assert_eq!(
+                    watch.snapshot().identity,
+                    None,
+                    "accepted completion retires Watch before agent-loss fanout"
+                );
+            }));
+        harness.pty.set_test_foreground(PtyForeground::Shell);
+        harness.feed(ParserEvent::CommandEnd {
+            exit: Some(0),
+            meta: CommandMeta {
+                id: Some("other".into()),
+                ..CommandMeta::default()
+            },
+        });
+        assert_eq!(harness.ctx.watch_reader.snapshot().identity, None);
+        assert_eq!(harness.commands_finished.borrow().len(), 1);
+    }
+
+    #[test]
+    fn reader_watch_trusted_a_and_alt_boundaries_retire_before_observers() {
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        harness.feed_raw(b"\x1b]133;C\x07");
+        let primary = harness.ctx.watch_reader.snapshot();
+        harness.feed_raw(b"\x1b[?1049h");
+        assert!(!harness.ctx.watch_reader.snapshot().available);
+        harness.feed_raw(b"\x1b[?1049l");
+        let returned = harness.ctx.watch_reader.snapshot();
+        assert!(returned.available);
+        assert_ne!(primary.identity, returned.identity);
+        harness.ctx.active_agent_generation_rc.set(Some(42));
+        let watch = harness.ctx.watch_reader.clone();
+        harness
+            .ctx
+            .agent_execution_lost_cbs
+            .borrow_mut()
+            .push(Box::new(move |_, _| {
+                assert_eq!(
+                    watch.snapshot().identity,
+                    None,
+                    "trusted A retires Watch before recovery fanout"
+                );
+            }));
+        harness.pty.set_test_foreground(PtyForeground::Unknown);
+        harness.feed_raw(b"\x1b]133;A\x07");
+        assert_eq!(
+            harness.ctx.watch_reader.snapshot(),
+            returned,
+            "Unknown A is not trusted recovery"
+        );
+        harness.pty.set_test_foreground(PtyForeground::Shell);
+        harness.feed_raw(b"\x1b]133;A\x07");
+        assert_eq!(harness.ctx.watch_reader.snapshot().identity, None);
+        assert_eq!(harness.commands_finished.borrow().len(), 1);
     }
 
     #[test]
@@ -28444,6 +31978,7 @@ mod tests {
         fn new(state: BlockState, foreground: PtyForeground) -> Self {
             let pty =
                 Rc::new(crate::pty::OwnedPty::for_tests(foreground).expect("open a test PTY"));
+            pty.enable_immediate_controls().unwrap();
             let finished = Rc::new(RefCell::new(Vec::new()));
             let human_inputs = Rc::new(Cell::new(0));
             let human_input: super::HumanInputCallbacks = Rc::new(RefCell::new(Vec::new()));
@@ -28454,6 +31989,7 @@ mod tests {
                     .push(Box::new(move |_| human_inputs.set(human_inputs.get() + 1)));
             }
             let sink = super::LiveCommitSink {
+                input_feedback: super::input_feedback::InputFeedback::detached(),
                 pty: pty.clone(),
                 bstate: Rc::new(Cell::new(state)),
                 typed_cmd: Rc::new(RefCell::new(String::new())),
@@ -28569,6 +32105,39 @@ mod tests {
         assert_eq!(harness.human_inputs.get(), 2);
     }
 
+    #[test]
+    fn a_private_cursor_report_preserves_the_pending_plain_answer() {
+        use super::LiveCommitRoute;
+        use jterm_core::terminal_report::TerminalReport;
+
+        for private in ["\x1b[?1;2R", "\x1b[?1;2;1R"] {
+            let harness = CommitHarness::new(BlockState::CollectingOutput, PtyForeground::Other);
+            harness.press(super::KittyKey::Unicode('b'), true, false);
+            let recorded = harness.sink.kitty_last_key.get();
+            // Only the plain CSI 6n query is counted by the reader.
+            harness.sink.cpr_outstanding.set(1);
+            for reply in [private, "\x1b[1;2R"] {
+                assert_eq!(
+                    harness.sink.on_commit(reply),
+                    LiveCommitRoute::Report(TerminalReport::CursorPosition)
+                );
+                assert_eq!(harness.written(), reply.as_bytes());
+                assert_eq!(
+                    harness.sink.cpr_outstanding.get(),
+                    u32::from(reply == private)
+                );
+                assert_eq!(harness.human_inputs.get(), 0);
+                assert_eq!(harness.sink.selected_block_id.get(), Some(7));
+                assert_eq!(harness.sink.kitty_last_key.get(), recorded);
+            }
+            // With the plain query settled, Shift+F3 is input again.
+            assert_eq!(harness.sink.on_commit("\x1b[1;2R"), LiveCommitRoute::Typed);
+            assert_eq!(harness.written(), b"\x1b[1;2R");
+            assert_eq!(harness.human_inputs.get(), 1);
+            assert_eq!(harness.sink.selected_block_id.get(), None);
+        }
+    }
+
     /// VTE 0.76 commits Alt+b as ESC and then `b`. Taken one at a time, the
     /// ESC was kitty-encoded as the whole chord and the `b` typed after it, so
     /// every Alt shortcut in claude, codex and kimi also typed its letter.
@@ -28618,6 +32187,1499 @@ mod tests {
         harness.press(KittyKey::Escape, false, false);
         assert_eq!(harness.sink.on_commit("\x1b"), LiveCommitRoute::Typed);
         assert_eq!(harness.written(), b"\x1b");
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn chat_docking_keeps_pty_rows_and_native_hit_geometry_stable() {
+        use gtk4::prelude::*;
+        use vte4::TerminalExt;
+        gtk4::init().expect("gtk init");
+        let view = super::TermView::new_with_spawner(
+            &crate::config::Config::safe_defaults(),
+            &crate::config::TerminalMode::Chat,
+            &["sh".to_string()],
+            None,
+            None,
+            &[],
+            |_, _, _, _| crate::pty::OwnedPty::for_tests(PtyForeground::Shell),
+        )
+        .expect("nonexecuting chat PTY");
+        let window = gtk4::Window::builder()
+            .default_width(640)
+            .default_height(480)
+            .build();
+        window.set_child(Some(&view.root));
+        window.present();
+        let settle = || {
+            let context = gtk4::glib::MainContext::default();
+            let started = std::time::Instant::now();
+            while started.elapsed() < std::time::Duration::from_millis(180) {
+                while context.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        settle();
+        view.ftcs_seen.set(true);
+        let native = view.active_vte.clone();
+        let anchor = view.active.borrow().widget().clone();
+        let mut stable_rows = None;
+        for state in [
+            BlockState::AwaitingCommand,
+            BlockState::CollectingOutput,
+            BlockState::AwaitingCommand,
+            BlockState::CollectingOutput,
+        ] {
+            view.bstate.set(state);
+            view.render_backend.sync_geometry_to_pty();
+            settle();
+            view.render_backend.sync_geometry_to_pty();
+            let grid = super::pty_grid_size(&view.active_vte, &view.block_scroll);
+            if let Some(rows) = stable_rows {
+                assert_eq!(grid.1, rows);
+            } else {
+                stable_rows = Some(grid.1);
+            }
+            assert_eq!(view.active_vte, native);
+            assert_eq!(anchor.parent().as_ref(), Some(view.block_list.upcast_ref()));
+            let clip = view.active.borrow().live_clip();
+            let parent = clip.parent().unwrap();
+            assert_eq!(
+                parent.has_css_class("chat-composer"),
+                state == BlockState::AwaitingCommand
+            );
+            if state == BlockState::AwaitingCommand {
+                let bounds = clip.compute_bounds(&view.root).expect("same native tree");
+                assert!(bounds.y() >= 0.0);
+                assert!(bounds.y() + bounds.height() <= view.root.height() as f32 + 1.0);
+                assert_eq!(clip.overflow(), gtk4::Overflow::Hidden);
+            }
+        }
+        for state in [
+            BlockState::AltScreen,
+            BlockState::RawFallback,
+            BlockState::AwaitingCommand,
+        ] {
+            view.bstate.set(state);
+            view.render_backend.sync_geometry_to_pty();
+            settle();
+            assert_eq!(view.active_vte, native);
+            assert_eq!(anchor.parent().as_ref(), Some(view.block_list.upcast_ref()));
+        }
+        // Height-only resizes must wake the settling tick after it has gone
+        // idle, without a shell output event or an explicit geometry sync.
+        // In Chat's full native surfaces the scroller remains mapped, so its
+        // page-size notification is still a valid resize trigger.
+        for state in [
+            BlockState::AwaitingCommand,
+            BlockState::AltScreen,
+            BlockState::RawFallback,
+        ] {
+            view.bstate.set(state);
+            if state == BlockState::AltScreen {
+                view.active_vte.feed(b"\x1b[?1049h");
+            }
+            view.render_backend.sync_geometry_to_pty();
+            settle();
+            assert!(
+                view.block_scroll.is_mapped(),
+                "the resize source stays mapped"
+            );
+            assert!(
+                view.resize_tick_id.borrow().is_none(),
+                "resize observer stands down at rest"
+            );
+            let before = view.pty.test_slave_winsize();
+            window.set_default_size(640, 640);
+            settle();
+            let grown = view.pty.test_slave_winsize();
+            assert_eq!(grown.0, before.0, "height-only resize preserves columns");
+            assert!(
+                grown.1 > before.1,
+                "{state:?}: child rows follow taller pane"
+            );
+            assert_eq!(
+                grown,
+                super::pty_grid_size(&view.active_vte, &view.block_scroll)
+            );
+            if state != BlockState::AwaitingCommand {
+                assert_eq!(view.active_vte.row_count(), i64::from(grown.1));
+            }
+            window.set_default_size(640, 480);
+            settle();
+            assert_eq!(
+                view.pty.test_slave_winsize(),
+                before,
+                "resize does not accumulate"
+            );
+            assert_eq!(view.active_vte, native);
+            if state == BlockState::AltScreen {
+                view.active_vte.feed(b"\x1b[?1049l");
+            }
+        }
+        window.close();
+    }
+
+    fn chat_display_settle() {
+        let context = gtk4::glib::MainContext::default();
+        let started = std::time::Instant::now();
+        while started.elapsed() < std::time::Duration::from_millis(350) {
+            while context.iteration(false) {}
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    fn chat_display_view(mode: crate::config::TerminalMode) -> super::TermView {
+        super::TermView::new_with_spawner(
+            &crate::config::Config::safe_defaults(),
+            &mode,
+            &["sh".into()],
+            None,
+            None,
+            &[],
+            |_, _, _, _| crate::pty::OwnedPty::for_tests(PtyForeground::Shell),
+        )
+        .unwrap()
+    }
+
+    fn chat_display_widget(root: &gtk4::Widget, class: &str) -> gtk4::Widget {
+        use gtk4::prelude::*;
+        let mut pending = vec![root.clone()];
+        while let Some(widget) = pending.pop() {
+            if widget.has_css_class(class) {
+                return widget;
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                pending.push(widget);
+            }
+        }
+        panic!("missing native Chat widget {class}");
+    }
+
+    fn chat_control_pointer(button: &gtk4::Button) -> gtk4::GestureClick {
+        use gtk4::prelude::*;
+        let controllers = button.observe_controllers();
+        (0..controllers.n_items())
+            .filter_map(|i| controllers.item(i))
+            .filter_map(|c| c.downcast::<gtk4::GestureClick>().ok())
+            .find(|c| c.name().as_deref() == Some("chat-control-press"))
+            .unwrap()
+    }
+
+    fn chat_control_key(button: &gtk4::Button) -> gtk4::EventControllerKey {
+        use gtk4::prelude::*;
+        let controllers = button.observe_controllers();
+        (0..controllers.n_items())
+            .filter_map(|i| controllers.item(i))
+            .filter_map(|c| c.downcast::<gtk4::EventControllerKey>().ok())
+            .find(|c| c.name().as_deref() == Some("chat-control-key"))
+            .unwrap()
+    }
+
+    fn chat_control_click(button: &gtk4::Button) {
+        use gtk4::prelude::*;
+        chat_control_pointer(button).emit_by_name::<()>("pressed", &[&1_i32, &1_f64, &1_f64]);
+        button.emit_clicked();
+        chat_control_pointer(button).emit_by_name::<()>("released", &[&1_i32, &1_f64, &1_f64]);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn chat_stop_stays_bound_across_held_replay_and_pointer_or_key_press() {
+        use gtk4::prelude::*;
+        use vte4::TerminalExt;
+        gtk4::init().unwrap();
+        let view = chat_display_view(crate::config::TerminalMode::Chat);
+        let window = gtk4::Window::builder()
+            .default_width(700)
+            .default_height(500)
+            .child(&view.root)
+            .build();
+        window.present();
+        chat_display_settle();
+        let inputs = Rc::new(Cell::new(0));
+        let observed = inputs.clone();
+        view.connect_human_input(move |_| observed.set(observed.get() + 1));
+        let prompt = b"\x1b]133;A\x07$ \x1b]133;B\x07";
+        let start = b"same\r\n\x1b]133;C;cmdline_url=same\x07";
+        let next = b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07same\r\n\x1b]133;C;cmdline_url=same\x07";
+        view.pty.write_test_slave(prompt);
+        chat_display_settle();
+        view.pty.write_test_slave(start);
+        chat_display_settle();
+        view.pty.drain_test_slave(PTY_REPLY_WAIT);
+        assert_eq!(view.bstate.get(), BlockState::CollectingOutput);
+        for class in ["chat-stop", "chat-sticky-stop"] {
+            let stop = chat_display_widget(view.root.upcast_ref(), class)
+                .downcast::<gtk4::Button>()
+                .unwrap();
+            view.pty.write_test_slave(b"selectable running output\r\n");
+            chat_display_settle();
+            view.active_vte.select_all();
+            assert!(view.active_vte.has_selection());
+            let before = view.block_data.borrow().len();
+            view.selection_feed_hold.begin_drag();
+            view.selection_feed_hold.end_drag(true);
+            view.pty.write_test_slave(next);
+            chat_display_settle();
+            assert_eq!(
+                view.block_data.borrow().len(),
+                before,
+                "reader feed is really parked"
+            );
+            if class == "chat-stop" {
+                // Native event ordering: common ancestor capture runs before
+                // the button's capture handler. It must not clear the existing
+                // live selection (which would synchronously replay D/A/B/C).
+                let bounds = stop.compute_bounds(&view.root).unwrap();
+                let x = f64::from(bounds.x() + bounds.width() / 2.0);
+                let y = f64::from(bounds.y() + bounds.height() / 2.0);
+                let controllers = view.root.observe_controllers();
+                let click = (0..controllers.n_items())
+                    .filter_map(|i| controllers.item(i))
+                    .filter_map(|c| c.downcast::<gtk4::GestureClick>().ok())
+                    .find(|c| c.button() == gtk4::gdk::BUTTON_PRIMARY)
+                    .unwrap();
+                click.emit_by_name::<()>("pressed", &[&1_i32, &x, &y]);
+                let drag = (0..controllers.n_items())
+                    .filter_map(|i| controllers.item(i))
+                    .find_map(|c| c.downcast::<gtk4::GestureDrag>().ok())
+                    .unwrap();
+                drag.emit_by_name::<()>("drag-begin", &[&x, &y]);
+                drag.emit_by_name::<()>("drag-end", &[&0_f64, &0_f64]);
+                chat_display_settle();
+                assert_eq!(
+                    view.block_data.borrow().len(),
+                    before,
+                    "ancestor capture/end cannot flush the control's hold"
+                );
+                assert!(view.active_vte.has_selection());
+                let controllers = stop.observe_controllers();
+                let press = (0..controllers.n_items())
+                    .filter_map(|i| controllers.item(i))
+                    .filter_map(|c| c.downcast::<gtk4::GestureClick>().ok())
+                    .find(|c| c.name().as_deref() == Some("chat-control-press"))
+                    .unwrap();
+                press.emit_by_name::<()>("pressed", &[&1_i32, &1_f64, &1_f64]);
+            }
+            if class == "chat-sticky-stop" {
+                chat_control_pointer(&stop)
+                    .emit_by_name::<()>("pressed", &[&1_i32, &1_f64, &1_f64]);
+            }
+            stop.emit_clicked();
+            chat_display_settle();
+            assert_eq!(
+                view.block_data.borrow().len(),
+                before + 1,
+                "real replay finalized old command"
+            );
+            assert_eq!(view.bstate.get(), BlockState::CollectingOutput);
+            assert!(
+                view.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty(),
+                "old Stop cannot interrupt next identical command"
+            );
+            assert_eq!(inputs.get(), 0);
+        }
+        let stop = chat_display_widget(view.root.upcast_ref(), "chat-stop")
+            .downcast::<gtk4::Button>()
+            .unwrap();
+        // A process-group handoff without a parser/UI turn is still a stale
+        // represented target and must be rejected at the real write boundary.
+        view.pty.set_test_foreground(PtyForeground::Other);
+        chat_control_click(&stop);
+        assert!(view.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+        assert_eq!(inputs.get(), 0);
+        view.pty.set_test_foreground(PtyForeground::Shell);
+        // A harmless held output batch keeps the same generation: exactly one ^C.
+        view.selection_feed_hold.begin_drag();
+        view.pty.write_test_slave(b"still running\r\n");
+        chat_display_settle();
+        chat_control_click(&stop);
+        assert_eq!(view.pty.drain_test_slave(PTY_REPLY_WAIT), b"\x03");
+        assert_eq!(inputs.get(), 1);
+        for pointer in [true, false] {
+            let controllers = stop.observe_controllers();
+            if pointer {
+                let press = (0..controllers.n_items())
+                    .filter_map(|i| controllers.item(i))
+                    .filter_map(|c| c.downcast::<gtk4::GestureClick>().ok())
+                    .find(|c| c.name().as_deref() == Some("chat-control-press"))
+                    .unwrap();
+                press.emit_by_name::<()>("pressed", &[&1_i32, &1_f64, &1_f64]);
+            } else {
+                let key = (0..controllers.n_items())
+                    .filter_map(|i| controllers.item(i))
+                    .filter_map(|c| c.downcast::<gtk4::EventControllerKey>().ok())
+                    .find(|c| c.name().as_deref() == Some("chat-control-key"))
+                    .unwrap();
+                key.emit_by_name::<bool>(
+                    "key-pressed",
+                    &[
+                        &gtk4::gdk::Key::space,
+                        &0_u32,
+                        &gtk4::gdk::ModifierType::empty(),
+                    ],
+                );
+            }
+            view.pty.write_test_slave(next);
+            chat_display_settle();
+            if !pointer {
+                chat_control_key(&stop).emit_by_name::<()>(
+                    "key-released",
+                    &[
+                        &gtk4::gdk::Key::space,
+                        &0_u32,
+                        &gtk4::gdk::ModifierType::empty(),
+                    ],
+                );
+            }
+            stop.emit_clicked();
+            assert!(
+                view.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty(),
+                "release stays with its old press target"
+            );
+            assert_eq!(inputs.get(), 1);
+        }
+        view.selection_feed_hold.begin_drag();
+        view.pty
+            .write_test_slave(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        chat_display_settle();
+        chat_control_click(&stop);
+        assert_eq!(view.bstate.get(), BlockState::AwaitingCommand);
+        assert!(view.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+        view.pty.write_test_slave(start);
+        chat_display_settle();
+        view.pty.write_test_slave(b"\x1b[?1049h");
+        chat_display_settle();
+        chat_control_click(&stop);
+        assert!(view.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+        view.pty.write_test_slave(b"\x1b[?1049l");
+        chat_display_settle();
+        view.bstate.set(BlockState::RawFallback);
+        view.render_backend.sync_geometry_to_pty();
+        chat_control_click(&stop);
+        assert!(view.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+        assert_eq!(inputs.get(), 1);
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn chat_native_activate_preserves_send_and_stop_origins_through_delays() {
+        use gtk4::prelude::*;
+        gtk4::init().unwrap();
+        let view = chat_display_view(crate::config::TerminalMode::Chat);
+        let window = gtk4::Window::builder()
+            .default_width(700)
+            .default_height(500)
+            .child(&view.root)
+            .build();
+        window.present();
+        chat_display_settle();
+        let inputs = Rc::new(Cell::new(0));
+        let observed = inputs.clone();
+        view.connect_human_input(move |_| observed.set(observed.get() + 1));
+        let prompt = b"\x1b]133;A\x07$ \x1b]133;B\x07";
+        let start = b"same\r\n\x1b]133;C;cmdline_url=same\x07";
+        let next = b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07same\r\n\x1b]133;C;cmdline_url=same\x07";
+        let finish = b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07";
+        let stage = |bytes: &[u8]| {
+            view.selection_feed_hold.begin_drag();
+            view.selection_feed_hold.end_drag(true);
+            view.pty.write_test_slave(bytes);
+            chat_display_settle();
+        };
+        view.pty.write_test_slave(prompt);
+        chat_display_settle();
+        let send = chat_display_widget(view.root.upcast_ref(), "chat-submit")
+            .downcast::<gtk4::Button>()
+            .unwrap();
+        let stop = chat_display_widget(view.root.upcast_ref(), "chat-stop")
+            .downcast::<gtk4::Button>()
+            .unwrap();
+        // Missing-origin clicked is deliberately not a new request.
+        send.emit_clicked();
+        assert!(view.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+        // Same prompt, repeated native activation: GTK's real timer submits
+        // exactly once, and a later genuine PS2 activation remains possible.
+        for count in 1..=2 {
+            assert!(WidgetExt::activate(&send));
+            assert!(send.has_css_class("keyboard-activating"));
+            assert!(WidgetExt::activate(&send));
+            chat_display_settle();
+            assert_eq!(view.pty.drain_test_slave(PTY_REPLY_WAIT), b"\r");
+            assert_eq!(inputs.get(), count);
+        }
+        // Park a complete command + replacement prompt, then replay it after
+        // activation starts but before any native timer/main-loop turn.
+        let mut round_trip = start.to_vec();
+        round_trip.extend(finish);
+        stage(&round_trip);
+        let generation = view.verified_submission.prompt_anchor_generation.get();
+        assert!(WidgetExt::activate(&send));
+        view.selection_feed_hold.flush_now();
+        assert_ne!(
+            view.verified_submission.prompt_anchor_generation.get(),
+            generation
+        );
+        assert_eq!(view.bstate.get(), BlockState::AwaitingCommand);
+        send.emit_activate(); // cannot replace the first origin with new Prompt
+        chat_display_settle();
+        assert!(view.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+        assert_eq!(inputs.get(), 2);
+        view.pty.write_test_slave(start);
+        chat_display_settle();
+        // Accessibility/Widget::activate has no key press. A same-text new
+        // running command must still not inherit the pending interrupt.
+        stage(next);
+        let records = view.block_data.borrow().len();
+        assert!(WidgetExt::activate(&stop));
+        assert!(stop.has_css_class("keyboard-activating"));
+        view.selection_feed_hold.flush_now();
+        assert_eq!(view.block_data.borrow().len(), records + 1);
+        stop.emit_activate();
+        chat_display_settle();
+        assert!(view.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+        assert_eq!(inputs.get(), 2);
+        // Foreground handoff with no OSC/generation change is checked too.
+        assert!(WidgetExt::activate(&stop));
+        view.pty.set_test_foreground(PtyForeground::Other);
+        chat_display_settle();
+        assert!(view.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+        view.pty.set_test_foreground(PtyForeground::Shell);
+        chat_display_settle();
+        for key in [
+            gtk4::gdk::Key::space,
+            gtk4::gdk::Key::KP_Space,
+            gtk4::gdk::Key::Return,
+            gtk4::gdk::Key::ISO_Enter,
+            gtk4::gdk::Key::KP_Enter,
+        ] {
+            stage(next);
+            chat_control_key(&stop).emit_by_name::<bool>(
+                "key-pressed",
+                &[&key, &0_u32, &gtk4::gdk::ModifierType::empty()],
+            );
+            view.selection_feed_hold.flush_now();
+            chat_display_settle();
+            assert!(WidgetExt::activate(&stop));
+            // Press autorepeat before and after the native timeout cannot
+            // turn the held key into an intent for the next command.
+            chat_control_key(&stop).emit_by_name::<bool>(
+                "key-pressed",
+                &[&key, &0_u32, &gtk4::gdk::ModifierType::empty()],
+            );
+            stop.emit_activate();
+            chat_display_settle();
+            assert!(view.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+            chat_control_key(&stop).emit_by_name::<bool>(
+                "key-pressed",
+                &[&key, &0_u32, &gtk4::gdk::ModifierType::empty()],
+            );
+            assert!(WidgetExt::activate(&stop));
+            chat_control_key(&stop).emit_by_name::<()>(
+                "key-released",
+                &[&key, &0_u32, &gtk4::gdk::ModifierType::empty()],
+            );
+            chat_display_settle();
+            assert!(view.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+        }
+        assert_eq!(inputs.get(), 2);
+        // Cancellation remains a tombstone while GTK may still emit clicked;
+        // after that activation retires, the next same-command action works.
+        for hide in [false, true] {
+            assert!(WidgetExt::activate(&stop));
+            if hide {
+                stop.set_visible(false);
+                stop.set_visible(true);
+            } else {
+                stop.set_sensitive(false);
+                stop.set_sensitive(true);
+            }
+            stop.emit_activate();
+            chat_display_settle();
+            assert!(view.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+        }
+        assert!(WidgetExt::activate(&stop));
+        chat_display_settle();
+        assert_eq!(view.pty.drain_test_slave(PTY_REPLY_WAIT), b"\x03");
+        assert_eq!(inputs.get(), 3);
+        // A released pointer that never clicked cannot be consumed much later.
+        let pointer = chat_control_pointer(&stop);
+        pointer.emit_by_name::<()>("pressed", &[&1_i32, &1_f64, &1_f64]);
+        pointer.emit_by_name::<()>("released", &[&1_i32, &1_f64, &1_f64]);
+        chat_display_settle();
+        stop.emit_clicked();
+        assert!(view.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+        assert_eq!(inputs.get(), 3);
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn chat_send_button_observes_production_queue_admission_and_held_boundaries() {
+        use gtk4::prelude::*;
+        gtk4::init().unwrap();
+        let view = chat_display_view(crate::config::TerminalMode::Chat);
+        let window = gtk4::Window::builder()
+            .default_width(640)
+            .default_height(480)
+            .child(&view.root)
+            .build();
+        window.present();
+        chat_display_settle();
+        view.pty.write_test_slave(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        chat_display_settle();
+        let send = chat_display_widget(view.root.upcast_ref(), "chat-submit")
+            .downcast::<gtk4::Button>()
+            .unwrap();
+        let inputs = Rc::new(Cell::new(0));
+        let observed = inputs.clone();
+        view.connect_human_input(move |_| observed.set(observed.get() + 1));
+        view.pty.test_wait_input_idle();
+        let kernel_bytes = view.pty.test_fill_kernel_input();
+        let generation = view.accepted_input_generation.get();
+        chat_control_click(&send);
+        assert_eq!(inputs.get(), 0);
+        assert_eq!(view.accepted_input_generation.get(), generation);
+        assert!(!view.submission_pending.get());
+        let mut drained = Vec::new();
+        while drained.len() < kernel_bytes {
+            drained.extend(view.pty.drain_test_slave(PTY_REPLY_WAIT));
+        }
+        assert_eq!(drained, vec![b'x'; kernel_bytes]);
+        assert!(view.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+        let queue = view.pty.test_input_queue(1);
+        let before = view.accepted_input_generation.get();
+        view.pty.write_bytes(b"occupied").unwrap();
+        chat_control_click(&send);
+        assert_eq!(view.accepted_input_generation.get(), before);
+        assert!(!view.submission_pending.get());
+        assert_eq!(inputs.get(), 0);
+        assert_eq!(queue.try_recv().unwrap(), b"occupied");
+        assert!(queue.try_recv().is_err());
+        // Two activations at PS2 are two CRs, without refeeding command text.
+        for count in 1..=2 {
+            chat_control_click(&send);
+            assert_eq!(view.pty.drain_test_slave(PTY_REPLY_WAIT), b"\r");
+            assert!(queue.try_recv().is_err());
+            assert_eq!(inputs.get(), count);
+        }
+        view.selection_feed_hold.begin_drag();
+        view.pty
+            .write_test_slave(b"same\r\n\x1b]133;C;cmdline_url=same\x07");
+        chat_display_settle();
+        chat_control_click(&send);
+        assert_eq!(view.bstate.get(), BlockState::CollectingOutput);
+        assert!(queue.try_recv().is_err());
+        assert_eq!(inputs.get(), 2);
+        view.pty
+            .write_test_slave(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        chat_display_settle();
+        let before = view.accepted_input_generation.get();
+        assert!(!view.submission_pending.get());
+        view.pty.kill();
+        chat_control_click(&send);
+        assert_eq!(view.accepted_input_generation.get(), before);
+        assert!(!view.submission_pending.get());
+        assert_eq!(inputs.get(), 2);
+        assert!(queue.try_recv().is_err());
+        window.close();
+    }
+
+    fn assert_return_to_live_yields_to_newer_reading(mode: crate::config::TerminalMode) {
+        use gtk4::prelude::*;
+        gtk4::init().unwrap();
+        let view = chat_display_view(mode);
+        let spacer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        spacer.set_height_request(3000);
+        view.block_list.prepend(&spacer);
+        let search = gtk4::SearchEntry::new();
+        let layout = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        layout.append(&search);
+        layout.append(&view.root);
+        let window = gtk4::Window::builder()
+            .default_width(640)
+            .default_height(480)
+            .child(&layout)
+            .build();
+        window.present();
+        chat_display_settle();
+        assert!(search.grab_focus());
+        let focus_before = GtkWindowExt::focus(&window);
+        let adjustment = view.block_scroll.vadjustment();
+        let bottom = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+        assert!(bottom > 500.0, "fixture needs genuine native scroll range");
+        adjustment.set_value(bottom - 300.0);
+        assert!(view.scroll_debouncer.user_scrolled_up.get());
+        for _ in 0..3 {
+            // Exercise the real callback, including its focus and inner-VTE reset.
+            view.jump_fab.emit_clicked();
+        }
+        assert_eq!(GtkWindowExt::focus(&window), focus_before);
+        assert!(!view.scroll_debouncer.user_scrolled_up.get());
+        if let Some(live) = view.active_vte.vadjustment() {
+            assert!(
+                (live.value() - (live.upper() - live.page_size()).max(live.lower())).abs() < 1.0
+            );
+        }
+        // A scrollbar drag or find jump writes this adjustment and sets the
+        // real synchronous intent lock before any deferred pin callback runs.
+        let reading_position = bottom - 200.0;
+        adjustment.set_value(reading_position);
+        assert!(view.scroll_debouncer.user_scrolled_up.get());
+        // Streaming output requests use this same controller and must also yield.
+        view.scroll_debouncer.mark_dirty(&view.block_scroll);
+        view.scroll_debouncer
+            .pin_to_bottom_deferred(&view.block_scroll);
+        chat_display_settle();
+        assert!((adjustment.value() - reading_position).abs() < 1.0);
+        assert!(view.scroll_debouncer.user_scrolled_up.get());
+        assert_eq!(GtkWindowExt::focus(&window), focus_before);
+        // A fresh deliberate request still returns to the current bottom.
+        view.jump_fab.emit_clicked();
+        chat_display_settle();
+        let bottom = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+        assert!((adjustment.value() - bottom).abs() < 1.0);
+        assert_eq!(GtkWindowExt::focus(&window), focus_before);
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn block_return_to_live_yields_to_newer_reading_and_keeps_search_focus() {
+        assert_return_to_live_yields_to_newer_reading(crate::config::TerminalMode::Block);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn chat_return_to_live_yields_to_newer_reading_and_keeps_search_focus() {
+        assert_return_to_live_yields_to_newer_reading(crate::config::TerminalMode::Chat);
+    }
+
+    fn assert_tab_switch_keeps_search_focus(mode: crate::config::TerminalMode) {
+        use gtk4::prelude::*;
+        gtk4::init().unwrap();
+        let views = Rc::new([
+            chat_display_view(mode.clone()),
+            chat_display_view(mode.clone()),
+        ]);
+        let notebook = gtk4::Notebook::new();
+        for view in views.iter() {
+            notebook.append_page(&view.root, None::<&gtk4::Widget>);
+        }
+        let entry = gtk4::SearchEntry::new();
+        let search = gtk4::SearchBar::new();
+        search.set_child(Some(&entry));
+        search.connect_entry(&entry);
+        let layout = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        layout.append(&search);
+        layout.append(&notebook);
+        let newer_owner = gtk4::Entry::new();
+        layout.append(&newer_owner);
+        let window = gtk4::Window::builder()
+            .default_width(640)
+            .default_height(480)
+            .child(&layout)
+            .build();
+        let generation = Rc::new(Cell::new(0_u64));
+        let events = Rc::new(RefCell::new(Vec::new()));
+        for (index, view) in views.iter().enumerate() {
+            let events = events.clone();
+            view.active_vte
+                .connect_map(move |_| events.borrow_mut().push(format!("map:{index}")));
+        }
+        let views_for_switch = views.clone();
+        let search_for_switch = search.clone();
+        let entry_for_switch = entry.clone();
+        let events_for_switch = events.clone();
+        notebook.connect_switch_page(move |notebook, _, page| {
+            let view = &views_for_switch[page as usize];
+            crate::app::focus_switched_page(
+                &search_for_switch,
+                &entry_for_switch,
+                || generation.set(generation.get().wrapping_add(1)),
+                || {
+                    events_for_switch
+                        .borrow_mut()
+                        .push(format!("search:{page}"))
+                },
+                || Some(view.active_vte.clone()),
+                |terminal| {
+                    view.reveal_live_input();
+                    generation.set(generation.get().wrapping_add(1));
+                    let entry = entry_for_switch.clone();
+                    let queued_events = events_for_switch.clone();
+                    crate::app::queue_tab_terminal_focus(
+                        notebook,
+                        generation.clone(),
+                        generation.get(),
+                        terminal,
+                        page,
+                        search_for_switch.clone(),
+                        move || {
+                            queued_events.borrow_mut().push("queued-search".into());
+                            entry.grab_focus();
+                        },
+                    );
+                },
+            );
+        });
+        crate::app::connect_tab_search_focus_after_switch(&notebook, &search, &entry);
+        window.present();
+        chat_display_settle();
+        // Visit both pages first. The regression is an existing tab remap,
+        // not initial terminal creation or a synthetic visibility toggle.
+        for page in [1_u32, 0] {
+            notebook.set_current_page(Some(page));
+            chat_display_settle();
+            assert!(views[page as usize].active_vte.is_mapped());
+            assert!(
+                views[page as usize].active_vte.has_focus(),
+                "{mode:?}: ordinary switch must focus page {page}"
+            );
+        }
+        search.set_search_mode(true);
+        chat_display_settle();
+        assert!(entry.grab_focus());
+        let search_owns_focus = || {
+            GtkWindowExt::focus(&window).is_some_and(|owner| {
+                owner == entry.clone().upcast::<gtk4::Widget>() || owner.is_ancestor(&entry)
+            })
+        };
+        assert!(
+            search_owns_focus(),
+            "search entry must own focus before switching"
+        );
+        for page in [1_u32, 0] {
+            assert!(
+                !views[page as usize].active_vte.is_mapped(),
+                "destination must begin unmapped"
+            );
+            events.borrow_mut().clear();
+            notebook.set_current_page(Some(page));
+            assert!(
+                search_owns_focus(),
+                "{mode:?}: switch must synchronously restore search"
+            );
+            chat_display_settle();
+            assert!(views[page as usize].active_vte.is_mapped());
+            let observed = events.borrow();
+            assert!(
+                observed.contains(&format!("search:{page}")),
+                "production search branch was not reached: {observed:?}"
+            );
+            assert!(
+                observed.contains(&format!("map:{page}")),
+                "native terminal did not remap: {observed:?}"
+            );
+            eprintln!("{mode:?} page {page} switch/map ordering: {observed:?}");
+            assert!(search_owns_focus(), "{mode:?}: search lost focus after existing-tab switch; events={observed:?}, owner={:?}", GtkWindowExt::focus(&window));
+        }
+        // No main-loop turn between these switches: only the latest page and
+        // search owner may survive. In particular, no stale terminal tick may
+        // replay after the search branch invalidates it.
+        search.set_search_mode(false);
+        notebook.set_current_page(Some(1));
+        search.set_search_mode(true);
+        for page in [0_u32, 1, 0, 1] {
+            notebook.set_current_page(Some(page));
+            assert!(search_owns_focus());
+        }
+        chat_display_settle();
+        assert_eq!(notebook.current_page(), Some(1));
+        assert!(search_owns_focus());
+        assert!(
+            !events.borrow().iter().any(|event| event == "queued-search"),
+            "the superseded same-page terminal request must not replay search"
+        );
+        // A newer user focus choice after the synchronous switch must survive
+        // every pending idle/frame. Search stays open deliberately.
+        notebook.set_current_page(Some(0));
+        assert!(search_owns_focus());
+        assert!(newer_owner.grab_focus());
+        chat_display_settle();
+        assert!(GtkWindowExt::focus(&window).is_some_and(|owner| {
+            owner == newer_owner.clone().upcast::<gtk4::Widget>() || owner.is_ancestor(&newer_owner)
+        }));
+        // Closing search immediately after switching must not be undone by a
+        // deferred search grab. Match toggle_search's terminal-focus return.
+        notebook.set_current_page(Some(1));
+        assert!(search_owns_focus());
+        search.set_search_mode(false);
+        assert!(views[1].active_vte.grab_focus());
+        chat_display_settle();
+        assert!(views[1].active_vte.has_focus());
+        notebook.set_current_page(Some(0));
+        notebook.set_current_page(Some(1));
+        chat_display_settle();
+        assert!(
+            views[1].active_vte.has_focus(),
+            "closing search must permit ordinary terminal focus"
+        );
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn existing_block_tab_switch_preserves_global_search_focus() {
+        assert_tab_switch_keeps_search_focus(crate::config::TerminalMode::Block);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn existing_unified_tab_switch_preserves_global_search_focus() {
+        assert_tab_switch_keeps_search_focus(crate::config::TerminalMode::Unified);
+    }
+
+    /// Replay through the installed hold/parser/ReaderCtx/backend pipeline
+    /// synchronously, so the caller can move focus before its queued idle.
+    fn replay_native_focus_bytes(view: &super::TermView, bytes: &[u8]) {
+        view.selection_feed_hold.begin_drag();
+        assert!(view.selection_feed_hold.try_buffer(bytes));
+        view.selection_feed_hold.flush_now();
+    }
+
+    fn queue_native_focus_transition(view: &super::TermView, alt_exit: bool) {
+        use gtk4::prelude::*;
+        if alt_exit {
+            replay_native_focus_bytes(view, b"\x1b[?1049h");
+            assert_eq!(view.bstate.get(), BlockState::AltScreen);
+        } else {
+            replay_native_focus_bytes(view, b"\x1b]133;A\x07$ ");
+            assert_eq!(view.bstate.get(), BlockState::CollectingPrompt);
+        }
+        chat_display_settle();
+        assert!(view.active_vte.grab_focus());
+        assert!(view.active_vte.is_mapped());
+        replay_native_focus_bytes(
+            view,
+            if alt_exit {
+                b"\x1b[?1049l"
+            } else {
+                b"\x1b]133;B\x07"
+            },
+        );
+        assert_eq!(view.bstate.get(), BlockState::AwaitingCommand);
+        assert!(view.active_vte.has_focus());
+    }
+
+    fn drain_native_focus_idle() {
+        let context = gtk4::glib::MainContext::default();
+        while context.iteration(false) {}
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn deferred_live_focus_restores_empty_owner_after_prompt_end_and_alt_exit() {
+        use gtk4::prelude::*;
+        gtk4::init().unwrap();
+        for mode in [
+            crate::config::TerminalMode::Block,
+            crate::config::TerminalMode::Chat,
+            crate::config::TerminalMode::Unified,
+        ] {
+            let view = chat_display_view(mode.clone());
+            let window = gtk4::Window::builder()
+                .default_width(640)
+                .default_height(480)
+                .child(&view.root)
+                .build();
+            window.present();
+            replay_native_focus_bytes(&view, b"\x1b]133;A\x07$ \x1b]133;B\x07");
+            chat_display_settle();
+            for alt_exit in [false, true] {
+                for remap in [false, true] {
+                    queue_native_focus_transition(&view, alt_exit);
+                    GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+                    if remap {
+                        // A temporary mapping gap without a new owner must not
+                        // turn legitimate prompt restoration into a no-op.
+                        view.active_vte.set_visible(false);
+                        assert!(!view.active_vte.is_mapped());
+                        view.active_vte.set_visible(true);
+                        assert!(view.active_vte.is_mapped());
+                        // Mapping may synchronously restore this same terminal.
+                        // Reject any unrelated owner, then recreate the empty
+                        // focus precondition so the queued idle must do the work.
+                        let remapped_owner = GtkWindowExt::focus(&window);
+                        assert!(
+                            remapped_owner.as_ref().is_none_or(|owner| {
+                                owner == view.active_vte.upcast_ref::<gtk4::Widget>()
+                            }),
+                            "{mode:?}: remap selected another owner (alt_exit={alt_exit}): {remapped_owner:?}"
+                        );
+                        GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+                    }
+                    assert!(
+                        GtkWindowExt::focus(&window).is_none(),
+                        "{mode:?}: fixture must clear focus before idle (alt_exit={alt_exit}, remap={remap})"
+                    );
+                    drain_native_focus_idle();
+                    assert!(
+                        view.active_vte.has_focus(),
+                        "{mode:?}: empty focus must restore (alt_exit={alt_exit}, remap={remap})"
+                    );
+                }
+            }
+            window.close();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn deferred_live_focus_never_steals_new_pane_find_or_history_ownership() {
+        use gtk4::prelude::*;
+        gtk4::init().unwrap();
+        for mode in [
+            crate::config::TerminalMode::Block,
+            crate::config::TerminalMode::Chat,
+            crate::config::TerminalMode::Unified,
+        ] {
+            let view = chat_display_view(mode.clone());
+            let other = chat_display_view(crate::config::TerminalMode::Block);
+            let find = gtk4::SearchEntry::new();
+            let panes = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+            panes.append(&view.root);
+            panes.append(&other.root);
+            let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            root.append(&find);
+            root.append(&panes);
+            let window = gtk4::Window::builder()
+                .default_width(1200)
+                .default_height(800)
+                .child(&root)
+                .build();
+            window.present();
+            replay_native_focus_bytes(&view, b"\x1b]133;A\x07$ \x1b]133;B\x07");
+            replay_native_focus_bytes(
+                &other,
+                b"\x1b]133;A\x07$ \x1b]133;B\x07history\r\n\x1b]133;C;cmdline_url=history\x07output\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07",
+            );
+            chat_display_settle();
+            let history = other.finished_blocks.borrow()[0].command_vte.clone();
+            for alt_exit in [false, true] {
+                for (name, owner) in [
+                    ("pane", other.active_vte.clone().upcast::<gtk4::Widget>()),
+                    ("find", find.clone().upcast()),
+                    ("history", history.clone().upcast()),
+                ] {
+                    for clear_new_owner in [false, true] {
+                        queue_native_focus_transition(&view, alt_exit);
+                        assert!(owner.is_mapped());
+                        assert!(owner.grab_focus());
+                        let new_owner = GtkWindowExt::focus(&window).unwrap();
+                        assert_ne!(new_owner, view.active_vte.clone().upcast::<gtk4::Widget>());
+                        if clear_new_owner {
+                            GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+                        }
+                        drain_native_focus_idle();
+                        let expected = (!clear_new_owner).then_some(new_owner);
+                        assert_eq!(
+                            GtkWindowExt::focus(&window),
+                            expected,
+                            "{mode:?}: {name} supersedes the pending restore (alt_exit={alt_exit}, clear={clear_new_owner})"
+                        );
+                    }
+                }
+            }
+            window.close();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn deferred_live_focus_retires_hidden_detached_and_changed_root_targets() {
+        use gtk4::prelude::*;
+        gtk4::init().unwrap();
+        for mode in [
+            crate::config::TerminalMode::Block,
+            crate::config::TerminalMode::Chat,
+            crate::config::TerminalMode::Unified,
+        ] {
+            let view = chat_display_view(mode.clone());
+            let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            root.append(&view.root);
+            let window = gtk4::Window::builder()
+                .default_width(640)
+                .default_height(480)
+                .child(&root)
+                .build();
+            let other_root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            let other_window = gtk4::Window::builder()
+                .default_width(640)
+                .default_height(480)
+                .child(&other_root)
+                .build();
+            // The source must own global input focus before each strict
+            // has_focus admission check; the destination only tests rooting.
+            other_window.present();
+            window.present();
+            replay_native_focus_bytes(&view, b"\x1b]133;A\x07$ \x1b]133;B\x07");
+            chat_display_settle();
+            for alt_exit in [false, true] {
+                queue_native_focus_transition(&view, alt_exit);
+                GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+                view.root.set_visible(false);
+                drain_native_focus_idle();
+                assert!(!view.active_vte.has_focus(), "{mode:?}: hidden target");
+                view.root.set_visible(true);
+
+                queue_native_focus_transition(&view, alt_exit);
+                // GTK defers focused-widget removal cleanup until after paint.
+                // Establish None before detaching so only our pending request
+                // can change it while this fixture drains ready idle sources.
+                GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+                assert!(GtkWindowExt::focus(&window).is_none());
+                root.remove(&view.root);
+                drain_native_focus_idle();
+                assert!(view.active_vte.root().is_none());
+                assert!(!view.active_vte.has_focus(), "{mode:?}: detached target");
+                root.append(&view.root);
+
+                queue_native_focus_transition(&view, alt_exit);
+                GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+                root.remove(&view.root);
+                other_root.append(&view.root);
+                // Returning to the original root must not resurrect a request
+                // that crossed a different window in the meantime.
+                other_root.remove(&view.root);
+                root.append(&view.root);
+                GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+                drain_native_focus_idle();
+                assert!(
+                    GtkWindowExt::focus(&window).is_none(),
+                    "{mode:?}: changed root"
+                );
+            }
+            other_window.close();
+            window.close();
+        }
+
+        // A pending restore owns no native widget strongly, including when the
+        // target and window disappear before its one idle can consume it.
+        let target = vte4::Terminal::new();
+        let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        root.append(&target);
+        let other = gtk4::Entry::new();
+        root.append(&other);
+        let window = gtk4::Window::builder().child(&root).build();
+        window.present();
+        chat_display_settle();
+        // With the native objects still alive, these weak cells can expire
+        // only if both temporary observers have actually been disconnected.
+        for outcome in ["restored", "superseded", "abandoned"] {
+            assert!(target.grab_focus());
+            let request = super::DeferredLiveFocus::new(&target).unwrap();
+            let observer_state = Rc::downgrade(&request.superseded);
+            if outcome == "abandoned" {
+                drop(request);
+            } else {
+                request.defer();
+                if outcome == "superseded" {
+                    assert!(other.grab_focus());
+                } else {
+                    GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+                }
+                drain_native_focus_idle();
+                assert_eq!(target.has_focus(), outcome == "restored");
+            }
+            assert!(
+                observer_state.upgrade().is_none(),
+                "{outcome}: observer leak"
+            );
+        }
+        assert!(target.grab_focus());
+        super::restore_live_focus_deferred(&target);
+        let weak_target = target.downgrade();
+        let weak_window = window.downgrade();
+        GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+        assert!(GtkWindowExt::focus(&window).is_none());
+        root.remove(&target);
+        window.destroy();
+        drop(target);
+        drop(window);
+        assert!(weak_target.upgrade().is_none());
+        assert!(weak_window.upgrade().is_none());
+        drain_native_focus_idle();
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn chat_long_prompt_shrinks_and_mapped_block_pane_keeps_focus() {
+        use gtk4::prelude::*;
+        use vte4::TerminalExt;
+        gtk4::init().unwrap();
+        let chat = chat_display_view(crate::config::TerminalMode::Chat);
+        let block = chat_display_view(crate::config::TerminalMode::Block);
+        let panes = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        panes.append(&chat.root);
+        panes.append(&block.root);
+        let window = gtk4::Window::builder()
+            .default_width(1200)
+            .default_height(800)
+            .child(&panes)
+            .build();
+        window.present();
+        chat_display_settle();
+        chat.pty.write_test_slave(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        chat_display_settle();
+        let live = chat.active_vte.clone();
+        let long_input = format!("{}tail-visible", "continued input\n".repeat(80));
+        *chat.typed_cmd.borrow_mut() = long_input.clone();
+        chat.active_vte
+            .feed(long_input.replace('\n', "\r\n").as_bytes());
+        chat.render_backend.sync_geometry_to_pty();
+        chat_display_settle();
+        let large = chat.pty.test_slave_winsize();
+        let viewport = chat_display_widget(chat.root.upcast_ref(), "chat-composer-viewport");
+        assert!(
+            viewport.height() > 300,
+            "exercise a genuinely tall composer"
+        );
+        window.set_default_size(1200, 360);
+        chat_display_settle();
+        assert!(
+            window.height() <= 380,
+            "old requested editor height must not pin window minimum"
+        );
+        assert!(chat.pty.test_slave_winsize().1 < large.1);
+        assert_eq!(
+            *chat.typed_cmd.borrow(),
+            long_input,
+            "resize does not edit input"
+        );
+        assert_eq!(chat.active_vte, live);
+        let bounds = viewport.compute_bounds(&chat.root).unwrap();
+        assert!(bounds.y() + bounds.height() <= chat.root.height() as f32 + 1.0);
+        assert_eq!(viewport.overflow(), gtk4::Overflow::Hidden);
+        for widget in [
+            chat.active.borrow().live_clip().upcast::<gtk4::Widget>(),
+            chat_display_widget(chat.root.upcast_ref(), "chat-controls"),
+            chat_display_widget(chat.root.upcast_ref(), "chat-submit"),
+        ] {
+            let bounds = widget.compute_bounds(&chat.root).unwrap();
+            assert!(widget.is_mapped() && bounds.height() > 0.0);
+            assert!(
+                bounds.y() >= 0.0
+                    && bounds.y() + bounds.height() <= chat.root.height() as f32 + 1.0,
+                "composer and footer stay entirely inside their pane: {bounds:?}"
+            );
+        }
+        assert!(
+            chat.active_vte
+                .text_format(vte4::Format::Text)
+                .unwrap()
+                .contains("tail-visible"),
+            "the end of multiline input stays visible after shrink"
+        );
+        // Real parser transitions retain the focused live surface.
+        assert!(chat.active_vte.grab_focus());
+        chat.pty
+            .write_test_slave(b"\x1b]133;C;cmdline_url=same\x07");
+        chat_display_settle();
+        assert!(chat.active_vte.has_focus());
+        chat.pty
+            .write_test_slave(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        chat_display_settle();
+        assert!(chat.active_vte.has_focus());
+        assert!(block.active_vte.grab_focus());
+        for _ in 0..2 {
+            chat.pty
+                .write_test_slave(b"same\r\n\x1b]133;C;cmdline_url=same\x07");
+            chat_display_settle();
+            chat.pty
+                .write_test_slave(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+            chat_display_settle();
+            assert!(
+                block.active_vte.has_focus(),
+                "background Chat reparent cannot steal Block focus"
+            );
+            assert!(!chat.active_vte.has_focus());
+        }
+        window.close();
+    }
+
+    #[test]
+    fn chat_optional_controls_kernel_pressure_has_no_accepted_feedback_or_late_byte() {
+        for stop in [false, true] {
+            let harness = CommitHarness::new(
+                if stop {
+                    BlockState::CollectingOutput
+                } else {
+                    BlockState::AwaitingCommand
+                },
+                if stop {
+                    PtyForeground::Other
+                } else {
+                    PtyForeground::Shell
+                },
+            );
+            let count = harness.pty.test_fill_kernel_input();
+            let accepted = if stop {
+                super::admit_chat_stop_input(
+                    &harness.pty,
+                    harness.pty.foreground_token(),
+                    || true,
+                    &harness.sink.human_input,
+                    &harness.sink.input_feedback,
+                )
+            } else {
+                super::submit_chat_enter(&harness.sink, true)
+            };
+            assert!(!accepted);
+            assert_eq!(harness.human_inputs.get(), 0);
+            assert_eq!(harness.sink.accepted_input_generation.get(), 0);
+            assert!(!harness.sink.submission_pending.get());
+            assert_eq!(harness.sink.selected_block_id.get(), Some(7));
+            let mut drained = Vec::new();
+            while drained.len() < count {
+                drained.extend(harness.written());
+            }
+            assert_eq!(drained, vec![b'x'; count]);
+            assert!(harness.written().is_empty());
+        }
+    }
+
+    #[test]
+    fn chat_buttons_reject_enhanced_enter_and_paste_frames_without_touching_native_keys() {
+        let harness = CommitHarness::new(BlockState::AwaitingCommand, PtyForeground::Shell);
+        harness.sink.kitty_flags.set(1);
+        assert!(!super::submit_chat_enter(&harness.sink, true));
+        assert!(harness.written().is_empty());
+        harness.sink.kitty_flags.set(0);
+        harness.pty.set_shell_bracketed_paste(true);
+        harness.pty.write_bytes(b"\x1b[200~").unwrap();
+        assert_eq!(harness.written(), b"\x1b[200~");
+        harness.pty.test_wait_input_idle();
+        assert!(!super::submit_chat_enter(&harness.sink, true));
+        assert!(harness.written().is_empty());
+        assert_eq!(harness.human_inputs.get(), 0);
+        harness.pty.write_bytes(b"\x1b[201~").unwrap();
+        assert_eq!(harness.written(), b"\x1b[201~");
+        harness.pty.test_wait_input_idle();
+        assert!(super::submit_chat_enter(&harness.sink, true));
+        assert_eq!(harness.written(), b"\r");
+        assert_eq!(harness.human_inputs.get(), 1);
+    }
+
+    #[test]
+    fn chat_optional_controls_do_not_wait_behind_inflight_native_input() {
+        for stop in [false, true] {
+            let harness = CommitHarness::new(
+                if stop {
+                    BlockState::CollectingOutput
+                } else {
+                    BlockState::AwaitingCommand
+                },
+                if stop {
+                    PtyForeground::Other
+                } else {
+                    PtyForeground::Shell
+                },
+            );
+            // Larger than the kernel PTY buffer, but below the ordinary input
+            // cap. The worker takes it out of the queue and blocks on its tail.
+            let payload = vec![b'x'; crate::pty::MAX_PTY_INPUT_MESSAGE_BYTES];
+            harness.pty.write_bytes(&payload).unwrap();
+            harness.pty.test_wait_inflight();
+            let admitted = if stop {
+                super::admit_chat_stop_input(
+                    &harness.pty,
+                    harness.pty.foreground_token(),
+                    || true,
+                    &harness.sink.human_input,
+                    &harness.sink.input_feedback,
+                )
+            } else {
+                super::submit_chat_enter(&harness.sink, true)
+            };
+            // Drain before asserting so even a failing regression releases the
+            // real writer and proves which byte eventually reached the slave.
+            let mut delivered = Vec::new();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while delivered.len() < payload.len() {
+                assert!(std::time::Instant::now() < deadline);
+                delivered.extend(harness.written());
+            }
+            harness.pty.test_wait_input_idle();
+            delivered.extend(harness.written());
+            assert!(
+                !admitted,
+                "optional action cannot queue behind inflight input"
+            );
+            assert_eq!(delivered, payload, "no delayed action byte may survive");
+            assert_eq!(harness.human_inputs.get(), 0);
+        }
+    }
+
+    #[test]
+    fn chat_stop_admission_rejects_pressure_and_closed_without_accepted_feedback() {
+        let harness = CommitHarness::new(BlockState::CollectingOutput, PtyForeground::Other);
+        let queue = harness.pty.test_input_queue(1);
+        harness.pty.write_bytes(b"occupied").unwrap();
+        assert!(!super::admit_chat_stop_input(
+            &harness.pty,
+            harness.pty.foreground_token(),
+            || true,
+            &harness.sink.human_input,
+            &harness.sink.input_feedback,
+        ));
+        assert_eq!(harness.human_inputs.get(), 0);
+        assert_eq!(queue.try_recv().unwrap(), b"occupied");
+        assert!(super::admit_chat_stop_input(
+            &harness.pty,
+            harness.pty.foreground_token(),
+            || true,
+            &harness.sink.human_input,
+            &harness.sink.input_feedback,
+        ));
+        assert_eq!(harness.written(), b"\x03");
+        assert!(queue.try_recv().is_err());
+        assert_eq!(harness.human_inputs.get(), 1);
+        harness.pty.kill();
+        assert!(!super::admit_chat_stop_input(
+            &harness.pty,
+            harness.pty.foreground_token(),
+            || true,
+            &harness.sink.human_input,
+            &harness.sink.input_feedback,
+        ));
+        assert_eq!(harness.human_inputs.get(), 1);
+    }
+
+    #[test]
+    fn chat_send_rejects_replaced_prompt_at_the_immediate_write_boundary() {
+        let harness = CommitHarness::new(BlockState::AwaitingCommand, PtyForeground::Shell);
+        let prompt = Cell::new(1_u64);
+        let captured = prompt.get();
+        let foreground = harness.pty.shell_foreground_token();
+        prompt.set(2);
+        assert!(!super::submit_chat_enter_for_target(
+            &harness.sink,
+            true,
+            foreground,
+            || prompt.get() == captured
+        ));
+        assert!(harness.written().is_empty());
+        assert_eq!(harness.human_inputs.get(), 0);
+        assert_eq!(harness.sink.accepted_input_generation.get(), 0);
+        assert!(!harness.sink.submission_pending.get());
+        let captured = prompt.get();
+        assert!(super::submit_chat_enter_for_target(
+            &harness.sink,
+            true,
+            foreground,
+            || prompt.get() == captured
+        ));
+        assert_eq!(harness.written(), b"\r");
+        assert_eq!(harness.human_inputs.get(), 1);
+    }
+
+    #[test]
+    fn chat_submit_rejects_closed_writer_without_accepted_input() {
+        let harness = CommitHarness::new(BlockState::AwaitingCommand, PtyForeground::Shell);
+        let draft = "echo 你好🙂";
+        *harness.sink.typed_cmd.borrow_mut() = draft.to_string();
+        harness.pty.kill();
+        assert!(!super::submit_chat_enter(&harness.sink, true));
+        assert_eq!(harness.sink.typed_cmd.borrow().as_str(), draft);
+        assert_eq!(
+            harness.sink.typed_cmd_fidelity.get(),
+            TypedShadowFidelity::ExactOpen
+        );
+        assert!(harness.written().is_empty());
+        assert!(!harness.sink.submission_pending.get());
+        assert_eq!(harness.sink.accepted_input_generation.get(), 0);
+        assert_eq!(harness.human_inputs.get(), 0);
+        assert_eq!(harness.sink.selected_block_id.get(), Some(7));
+    }
+
+    #[test]
+    fn chat_submit_rejects_full_queue_then_admits_exactly_one_enter() {
+        let harness = CommitHarness::new(BlockState::AwaitingCommand, PtyForeground::Shell);
+        let draft = "echo 你好🙂";
+        *harness.sink.typed_cmd.borrow_mut() = draft.to_string();
+        let queue = harness.pty.test_input_queue(1);
+        harness.pty.write_bytes(b"occupied").unwrap();
+        assert!(!super::submit_chat_enter(&harness.sink, true));
+        assert_eq!(harness.sink.typed_cmd.borrow().as_str(), draft);
+        assert_eq!(
+            harness.sink.typed_cmd_fidelity.get(),
+            TypedShadowFidelity::ExactOpen
+        );
+        assert!(!harness.sink.submission_pending.get());
+        assert_eq!(harness.sink.accepted_input_generation.get(), 0);
+        assert_eq!(harness.human_inputs.get(), 0);
+        assert_eq!(harness.sink.selected_block_id.get(), Some(7));
+        assert_eq!(queue.try_recv().unwrap(), b"occupied");
+        assert!(queue.try_recv().is_err());
+        assert!(super::submit_chat_enter(&harness.sink, true));
+        assert_eq!(harness.written(), b"\r");
+        assert!(queue.try_recv().is_err());
+        assert!(harness.sink.submission_pending.get());
+        assert_eq!(harness.sink.accepted_input_generation.get(), 1);
+        assert_eq!(harness.human_inputs.get(), 1);
+    }
+
+    #[test]
+    fn chat_submit_cannot_count_an_earlier_held_escape_as_enter_admission() {
+        let harness = CommitHarness::new(BlockState::AwaitingCommand, PtyForeground::Shell);
+        let queue = harness.pty.test_input_queue(1);
+        harness.press(super::KittyKey::Unicode('f'), true, false);
+        assert_eq!(
+            harness.sink.on_commit("\x1b"),
+            super::LiveCommitRoute::HeldAltEscape
+        );
+        // A button must not flush or consume half a native Alt chord.
+        assert!(!super::submit_chat_enter(&harness.sink, true));
+        assert!(queue.try_recv().is_err());
+        assert!(harness.sink.alt_escape.get().is_holding());
+        assert!(!harness.sink.submission_pending.get());
+        assert_eq!(harness.sink.accepted_input_generation.get(), 0);
+        assert_eq!(harness.human_inputs.get(), 0);
+    }
+
+    #[test]
+    fn chat_submit_is_one_enter_and_ps2_pending_does_not_replay_commands() {
+        let harness = CommitHarness::new(BlockState::AwaitingCommand, PtyForeground::Shell);
+        *harness.sink.typed_cmd.borrow_mut() = "printf 'first\nsecond'".to_string();
+        assert!(super::submit_chat_enter(&harness.sink, true));
+        assert!(harness.sink.submission_pending.get());
+        assert_eq!(harness.written(), b"\r");
+        // A continued PS2 edit can still use Send without a fresh OSC B.
+        assert!(super::submit_chat_enter(&harness.sink, true));
+        assert_eq!(harness.written(), b"\r");
+        for state in [
+            BlockState::CollectingOutput,
+            BlockState::PostCommand,
+            BlockState::AltScreen,
+            BlockState::RawFallback,
+        ] {
+            harness.sink.bstate.set(state);
+            assert!(!super::submit_chat_enter(&harness.sink, true));
+            assert!(harness.written().is_empty());
+        }
+        harness.sink.bstate.set(BlockState::AwaitingCommand);
+        assert!(!super::submit_chat_enter(&harness.sink, false));
+        assert!(harness.written().is_empty());
+        for foreground in [PtyForeground::Other, PtyForeground::Unknown] {
+            harness.sink.pty.set_test_foreground(foreground);
+            assert!(!super::submit_chat_enter(&harness.sink, true));
+            assert!(harness.written().is_empty());
+        }
+        harness.sink.pty.set_test_foreground(PtyForeground::Shell);
+        // Selection-held parser boundaries must be flushed before deciding.
+        let hold = super::SelectionFeedHold::new();
+        let state = harness.sink.bstate.clone();
+        hold.set_flush(move |_| state.set(BlockState::CollectingOutput));
+        hold.begin_drag();
+        assert!(hold.try_buffer(b"pending shell boundary"));
+        hold.flush_now();
+        assert!(!super::submit_chat_enter(&harness.sink, true));
+        assert!(harness.written().is_empty());
     }
 
     /// Both halves of a chord commit inside one key press, so a held ESC never
@@ -28920,6 +33982,125 @@ mod tests {
         );
     }
 
+    #[test]
+    fn organism_knowledge_uses_real_prompt_proof_and_invalidates_before_fanout() {
+        use jterm_core::organism_live::LiveActivityKnowledge;
+        let harness = ReaderHarness::new();
+        let ctx = &harness.ctx.verified_submission;
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, false, [0, 0, 0]),
+            LiveActivityKnowledge::Unknown
+        );
+        harness.arm_verified_prompt();
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, false, [0, 0, 0]),
+            LiveActivityKnowledge::KnownIdle
+        );
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, true, [0, 0, 0]),
+            LiveActivityKnowledge::Unknown
+        );
+        assert_eq!(
+            ctx.organism_activity_knowledge(true, false, [0, 0, 0]),
+            LiveActivityKnowledge::Unknown
+        );
+        ctx.typed_cmd.borrow_mut().push(' ');
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, false, [0, 0, 0]),
+            LiveActivityKnowledge::Unknown
+        );
+        ctx.typed_cmd.borrow_mut().clear();
+        let notices = Rc::new(Cell::new(0));
+        let seen = notices.clone();
+        let state = ctx.bstate.clone();
+        ctx.prompt_evidence_invalidated
+            .borrow_mut()
+            .push(Rc::new(move || {
+                assert_ne!(state.get(), BlockState::AwaitingCommand);
+                seen.set(seen.get() + 1);
+            }));
+        harness.feed(ParserEvent::PromptStart);
+        assert_eq!(notices.get(), 1);
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, false, [0, 0, 0]),
+            LiveActivityKnowledge::Unknown
+        );
+        harness.arm_verified_prompt();
+        let before_reset = notices.get();
+        harness.feed(ParserEvent::HardReset);
+        assert_eq!(notices.get(), before_reset + 1);
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, false, [0, 0, 0]),
+            LiveActivityKnowledge::Unknown
+        );
+        harness.arm_verified_prompt();
+        harness.feed(command_start(Some("work")));
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, false, [0, 0, 0]),
+            LiveActivityKnowledge::Busy
+        );
+    }
+
+    #[test]
+    fn organism_reviewed_admission_notifies_only_after_successful_proof_loss() {
+        use jterm_core::organism_live::LiveActivityKnowledge;
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        let ctx = &harness.ctx.verified_submission;
+        let notices = Rc::new(Cell::new(0));
+        let seen = notices.clone();
+        let dirty = ctx.idle_input_dirty.clone();
+        ctx.prompt_evidence_invalidated
+            .borrow_mut()
+            .push(Rc::new(move || {
+                assert!(dirty.get());
+                seen.set(seen.get() + 1);
+            }));
+        assert!(ctx.try_recall_command("echo recall", false, [0, 0, 0]));
+        assert_eq!(notices.get(), 1);
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, false, [0, 0, 0]),
+            LiveActivityKnowledge::Unknown
+        );
+        assert!(!ctx.try_recall_command("must refuse", false, [0, 0, 0]));
+        assert_eq!(notices.get(), 1);
+    }
+
+    #[test]
+    fn organism_verified_begin_notifies_after_source_install_and_refusal_is_silent() {
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        let ctx = &harness.ctx.verified_submission;
+        let notices = Rc::new(Cell::new(0));
+        let seen = notices.clone();
+        let dirty = ctx.idle_input_dirty.clone();
+        let source = ctx.source_id.clone();
+        ctx.prompt_evidence_invalidated
+            .borrow_mut()
+            .push(Rc::new(move || {
+                assert!(dirty.get());
+                assert!(source.borrow().is_some());
+                seen.set(seen.get() + 1);
+            }));
+        ctx.idle_input_dirty.set(true);
+        assert!(ctx.begin("echo refused", None, [0, 0, 0]).is_err());
+        assert_eq!(notices.get(), 0);
+        ctx.idle_input_dirty.set(false);
+        assert!(ctx.begin("echo reviewed", None, [0, 0, 0]).is_ok());
+        assert_eq!(notices.get(), 1);
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, false, [0, 0, 0]),
+            jterm_core::organism_live::LiveActivityKnowledge::Unknown
+        );
+        ctx.invalidate_for_terminal_reset();
+        assert!(ctx.source_id.borrow().is_none());
+        assert_eq!(
+            notices.get(),
+            1,
+            "retirement does not manufacture prompt restoration"
+        );
+    }
+
     /// The anchor a verified submission compares the cursor against is the
     /// PromptEnd anchor rebased onto the surface's *current* row count — the
     /// compact/full `set_size` churn moves the text buffer under it. The two
@@ -29092,10 +34273,12 @@ mod tests {
         let harness = ReaderHarness::new();
         harness.arm_verified_prompt();
 
-        assert!(harness
-            .ctx
-            .verified_submission
-            .try_submit_historical_rerun("printf SAFE", [0, 0, 0]));
+        assert!(harness.ctx.verified_submission.try_submit_historical_rerun(
+            71,
+            "printf SAFE",
+            Some(&super::historical_replay_tests::record("printf SAFE")),
+            [0, 0, 0]
+        ));
         assert_eq!(
             harness.pty.drain_test_slave(PTY_REPLY_WAIT),
             b"printf SAFE",
@@ -29216,10 +34399,12 @@ mod tests {
             }
 
             assert!(
-                !harness
-                    .ctx
-                    .verified_submission
-                    .try_submit_historical_rerun(command, [0, 0, 0]),
+                !harness.ctx.verified_submission.try_submit_historical_rerun(
+                    71,
+                    command,
+                    Some(&super::historical_replay_tests::record(command)),
+                    [0, 0, 0]
+                ),
                 "{refusal:?} must refuse"
             );
             assert_eq!(
@@ -29229,6 +34414,325 @@ mod tests {
                 b"",
                 "{refusal:?} must write no PTY bytes"
             );
+        }
+    }
+    #[test]
+    fn historical_provenance_refusals_write_no_pty_bytes() {
+        for refusal in [
+            "missing",
+            "screen",
+            "truncated",
+            "wrong-id",
+            "changed-command",
+            "restored",
+        ] {
+            let harness = ReaderHarness::new();
+            harness.arm_verified_prompt();
+            let _ = harness.pty.drain_test_slave(PTY_REPLY_WAIT);
+            let command = "printf '%s' 'Ａ Ｂ Ｃ'";
+            let mut record = super::historical_replay_tests::record(command);
+            match refusal {
+                "screen" | "restored" => record.command_exact = false,
+                "truncated" => record.command_truncated = true,
+                "wrong-id" => record.id += 1,
+                "changed-command" => record.cmd = "printf changed".into(),
+                _ => {}
+            }
+            let current = (refusal != "missing").then_some(&record);
+            assert!(
+                !harness.ctx.verified_submission.try_submit_historical_rerun(
+                    71,
+                    command,
+                    current,
+                    [0, 0, 0]
+                ),
+                "{refusal}"
+            );
+            assert_eq!(
+                harness
+                    .pty
+                    .drain_test_slave(std::time::Duration::from_millis(5)),
+                b"",
+                "{refusal} wrote bytes"
+            );
+            assert!(!harness.ctx.submission_pending_rc.get());
+        }
+    }
+}
+
+#[cfg(test)]
+mod controller_palette_regressions {
+    use super::*;
+
+    #[test]
+    fn ansi256_cube_matches_all_xterm_levels() {
+        let palette = [RGBA::new(0.0, 0.0, 0.0, 1.0); 16];
+        let levels = [0, 95, 135, 175, 215, 255];
+        for idx in 16_u8..=231 {
+            let cube = usize::from(idx - 16);
+            assert_eq!(
+                ansi256_to_rgb(idx, &palette),
+                (levels[cube / 36], levels[(cube % 36) / 6], levels[cube % 6]),
+                "palette index {idx}",
+            );
+        }
+    }
+
+    #[test]
+    fn ansi256_keeps_all_configured_base_colors() {
+        let palette = std::array::from_fn(|index| {
+            RGBA::new(index as f32 / 16.0, (15 - index) as f32 / 16.0, 0.5, 1.0)
+        });
+        for idx in 0_u8..16 {
+            let color = palette[usize::from(idx)];
+            assert_eq!(
+                ansi256_to_rgb(idx, &palette),
+                (
+                    (color.red() * 255.0) as u8,
+                    (color.green() * 255.0) as u8,
+                    (color.blue() * 255.0) as u8,
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn ansi256_keeps_all_grayscale_levels() {
+        let palette = [RGBA::new(0.0, 0.0, 0.0, 1.0); 16];
+        for idx in 232_u8..=255 {
+            let gray = 8 + (idx - 232) * 10;
+            assert_eq!(ansi256_to_rgb(idx, &palette), (gray, gray, gray));
+        }
+    }
+}
+
+#[cfg(test)]
+mod controller_selection_regressions {
+    use super::selected_visible_id_range;
+
+    #[test]
+    fn range_selection_excludes_filtered_cards_in_both_directions() {
+        let cards = [(10, false), (20, true), (30, false)];
+        assert_eq!(
+            selected_visible_id_range(cards, 10, 30),
+            Some((10, vec![10, 30]))
+        );
+        assert_eq!(
+            selected_visible_id_range(cards, 30, 10),
+            Some((30, vec![10, 30]))
+        );
+    }
+
+    #[test]
+    fn range_selection_rebases_a_filtered_or_missing_anchor() {
+        let cards = [(10, true), (20, false), (30, false)];
+        for anchor in [10, 99] {
+            assert_eq!(
+                selected_visible_id_range(cards, anchor, 30),
+                Some((30, vec![30]))
+            );
+        }
+    }
+
+    #[test]
+    fn range_selection_refuses_hidden_missing_and_empty_targets() {
+        let cards = [(10, false), (20, true)];
+        assert_eq!(selected_visible_id_range(cards, 10, 20), None);
+        assert_eq!(selected_visible_id_range(cards, 10, 99), None);
+        assert_eq!(
+            selected_visible_id_range([(10, true), (20, true)], 10, 20),
+            None
+        );
+        assert_eq!(selected_visible_id_range([], 10, 20), None);
+    }
+
+    #[test]
+    fn range_selection_preserves_all_visible_document_order() {
+        let cards = [(30, false), (10, false), (20, false)];
+        assert_eq!(
+            selected_visible_id_range(cards, 30, 20),
+            Some((30, vec![30, 10, 20]))
+        );
+    }
+}
+
+#[cfg(test)]
+mod controller_evidence_regressions {
+    use super::*;
+
+    #[test]
+    fn short_agent_evidence_preserves_each_known_capture_loss() {
+        for notice in [
+            FINISHED_OUTPUT_NOT_RETAINED,
+            FINISHED_OUTPUT_TEXT_TRUNCATED,
+            FINISHED_OUTPUT_PARTLY_RETAINED,
+        ] {
+            assert!(output_evidence_is_truncated("tail", "tail", Some(notice)));
+        }
+    }
+
+    #[test]
+    fn literal_elision_words_and_unrelated_notices_are_not_capture_loss() {
+        for text in ["0 lines elided", "0 bytes elided", "complete output", ""] {
+            assert!(!output_evidence_is_truncated(text, text, None));
+            assert!(!output_evidence_is_truncated(
+                text,
+                text,
+                Some("unrelated diagnostic")
+            ));
+        }
+    }
+
+    #[test]
+    fn actual_context_sampling_marks_agent_evidence_truncated() {
+        assert!(output_evidence_is_truncated(
+            "head\nmiddle\ntail",
+            "head\ntail",
+            None
+        ));
+        assert!(output_evidence_is_truncated("éé", "é", None));
+    }
+}
+
+#[cfg(test)]
+mod controller_navigation_regressions {
+    use super::{step_marked_indices, visible_marked_positions, visible_neighbor_after_removal};
+
+    #[test]
+    fn bookmark_steps_use_visible_marks_and_wrap_both_directions() {
+        let positions =
+            visible_marked_positions([(true, false), (true, true), (false, false), (true, false)]);
+        assert_eq!(positions, vec![0, 3]);
+        assert_eq!(step_marked_indices(&positions, Some(0), 1), Some(3));
+        assert_eq!(step_marked_indices(&positions, Some(3), -1), Some(0));
+        assert_eq!(step_marked_indices(&positions, Some(3), 1), Some(0));
+        assert_eq!(step_marked_indices(&positions, Some(0), -1), Some(3));
+        assert!(visible_marked_positions([(true, true), (false, false)]).is_empty());
+    }
+
+    #[test]
+    fn delete_neighbor_skips_hidden_cards_and_prefers_next() {
+        let cards = [(10, false), (20, true), (30, false), (40, true)];
+        assert_eq!(visible_neighbor_after_removal(cards, 1), Some(30));
+        assert_eq!(visible_neighbor_after_removal(cards, 3), Some(30));
+        assert_eq!(visible_neighbor_after_removal(cards, 4), Some(30));
+        assert_eq!(visible_neighbor_after_removal([(10, true)], 0), None);
+        assert_eq!(visible_neighbor_after_removal([], 0), None);
+    }
+
+    #[test]
+    fn unfiltered_delete_neighbor_preserves_existing_order() {
+        let cards = [(30, false), (10, false), (20, false)];
+        assert_eq!(visible_neighbor_after_removal(cards, 0), Some(30));
+        assert_eq!(visible_neighbor_after_removal(cards, 1), Some(10));
+        assert_eq!(visible_neighbor_after_removal(cards, 3), Some(20));
+    }
+}
+
+#[cfg(test)]
+mod fold_geometry_tests;
+
+#[cfg(test)]
+mod search_navigation_tests;
+#[cfg(test)]
+mod task_focus_tests;
+
+#[cfg(test)]
+mod incremental_find_tests;
+
+#[cfg(test)]
+mod font_sync_tests;
+
+impl TermView {
+    /// Share the same mutable map as key dispatch; menu rebuilds see reloads.
+    pub(crate) fn set_menu_keybindings(&self, map: Rc<RefCell<crate::keybindings::KeybindingMap>>) {
+        *self.menu_keybindings.borrow_mut() = Some(map);
+    }
+}
+
+#[cfg(test)]
+mod command_reuse_menu_label_tests {
+    #[test]
+    fn labels_distinguish_the_actual_single_and_multiple_paths() {
+        assert_eq!(super::command_reuse_menu_label(1), "Recall command");
+        assert_eq!(super::command_reuse_menu_label(2), "Recall commands");
+        assert_eq!(super::command_reuse_menu_label(128), "Recall commands");
+    }
+}
+
+#[cfg(test)]
+mod readline_preservation_tests;
+
+#[cfg(test)]
+mod chat_render_tests;
+
+#[cfg(test)]
+mod chat_shell_tests;
+
+#[cfg(test)]
+mod historical_replay_tests {
+    use super::*;
+
+    pub(super) fn record(command: &str) -> BlockData {
+        serde_json::from_value(serde_json::json!({
+            "id": 71, "prompt": "$ ", "cmd": command, "cmd_markup": null,
+            "output": "", "exit_code": 0, "estimated_height": 40,
+            "line_count": 0, "command_exact": true, "command_truncated": false
+        }))
+        .expect("owned historical record")
+    }
+
+    #[test]
+    fn exact_history_preserves_spaces_and_fullwidth_bytes() {
+        for command in ["printf SAFE", "  printf '%s' 'ＡＢＣ  中文'  "] {
+            let record = record(command);
+            assert_eq!(
+                historical_rerun_disabled_reason(71, command, Some(&record)),
+                None
+            );
+            assert_eq!(
+                historical_rerun_paste(command).unwrap().bytes,
+                command.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn history_replay_rejects_uncertain_truncated_missing_and_stale_records() {
+        let command = "printf '%s' 'Ａ Ｂ Ｃ'";
+        let exact = record(command);
+        assert!(historical_rerun_disabled_reason(71, command, None).is_some());
+        assert!(historical_rerun_disabled_reason(72, command, Some(&exact)).is_some());
+        assert!(historical_rerun_disabled_reason(71, "printf changed", Some(&exact)).is_some());
+        for (is_exact, truncated) in [(false, false), (false, true), (true, true)] {
+            let mut capture = exact.clone();
+            capture.command_exact = is_exact;
+            capture.command_truncated = truncated;
+            assert!(historical_rerun_disabled_reason(71, command, Some(&capture)).is_some());
+            assert_eq!(
+                capture.cmd, command,
+                "never repair fullwidth padding by guessing"
+            );
+        }
+    }
+
+    #[test]
+    fn old_records_default_uncertain_and_unsafe_exact_records_still_fail() {
+        let mut value = serde_json::to_value(record("printf SAFE")).unwrap();
+        value.as_object_mut().unwrap().remove("command_exact");
+        value.as_object_mut().unwrap().remove("command_truncated");
+        let old: BlockData = serde_json::from_value(value).unwrap();
+        assert!(historical_rerun_disabled_reason(71, &old.cmd, Some(&old)).is_some());
+        for command in [
+            "",
+            "  ",
+            "printf A\nprintf B",
+            "printf \x1b[201~B",
+            TRUNCATED_COMMAND_PLACEHOLDER,
+            UNAVAILABLE_COMMAND_PLACEHOLDER,
+        ] {
+            let record = record(command);
+            assert!(historical_rerun_disabled_reason(71, command, Some(&record)).is_some());
         }
     }
 }

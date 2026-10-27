@@ -199,6 +199,9 @@ impl PaneLeaf {
             self.root_widget()
                 .set_data::<bool>(PANE_REMOTE_DATA_KEY, remote);
         }
+        if let Self::Vte(view) = self {
+            view.set_organism_local(!remote);
+        }
     }
 
     pub(crate) fn is_remote(&self) -> bool {

@@ -1,6 +1,7 @@
 //! panes — UiState methods extracted from ui (mechanical split, no logic changes)
 use gtk4::prelude::*;
 use gtk4::{Orientation, Paned};
+use jterm_core::pane_layout::{directional_focus_target, PaneRect, Rect as PaneBounds};
 use libadwaita as adw;
 use std::io;
 use std::rc::Rc;
@@ -59,40 +60,6 @@ fn balanced_split_position(extent: i32, start_span: u32, end_span: u32) -> Optio
     let total_span = u64::from(start_span) + u64::from(end_span);
     let position = i64::from(extent) * i64::from(start_span) / total_span as i64;
     Some(position.clamp(1, i64::from(extent - 1)) as i32)
-}
-
-fn nearest_directional_index(
-    centers: &[(f32, f32)],
-    focused: usize,
-    direction: Direction,
-) -> Option<usize> {
-    let (focused_x, focused_y) = *centers.get(focused)?;
-    centers
-        .iter()
-        .enumerate()
-        .filter_map(|(index, &(x, y))| {
-            if index == focused {
-                return None;
-            }
-            let dx = x - focused_x;
-            let dy = y - focused_y;
-            let in_direction = match direction {
-                Direction::Left => dx < -1.0,
-                Direction::Right => dx > 1.0,
-                Direction::Up => dy < -1.0,
-                Direction::Down => dy > 1.0,
-            };
-            if !in_direction {
-                return None;
-            }
-            let distance = match direction {
-                Direction::Left | Direction::Right => dx.abs() + dy.abs() * 0.1,
-                Direction::Up | Direction::Down => dy.abs() + dx.abs() * 0.1,
-            };
-            Some((index, distance))
-        })
-        .min_by(|(_, left), (_, right)| left.total_cmp(right))
-        .map(|(index, _)| index)
 }
 
 /// The pane `focused` should swap with: the next entry in visual order,
@@ -236,6 +203,7 @@ impl UiState {
             None,
         ));
         drop(shell_argv);
+        view.enable_local_launch_recovery();
 
         let terminal = view.vte().clone();
         setup_terminal_click_handler(&terminal);
@@ -302,10 +270,14 @@ impl UiState {
             Some(&sid),
             initial_commands,
         )?);
-        if matches!(mode, crate::config::TerminalMode::Block) {
+        if matches!(
+            mode,
+            crate::config::TerminalMode::Block | crate::config::TerminalMode::Chat
+        ) {
             TermView::arm_shell_integration_notice(&view, shell_argv.as_slice());
         }
         drop(shell_argv);
+        view.set_menu_keybindings(self.keybinding_map.clone());
         view.start_history_load();
 
         let terminal = view.vte().clone();
@@ -327,6 +299,7 @@ impl UiState {
         });
 
         self.connect_block_command_history(&view);
+        self.connect_unified_navigation(&view);
         self.connect_block_ai_action(&view);
         self.connect_bottom_bar_block_status(&view);
         self.attach_ascii_organism_to_view(&view, false);
@@ -359,6 +332,16 @@ impl UiState {
             self.connect_tab_activity(&leaf, &root);
         }
         Ok(leaf)
+    }
+
+    pub(crate) fn connect_unified_navigation(&self, view: &Rc<TermView>) {
+        let ui = self.unified_navigation_owner.borrow().clone();
+        let weak = Rc::downgrade(view);
+        view.connect_unified_navigation(move |action| {
+            if let (Some(view), Some(ui)) = (weak.upgrade(), ui.upgrade()) {
+                ui.execute_unified_navigation_for(&view, action);
+            }
+        });
     }
 
     /// Append finished Block commands to the cross-session command history.
@@ -413,14 +396,15 @@ impl UiState {
             // leaf: the pane tree, headers and drag/drop are identical, so the
             // requested mode travels on into `TermView::new` and picks the
             // backend there.
-            crate::config::TerminalMode::Block | crate::config::TerminalMode::Unified => self
-                .create_block_leaf(
-                    mode,
-                    working_directory,
-                    session_id,
-                    initial_commands,
-                    tab_widget_name,
-                ),
+            crate::config::TerminalMode::Block
+            | crate::config::TerminalMode::Chat
+            | crate::config::TerminalMode::Unified => self.create_block_leaf(
+                mode,
+                working_directory,
+                session_id,
+                initial_commands,
+                tab_widget_name,
+            ),
             crate::config::TerminalMode::Vte => Ok(self.create_vte_leaf(
                 working_directory,
                 session_id,
@@ -445,35 +429,45 @@ impl UiState {
         );
         let ui = self.clone();
         let target_root = leaf.root_widget().downgrade();
+        let drop_intent = super::path_drop::DropIntent::install(leaf);
         path_target.connect_drop(move |_, value, _x, _y| {
             let Ok(files) = value.get::<gtk4::gdk::FileList>() else {
                 return false;
             };
+            // Every new file drop supersedes the previous intent, even when
+            // the new payload has no usable local paths or fails admission.
+            drop_intent.invalidate();
             let paths = files
                 .files()
                 .into_iter()
                 .filter_map(|file| file.path())
+                .take(17)
                 .collect::<Vec<_>>();
             if paths.is_empty() {
                 return false;
             }
-            let result = crate::image_drop::dropped_paths_payload(&paths)
-                .map_err(|error| error.to_string())
-                .and_then(|payload| {
-                    target_root
-                        .upgrade()
-                        .and_then(|root| PaneLeaf::from_widget(&root))
-                        .ok_or_else(|| "the target terminal is no longer available".to_string())
-                        .map(|leaf| (leaf, payload))
+            let result = target_root
+                .upgrade()
+                .and_then(|root| PaneLeaf::from_widget(&root))
+                .and_then(|leaf| {
+                    super::path_drop::DropDestination::capture(
+                        &leaf,
+                        &ui.notebook,
+                        ui.tab_focus_generation.clone(),
+                        &drop_intent,
+                    )
                 })
-                .and_then(|(leaf, payload)| {
-                    leaf.grab_focus();
-                    // A Block pane pastes it (bracketed when the program asked
-                    // for 2004); a plain VTE pane keeps its review-input path.
-                    match leaf.block_view() {
-                        Some(view) => view.paste_text(&payload),
-                        None => leaf.write_review_input(&payload),
-                    }
+                .ok_or_else(|| "the target terminal is no longer available".to_string())
+                .and_then(|destination| {
+                    let validation = crate::image_drop::PathValidation::start(paths)
+                        .map_err(|error| error.to_string())?;
+                    let overlay = ui.toast_overlay.downgrade();
+                    destination.wait(validation, move |error| {
+                        if let Some(overlay) = overlay.upgrade() {
+                            overlay.add_toast(adw::Toast::new(&format!("Drop rejected: {error}")));
+                        }
+                    });
+                    Ok(())
                 });
             if let Err(error) = result {
                 ui.toast_overlay
@@ -873,13 +867,11 @@ impl UiState {
             return;
         };
         let current_term = current_leaf.terminal().clone();
-        // Block views track cwd themselves (their PTY is not owned by the live
-        // VTE), so prefer that over VTE's OSC 7 / child-pid inspection.
-        let working_directory = current_leaf
-            .block_view()
-            .map(|view| view.cwd())
-            .filter(|cwd| !cwd.is_empty())
-            .or_else(|| terminal_working_directory(&current_term));
+        // A split starts a local shell even beside a remote pane. Raw Block
+        // cwd metadata may name a different machine, so use only a local OSC 7
+        // authority or the original local PTY child's /proc directory.
+        let working_directory = terminal_working_directory(&current_term)
+            .or_else(|| crate::process::process_cwd(current_leaf.process_probe().1));
         let tab_widget_name = Some(page_widget.widget_name().to_string());
         let pinned = self.tab_page_is_pinned(&page_widget);
         let custom_title = tab_custom_title_cell(&page_widget);
@@ -1018,10 +1010,19 @@ impl UiState {
             return;
         }
 
-        let focused = leaves
+        // Finished Block cards and pane controls can hold focus instead of
+        // the live VTE. Resolve the same owning/last-active leaf used by
+        // directional focus rather than silently cycling from pane zero.
+        let Some(active) = node.active_leaf() else {
+            return;
+        };
+        let active_root = active.root_widget();
+        let Some(focused) = leaves
             .iter()
-            .position(|leaf| leaf.terminal().has_focus())
-            .unwrap_or(0);
+            .position(|leaf| leaf.root_widget() == active_root)
+        else {
+            return;
+        };
         let next = if direction > 0 {
             (focused + 1) % leaves.len()
         } else if focused == 0 {
@@ -1135,12 +1136,21 @@ impl UiState {
         let mut positioned = Vec::with_capacity(leaves.len());
         for leaf in leaves {
             let root = leaf.root_widget();
+            if !root.is_mapped() {
+                continue;
+            }
             let Some(bounds) = root.compute_bounds(&page_widget) else {
                 continue;
             };
-            let cx = bounds.x() + bounds.width() / 2.0;
-            let cy = bounds.y() + bounds.height() / 2.0;
-            positioned.push((leaf, (cx, cy)));
+            positioned.push((
+                leaf,
+                PaneBounds {
+                    x: bounds.x(),
+                    y: bounds.y(),
+                    width: bounds.width(),
+                    height: bounds.height(),
+                },
+            ));
         }
 
         let Some(focused_index) = positioned
@@ -1150,29 +1160,33 @@ impl UiState {
             log::debug!("focus_pane_directional: focused leaf not in positioned set");
             return;
         };
-        let centers = positioned
+        let rects = positioned
             .iter()
-            .map(|(_, center)| *center)
+            .enumerate()
+            .map(|(session, (_, rect))| PaneRect {
+                session,
+                rect: *rect,
+            })
             .collect::<Vec<_>>();
-        let Some(target) = nearest_directional_index(&centers, focused_index, direction) else {
+        let Some(target) = directional_focus_target(&rects, focused_index, direction) else {
             log::debug!(
                 "focus_pane_directional: no pane {direction:?} of index {focused_index} \
-                 (centers: {centers:?})"
+                 (rects: {rects:?})"
             );
             return;
         };
         log::debug!("focus_pane_directional: focusing pane {target}");
         positioned[target].0.grab_focus();
+        self.refresh_pane_headers();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        balanced_split_position, equalize_pane_tree, nearest_directional_index,
-        prepare_then_commit, swap_target_in_visual_order,
+        balanced_split_position, equalize_pane_tree, prepare_then_commit,
+        swap_target_in_visual_order,
     };
-    use crate::keybindings::Direction;
     use std::cell::Cell;
 
     #[test]
@@ -1258,6 +1272,66 @@ mod tests {
         assert_eq!(root.end_child().as_ref(), Some(&nested_widget));
         assert_eq!(nested.start_child().as_ref(), Some(&leaf_b_widget));
         assert_eq!(nested.end_child().as_ref(), Some(&leaf_c_widget));
+
+        // Reuse these ordinary button leaves to exercise native Notebook
+        // reparenting. No terminal, child process or destructive close exists.
+        let notebook = gtk4::Notebook::new();
+        notebook.append_page(&root, None::<&gtk4::Widget>);
+        let foreground = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let entry = gtk4::Entry::new();
+        foreground.append(&entry);
+        notebook.append_page(&foreground, None::<&gtk4::Widget>);
+        let window = gtk4::Window::builder().child(&notebook).build();
+        window.present();
+        let main = gtk4::glib::MainContext::default();
+        let spin_until = |condition: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+            while !condition() && std::time::Instant::now() < deadline {
+                while main.pending() {
+                    main.iteration(false);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(condition(), "GTK pane fixture did not settle");
+        };
+        spin_until(&|| root.is_mapped());
+        let swap = super::detach_leaf_for_zoom(&notebook, &root_widget, &leaf_a_widget).unwrap();
+        notebook.set_current_page(Some(1));
+        spin_until(&|| entry.is_mapped());
+        assert!(entry.grab_focus());
+        let native_root = window.upcast_ref::<gtk4::Root>();
+        let focus = native_root.focus().expect("entry owns focus");
+        assert!(super::widget_is_within(&focus, entry.upcast_ref()));
+        assert_eq!(
+            super::restore_zoomed_leaf_preserving_selection(&notebook, &swap),
+            Some(0)
+        );
+        assert_eq!(
+            notebook.nth_page(notebook.current_page()),
+            Some(foreground.clone().upcast())
+        );
+        assert_eq!(native_root.focus().as_ref(), Some(&focus));
+
+        let promoted = super::detach_leaf_and_promote(&notebook, &leaf_a_widget).unwrap();
+        assert_eq!(promoted, nested_widget);
+        assert_eq!(
+            notebook.nth_page(notebook.current_page()),
+            Some(foreground.clone().upcast())
+        );
+        assert_eq!(native_root.focus().as_ref(), Some(&focus));
+
+        // The same preserving operation still selects the replacement when
+        // the replaced zoom itself was the active page.
+        notebook.set_current_page(Some(0));
+        spin_until(&|| leaf_b.is_mapped());
+        assert!(leaf_b.grab_focus());
+        let swap = super::detach_leaf_for_zoom(&notebook, &nested_widget, &leaf_b_widget).unwrap();
+        let _ = super::restore_zoomed_leaf_preserving_selection(&notebook, &swap).unwrap();
+        assert_eq!(
+            notebook.nth_page(notebook.current_page()),
+            Some(nested_widget)
+        );
+        window.close();
     }
 
     #[test]
@@ -1269,48 +1343,6 @@ mod tests {
         assert_eq!(swap_target_in_visual_order(1, 0), None);
         // A pane missing from the order cannot be swapped at all.
         assert_eq!(swap_target_in_visual_order(2, 2), None);
-    }
-
-    #[test]
-    fn directional_focus_selects_the_nearest_pane_on_each_axis() {
-        // 2x2 pane grid in visual order.
-        let centers = [(25.0, 25.0), (75.0, 25.0), (25.0, 75.0), (75.0, 75.0)];
-
-        assert_eq!(
-            nearest_directional_index(&centers, 3, Direction::Left),
-            Some(2)
-        );
-        assert_eq!(
-            nearest_directional_index(&centers, 2, Direction::Right),
-            Some(3)
-        );
-        assert_eq!(
-            nearest_directional_index(&centers, 3, Direction::Up),
-            Some(1)
-        );
-        assert_eq!(
-            nearest_directional_index(&centers, 1, Direction::Down),
-            Some(3)
-        );
-    }
-
-    #[test]
-    fn directional_focus_does_not_wrap_at_an_outer_edge() {
-        let centers = [(25.0, 25.0), (75.0, 25.0)];
-
-        assert_eq!(
-            nearest_directional_index(&centers, 0, Direction::Left),
-            None
-        );
-        assert_eq!(
-            nearest_directional_index(&centers, 1, Direction::Right),
-            None
-        );
-        assert_eq!(nearest_directional_index(&centers, 0, Direction::Up), None);
-        assert_eq!(
-            nearest_directional_index(&centers, 0, Direction::Down),
-            None
-        );
     }
 
     #[test]
