@@ -121,14 +121,42 @@ impl UiState {
     /// Re-collect the focused pane's snapshot and repaint the bar. Cheap when
     /// nothing changed: identical content skips the label rebuild entirely.
     pub(crate) fn refresh_bottom_bar(&self) {
-        if !self.bottom_bar.get_visible() {
-            return;
-        }
+        let index = self.notebook.current_page().unwrap_or(0);
+        let page = self.notebook.nth_page(Some(index));
+        let private = page
+            .as_ref()
+            .and_then(super::tab_private_title_cell)
+            .is_some_and(|flag| flag.get());
+        let title = page
+            .as_ref()
+            .and_then(|page| super::tab_display_title(&self.notebook, page))
+            .unwrap_or_default();
         let leaf = self.current_pane_leaf();
         let cwd = leaf
             .as_ref()
             .and_then(|leaf| self.pane_working_directory(leaf))
             .map(PathBuf::from);
+        let home = glib::home_dir();
+        let content = jterm_core::title_bar::compose(&jterm_core::title_bar::Snapshot {
+            app: "Forge",
+            title: &title,
+            cwd: cwd.as_deref(),
+            home: Some(home.as_path()),
+            mode: self.config.borrow().terminal_mode.as_str(),
+            tab_index: index as usize,
+            tab_count: self.notebook.n_pages() as usize,
+            private,
+            pane_count: page
+                .as_ref()
+                .and_then(super::PaneNode::from_widget)
+                .map_or(0, |node| node.leaves().len()),
+            ..Default::default()
+        });
+        self.window.set_title(Some(&content.window_title));
+        self.title_bar.update(content);
+        if !self.bottom_bar.get_visible() {
+            return;
+        }
         // Never wait for Git on GTK's frame thread. The worker refreshes its
         // cache and the next status tick observes the completed value.
         let git = cwd

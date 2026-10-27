@@ -723,7 +723,10 @@ pub fn run() -> glib::ExitCode {
              .tab-pin-icon { font-size: 0.9em; opacity: 0.8; margin-right: 2px; }
              .tab-selected { background-color: alpha(currentColor, 0.14); outline: 2px solid alpha(currentColor, 0.8); outline-offset: -2px; }
              .tab-conn-dot { font-size: 0.7em; margin-right: 2px; }
-             .window-controls { margin-left: 2px; }
+             .workspace-title-bar { padding: 0 4px; border-bottom: 1px solid alpha(currentColor, 0.10); }
+         .workspace-title-bar .window-control { min-width: 32px; min-height: 30px; border-radius: 4px; }
+         .workspace-title-bar .window-control:last-child:hover { background-color: #be3737; color: white; }
+ .window-controls { margin-left: 2px; }
              .window-control { min-width: 24px; min-height: 24px; padding: 0; border-radius: 999px; }
              @keyframes conn-pulse { 0% { opacity: 1.0; } 50% { opacity: 0.35; } 100% { opacity: 1.0; } }
              .tab-conn-dot.tab-connecting { animation: conn-pulse 1.2s ease-in-out infinite; }
@@ -913,13 +916,17 @@ pub fn run() -> glib::ExitCode {
         trailing_actions.append(&tasks_button);
         trailing_actions.append(&agent_toggle);
         trailing_actions.append(&add_tab_button);
-        trailing_actions.append(&minimize_window_button);
-        trailing_actions.append(&maximize_window_button);
-        trailing_actions.append(&close_window_button);
+        let title_bar = ui::TitleBar::new();
+        title_bar.root.append(&minimize_window_button);
+        title_bar.root.append(&maximize_window_button);
+        title_bar.root.append(&close_window_button);
         top_bar.add_overlay(&trailing_actions);
 
         let top_bar_handle = gtk4::WindowHandle::new();
-        top_bar_handle.set_child(Some(&top_bar));
+        let chrome = gtk4::Box::new(Orientation::Vertical, 0);
+        chrome.append(&title_bar.root);
+        chrome.append(&top_bar);
+        top_bar_handle.set_child(Some(&chrome));
         top_bar_handle.add_css_class("forge-font-chrome");
         ui::install_top_tab_geometry_reveal(&top_tab_scroll);
 
@@ -1220,9 +1227,18 @@ pub fn run() -> glib::ExitCode {
         content_box.set_end_child(Some(&ai_paned));
         content_box.set_resize_start_child(false);
         content_box.set_resize_end_child(true);
-        content_box.set_shrink_start_child(false);
+        content_box.set_shrink_start_child(true);
         content_box.set_shrink_end_child(true);
         content_box.set_position(config.borrow().sidebar_width as i32);
+        let sidebar_last_width = Rc::new(Cell::new(config.borrow().sidebar_width));
+        let measured_sidebar_width = sidebar_last_width.clone();
+        content_box.connect_position_notify(move |paned| {
+            if paned.width() > 0 && paned.start_child().is_some_and(|child| child.is_visible()) {
+                let position = jterm_core::title_bar::sidebar_position(paned.position(), paned.width());
+                if position != paned.position() { paned.set_position(position); }
+                measured_sidebar_width.set(position as u32);
+            }
+        });
 
         // Main layout: draggable top bar + content box (vertical), with the
         // status bar spanning the full window width underneath both.
@@ -1307,6 +1323,7 @@ pub fn run() -> glib::ExitCode {
             sidebar_tab_mirror_scroll: sidebar_tab_mirror_scroll.clone(),
             top_tab_scroll: top_tab_scroll.clone(),
             bottom_bar: bottom_bar.clone(),
+            title_bar,
             bottom_bar_left: bottom_bar_left.clone(),
             bottom_bar_right: bottom_bar_right.clone(),
             bottom_bar_content: Rc::new(RefCell::new(Default::default())),
@@ -2125,7 +2142,11 @@ pub fn run() -> glib::ExitCode {
             }
 
             // Persist the current sidebar geometry/state before teardown.
-            let width = paned_for_close.position().max(120) as u32;
+            let width = if sidebar_for_close.is_visible() {
+                paned_for_close.position().clamp(120, 800) as u32
+            } else {
+                sidebar_last_width.get()
+            };
             {
                 let mut config = config_for_close.borrow_mut();
                 config.sidebar_width = width;

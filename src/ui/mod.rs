@@ -19,6 +19,8 @@ mod agent_sessions;
 mod ai_chat_store;
 mod ai_panel;
 mod bottom_bar;
+mod title_bar;
+pub(crate) use title_bar::TitleBar;
 mod bounded_text;
 mod command_correction;
 mod command_palette;
@@ -341,6 +343,7 @@ pub(crate) struct UiState {
     /// Window-global bottom status bar (the `jterm_core::bottom_bar`
     /// contract), spanning sidebar and content at the very bottom.
     pub(crate) bottom_bar: gtk4::Box,
+    pub(crate) title_bar: TitleBar,
     /// Left-packed segment container inside the bar.
     pub(crate) bottom_bar_left: gtk4::Box,
     /// Right-aligned segment container inside the bar.
