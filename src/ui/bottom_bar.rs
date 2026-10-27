@@ -153,7 +153,6 @@ impl UiState {
             ..Default::default()
         });
         self.window.set_title(Some(&content.window_title));
-        self.title_bar.update(content);
         if !self.bottom_bar.get_visible() {
             return;
         }

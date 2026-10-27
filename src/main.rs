@@ -723,9 +723,6 @@ pub fn run() -> glib::ExitCode {
              .tab-pin-icon { font-size: 0.9em; opacity: 0.8; margin-right: 2px; }
              .tab-selected { background-color: alpha(currentColor, 0.14); outline: 2px solid alpha(currentColor, 0.8); outline-offset: -2px; }
              .tab-conn-dot { font-size: 0.7em; margin-right: 2px; }
-             .workspace-title-bar { padding: 0 4px; border-bottom: 1px solid alpha(currentColor, 0.10); }
-         .workspace-title-bar .window-control { min-width: 32px; min-height: 30px; border-radius: 4px; }
-         .workspace-title-bar .window-control:last-child:hover { background-color: #be3737; color: white; }
  .window-controls { margin-left: 2px; }
              .window-control { min-width: 24px; min-height: 24px; padding: 0; border-radius: 999px; }
              @keyframes conn-pulse { 0% { opacity: 1.0; } 50% { opacity: 0.35; } 100% { opacity: 1.0; } }
@@ -916,17 +913,13 @@ pub fn run() -> glib::ExitCode {
         trailing_actions.append(&tasks_button);
         trailing_actions.append(&agent_toggle);
         trailing_actions.append(&add_tab_button);
-        let title_bar = ui::TitleBar::new();
-        title_bar.root.append(&minimize_window_button);
-        title_bar.root.append(&maximize_window_button);
-        title_bar.root.append(&close_window_button);
+        trailing_actions.append(&minimize_window_button);
+        trailing_actions.append(&maximize_window_button);
+        trailing_actions.append(&close_window_button);
         top_bar.add_overlay(&trailing_actions);
 
         let top_bar_handle = gtk4::WindowHandle::new();
-        let chrome = gtk4::Box::new(Orientation::Vertical, 0);
-        chrome.append(&title_bar.root);
-        chrome.append(&top_bar);
-        top_bar_handle.set_child(Some(&chrome));
+        top_bar_handle.set_child(Some(&top_bar));
         top_bar_handle.add_css_class("forge-font-chrome");
         ui::install_top_tab_geometry_reveal(&top_tab_scroll);
 
@@ -1323,7 +1316,6 @@ pub fn run() -> glib::ExitCode {
             sidebar_tab_mirror_scroll: sidebar_tab_mirror_scroll.clone(),
             top_tab_scroll: top_tab_scroll.clone(),
             bottom_bar: bottom_bar.clone(),
-            title_bar,
             bottom_bar_left: bottom_bar_left.clone(),
             bottom_bar_right: bottom_bar_right.clone(),
             bottom_bar_content: Rc::new(RefCell::new(Default::default())),

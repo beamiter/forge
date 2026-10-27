@@ -137,10 +137,8 @@ fn vte_live_cwd(terminal: &glib::WeakRef<vte4::Terminal>) -> Option<String> {
 fn tab_label_for_osc_title(title: &str, default: &str, custom: bool) -> Option<String> {
     if custom {
         None
-    } else if title.is_empty() {
-        Some(default.to_string())
     } else {
-        Some(title.to_string())
+        Some(jterm_core::title_bar::tab_label(title, default))
     }
 }
 
@@ -859,6 +857,7 @@ impl UiState {
                 let strip = strip_label.clone();
                 let custom = custom_title.clone();
                 let ui_for_bar = UiState::clone(self);
+                let terminal_for_pwd = view.vte().downgrade();
                 view.connect_cwd_changed(move |dir| {
                     // The bottom bar follows the focused pane's cwd; repaint
                     // before the tab-title guards, which do not apply to it.
@@ -869,7 +868,14 @@ impl UiState {
                     if identity.widget_name() != expected_name || custom.get() {
                         return;
                     }
-                    let title = default_tab_title(tab_num + 1, Some(dir));
+                    let reported = terminal_for_pwd
+                        .upgrade()
+                        .and_then(|terminal| terminal.window_title())
+                        .unwrap_or_default();
+                    let title = jterm_core::title_bar::tab_label(
+                        &reported,
+                        &default_tab_title(tab_num + 1, Some(dir)),
+                    );
                     header.set_text(&title);
                     if !tab_private_title_cell(&identity).is_some_and(|flag| flag.get()) {
                         strip.set_text(&title);
@@ -890,7 +896,7 @@ impl UiState {
                     }
                     // An empty title hands the label back to the cwd default.
                     let default = match view_for_default.upgrade() {
-                        Some(view) if title.is_empty() => {
+                        Some(view) if jterm_core::title_bar::tab_label(title, "").is_empty() => {
                             let cwd = jterm_core::review_input::safe_inline_display(
                                 &view.cwd(),
                                 4 * 1024,
@@ -915,6 +921,7 @@ impl UiState {
                 let strip = strip_label.clone();
                 let custom = custom_title.clone();
                 let ui_for_bar = UiState::clone(self);
+                let terminal_for_pwd = view.vte().downgrade();
                 view.connect_cwd_changed(move |dir| {
                     ui_for_bar.refresh_bottom_bar();
                     let Some(identity) = identity.upgrade() else {
@@ -923,7 +930,14 @@ impl UiState {
                     if identity.widget_name() != expected_name || custom.get() {
                         return;
                     }
-                    let title = default_tab_title(tab_num + 1, Some(dir));
+                    let reported = terminal_for_pwd
+                        .upgrade()
+                        .and_then(|terminal| terminal.window_title())
+                        .unwrap_or_default();
+                    let title = jterm_core::title_bar::tab_label(
+                        &reported,
+                        &default_tab_title(tab_num + 1, Some(dir)),
+                    );
                     header.set_text(&title);
                     if !tab_private_title_cell(&identity).is_some_and(|flag| flag.get()) {
                         strip.set_text(&title);
@@ -943,7 +957,7 @@ impl UiState {
                         return;
                     }
                     // An empty title hands the label back to the cwd default.
-                    let default = if title.is_empty() {
+                    let default = if jterm_core::title_bar::tab_label(title, "").is_empty() {
                         default_tab_title(tab_num + 1, vte_live_cwd(&terminal).as_deref())
                     } else {
                         String::new()
@@ -2083,6 +2097,7 @@ impl UiState {
                 let identity_for_pwd = view_type.root_widget().downgrade();
                 let expected_name_for_pwd = format!("tab-{tab_num}");
                 let ui_for_bar = UiState::clone(self);
+                let terminal_for_pwd = term_view.vte().downgrade();
                 term_view.connect_cwd_changed(move |dir| {
                     ui_for_bar.refresh_bottom_bar();
                     let Some(identity) = identity_for_pwd.upgrade() else {
@@ -2092,7 +2107,14 @@ impl UiState {
                     {
                         return;
                     }
-                    let new_title = default_tab_title(tab_index_for_pwd, Some(dir));
+                    let reported = terminal_for_pwd
+                        .upgrade()
+                        .and_then(|terminal| terminal.window_title())
+                        .unwrap_or_default();
+                    let new_title = jterm_core::title_bar::tab_label(
+                        &reported,
+                        &default_tab_title(tab_index_for_pwd, Some(dir)),
+                    );
                     if label_for_pwd.text().as_str() != new_title {
                         label_for_pwd.set_text(&new_title);
                         if !tab_private_title_cell(&identity).is_some_and(|flag| flag.get()) {
@@ -2107,6 +2129,7 @@ impl UiState {
                 let identity_for_pwd = view_type.root_widget().downgrade();
                 let expected_name_for_pwd = format!("tab-{tab_num}");
                 let ui_for_bar = UiState::clone(self);
+                let terminal_for_pwd = vte_view.vte().downgrade();
                 vte_view.connect_cwd_changed(move |dir| {
                     ui_for_bar.refresh_bottom_bar();
                     let Some(identity) = identity_for_pwd.upgrade() else {
@@ -2116,7 +2139,14 @@ impl UiState {
                     {
                         return;
                     }
-                    let new_title = default_tab_title(tab_index_for_pwd, Some(dir));
+                    let reported = terminal_for_pwd
+                        .upgrade()
+                        .and_then(|terminal| terminal.window_title())
+                        .unwrap_or_default();
+                    let new_title = jterm_core::title_bar::tab_label(
+                        &reported,
+                        &default_tab_title(tab_index_for_pwd, Some(dir)),
+                    );
                     if label_for_pwd.text().as_str() != new_title {
                         label_for_pwd.set_text(&new_title);
                         if !tab_private_title_cell(&identity).is_some_and(|flag| flag.get()) {
@@ -2151,7 +2181,7 @@ impl UiState {
                 if identity.widget_name() != expected_name_for_title {
                     return;
                 }
-                let default = if title.is_empty() {
+                let default = if jterm_core::title_bar::tab_label(title, "").is_empty() {
                     default_title()
                 } else {
                     String::new()

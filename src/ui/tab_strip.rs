@@ -513,10 +513,12 @@ impl UiState {
     /// Keep a filtered tab's visibility correct when OSC title/cwd updates or
     /// rename operations change its title without changing the query.
     pub(crate) fn track_tab_title_for_filter(&self, button: &ToggleButton, title: &gtk4::Label) {
+        title.set_tooltip_text(Some(title.text().as_str()));
         let filter = self.tab_search_entry.clone();
         let button = button.clone();
         let ui = self.clone();
         title.connect_notify_local(Some("label"), move |label, _| {
+            label.set_tooltip_text(Some(label.text().as_str()));
             button.set_visible(tab_title_matches(
                 filter.text().as_str(),
                 label.text().as_str(),
