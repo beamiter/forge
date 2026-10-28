@@ -484,6 +484,8 @@ pub(crate) struct UiState {
     pub(crate) keybinding_map: Rc<RefCell<KeybindingMap>>,
     pub(crate) zoom_state: Rc<RefCell<Option<ZoomState>>>,
     pub(crate) scrollbar_css: CssProvider,
+    /// Role-sized reference text follows the two independent zoom groups.
+    pub(crate) reference_font_css: CssProvider,
     /// Maps tab_num → session_id for jsh session persistence.
     pub(crate) session_ids: Rc<RefCell<HashMap<u32, String>>>,
     /// Maps tab_num → remote connection record (status + reconnect info).

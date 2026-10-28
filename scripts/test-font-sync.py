@@ -145,7 +145,16 @@ fn native_pango_fallback_is_finite_and_reset_is_exact() {
         main_source = (ROOT / "src/main.rs").read_text()
         assert 'window.add_css_class("forge-window");' in main_source
         assert 'ui.apply_dynamic_css();' in main_source
-        assert 'top_bar.set_measure_overlay(&top_tab_scroll, true);' in main_source
+        shell = (ROOT / "src/ui/reference_shell.rs").read_text()
+        assert 'let canvas_header = ui::reference_shell::center_header(&top_tab_scroll);' in main_source
+        assert 'right_col.append(&canvas_header);' in main_source
+        assert 'header.append(top_tabs);' in shell
+        assert 'top_tabs.add_css_class("forge-font-chrome");' in shell
+        routing = re.sub(r"\s+", "", main_source)
+        for root, group in [('canvas_header', 'Chrome'), ('notebook', 'Content'), ('search_bar', 'Content')]:
+            assert f'({root}.clone().upcast::<gtk4::Widget>(),FontGroup::{group})' in routing
+        assert '(right_col.clone().upcast::<gtk4::Widget>(),FontGroup::Content)' not in routing
+        assert 'font_roots.push((composer,FontGroup::Content));' in routing
         assert 'top_tab_scroll.set_propagate_natural_width(false);' in main_source
         compact = re.sub(r"\s+", "", controller)
         assert 'crate::font::window_font_css(&config.font_desc,self.font_scale.get(),&config.chrome_font_size,config.chrome_font_scale,)' in compact

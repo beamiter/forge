@@ -196,57 +196,17 @@ fn production_top_tabs_bound_viewport_minimum_across_font_extremes() {
     );
     let window = gtk::Window::new();
     window.add_css_class("forge-window");
-    let top = gtk::Overlay::new();
-    top.add_css_class("top-bar");
-    top.set_height_request(40);
-    top.set_hexpand(true);
-    top.set_child(Some(&gtk::Box::new(gtk::Orientation::Horizontal, 0)));
-    let leading = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-    leading.set_halign(gtk::Align::Start);
-    leading.set_valign(gtk::Align::Center);
-    for icon in [
-        "system-search-symbolic",
-        "sidebar-show-symbolic",
-        "view-list-symbolic",
-        "text-editor-symbolic",
-    ] {
-        let button = gtk::Button::from_icon_name(icon);
-        button.add_css_class("flat");
-        leading.append(&button);
-    }
-    top.add_overlay(&leading);
+    window.add_css_class("reference-shell");
+    super::reference_shell::install_css();
     let scroll = scroller();
     super::tab_strip::install_top_tab_geometry_reveal(&scroll);
-    top.add_overlay(&scroll);
-    top.set_measure_overlay(&scroll, true);
-    let trailing = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-    trailing.set_halign(gtk::Align::End);
-    trailing.set_valign(gtk::Align::Center);
-    trailing.add_css_class("top-bar-actions");
-    trailing.add_css_class("window-controls");
-    let agent = gtk::ToggleButton::new();
-    agent.set_icon_name("system-run-symbolic");
-    agent.add_css_class("flat");
-    trailing.append(&agent);
-    for icon in [
-        "list-add-symbolic",
-        "window-minimize-symbolic",
-        "window-maximize-symbolic",
-        "window-close-symbolic",
-    ] {
-        let button = gtk::Button::from_icon_name(icon);
-        button.add_css_class("flat");
-        if icon != "list-add-symbolic" {
-            button.add_css_class("window-control");
-        }
-        trailing.append(&button);
-    }
-    top.add_overlay(&trailing);
-    let handle = gtk::WindowHandle::new();
-    handle.add_css_class("forge-font-chrome");
-    handle.set_child(Some(&top));
+    let top = super::reference_shell::center_header(&scroll);
+    assert_eq!(scroll.parent().as_ref(), Some(top.upcast_ref()));
+    assert!(scroll.has_css_class("forge-font-chrome"));
+    assert_eq!((scroll.margin_start(), scroll.margin_end()), (0, 0));
+    let actions = top.last_child().expect("shared header actions");
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    root.append(&handle);
+    root.append(&top);
     let sidebar = gtk::ScrolledWindow::new();
     sidebar.add_css_class("forge-font-chrome");
     sidebar.set_hexpand(false);
@@ -334,6 +294,16 @@ fn production_top_tabs_bound_viewport_minimum_across_font_extremes() {
                             );
                             assert_eq!(tabs[0].1.ellipsize(), gtk::pango::EllipsizeMode::End);
                             assert_eq!(scroll.hscrollbar_policy(), gtk::PolicyType::External);
+                            let action_bounds = actions
+                                .compute_bounds(&top)
+                                .expect("actions remain in the measured header");
+                            assert!(
+                                action_bounds.x() >= 0.0
+                                    && action_bounds.x() + action_bounds.width()
+                                        <= top.width() as f32 + 1.0,
+                                "header actions remain reachable: {action_bounds:?}"
+                            );
+                            assert!(scroll.width() > 0, "tabs retain a usable viewport");
                             measurements += 1;
                             println!("TAB_GEOMETRY font={description} scale={scale} px={px} width={width} status={status} long={long} count={count} requested={requested} policy={:?} scroll={:?} strip={:?} top={:?} window={:?} title={:?} image={:?}", scroll.hscrollbar_policy(), measure(&scroll), measure(&strip), measure(&top), measure(&window), measure(&tabs[0].1), measure(&tabs[0].2));
                             // Compare like-for-like single/multiple tabs. Fixed tab requests,

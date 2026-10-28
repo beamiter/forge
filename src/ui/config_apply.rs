@@ -780,6 +780,11 @@ impl UiState {
              .bottom-bar .bb-err {{ color: rgb({err_r},{err_g},{err_b}); }}"
         );
         self.scrollbar_css.load_from_string(&css);
+        self.reference_font_css
+            .load_from_string(&super::reference_shell::role_font_css(
+                config.chrome_font_scale,
+                self.font_scale.get(),
+            ));
         self.ai_panel.apply_theme_colors();
     }
 

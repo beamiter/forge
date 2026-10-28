@@ -819,8 +819,8 @@ pub fn run() -> glib::ExitCode {
         top_tab_scroll.set_margin_start(164);
         top_tab_scroll.set_margin_end(104);
 
-        // Overlay the leading controls, tab strip, and trailing actions so tab
-        // geometry is independent of which controls happen to be visible.
+        // Build the global toolbar. The retained top-tab scroller is measured
+        // by reference_shell::center_header below, outside this overlay.
         let top_bar = gtk4::Overlay::new();
         top_bar.add_css_class("top-bar");
         top_bar.set_height_request(40);
@@ -836,9 +836,6 @@ pub fn run() -> glib::ExitCode {
         leading_actions.append(&toggle_placement_btn);
         leading_actions.append(&vim9_ide_btn);
         top_bar.add_overlay(&leading_actions);
-        // Font zoom can exceed the compact minimum. Include tab text in the
-        // bar's height while the scroller still clamps its minimum width.
-
         // A compact, stateful counterpart to Ctrl+Alt+G. Its checked state
         // follows the lifetime of the approval-gated Shell Agent session;
         // the full name remains available through its tooltip/accessibility.
@@ -1187,7 +1184,8 @@ pub fn run() -> glib::ExitCode {
         right_col.add_css_class("reference-central");
         right_col.set_hexpand(true);
         right_col.set_vexpand(true);
-        right_col.append(&ui::reference_shell::center_header(&top_tab_scroll));
+        let canvas_header = ui::reference_shell::center_header(&top_tab_scroll);
+        right_col.append(&canvas_header);
         right_col.append(&notebook);
         right_col.append(&search_bar);
 
@@ -1385,6 +1383,7 @@ pub fn run() -> glib::ExitCode {
             keybinding_map: Rc::new(RefCell::new(keybinding_map)),
             zoom_state: Rc::new(RefCell::new(None)),
             scrollbar_css: CssProvider::new(),
+            reference_font_css: CssProvider::new(),
             session_ids: Rc::new(RefCell::new(HashMap::new())),
             tab_connections: Rc::new(RefCell::new(HashMap::new())),
             ai_panel: ai_panel_widget.clone(),
@@ -2059,13 +2058,22 @@ pub fn run() -> glib::ExitCode {
         // only inter-region split handles lack a group. Internal terminal
         // split handles remain in the Content subtree.
         use crate::font_zoom::FontGroup;
-        for (root, group) in [
+        let mut font_roots = vec![
             (top_bar_handle.clone().upcast::<gtk4::Widget>(), FontGroup::Chrome),
             (sidebar.clone().upcast::<gtk4::Widget>(), FontGroup::Chrome),
-            (right_col.clone().upcast::<gtk4::Widget>(), FontGroup::Content),
+            (canvas_header.clone().upcast::<gtk4::Widget>(), FontGroup::Chrome),
+            (notebook.clone().upcast::<gtk4::Widget>(), FontGroup::Content),
+            (search_bar.clone().upcast::<gtk4::Widget>(), FontGroup::Content),
             (side_stack.clone().upcast::<gtk4::Widget>(), FontGroup::Chrome),
             (bottom_bar.clone().upcast::<gtk4::Widget>(), FontGroup::Chrome),
-        ] {
+        ];
+        if let Some(composer) = right_col
+            .last_child()
+            .filter(|child| child.has_css_class("reference-block-composer"))
+        {
+            font_roots.push((composer, FontGroup::Content));
+        }
+        for (root, group) in font_roots {
             let controller = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
             controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
             let ui = ui.clone();

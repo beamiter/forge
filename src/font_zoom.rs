@@ -131,15 +131,24 @@ mod tests {
         for root in [
             "top_bar_handle",
             "sidebar",
-            "right_col",
+            "canvas_header",
+            "notebook",
+            "search_bar",
             "side_stack",
             "bottom_bar",
         ] {
             assert!(route.contains(&format!("{root}.clone().upcast::<gtk4::Widget>()")));
         }
         let compact: String = route.chars().filter(|c| !c.is_whitespace()).collect();
-        assert_eq!(compact.matches("FontGroup::Chrome),").count(), 4);
-        assert_eq!(compact.matches("FontGroup::Content),").count(), 1);
+        assert_eq!(compact.matches("FontGroup::Chrome),").count(), 5);
+        assert_eq!(compact.matches("FontGroup::Content),").count(), 2);
+        assert!(compact.contains("font_roots.push((composer,FontGroup::Content));"));
+        assert!(
+            !compact.contains("(right_col.clone().upcast::<gtk4::Widget>(),FontGroup::Content)")
+        );
+        assert!(
+            compact.contains("(canvas_header.clone().upcast::<gtk4::Widget>(),FontGroup::Chrome)")
+        );
         assert!(route.contains("PropagationPhase::Capture"));
         assert!(route.contains("SURFACE_UNITS_PER_STEP"));
         assert!(route.contains("return true.into()"));

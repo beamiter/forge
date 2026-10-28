@@ -24,7 +24,7 @@ def main():
     resize = (ROOT / "src/ui/tab_strip.rs").read_text()
     fixture = (ROOT / "src/ui/tab_geometry_tests.rs").read_text()
     checks = []
-    scroll = section(source, "let top_tab_scroll = ScrolledWindow::new();", "// Overlay the leading controls")
+    scroll = section(source, "let top_tab_scroll = ScrolledWindow::new();", "// Build the global toolbar.")
     checks.append(("scroller", scroll.replace("set_visible(false)", "set_visible(true)")))
     shape = section(tabs, "let strip_label = Label::new(Some(&label_text));", "// Keep an explicit handle to the title label.")
     shape = shape.replace("*strip_btn_label.borrow_mut() = Some(strip_label.clone());", "").replace("if remote.is_some()", "if status")
@@ -63,20 +63,28 @@ def main():
     ]:
         assert compact(production) in compact(layout), production
         assert compact(native) in compact(fixture), native
-    for production, native in [
-        ('top_bar.set_measure_overlay(&top_tab_scroll, true);', 'top.set_measure_overlay(&scroll, true);'),
-        ('top_bar.set_height_request(40);', 'top.set_height_request(40);'),
-        ('top_bar.set_hexpand(true);', 'top.set_hexpand(true);'),
-        ('top_bar_handle.add_css_class("forge-font-chrome");', 'handle.add_css_class("forge-font-chrome");'),
+    # The strip moved out of the titlebar overlay into the shared canvas
+    # header. Exercise that constructor itself, rather than maintaining an
+    # obsolete duplicate of the pre-reference overlay in the native fixture.
+    shell = (ROOT / 'src/ui/reference_shell.rs').read_text()
+    assert compact('let canvas_header = ui::reference_shell::center_header(&top_tab_scroll);') in compact(source)
+    assert compact('right_col.append(&canvas_header);') in compact(source)
+    assert compact('let top = super::reference_shell::center_header(&scroll);') in compact(fixture)
+    for production in [
+        'header.append(top_tabs);',
+        'top_tabs.add_css_class("forge-font-chrome");',
+        'top_tabs.set_margin_start(0);',
+        'top_tabs.set_margin_end(0);',
+        'label.set_ellipsize(gtk4::pango::EllipsizeMode::End);',
     ]:
-        assert compact(production) in compact(source), production
-        assert compact(native) in compact(fixture), native
+        assert compact(production) in compact(shell), production
+    assert 'super::reference_shell::install_css();' in fixture
     assert 'ui::install_top_tab_geometry_reveal(&top_tab_scroll);' in source
     assert 'super::tab_strip::install_top_tab_geometry_reveal(&scroll);' in fixture
     assert 'super::tab_strip::install_tab_reveal_on_map(button);' in tabs
     assert 'super::tab_strip::sync_strip_buttons_active(&strip, (count - 1) as u32);' in fixture
     assert 'font_groups_stay_independent_across_native_panes_and_late_rows' in (ROOT / 'src/block_view/font_sync_tests.rs').read_text()
-    print('PASS: scroller, full production CSS, fresh/moved tab shape, resize handle, placement and overlay source contracts')
+    print('PASS: scroller, full production CSS, fresh/moved tab shape, resize handle, placement and actual shared-header source contracts')
 
 
 if __name__ == '__main__':

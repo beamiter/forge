@@ -38,6 +38,128 @@ fn label(value: &str, class: &str) -> gtk4::Label {
     label
 }
 
+/// Keep the reference hierarchy at zoom 1, scaling only its authored text sizes.
+/// The surface provider intentionally outranks the general application theme;
+/// these role declarations must share that authority without lifting unrelated
+/// dynamic colors or changing every role to one global size.
+pub(crate) fn role_font_css(chrome_scale: f64, content_scale: f64) -> String {
+    let valid_scale = |scale: f64| {
+        if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        }
+    };
+    let chrome_scale = valid_scale(chrome_scale);
+    let content_scale = valid_scale(content_scale);
+    let mut css = String::new();
+    for rule in include_str!("reference_shell.css").split('}') {
+        let Some((selectors, body)) = rule.split_once('{') else {
+            continue;
+        };
+        let size = body.split(';').find_map(|declaration| {
+            let (property, value) = declaration.split_once(':')?;
+            (property.trim() == "font-size")
+                .then(|| value.trim().strip_suffix("px")?.trim().parse::<f64>().ok())
+                .flatten()
+        });
+        let Some(size) = size else { continue };
+        for selector in selectors.split(',') {
+            let rich_content = [
+                ".reference-rich-conversation",
+                ".reference-role-header",
+                ".reference-rich-terminal",
+            ]
+            .iter()
+            .any(|scope| selector.contains(scope));
+            let native_input = [
+                ".term-chat-root",
+                ".chat-controls",
+                ".reference-block-composer",
+                ".reference-composer-controls",
+                ".reference-unavailable-tool",
+                ".reference-model-selector",
+            ]
+            .iter()
+            .any(|scope| selector.contains(scope));
+            // Native composer/input sizing retains its existing controller.
+            // Only semantic message roles join Content's stylesheet authority.
+            if native_input && !rich_content {
+                continue;
+            }
+            let scale = if rich_content {
+                content_scale
+            } else {
+                chrome_scale
+            };
+            css.push_str(&format!(
+                "{} {{ font-size: {:.6}px; }}\n",
+                selector.trim(),
+                size * scale
+            ));
+        }
+    }
+    css
+}
+
+/// Test-only after-paint evidence reads actual native labels, not config values.
+fn reference_role_fonts(ui: &UiState) -> serde_json::Value {
+    let mut roles = serde_json::Map::new();
+    let mut add = |name: &str, widget: Option<gtk4::Widget>| {
+        if let Some(label) = widget.and_then(|widget| widget.downcast::<gtk4::Label>().ok()) {
+            let font = label.pango_context().font_description();
+            let (ink, logical) = label.layout().pixel_extents();
+            roles.insert(name.to_string(), serde_json::json!({
+                "text": label.text().to_string(),
+                "font_description":font.as_ref().map(ToString::to_string),
+                "font_size_pango_units":font.as_ref().map(|font|font.size()),
+                "font_size_absolute":font.as_ref().map(|font|font.is_size_absolute()),
+                "ink_xywh":[ink.x(),ink.y(),ink.width(),ink.height()],
+                "logical_xywh":[logical.x(),logical.y(),logical.width(),logical.height()],
+                "bounds":label.compute_bounds(&ui.window).map(|r|serde_json::json!([r.x(),r.y(),r.width(),r.height()])),
+            }));
+        }
+    };
+    for (name, class) in [
+        ("canvas_title", "reference-canvas-title"),
+        ("canvas_subtitle", "reference-canvas-subtitle"),
+        ("agent_title", "reference-card-title"),
+        ("metadata_label", "reference-inspector-metadata-label"),
+        ("metadata_value", "reference-inspector-metadata-value"),
+        ("toolbar_product", "reference-product"),
+        ("content_heading", "reference-message-heading"),
+        ("content_paragraph", "reference-message-paragraph"),
+        ("content_code", "reference-code-line"),
+    ] {
+        add(name, widget_with_class(ui.window.upcast_ref(), class));
+    }
+    if let Some(content) = widget_with_class(ui.window.upcast_ref(), "reference-rich-conversation")
+    {
+        for (name, class) in [
+            ("content_author", "reference-message-author"),
+            ("content_timing", "reference-message-timing"),
+            ("content_metadata", "reference-chip-text"),
+            ("content_task", "reference-step-title"),
+            ("content_task_elapsed", "reference-step-elapsed"),
+            ("content_diff_path", "reference-code-path"),
+            ("content_gutter", "reference-line-number"),
+        ] {
+            add(name, widget_with_class(&content, class));
+        }
+        if let Some(assistant) = widget_with_class(&content, "reference-assistant-message") {
+            add(
+                "content_assistant_body",
+                widget_with_class(&assistant, "reference-message-paragraph"),
+            );
+        }
+    }
+    let copy = widget_with_class(ui.window.upcast_ref(), "reference-rich-diff")
+        .and_then(|diff| widget_with_class(&diff, "reference-code-action"))
+        .and_then(|button| button.compute_bounds(&ui.window))
+        .map(|r| serde_json::json!([r.x(), r.y(), r.width(), r.height()]));
+    serde_json::json!({"roles":roles,"copy_action_xywh":copy,"chrome_scale":ui.config.borrow().chrome_font_scale,"content_scale":ui.font_scale.get()})
+}
+
 /// Shared vector paths, painted by Cairo rather than font-dependent glyphs.
 pub(crate) fn vector_icon(icon: jterm_core::reference_icons::Icon, size: i32) -> gtk4::DrawingArea {
     let area = gtk4::DrawingArea::new();
@@ -479,6 +601,10 @@ pub(crate) fn center_header(top_tabs: &gtk4::ScrolledWindow) -> gtk4::Box {
         title.append(&label("Terminal session", "reference-canvas-subtitle"));
     }
     header.append(&title);
+    // The retained strip now lives in this ordinary measured header, rather
+    // than in the titlebar overlay. Keep chrome font routing on the scroller
+    // itself so placement changes do not make tabs inherit the terminal font.
+    top_tabs.add_css_class("forge-font-chrome");
     top_tabs.set_margin_start(0);
     top_tabs.set_margin_end(0);
     header.append(top_tabs);
@@ -665,6 +791,7 @@ pub(crate) fn install(
         ("Chat", TerminalMode::Chat),
     ] {
         let button = gtk4::ToggleButton::with_label(title);
+        button.set_focus_on_click(false);
         if let Some(first) = &group {
             button.set_group(Some(first));
         } else {
@@ -1205,6 +1332,7 @@ pub(crate) fn install(
                             snapshot["speech_dismiss"] = bounds("reference-organism-dismiss").unwrap_or(serde_json::Value::Null);
                             snapshot["tools_open"] = serde_json::json!(widget_with_class(ui.window.upcast_ref(), "reference-tools-popover").is_some());
                             snapshot["focused_widget"] = serde_json::json!(gtk4::prelude::RootExt::focus(&ui.window).map(|widget|widget.widget_name().to_string()));
+                            snapshot["reference_role_fonts"] = reference_role_fonts(&ui);
                             let _ = writeln!(file, "{snapshot}");
                         }
                     }
@@ -1228,6 +1356,13 @@ pub(crate) fn install(
         });
     }
     install_css();
+    if let Some(display) = gtk4::gdk::Display::default() {
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &ui.reference_font_css,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 21,
+        );
+    }
 }
 
 pub(crate) fn install_css() {
@@ -1241,6 +1376,7 @@ pub(crate) fn install_css() {
         .replace("@INSPECTOR@", &hex(token::color::INSPECTOR))
         .replace("@INSPECTOR_CARD@", &hex(token::color::INSPECTOR_CARD))
         .replace("@CANVAS@", &hex(token::color::CANVAS))
+        .replace("@CANVAS_COOL@", &hex(token::color::CANVAS_COOL))
         .replace("@ACCENT@", &hex(token::color::ACCENT))
         .replace(
             "@PROFILE_BACKGROUND@",
@@ -1255,5 +1391,66 @@ pub(crate) fn install_css() {
             &provider,
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 20,
         );
+    }
+}
+
+#[cfg(test)]
+mod role_font_tests {
+    use super::role_font_css;
+
+    #[test]
+    fn reference_role_fonts_keep_hierarchy_and_disjoint_groups() {
+        let normal = role_font_css(1.0, 1.0);
+        let ui = role_font_css(1.3, 1.0);
+        let content = role_font_css(1.0, 1.3);
+        for (selector, size, ui_size) in [
+            (".reference-shell .reference-canvas-title", 12.0, 15.6),
+            (
+                "window.forge-window.reference-shell .reference-rich-inspector label.reference-card-title",
+                11.0,
+                14.3,
+            ),
+            (
+                "window.forge-window.reference-shell .reference-rich-inspector label",
+                9.0,
+                11.7,
+            ),
+            (
+                "window.forge-window.reference-shell .reference-toolbar label",
+                10.0,
+                13.0,
+            ),
+        ] {
+            let declaration = |size: f64| format!("{selector} {{ font-size: {size:.6}px; }}");
+            assert!(normal.contains(&declaration(size)), "{selector}");
+            assert!(ui.contains(&declaration(ui_size)), "UI: {selector}");
+            assert!(content.contains(&declaration(size)), "Content leaves UI: {selector}");
+        }
+        for (selector, size) in [
+            ("label.reference-message-heading", 20.0),
+            ("label.reference-message-paragraph", 12.0),
+            ("label.reference-message-author", 12.0),
+            ("label.reference-chip-text", 9.0),
+            (".reference-rich-step label", 10.0),
+            (".reference-code-header label", 10.0),
+            ("label.reference-code-line", 10.0),
+            ("label.reference-line-number", 10.0),
+        ] {
+            let selector = format!(
+                "window.forge-window.reference-shell .reference-rich-conversation {selector}"
+            );
+            let declaration =
+                |scale: f64| format!("{selector} {{ font-size: {:.6}px; }}", size * scale);
+            assert!(normal.contains(&declaration(1.0)), "{selector}");
+            assert!(
+                ui.contains(&declaration(1.0)),
+                "UI leaves Content: {selector}"
+            );
+            assert!(content.contains(&declaration(1.3)), "Content: {selector}");
+        }
+        assert_eq!(role_font_css(f64::NAN, -1.0), normal);
+        assert!(!ui.contains(".chat-controls"));
+        assert!(!ui.contains("margin:"));
+        assert!(!ui.contains("padding:"));
     }
 }
