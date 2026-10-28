@@ -6,7 +6,7 @@ use super::UiState;
 use crate::config::{SidebarView, TabPlacement, TerminalMode};
 use gtk4::prelude::*;
 use gtk4::{glib, Orientation};
-use jterm_core::reference_shell as token;
+use jterm_core::developer_workspace as token;
 use std::rc::Rc;
 
 fn product_identity(product: &str, size: i32) -> gtk4::Image {
@@ -271,11 +271,26 @@ fn tools_history_viewport(widget: &gtk4::Widget) -> Option<gtk4::Viewport> {
 /// Suppress GTK's independent focus reveal only while the popup acquires and
 /// returns focus. History Tab navigation keeps its normal native policy.
 fn guard_tools_focus(tools: &gtk4::MenuButton, popup: &gtk4::Popover) {
+    let begin = guard_history_popup_focus(tools.upcast_ref(), popup);
+    let click = gtk4::GestureClick::new();
+    click.set_button(1);
+    click.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    click.connect_pressed(move |_, _, _, _| begin());
+    tools.add_controller(click);
+}
+
+/// A popup may return focus to history without rounding the reader's
+/// fractional position. Restore native focus reveal after that short exchange;
+/// normal keyboard navigation must still bring offscreen controls into view.
+pub(crate) fn guard_history_popup_focus(
+    anchor: &gtk4::Widget,
+    popup: &gtk4::Popover,
+) -> Rc<dyn Fn()> {
     let saved: Rc<std::cell::RefCell<Option<(gtk4::Viewport, bool)>>> =
         Rc::new(std::cell::RefCell::new(None));
     let generation = Rc::new(std::cell::Cell::new(0u64));
     let begin: Rc<dyn Fn()> = {
-        let weak = tools.downgrade();
+        let weak = anchor.downgrade();
         let saved = saved.clone();
         let generation = generation.clone();
         Rc::new(move || {
@@ -292,15 +307,9 @@ fn guard_tools_focus(tools: &gtk4::MenuButton, popup: &gtk4::Popover) {
             }
         })
     };
-    let click = gtk4::GestureClick::new();
-    click.set_button(1);
-    click.set_propagation_phase(gtk4::PropagationPhase::Capture);
-    let action = begin.clone();
-    click.connect_pressed(move |_, _, _, _| action());
-    tools.add_controller(click);
     let action = begin.clone();
     popup.connect_show(move |_| action());
-    let weak = tools.downgrade();
+    let weak = anchor.downgrade();
     popup.connect_closed(move |_| {
         let Some(tools) = weak.upgrade() else {
             return;
@@ -323,6 +332,7 @@ fn guard_tools_focus(tools: &gtk4::MenuButton, popup: &gtk4::Popover) {
             glib::ControlFlow::Break
         });
     });
+    begin
 }
 
 fn tool_menu_row(icon: &str, name: &str, detail: &str) -> gtk4::Button {
@@ -353,6 +363,9 @@ pub(crate) fn composer_controls(on_terminal: impl Fn() + 'static) -> (gtk4::Box,
     controls.add_css_class("chat-controls");
     controls.add_css_class("reference-composer-controls");
     controls.set_valign(gtk4::Align::End);
+    // Extra pixels in the minimum dock belong above this fixed28px footer,
+    // including when the native editor is seated in a running command card.
+    controls.set_vexpand(true);
     let group = gtk4::Box::new(Orientation::Horizontal, token::METADATA_GAP as i32);
     for (key, title) in [
         ("plus", ""),
@@ -549,6 +562,7 @@ pub(crate) fn inspector(stack: &gtk4::Stack) -> gtk4::Box {
     root.set_vexpand(true);
     let tabs = gtk4::Box::new(Orientation::Horizontal, 6);
     tabs.add_css_class("reference-inspector-tabs");
+    tabs.set_height_request(token::INSPECTOR_TABS_HEIGHT as i32);
     let agent = gtk4::ToggleButton::with_label("Agent");
     let context_tab = gtk4::ToggleButton::with_label("Context");
     let files = gtk4::ToggleButton::with_label("Files");
@@ -725,7 +739,7 @@ pub(crate) fn install(
             if let Some(header) =
                 widget_with_class_any(center.upcast_ref(), "reference-canvas-header")
             {
-                header.set_height_request(42);
+                header.set_height_request(token::CANVAS_HEADER_HEIGHT as i32);
             }
         }
         let center_for_switch = center.downgrade();
@@ -770,11 +784,7 @@ pub(crate) fn install(
                 if let Some(header) =
                     widget_with_class_any(center.upcast_ref(), "reference-canvas-header")
                 {
-                    header.set_height_request(if developer {
-                        42
-                    } else {
-                        token::CANVAS_HEADER_HEIGHT as i32
-                    });
+                    header.set_height_request(token::CANVAS_HEADER_HEIGHT as i32);
                 }
             }
             if let Some(ui) = ui_for_switch.upgrade() {
@@ -835,11 +845,13 @@ pub(crate) fn install(
     toolbar.append(&toolbar_fill);
     let modes = gtk4::Box::new(Orientation::Horizontal, 2);
     modes.add_css_class("reference-mode-switch");
-    modes.set_valign(gtk4::Align::Center);
+    modes.set_valign(gtk4::Align::Start);
+    modes.set_margin_top(token::MODE_CONTROL_TOP as i32);
     modes.set_height_request(token::MODE_CONTROL_HEIGHT as i32);
     let mut group: Option<gtk4::ToggleButton> = None;
     for (title, mode) in [("Block", TerminalMode::Block), ("Chat", TerminalMode::Chat)] {
         let button = gtk4::ToggleButton::with_label(title);
+        button.set_width_request(token::MODE_CONTROL_MIN_WIDTH as i32);
         button.set_focus_on_click(false);
         if let Some(first) = &group {
             button.set_group(Some(first));
@@ -1231,7 +1243,11 @@ pub(crate) fn install(
                 let mut measured = Vec::new();
                 let mut child = widget_with_class(ui.window.upcast_ref(), class).and_then(|widget|widget.first_child());
                 while let Some(widget) = child {
-                    measured.push(serde_json::json!({"bounds":bounds(&widget),"label":widget.downcast_ref::<gtk4::Label>().map(|label|label.text().to_string()),"classes":widget.css_classes().iter().map(|value|value.as_str()).collect::<Vec<_>>()}));
+                    let button = widget.downcast_ref::<gtk4::Button>();
+                    let text = widget.downcast_ref::<gtk4::Label>().map(|label|label.text().to_string())
+                        .or_else(||button.and_then(|button|button.label()).map(|value|value.to_string()));
+                    let content = button.and_then(|button|button.child());
+                    measured.push(serde_json::json!({"bounds":bounds(&widget),"label":text,"visible":widget.is_visible(),"mapped":widget.is_mapped(),"opacity":widget.opacity(),"color":widget.color().to_string(),"content_bounds":content.as_ref().and_then(&bounds),"content_color":content.as_ref().map(|widget|widget.color().to_string()),"classes":widget.css_classes().iter().map(|value|value.as_str()).collect::<Vec<_>>()}));
                     child = widget.next_sibling();
                 }
                 measured
@@ -1244,9 +1260,17 @@ pub(crate) fn install(
                 "prompt_status":ui.current_term_view().map(|view| format!("{:?}", view.command_prompt_status())),
                 "presentation":if ui.config.borrow().terminal_mode == TerminalMode::Chat {"Chat"} else {"Block"},
                 "titlebar":bounds(top_for_geometry.upcast_ref()),
+                "center_header":widget_with_class(ui.window.upcast_ref(), "reference-canvas-header").and_then(|w| bounds(&w)),
+                "search":widget_with_class(ui.window.upcast_ref(), "reference-search").and_then(|w| bounds(&w)),
+                "mode_controls":widget_with_class(ui.window.upcast_ref(), "reference-mode-switch").and_then(|w| bounds(&w)),
+                "mode_buttons":child_bounds("reference-mode-switch"),
                 "rail":bounds(rail_for_geometry.upcast_ref()),
                 "navigation":bounds(ui.sidebar.upcast_ref()),
                 "inspector":bounds(ui.reference_inspector.upcast_ref()),
+                "inspector_tabs":widget_with_class(ui.window.upcast_ref(), "reference-inspector-tabs").and_then(|w| bounds(&w)),
+                "inspector_tab_children":child_bounds("reference-inspector-tabs"),
+                "inspector_stack":{"visible_name":ui.side_stack.visible_child_name().map(|value|value.to_string()),"transition_running":ui.side_stack.is_transition_running(),"bounds":bounds(ui.side_stack.upcast_ref())},
+                "inspector_card":widget_with_class(ui.window.upcast_ref(), "reference-agent-card").and_then(|w| bounds(&w)),
                 "center":ui.notebook.parent().and_then(|p| bounds(&p)),
                 "navigation_status":widget_with_class(ui.window.upcast_ref(), "reference-navigation-status").and_then(|w| bounds(&w)),
                 "spaces":widget_with_class(ui.window.upcast_ref(), "reference-spaces").and_then(|w| bounds(&w)),
@@ -1261,7 +1285,7 @@ pub(crate) fn install(
                 "inspector_output_heading":widget_with_class(ui.window.upcast_ref(), "reference-inspector-output-heading").and_then(|w| bounds(&w)),
                 "inspector_output":widget_with_class(ui.window.upcast_ref(), "reference-inspector-output").and_then(|w| bounds(&w)),
                 "tools":widget_with_class(ui.window.upcast_ref(), "reference-tools").and_then(|w| bounds(&w)),
-                "composer":widget_with_class(ui.window.upcast_ref(), "chat-composer-card").or_else(|| widget_with_class(ui.window.upcast_ref(), "reference-block-composer")).and_then(|w| bounds(&w)),
+                "composer":widget_with_class(ui.window.upcast_ref(), "chat-dock").or_else(|| widget_with_class(ui.window.upcast_ref(), "reference-block-composer")).and_then(|w| bounds(&w)),
             });
             if let Ok(bytes) = serde_json::to_vec_pretty(&snapshot) { let _ = std::fs::write(destination, bytes); }
             });
@@ -1436,6 +1460,39 @@ pub(crate) fn install_css() {
         &hex(token::color::PROFILE_BACKGROUND),
     )
     .replace("@PROFILE_BORDER@", &hex(token::color::PROFILE_BORDER));
+    // GTK CSS minima exclude the surrounding padding/border. Keep those
+    // insets explicit while binding the total measured geometry to the same
+    // native contract used by both Block and Chat widget requests.
+    let css = [
+        ("@TITLEBAR_HEIGHT@", token::TITLEBAR_HEIGHT),
+        ("@SEARCH_INNER_HEIGHT@", token::SEARCH_HEIGHT - 2.0),
+        ("@MODE_HEIGHT@", token::MODE_CONTROL_HEIGHT),
+        ("@MODE_MIN_WIDTH@", token::MODE_CONTROL_MIN_WIDTH),
+        (
+            "@RAIL_PADDING_X@",
+            (token::RAIL_WIDTH - token::SELECTED_RAIL_SIZE - 1.0) / 2.0,
+        ),
+        (
+            "@NAVIGATION_CONTENT_MIN@",
+            token::NAVIGATION_WIDTH - 2.0 - 2.0 * token::NAVIGATION_PADDING,
+        ),
+        ("@HEADER_INNER_HEIGHT@", token::CANVAS_HEADER_HEIGHT - 1.0),
+        ("@INSPECTOR_CONTENT_MIN@", token::INSPECTOR_WIDTH - 1.0),
+        (
+            "@INSPECTOR_TABS_INNER_HEIGHT@",
+            token::INSPECTOR_TABS_HEIGHT - 1.0,
+        ),
+        ("@INSPECTOR_CARD_MARGIN@", token::INSPECTOR_INSET - 1.0),
+        ("@COMPOSER_INSET@", token::COMPOSER_INSET),
+        ("@COMPOSER_BOTTOM@", token::COMPOSER_BOTTOM),
+        ("@COMPOSER_INNER_HEIGHT@", token::COMPOSER_HEIGHT - 2.0),
+        ("@BLOCK_DOCK_INNER_HEIGHT@", token::COMPOSER_HEIGHT - 16.0),
+        ("@CARD_INSET@", token::CARD_HORIZONTAL_INSET),
+    ]
+    .into_iter()
+    .fold(css, |css, (name, value)| {
+        css.replace(name, &value.to_string())
+    });
     let provider = gtk4::CssProvider::new();
     provider.load_from_string(&css);
     if let Some(display) = gtk4::gdk::Display::default() {

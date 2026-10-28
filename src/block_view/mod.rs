@@ -4280,6 +4280,18 @@ impl BlockBackend {
         let fix_block_cbs_for_menu = self.fix_block_with_agent_cbs.clone();
         let current_cwd_for_menu = self.current_cwd_for_menu.clone();
         let menu_keybindings = self.menu_keybindings.clone();
+        let fold_layout = FoldLayoutSync {
+            finished: Rc::downgrade(&self.finished_blocks_for_cb),
+            data: self.block_data_for_cb.clone(),
+            index: self.block_document_index_for_cb.clone(),
+            config: self.config_for_cb.clone(),
+            active: Rc::downgrade(&self.active_rc),
+            scroll: self.block_scroll_rc.downgrade(),
+            list: self.block_list_rc.downgrade(),
+            viewport: self.viewport_rc.clone(),
+            visible: self.visible_indices_rc.clone(),
+            redraw: self.failure_marker_redraw.clone(),
+        };
 
         // Read-only inspection is shared by the persistent header and menu.
         // Keep only weak native window/card references; no history/VTE copies.
@@ -4378,10 +4390,18 @@ impl BlockBackend {
             }
 
             let popover = gtk4::Popover::new();
+            if finished_widget.has_css_class("developer-command-card") {
+                popover.add_css_class("developer-block-menu");
+                popover.set_width_request(264);
+            }
             *open_popover.borrow_mut() = popover.downgrade();
             popover.set_parent(&finished_widget);
             popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
             popover.set_has_arrow(false);
+            crate::ui::reference_shell::guard_history_popup_focus(
+                finished_widget.upcast_ref(),
+                &popover,
+            );
 
             let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
             vbox.add_css_class("menu");
@@ -4957,12 +4977,23 @@ impl BlockBackend {
                 );
                 let popover_c = popover.downgrade();
                 let finished = finished_blocks_for_menu.clone();
+                let fold_layout = fold_layout.clone();
+                let card_widget = finished_widget.downgrade();
                 item.connect_clicked(move |_| {
                     popdown_if_alive(&popover_c);
-                    if let Some(finished) = finished.upgrade() {
-                        if let Some(block) = finished.borrow().iter().find(|b| b.id == block_id) {
-                            block.set_collapsed(!block.is_collapsed());
-                        }
+                    let (Some(finished), Some(widget)) =
+                        (finished.upgrade(), card_widget.upgrade())
+                    else {
+                        return;
+                    };
+                    let changed = finished
+                        .borrow()
+                        .iter()
+                        .find(|card| card.id == block_id && card.widget() == &widget)
+                        .is_some_and(|card| card.set_collapsed(!card.is_collapsed()));
+                    if changed {
+                        fold_layout.reconcile(block_id, &widget, false);
+                        fold_layout.after_allocation(block_id, &widget);
                     }
                 });
                 vbox.append(&item);
@@ -6163,6 +6194,100 @@ impl VerifiedSubmissionCtx {
         *self.source_id.borrow_mut() = Some(source_id);
         self.notify_prompt_evidence_invalidated();
         Ok(())
+    }
+}
+
+/// Consume the existing empty-editor layout proof without relying on a UI
+/// readiness query happening before the next human keystroke. Both command
+/// capture and verified submission read these same prompt-anchor cells.
+///
+/// This never promotes a dirty editor to Ready: it requires every original
+/// coarse guard, a real local resize epoch, the same nonempty native prompt
+/// prefix and an empty suffix at the native cursor. A draft, queued input,
+/// prefill, unknown foreground owner or interleaved input declines the repair.
+struct PromptResizeReanchor {
+    vte: glib::WeakRef<Terminal>,
+    pty: std::rc::Weak<OwnedPty>,
+    config: Rc<RefCell<Config>>,
+    rebase_on_row_delta: bool,
+    bstate: Rc<Cell<BlockState>>,
+    fullscreen: Rc<Cell<bool>>,
+    dirty: Rc<Cell<bool>>,
+    submitted: Rc<Cell<bool>>,
+    typeahead: Rc<Cell<bool>>,
+    synced: Rc<Cell<bool>>,
+    typed: Rc<RefCell<String>>,
+    ready: Rc<Cell<bool>>,
+    anchor: Rc<Cell<(i64, i64)>>,
+    rows: Rc<Cell<i64>>,
+    anchor_resize: Rc<Cell<u64>>,
+    resize: Rc<Cell<u64>>,
+    prefix: Rc<RefCell<String>>,
+    identity_output: Rc<Cell<bool>>,
+    input_generation: Rc<Cell<u64>>,
+}
+
+impl PromptResizeReanchor {
+    fn reconcile(&self) {
+        let epoch = self.resize.get();
+        let input_generation = self.input_generation.get();
+        if epoch == self.anchor_resize.get()
+            || !self.ready.get()
+            || classify_command_prompt_status(
+                self.bstate.get(),
+                self.fullscreen.get(),
+                self.dirty.get() || self.submitted.get() || self.typeahead.get(),
+                self.synced.get(),
+                self.typed.borrow().trim().is_empty(),
+            ) != CommandPromptStatus::Ready
+        {
+            return;
+        }
+        let (Some(vte), Some(pty)) = (self.vte.upgrade(), self.pty.upgrade()) else {
+            return;
+        };
+        if pty.foreground_owner() != PtyForeground::Shell {
+            return;
+        }
+        let rows = vte.row_count();
+        let previous = prompt_anchor_for_surface(
+            self.rebase_on_row_delta,
+            self.anchor.get(),
+            self.rows.get(),
+            rows,
+        );
+        let cursor = vte.cursor_position();
+        let prefix = visible_row_prefix(&vte, cursor);
+        let saved = self.prefix.borrow();
+        let same_prefix = !saved.is_empty() && prefix.as_deref() == Some(saved.as_str());
+        drop(saved);
+        if !same_prefix {
+            return;
+        }
+        let suffix = click_cursor::verified_suffix_is_empty(
+            &vte,
+            click_cursor::suggestion_rgb(&self.config.borrow().palette),
+        );
+        if !prompt_layout_reflow_can_reanchor(
+            self.rows.get() > 0 && rows > 0 && self.rows.get() != rows,
+            true,
+            self.identity_output.get(),
+            previous,
+            cursor,
+            suffix,
+            same_prefix,
+        ) || self.input_generation.get() != input_generation
+            || self.resize.get() != epoch
+        {
+            return;
+        }
+        self.anchor.set(cursor);
+        self.rows.set(rows);
+        self.anchor_resize.set(epoch);
+        if let Some(prefix) = prefix {
+            *self.prefix.borrow_mut() = prefix;
+        }
+        log::debug!("native empty prompt reanchored after resize: previous={previous:?} cursor={cursor:?} rows={rows} epoch={epoch}");
     }
 }
 
@@ -7563,6 +7688,7 @@ fn command_reuse_menu_label(selected_count: usize) -> &'static str {
 /// them when the user re-runs a command from history.
 struct BlockBackend {
     chat_presentation: Option<Rc<chat::ChatPresentation>>,
+    rebase_prompt_on_row_delta: bool,
     menu_keybindings: shortcut_hints::MenuKeybindings,
     active_rc: Rc<RefCell<ActiveBlock>>,
     /// The live VTE — every byte is fed here; alt-screen toggles feed it 1049h/l.
@@ -7590,6 +7716,7 @@ struct BlockBackend {
     toggle_bookmark: BookmarkToggle,
     block_data_for_cb: Rc<RefCell<VecDeque<BlockData>>>,
     block_document_index_for_cb: Rc<RefCell<BlockDocumentIndex>>,
+    viewport_rc: Rc<RefCell<ViewportState>>,
     unread_count_rc: Rc<Cell<u32>>,
     /// Switches the live surface between compact prompt and full-screen
     /// layouts. PTY geometry is deliberately synchronized separately.
@@ -7641,6 +7768,111 @@ struct BlockBackend {
     /// every feed and by `reset_kitty_pipeline`, so a skipped admit cannot
     /// leak a stale texture across events.
     kitty_pending_admission: RefCell<Option<(gtk4::gdk::Texture, usize)>>,
+}
+
+/// Menu folding must update the retained document just like the pane's fold
+/// actions. The second, bounded frame samples the actual new allocation, which
+/// includes selected-card chrome; it must not retain the old collapsed span.
+#[derive(Clone)]
+struct FoldLayoutSync {
+    finished: std::rc::Weak<RefCell<Vec<FinishedBlock>>>,
+    data: Rc<RefCell<VecDeque<BlockData>>>,
+    index: Rc<RefCell<BlockDocumentIndex>>,
+    config: Rc<RefCell<Config>>,
+    active: std::rc::Weak<RefCell<ActiveBlock>>,
+    scroll: glib::WeakRef<ScrolledWindow>,
+    list: glib::WeakRef<gtk4::Box>,
+    viewport: Rc<RefCell<ViewportState>>,
+    visible: Rc<RefCell<std::collections::HashSet<usize>>>,
+    redraw: FailureMarkerRedraw,
+}
+
+impl FoldLayoutSync {
+    fn reconcile(&self, id: u64, widget: &gtk4::Box, measured: bool) {
+        let (Some(finished), Some(scroll), Some(list)) = (
+            self.finished.upgrade(),
+            self.scroll.upgrade(),
+            self.list.upgrade(),
+        ) else {
+            return;
+        };
+        let finished = finished.borrow();
+        let Some(card) = finished
+            .iter()
+            .find(|card| card.id == id && card.widget() == widget)
+        else {
+            return;
+        };
+        let config = self.config.borrow();
+        let fallback = self
+            .active
+            .upgrade()
+            .map(|active| active.borrow().grid_cols() as i64)
+            .unwrap_or(80);
+        let mut data = self.data.borrow_mut();
+        let Some(record) = data.iter_mut().find(|record| record.id == id) else {
+            return;
+        };
+        record.estimated_height = if card.is_filtered_out() {
+            0
+        } else if measured
+            && card.widget().is_mapped()
+            && card.widget().height_request() == -1
+            && card.widget().height() > 1
+        {
+            card.remember_allocated_height(card.widget().height())
+        } else {
+            card.set_placeholder_height(collapsed_aware_block_height(
+                &config,
+                record,
+                card.is_collapsed(),
+                fallback,
+            ))
+        };
+        let mut index = self.index.borrow_mut();
+        index.mark_stale();
+        index.reconcile(&data);
+        let adjustment = scroll.vadjustment();
+        if let Some(next) = viewport_state_for_scroll(
+            &index,
+            adjustment.value(),
+            adjustment.page_size(),
+            config.virtual_scroll_margin,
+        ) {
+            *self.viewport.borrow_mut() = next.clone();
+            apply_visible_indices_with_measurement(
+                &finished,
+                &mut data,
+                &mut index,
+                &mut self.visible.borrow_mut(),
+                visible_indices_for_viewport(&next),
+                measured,
+            );
+        }
+        drop(index);
+        drop(data);
+        drop(config);
+        drop(finished);
+        (self.redraw)();
+        list.queue_allocate();
+    }
+
+    fn after_allocation(&self, id: u64, widget: &gtk4::Box) {
+        let layout = self.clone();
+        let weak = widget.downgrade();
+        let frames = Cell::new(0);
+        widget.add_tick_callback(move |_, _| {
+            let count = frames.get() + 1;
+            frames.set(count);
+            if count < 2 {
+                return glib::ControlFlow::Continue;
+            }
+            if let Some(widget) = weak.upgrade() {
+                layout.reconcile(id, &widget, true);
+            }
+            glib::ControlFlow::Break
+        });
+    }
 }
 
 /// Captures the shared handles the PTY reader/exit callbacks need, so
@@ -9968,11 +10200,15 @@ impl RenderBackend for BlockBackend {
     }
 
     fn command_capture_anchor(&self, provisional: (i64, i64), anchor_rows: i64) -> (i64, i64) {
-        // Verbatim pre-split math: shift the anchor row by the row-count
-        // delta the compact/full `set_size` churn produced between PromptEnd
-        // and CommandStart. Through the shared policy, which is also what this
-        // pane's `SubmissionSurface` answers with.
-        prompt_anchor_for_surface(true, provisional, anchor_rows, self.active_vte.row_count())
+        let rows = self.active_vte.row_count();
+        let anchor = prompt_anchor_for_surface(
+            self.rebase_prompt_on_row_delta,
+            provisional,
+            anchor_rows,
+            rows,
+        );
+        log::debug!("command anchor: row_delta={} provisional={provisional:?} recorded_rows={anchor_rows} current_rows={rows} cursor={:?} resolved={anchor:?}", self.rebase_prompt_on_row_delta, self.active_vte.cursor_position());
+        anchor
     }
 
     fn grid_cols(&self) -> i64 {
@@ -14415,6 +14651,10 @@ impl TermView {
         // constructor — that mode has no `TermView` at all — and is treated as
         // Block if it somehow does.
         let unified = mode.is_unified();
+        // New Block keeps a full native grid in both seats. Only the legacy
+        // compact-grid policy may shift an absolute anchor by a row delta.
+        // Capture and verified submission must use this exact same decision.
+        let rebase_prompt_on_row_delta = !unified && !block_mode;
         let unified_navigation = unified.then(unified_navigation::NavigationBar::new);
         if let Some(navigation) = &unified_navigation {
             // A permanent compact row in the normal document; it never
@@ -14976,7 +15216,9 @@ impl TermView {
                             | jterm_core::chat_mode::ChatSurface::Fullscreen
                     )
                 );
-                let compact_rows = if chat_presentation.is_some() {
+                let compact_rows = if block_mode {
+                    developer_block::composer_rows
+                } else if chat_presentation.is_some() {
                     chat::composer_rows
                 } else {
                     compact_card_rows
@@ -15023,6 +15265,27 @@ impl TermView {
                         }
                         BlockState::CollectingOutput | BlockState::PostCommand => {
                             let output_started = !live_raw_output_for_layout.borrow().is_empty();
+                            if block_mode && output_started && !live_force_full_for_layout.get() {
+                                if let Some(old_origin) = live_cursor_origin.get() {
+                                    let cursor = vte.cursor_position().1;
+                                    if cursor < old_origin {
+                                        if let Some(displayed_origin) = displayed_live_origin(&vte)
+                                        {
+                                            if let Some((origin, high)) =
+                                                developer_block::rebased_cursor_high_water(
+                                                    old_origin,
+                                                    live_cursor_high.get(),
+                                                    cursor,
+                                                    displayed_origin,
+                                                )
+                                            {
+                                                live_cursor_origin.set(Some(origin));
+                                                live_cursor_high.set(high);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             // Once any content (including a footer below the
                             // cursor) filled the card, no origin recovery or
                             // text probing can make it more visible.
@@ -15282,9 +15545,7 @@ impl TermView {
             input_feedback: input_feedback.clone(),
             surface: Rc::new(VteSubmissionSurface {
                 vte: active_vte.clone(),
-                // Same bit that selects the render backend below, so this
-                // surface's anchor policy is that backend's by construction.
-                rebase_on_row_delta: !unified,
+                rebase_on_row_delta: rebase_prompt_on_row_delta,
             }),
             bstate: bstate.clone(),
             pty: pty.clone(),
@@ -15719,6 +15980,7 @@ impl TermView {
             } else {
                 Rc::new(BlockBackend {
                     chat_presentation: chat_presentation.clone(),
+                    rebase_prompt_on_row_delta,
                     active_rc,
                     active_vte: active_vte_rc,
                     block_list_rc,
@@ -15742,6 +16004,7 @@ impl TermView {
                     toggle_bookmark: toggle_bookmark.clone(),
                     block_data_for_cb,
                     block_document_index_for_cb: block_document_index.clone(),
+                    viewport_rc: viewport.clone(),
                     unread_count_rc: unread_count.clone(),
                     layout_active_surface: layout_active_surface.clone(),
                     config_for_cb: config_for_cb.clone(),
@@ -16278,6 +16541,40 @@ impl TermView {
         // typed command line so the finalize path can style it into the block.
         // The same signal also carries libvte's own reports and the two halves
         // of an Alt chord; `LiveCommitSink` tells them apart.
+        let prompt_resize_reanchor = (block_mode || chat_mode).then(|| {
+            Rc::new(PromptResizeReanchor {
+                vte: active_vte.downgrade(),
+                pty: Rc::downgrade(&pty),
+                config: config_shared.clone(),
+                rebase_on_row_delta: rebase_prompt_on_row_delta,
+                bstate: bstate.clone(),
+                fullscreen: fullscreen.clone(),
+                dirty: idle_input_dirty.clone(),
+                submitted: submission_pending.clone(),
+                typeahead: pending_typeahead.clone(),
+                synced: pty_synced.clone(),
+                typed: typed_cmd.clone(),
+                ready: prompt_anchor_ready.clone(),
+                anchor: prompt_end_pos.clone(),
+                rows: prompt_anchor_rows.clone(),
+                anchor_resize: prompt_anchor_resize_generation.clone(),
+                resize: pty_resize_generation.clone(),
+                prefix: prompt_anchor_prefix.clone(),
+                identity_output: prompt_identity_output.clone(),
+                input_generation: accepted_input_generation.clone(),
+            })
+        });
+        if let Some(proof) = prompt_resize_reanchor.clone() {
+            let cpr = cpr_outstanding.clone();
+            // Registered before input forwarding. Inspect only the still-empty
+            // native editor, before this human commit can taint it or write PTY
+            // bytes. VTE's own protocol reports are not human input.
+            active_vte.connect_commit(move |_, text, _| {
+                if classify_terminal_report(text.as_bytes(), cpr.get() > 0).is_none() {
+                    proof.reconcile();
+                }
+            });
+        }
         let live_commit = LiveCommitSink {
             input_feedback: input_feedback.clone(),
             pty: pty.clone(),
@@ -17124,7 +17421,7 @@ impl TermView {
         }
 
         // ── Resize handler: sync PTY cols/rows when widget allocation changes ──
-        term_view.install_resize_tick(chat_presentation.as_deref());
+        term_view.install_resize_tick(chat_presentation.as_deref(), prompt_resize_reanchor);
 
         Ok(term_view)
     }
@@ -17141,7 +17438,11 @@ impl TermView {
     /// pixels nor the grid moved. Every poll reads absolute geometry, so a
     /// change that lands while the tick is dormant is picked up whole by the
     /// next armed poll — nothing accumulates.
-    fn install_resize_tick(&self, chat: Option<&chat::ChatPresentation>) {
+    fn install_resize_tick(
+        &self,
+        chat: Option<&chat::ChatPresentation>,
+        prompt_resize_reanchor: Option<Rc<PromptResizeReanchor>>,
+    ) {
         let pty_for_resize = self.pty.clone();
         let winsize_for_resize = Rc::downgrade(&self.pty_winsize);
         let scroll_for_resize = self.block_scroll.downgrade();
@@ -17176,6 +17477,7 @@ impl TermView {
             let clip_for_resize = clip_for_resize.clone();
             let last_pane = last_pane.clone();
             let grace_polls = grace_polls.clone();
+            let prompt_resize_reanchor = prompt_resize_reanchor.clone();
             let tick_id = vte_for_tick.add_tick_callback(move |vte, _clock| {
                 let Some(scroll_for_resize) = scroll_for_resize.upgrade() else {
                     tick_slot_for_tick.borrow_mut().take();
@@ -17204,6 +17506,9 @@ impl TermView {
                     {
                         settling = true;
                     }
+                }
+                if let Some(proof) = &prompt_resize_reanchor {
+                    proof.reconcile();
                 }
                 if !resize_tick_continues(settling, &grace_polls) {
                     // A full frame with no pane- or grid-level movement, after
@@ -19356,6 +19661,52 @@ impl TermView {
             Some(serde_json::json!({"record_id":record.id,"offset":adjustment.value()-prefix as f64}))
         });
         let finished = self.finished_blocks.borrow();
+        let native_font = self.active_vte.font().map(|requested| {
+            let loaded = self.active_vte.pango_context().load_font(&requested);
+            let resolved = loaded.as_ref().map(|font| font.describe());
+            let absolute = loaded
+                .as_ref()
+                .map(|font| font.describe_with_absolute_size());
+            serde_json::json!({
+                "requested":requested.to_string(),
+                "size_pango_units":requested.size(),
+                "size_absolute":requested.is_size_absolute(),
+                "resolved":resolved.as_ref().map(ToString::to_string),
+                "resolved_size_pango_units":resolved.as_ref().map(|font|font.size()),
+                "resolved_size_absolute":resolved.as_ref().map(|font|font.is_size_absolute()),
+                "resolved_absolute":absolute.as_ref().map(ToString::to_string),
+                "resolved_absolute_pango_units":absolute.as_ref().map(|font|font.size()),
+                "scale":self.active_vte.font_scale(),
+                "gtk_scale_factor":self.active_vte.scale_factor(),
+            })
+        });
+        #[allow(deprecated)]
+        let native_geometry = {
+            let clip = self.active.borrow().live_clip();
+            let vte = &self.active_vte;
+            let cursor = vte.cursor_position();
+            let top = vte.vadjustment().map(|value| value.value()).unwrap_or(0.0);
+            let style = vte.style_context();
+            let padding = style.padding();
+            let border = style.border();
+            let point = vte.compute_point(
+                &clip,
+                &gtk4::graphene::Point::new(
+                    (cursor.0 * vte.char_width()) as f32
+                        + f32::from(padding.left() + border.left()),
+                    ((cursor.1 as f64 - top) * vte.char_height() as f64) as f32
+                        + f32::from(padding.top() + border.top()),
+                ),
+            );
+            let bounds =
+                |rect: gtk4::graphene::Rect| [rect.x(), rect.y(), rect.width(), rect.height()];
+            serde_json::json!({
+                "clip":clip.compute_bounds(&self.root).map(bounds),
+                "native":vte.compute_bounds(&clip).map(bounds),
+                "native_top_row":top,
+                "cursor_cell":point.map(|p|[p.x(),p.y(),vte.char_width() as f32,vte.char_height() as f32]),
+            })
+        };
         let outputs: Vec<_> = finished.iter().filter(|card| card.output_vte.is_mapped()).map(|card| {
             let adjustment = card.output_vte.vadjustment();
             serde_json::json!({"id":card.id,"adjustment":adjustment.map(|a|(a.lower(),a.value(),a.upper(),a.page_size())),"exit_code":data.iter().find(|record|record.id==card.id).and_then(|record|record.exit_code),"duration_ms":data.iter().find(|record|record.id==card.id).and_then(|record|record.duration_ms),"height":card.widget().height(),"height_request":card.widget().height_request(),"estimated_height":data.iter().find(|record|record.id==card.id).map(|record|record.estimated_height),"developer":card.widget().has_css_class("developer-command-card"),"rows":card.output_vte.row_count(),"columns":card.output_vte.column_count(),"cell":[card.output_vte.char_width(),card.output_vte.char_height()]})
@@ -19368,6 +19719,8 @@ impl TermView {
             "child_winsize":self.pty_winsize.child_winsize(),
             "live_clip_height":self.active.borrow().live_clip().height(),
             "live_cell":[self.active_vte.char_width(),self.active_vte.char_height()],
+            "live_font":native_font,
+            "live_geometry":native_geometry,
             "live_has_selection":self.active_vte.has_selection(),
             "block_state":format!("{:?}", self.bstate.get()),
             "prompt_anchor":self.current_prompt_anchor(),
@@ -32755,6 +33108,7 @@ mod tests {
         use gtk4::prelude::*;
         use vte4::TerminalExt;
         gtk4::init().expect("gtk init");
+        crate::ui::reference_shell::install_css();
         let view = super::TermView::new_with_spawner(
             &crate::config::Config::safe_defaults(),
             &crate::config::TerminalMode::Chat,
@@ -32769,6 +33123,8 @@ mod tests {
             .default_width(640)
             .default_height(480)
             .build();
+        window.add_css_class("forge-window");
+        window.add_css_class("reference-shell");
         window.set_child(Some(&view.root));
         window.present();
         let settle = || {
@@ -32783,7 +33139,7 @@ mod tests {
         view.ftcs_seen.set(true);
         let native = view.active_vte.clone();
         let anchor = view.active.borrow().widget().clone();
-        let mut stable_rows = None;
+        let mut stable_grid = None;
         for state in [
             BlockState::AwaitingCommand,
             BlockState::CollectingOutput,
@@ -32795,11 +33151,26 @@ mod tests {
             settle();
             view.render_backend.sync_geometry_to_pty();
             let grid = super::pty_grid_size(&view.active_vte, &view.block_scroll);
-            if let Some(rows) = stable_rows {
-                assert_eq!(grid.1, rows);
+            if let Some(expected) = stable_grid {
+                assert_eq!(
+                    grid, expected,
+                    "Enter must preserve the physical grid in both seats"
+                );
             } else {
-                stable_rows = Some(grid.1);
+                stable_grid = Some(grid);
             }
+            assert_eq!(view.pty.test_slave_winsize(), grid);
+            assert_eq!(native.column_count(), i64::from(grid.0));
+            assert_eq!(native.row_count(), i64::from(grid.1));
+            let native_bounds = native
+                .compute_bounds(&view.active.borrow().live_clip())
+                .unwrap();
+            assert!(native_bounds.x() >= -1.0);
+            assert!(
+                native_bounds.x() + native_bounds.width()
+                    <= view.active.borrow().live_clip().width() as f32 + 1.0,
+                "the common grid must fit the real clip rather than hide right-hand columns"
+            );
             assert_eq!(view.active_vte, native);
             assert_eq!(anchor.parent().as_ref(), Some(view.block_list.upcast_ref()));
             let clip = view.active.borrow().live_clip();
@@ -32878,6 +33249,150 @@ mod tests {
             }
         }
         window.close();
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; native CPR and real child allocation"]
+    fn multiline_native_caret_fits_editor_and_footer() {
+        use gtk4::prelude::*;
+        use vte4::TerminalExt;
+        gtk4::init().unwrap();
+        crate::ui::reference_shell::install_css();
+        for mode in [
+            crate::config::TerminalMode::Chat,
+            crate::config::TerminalMode::Block,
+        ] {
+            let view = chat_display_view(mode.clone());
+            let window = gtk4::Window::builder()
+                .default_width(1129)
+                .default_height(844)
+                .child(&view.root)
+                .build();
+            window.add_css_class("forge-window");
+            window.add_css_class("reference-shell");
+            window.present();
+            let settle = || {
+                let clock = window.frame_clock().unwrap();
+                let count = Rc::new(Cell::new(0));
+                let seen = count.clone();
+                let signal = clock.connect_after_paint(move |_| seen.set(seen.get() + 1));
+                let start = std::time::Instant::now();
+                while count.get() < 8 && start.elapsed() < std::time::Duration::from_secs(3) {
+                    window.queue_draw();
+                    while gtk4::glib::MainContext::default().iteration(false) {}
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                clock.disconnect(signal);
+                assert!(count.get() >= 8);
+            };
+            settle();
+            let native = view.active_vte.clone();
+            let replies = Rc::new(RefCell::new(Vec::<String>::new()));
+            let seen = replies.clone();
+            native.connect_commit(move |_, text, _| seen.borrow_mut().push(text.to_string()));
+            for count in [4, 80] {
+                native.reset(true, true);
+                *view.typed_cmd.borrow_mut() = (0..count)
+                    .map(|i| format!("line-{i:03}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let output = format!(
+                    "\x1b[2J\x1b[H\x1b]133;A\x07> \x1b]133;B\x07{}",
+                    view.typed_cmd.borrow().replace('\n', "\r\n")
+                );
+                view.pty.write_test_slave(output.as_bytes());
+                settle();
+                for (width, height) in [(1129, 844), (813, 607), (1129, 844)] {
+                    window.set_default_size(width, height);
+                    settle();
+                    view.render_backend.sync_geometry_to_pty();
+                    settle();
+                    assert_eq!((window.width(), window.height()), (width, height));
+                    assert_eq!(native, view.active_vte);
+                    assert_eq!(
+                        view.pty.test_slave_winsize(),
+                        super::pty_grid_size(&native, &view.block_scroll)
+                    );
+                    assert_eq!(
+                        native.row_count(),
+                        i64::from(view.pty.test_slave_winsize().1)
+                    );
+                    assert_eq!(
+                        native.column_count(),
+                        i64::from(view.pty.test_slave_winsize().0)
+                    );
+                    replies.borrow_mut().clear();
+                    // The terminal itself answers screen-relative CPR. Do not
+                    // mix absolute ring cursor rows with rebased adjustment.
+                    native.feed(b"\x1b[6n");
+                    settle();
+                    let (row, col) = replies
+                        .borrow()
+                        .iter()
+                        .find_map(|reply| {
+                            let (row, col) = reply
+                                .strip_prefix("\x1b[")?
+                                .strip_suffix('R')?
+                                .split_once(';')?;
+                            Some((row.parse::<i64>().ok()?, col.parse::<i64>().ok()?))
+                        })
+                        .expect("native screen-relative CPR response");
+                    #[allow(deprecated)]
+                    let (padding, border) = {
+                        let style = native.style_context();
+                        (style.padding(), style.border())
+                    };
+                    let cursor = gtk4::graphene::Point::new(
+                        ((col - 1) * native.char_width()) as f32
+                            + f32::from(padding.left() + border.left()),
+                        ((row - 1) * native.char_height()) as f32
+                            + f32::from(padding.top() + border.top()),
+                    );
+                    let clip = view.active.borrow().live_clip();
+                    let local = native.compute_point(&clip, &cursor).unwrap();
+                    let viewport = native
+                        .ancestor(gtk4::ScrolledWindow::static_type())
+                        .unwrap();
+                    let editor = native.compute_point(&viewport, &cursor).unwrap();
+                    assert!(
+                        local.y() >= -1.0
+                            && local.y() + native.char_height() as f32
+                                <= clip.height() as f32 + 1.0,
+                        "{mode:?} {count} lines: native CPR caret {:?} must fit clip {}",
+                        local,
+                        clip.height()
+                    );
+                    assert!(
+                        editor.y() >= -1.0
+                            && editor.y() + native.char_height() as f32
+                                <= viewport.height() as f32 + 1.0,
+                        "{mode:?} {count} lines: CPR caret {:?} must fit actual editor viewport {}",
+                        editor,
+                        viewport.height()
+                    );
+                    let mut pending = vec![view.root.clone().upcast::<gtk4::Widget>()];
+                    let mut controls = None;
+                    while let Some(widget) = pending.pop() {
+                        if widget.has_css_class("chat-controls") {
+                            controls = Some(widget);
+                            break;
+                        }
+                        let mut child = widget.first_child();
+                        while let Some(widget) = child {
+                            child = widget.next_sibling();
+                            pending.push(widget);
+                        }
+                    }
+                    let controls = controls.unwrap().compute_bounds(&view.root).unwrap();
+                    let in_root = native.compute_point(&view.root, &cursor).unwrap();
+                    assert!(
+                        in_root.y() + native.char_height() as f32 <= controls.y() + 1.0,
+                        "{mode:?} {count} lines: footer must not cover native caret"
+                    );
+                }
+            }
+            window.close();
+        }
     }
 
     fn chat_display_settle() {

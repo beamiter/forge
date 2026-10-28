@@ -5042,6 +5042,18 @@ impl ActiveBlock {
         let grid_rows = grid_rows.max(1);
         let visible_rows = visible_rows.clamp(1, grid_rows);
         let clip_width = self.live_clip.width();
+        // Chat moves this one native surface between two differently inset
+        // seats. The retained history anchor stays allocated in both states;
+        // its horizontal chrome is invariant. Use the narrower actual content
+        // width so Enter never reflows the physical grid, and never expand the
+        // terminal beyond either real viewport. True window resizes reallocate
+        // that anchor and therefore still change the grid normally.
+        let clip_width =
+            if self.active_vte.has_css_class("chat-live-terminal") && self.widget.width() > 0 {
+                clip_width.min(self.widget.width())
+            } else {
+                clip_width
+            };
         let gutter = if self.active_vte.has_css_class("chat-live-terminal")
             || self.active_vte.has_css_class("docked-live-terminal")
         {

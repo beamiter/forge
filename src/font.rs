@@ -216,12 +216,17 @@ pub(crate) fn reference_ui_role_multiplier(
     chrome_scale: f64,
     context: &gtk::pango::Context,
 ) -> f64 {
-    reference_size_role_multiplier(chrome_size, "14", chrome_scale, context)
+    reference_size_role_multiplier(
+        chrome_size,
+        crate::config::DEFAULT_CHROME_FONT_SIZE,
+        chrome_scale,
+        context,
+    )
 }
 
 /// Rich Content follows the same Main size and scale as its native PTY.
-/// Preserve the authored hierarchy at Config's actual default size; the
-/// reference capture's explicitly configured 11pt is not the product default.
+/// Preserve authored20/12/10 roles at Config's absolute12px Main default.
+/// Explicit point/pixel settings still scale through the actual native context.
 pub(crate) fn reference_content_role_multiplier(
     content_desc: &str,
     content_scale: f64,
@@ -411,8 +416,9 @@ mod tests {
         let context = window.pango_context();
         let config = Config::safe_defaults();
         let nominal = FontDescription::from_string(&config.font_desc);
-        assert_eq!(nominal.size(), 14 * gtk::pango::SCALE);
-        assert!(!nominal.is_size_absolute());
+        assert_eq!(nominal.size(), 12 * gtk::pango::SCALE);
+        assert!(nominal.is_size_absolute());
+        assert_eq!(config.chrome_font_size, "14");
         let nominal_px = f64::from(
             context
                 .load_font(&nominal)
@@ -441,7 +447,14 @@ mod tests {
             let expected = if absolute {
                 size / nominal_px
             } else {
-                size / 14.0
+                f64::from(
+                    context
+                        .load_font(&FontDescription::from_string(&format!("Monospace {size}")))
+                        .unwrap()
+                        .describe_with_absolute_size()
+                        .size(),
+                ) / f64::from(gtk::pango::SCALE)
+                    / nominal_px
             } * scale;
             assert!((factor - expected).abs() < 0.001, "{factor} vs {expected}");
             eprintln!("reference-content-native: size={size}{unit} scale={scale} nominal_px={nominal_px} factor={factor} widget_scale={}", window.scale_factor());
@@ -565,8 +578,12 @@ mod tests {
         );
         let terminal = crate::terminal::create_terminal(&config);
         let reference = vte4::Terminal::new();
+        let mut reference_font = FontDescription::from_string(crate::config::DEFAULT_FONT_DESC);
+        reference_font.set_family(expected);
+        assert!(reference_font.is_size_absolute());
+        assert_eq!(reference_font.size(), 12 * gtk4::pango::SCALE);
         reference.set_font(Some(&font_description(
-            &format!("{expected} 14"),
+            &reference_font.to_string(),
             icon_family(&config),
         )));
         let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -991,7 +1008,7 @@ mod tests {
         for scale in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
             assert_eq!(effective_font_size_css("Monospace 14", scale), "14pt");
         }
-        assert_eq!(effective_font_size_css("Monospace", 1.0), "14pt");
+        assert_eq!(effective_font_size_css("Monospace", 1.0), "12px");
     }
 
     #[test]

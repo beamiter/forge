@@ -4,10 +4,37 @@ use super::*;
 use std::cell::RefCell;
 
 pub(super) const HEADER_HEIGHT: i32 = 40;
-pub(super) const CARD_GAP: i32 = 10;
+pub(super) const CARD_GAP: i32 = jterm_core::developer_workspace::CARD_GAP as i32;
 pub(super) const GUTTER_WIDTH: i32 = 24;
 pub(super) const GUTTER_GAP: i32 = 16;
 pub(super) const OUTPUT_PADDING: i32 = 6;
+
+/// The companion is not a reserved row in Block's real shell editor. Grow for
+/// every line the native prompt/completion UI actually draws; never crop it.
+pub(super) fn composer_rows(input: i64, drawn: i64, viewport: i64) -> i64 {
+    input.max(drawn).clamp(1, viewport.max(1))
+}
+
+/// libvte can renumber absolute ring rows when a real grid resize rewraps a
+/// short live screen. A cursor below its previous screen origin proves that
+/// the old absolute high-water belongs to a retired row domain. Translate its
+/// relative extent using the independently measured displayed origin; do not
+/// shrink the proven extent or reset/refeed the native terminal.
+pub(super) fn rebased_cursor_high_water(
+    old_origin: i64,
+    old_high: i64,
+    cursor: i64,
+    displayed_origin: i64,
+) -> Option<(i64, i64)> {
+    (cursor < old_origin && displayed_origin <= cursor).then(|| {
+        (
+            displayed_origin,
+            displayed_origin
+                .saturating_add(old_high.saturating_sub(old_origin).max(0))
+                .max(cursor),
+        )
+    })
+}
 
 pub(super) fn estimated_height(cell_height: i32, command_rows: i64, output_rows: i64) -> i32 {
     let output = if output_rows > 0 {
@@ -261,7 +288,7 @@ impl RunningHeader {
 pub(super) fn live_toolbar() -> (gtk4::Box, gtk4::Label, gtk4::Button, gtk4::Button) {
     let root = gtk4::Box::new(Orientation::Horizontal, 8);
     root.add_css_class("developer-live-toolbar");
-    root.set_height_request(36);
+    root.set_height_request(jterm_core::developer_workspace::LIVE_TOOLBAR_HEIGHT as i32);
     let count = gtk4::Label::new(Some("Live · 0 commands"));
     count.set_hexpand(true);
     count.set_xalign(0.0);
@@ -293,6 +320,20 @@ pub(super) fn live_toolbar() -> (gtk4::Box, gtk4::Label, gtk4::Button, gtk4::But
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn block_input_rows_follow_native_drawn_content_without_a_companion_floor() {
+        assert_eq!(composer_rows(1, 1, 30), 1);
+        assert_eq!(composer_rows(4, 1, 30), 4);
+        assert_eq!(composer_rows(1, 12, 30), 12);
+        assert_eq!(composer_rows(1, 100, 30), 30);
+    }
+    #[test]
+    fn ring_rebase_preserves_relative_extent_and_requires_cursor_domain_proof() {
+        assert_eq!(rebased_cursor_high_water(38, 42, 4, 0), Some((0, 4)));
+        assert_eq!(rebased_cursor_high_water(38, 44, 4, 0), Some((0, 6)));
+        assert_eq!(rebased_cursor_high_water(38, 42, 40, 38), None);
+        assert_eq!(rebased_cursor_high_water(38, 42, 4, 5), None);
+    }
     #[test]
     fn gutter_numbers_logical_lines_and_leaves_wrap_continuations_empty() {
         assert_eq!(logical_starts("abcde\nz\n", 3), (vec![(0, 1), (2, 2)], 3));

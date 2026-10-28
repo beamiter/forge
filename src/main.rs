@@ -615,8 +615,8 @@ pub fn run() -> glib::ExitCode {
         }
         config.sidebar_visible = true;
         config.tab_placement = crate::config::TabPlacement::Sidebar;
-        config.sidebar_width = jterm_core::reference_shell::NAVIGATION_WIDTH as u32;
-        config.ai_panel_width = jterm_core::reference_shell::INSPECTOR_WIDTH as u32;
+        config.sidebar_width = jterm_core::developer_workspace::NAVIGATION_WIDTH as u32;
+        config.ai_panel_width = jterm_core::developer_workspace::INSPECTOR_WIDTH as u32;
 
         // Cache shell selection once to avoid extra process probes per new tab.
         let shell_argv = Rc::new(RefCell::new(if launch.safe_mode {
@@ -630,8 +630,8 @@ pub fn run() -> glib::ExitCode {
         let available_themes = Rc::new(themes);
         let window = adw::ApplicationWindow::builder()
             .application(app)
-            .default_width(jterm_core::reference_shell::REFERENCE_WIDTH as i32)
-            .default_height(jterm_core::reference_shell::REFERENCE_HEIGHT as i32)
+            .default_width(jterm_core::developer_workspace::REFERENCE_WIDTH as i32)
+            .default_height(jterm_core::developer_workspace::REFERENCE_HEIGHT as i32)
             .title("forge")
             .name("win_name")
             .modal(false)

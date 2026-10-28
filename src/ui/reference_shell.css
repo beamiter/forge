@@ -1,35 +1,35 @@
 .reference-shell { background: @TITLEBAR@; color: #d9e4f5; font-family: "Inter", "DejaVu Sans", sans-serif; }
 window.reference-shell.csd { border: 0; padding: 0; margin: 0; outline: none; border-radius: 0; box-shadow: none; }
 window.reference-shell decoration { border: 0; padding: 0; margin: 0; border-radius: 0; box-shadow: none; }
-.reference-shell .reference-titlebar { padding: 0; min-height: 42px; background: @TITLEBAR@; color: #d9e4f5; }
-.reference-shell .reference-toolbar { padding: 0 10px; min-height: 42px; }
+.reference-shell .reference-titlebar { padding: 0; min-height: @TITLEBAR_HEIGHT@px; background: @TITLEBAR@; color: #d9e4f5; }
+.reference-shell .reference-toolbar { padding: 0 10px; min-height: @TITLEBAR_HEIGHT@px; }
 .reference-shell .reference-toolbar button { color: #c5d1e5; min-height: 26px; min-width: 22px; padding: 0 5px; border-radius: 7px; }
 .reference-shell .reference-toolbar .window-control { min-width: 16px; min-height: 16px; padding: 0; border: 1px solid #35445d; }
 .reference-shell .reference-product { font-size: 12px; font-weight: 700; margin: 0 10px 0 4px; }
 .reference-shell .reference-toolbar-path { font-size: 10px; color: #a7b8d3; }
-.reference-shell .reference-search { border: 1px solid #303d54; background: #192437; margin: 0; padding: 0 8px; min-height: 26px; border-radius: 7px; color: #a9bad2; }
+.reference-shell .reference-search { border: 1px solid #303d54; background: #192437; margin: 0; padding: 0 8px; min-height: @SEARCH_INNER_HEIGHT@px; border-radius: 7px; color: #a9bad2; }
 .reference-shell .reference-shortcut { font-size: 9px; background: #273349; color: #a9bbd7; padding: 2px 5px; border-radius: 4px; }
-.reference-shell .reference-mode-switch { border-radius: 7px; background: #172338; padding: 2px; }
-.reference-shell .reference-mode-switch button { font-size: 10px; min-width: 44px; }
+.reference-shell .reference-mode-switch { border-radius: 7px; background: #172338; padding: 0; }
+.reference-shell .reference-mode-switch button { font-size: 10px; min-width: @MODE_MIN_WIDTH@px; min-height: @MODE_HEIGHT@px; padding: 0; border-width: 0; }
 .reference-shell .reference-mode-switch button:not(:checked):hover { background: #24364f; }
 .reference-shell .reference-mode-switch button:checked { background: @ACCENT@; color: white; border-color: transparent; box-shadow: 0 0 6px alpha(@ACCENT@,.22); }
 .reference-shell .reference-mode-switch button:checked:hover { background: shade(@ACCENT@,1.08); }
 .reference-shell .reference-mode-switch button:checked:active { background: shade(@ACCENT@,.92); }
 .reference-shell .reference-mode-switch button:disabled { color: #90a0b9; background: #1d2b41; box-shadow: none; }
 .reference-shell .reference-mode-switch button:checked:disabled { color: #d5e0f4; background: alpha(@ACCENT@,.5); }
-.reference-shell .reference-rail { background: @RAIL@; border-right: 1px solid #253247; padding: 12px 10px 8px; min-width: 34px; }
+.reference-shell .reference-rail { background: @RAIL@; border-right: 1px solid #253247; padding: 12px @RAIL_PADDING_X@px 8px; min-width: 34px; }
 .reference-shell .reference-rail button { min-width: 32px; min-height: 32px; padding: 0; color: #8a9dbb; border-radius: 8px; }
 .reference-shell .reference-rail button:hover, .reference-shell .reference-rail button:checked { background: #273d70; color: #b9d2ff; }
 .reference-shell .reference-profile { min-width: 26px; min-height: 26px; padding: 0; font-size: 11px; color: #cedaf0; border: 1px solid @PROFILE_BORDER@; background: @PROFILE_BACKGROUND@; border-radius: 14px; font-weight: 600; }
-.reference-shell .reference-navigation { min-width: 207px; padding: 16px 14px 0; background: @NAVIGATION@; color: #bac9e1; border-right: 1px solid #2c394f; }
+.reference-shell .reference-navigation { min-width: @NAVIGATION_CONTENT_MIN@px; padding: 16px 14px 0; background: @NAVIGATION@; color: #bac9e1; border-right: 1px solid #2c394f; }
 .reference-shell .reference-section-label { color: #7d91ae; font-size: 8px; font-weight: 700; letter-spacing: 1px; margin: 0 0 9px; }
 .reference-shell .reference-workspace-selector { min-height: 31px; min-width: 0; padding: 0 8px; margin-bottom: 0; color: #c6d4eb; background: #23324a; border: 1px solid #35445e; border-radius: 8px; font-size: 10px; }
 .reference-shell .reference-workspace-selector:disabled { opacity: .8; }
 .reference-shell .reference-navigation .sidebar-switcher { margin: 0 0 8px; }
 .reference-shell .reference-navigation .sidebar-switcher button { color: #9eb1ce; padding: 4px 6px; font-size: 10px; min-height: 24px; border-radius: 6px; }
 .reference-shell .reference-navigation .sidebar-switcher button:checked { color: #e3ecff; background: #283d6f; }
-.reference-shell .reference-navigation .tab-strip-search { min-height: 22px; padding: 3px 6px; margin: 0 0 7px; border-radius: 6px; background: #101c2e; border: 1px solid #2b3b55; color: #b5c5df; font-size: 10px; }
-.reference-shell .reference-navigation .tab-strip-search text { color: #d4e2f8; caret-color: #d4e2f8; }
+.reference-shell .reference-navigation .tab-strip-search { min-width: 0; min-height: 22px; padding: 3px 6px; margin: 0 0 7px; border-radius: 6px; background: #101c2e; border: 1px solid #2b3b55; color: #b5c5df; font-size: 10px; }
+.reference-shell .reference-navigation .tab-strip-search text { font-size: 10px; color: #d4e2f8; caret-color: #d4e2f8; }
 .reference-shell .reference-navigation .tab-strip-btn { min-height: 29px; padding: 1px 7px; margin: 2px 0; border: 0; border-radius: 6px; color: #aebfd9; background: transparent; outline: none; font-size: 10px; }
 .reference-shell .reference-navigation .tab-strip-btn:checked { color: #e3ecff; background: #283d6f; box-shadow: inset -2px 0 #719cfa; }
 .reference-shell .reference-navigation .tab-strip-close { min-width: 12px; min-height: 16px; padding: 0; }
@@ -38,15 +38,15 @@ window.reference-shell decoration { border: 0; padding: 0; margin: 0; border-rad
 .reference-shell .reference-navigation-status { border-top: 1px solid #344158; margin-top: 10px; }
 .reference-shell .reference-navigation .bottom-bar { padding: 3px 0; background: transparent; border: none; font-size: 9px; min-height: 24px; color: #92a5c3; }
 .reference-shell paned > separator { min-width: 1px; min-height: 1px; background: #2d3a50; }
-.reference-shell .reference-canvas-header { min-height: 48px; padding: 0 24px; background: #f9fbff; border-bottom: 1px solid #dae3ef; color: #24334b; }
+.reference-shell .reference-canvas-header { min-height: @HEADER_INNER_HEIGHT@px; padding: 0 24px; background: #f9fbff; border-bottom: 1px solid #dae3ef; color: #24334b; }
 .reference-shell .reference-canvas-title { font-size: 12px; font-weight: 600; }
 .reference-shell .reference-canvas-subtitle { color: #7b8ca4; font-size: 9px; }
 .reference-shell .reference-canvas-header button { color: #657893; min-height: 24px; padding: 0 6px; }
-.reference-shell .reference-inspector { min-width: 305px; background: @INSPECTOR@; color: #bacbe5; border-left: 1px solid #29364b; }
-.reference-shell .reference-inspector-tabs { min-height: 48px; padding: 0 14px; border-bottom: 1px solid #253248; }
+.reference-shell .reference-inspector { min-width: @INSPECTOR_CONTENT_MIN@px; background: @INSPECTOR@; color: #bacbe5; border-left: 1px solid #29364b; }
+.reference-shell .reference-inspector-tabs { min-height: @INSPECTOR_TABS_INNER_HEIGHT@px; padding: 0 14px; border-bottom: 1px solid #253248; }
 .reference-shell .reference-inspector-tabs button { font-size: 10px; color: #8fa5c5; padding: 0 8px; min-height: 27px; border-radius: 6px; }
 .reference-shell .reference-inspector-tabs button:checked { color: #e2ecff; background: #233555; box-shadow: inset 0 -2px #6898f5; }
-.reference-shell .reference-agent-card { margin: 0 13px 14px; padding: 13px 13px 7px; border-radius: 12px; border: 1px solid #314056; background: #1c293a; }
+.reference-shell .reference-agent-card { margin: 0 @INSPECTOR_CARD_MARGIN@px 14px; padding: 13px 13px 7px; border-radius: 12px; border: 1px solid #314056; background: #1c293a; }
 .reference-shell .reference-card-title { color: #d4e1f6; font-weight: 600; font-size: 11px; }
 .reference-shell .reference-muted { color: #879bb9; font-size: 10px; }
 .reference-shell .reference-metadata { color: #b4c8e5; font-size: 9px; }
@@ -72,8 +72,8 @@ window.reference-shell decoration { border: 0; padding: 0; margin: 0; border-rad
 .reference-shell .term-chat-root .chat-command { background: #d9e4fa; color: #293e62; border: 1px solid #d0dff6; border-radius: 12px; padding: 8px 12px; }
 .reference-shell .term-chat-root .chat-result { background: transparent; border: none; box-shadow: none; padding: 9px 0 0; color: #26364c; }
 .reference-shell .term-chat-root .chat-meta-chip { color: #71839c; background: #e8effa; border: 1px solid #d6e1f1; font-size: 9px; padding: 2px 5px; }
-.reference-shell .term-chat-root .chat-dock, .reference-shell .term-chat-root .chat-dock.chat-dock-compact { margin: 0 28px 11px; }
-.reference-shell .term-chat-root .chat-composer-card { min-height: 78px; border-radius: 14px; background: #fefefe; border: 1px solid #bdcee6; box-shadow: 0 3px 10px alpha(#486ca6, .10); }
+.reference-shell .term-chat-root .chat-dock, .reference-shell .term-chat-root .chat-dock.chat-dock-compact { margin: 0 @COMPOSER_INSET@px @COMPOSER_BOTTOM@px; }
+.reference-shell .term-chat-root .chat-dock { min-height: @BLOCK_DOCK_INNER_HEIGHT@px; padding: 7px 0; border-radius: 14px; background: #fefefe; border: 1px solid #bdcee6; box-shadow: 0 3px 10px alpha(#486ca6, .10); }
 .reference-shell .term-chat-root .chat-composer { margin: 0; padding: 0 10px; background: transparent; border: none; box-shadow: none; }
 .reference-shell .term-chat-root .chat-controls { background: transparent; padding: 0 9px; border: none; min-height: 26px; }
 .reference-shell .term-chat-root .chat-input-hint { color: #8192aa; font-size: 9px; }
@@ -88,7 +88,7 @@ window.reference-shell decoration { border: 0; padding: 0; margin: 0; border-rad
         linear-gradient(90deg, alpha(#8498ef,.035), alpha(#8498ef,0) 14%, alpha(#a18bdf,0) 86%, alpha(#a18bdf,.04)),
         linear-gradient(180deg, @CANVAS@, @CANVAS_COOL@);
 }
-.reference-shell .reference-block-composer { min-height: 66px; margin: 0 28px 11px; padding: 6px 9px; border: 1px solid #bdcee6; border-radius: 14px; background: #fefefe; color: #6e829f; box-shadow: 0 3px 10px alpha(#486ca6,.10); }
+.reference-shell .reference-block-composer { min-height: @COMPOSER_INNER_HEIGHT@px; margin: 0 @COMPOSER_INSET@px @COMPOSER_BOTTOM@px; padding: 6px 9px; border: 1px solid #bdcee6; border-radius: 14px; background: #fefefe; color: #6e829f; box-shadow: 0 3px 10px alpha(#486ca6,.10); }
 .reference-shell .reference-block-composer button { min-height: 24px; min-width: 20px; padding: 0 5px; background: transparent; color: #6e829f; border-radius: 6px; font-size: 9px; }
 .reference-shell .reference-block-composer .reference-terminal-input { font-size: 11px; color: #91a0b6; }
 .reference-shell .reference-block-composer .reference-disabled-send { background: @ACCENT@; color: white; opacity: .5; }
@@ -212,13 +212,13 @@ window.forge-window.reference-shell .reference-navigation label.reference-local-
 .reference-shell .term-chat-root .chat-controls { margin-top: 5px; }
 
 /* Both presentations share this strip; only the native editor owner differs. */
-window.forge-window.reference-shell .reference-block-composer { padding: 0; min-height: 78px; }
+window.forge-window.reference-shell .reference-block-composer { padding: 0; min-height: @COMPOSER_INNER_HEIGHT@px; }
 window.forge-window.reference-shell .reference-block-composer .reference-terminal-input { min-height:42px; padding:0 9px; margin:0; border:0; border-radius:0; background:transparent; box-shadow:none; font-weight:400; }
 window.forge-window.reference-shell .reference-block-composer .reference-terminal-input label { font-size:12px; font-weight:400; }
 window.forge-window.reference-shell .reference-quiet-prompt { color:#34517a; }
 window.forge-window.reference-shell .reference-quiet-placeholder { color:#91a0b6; }
 window.forge-window.reference-shell .reference-composer-controls,
-window.forge-window.reference-shell .term-chat-root .reference-composer-controls { margin:1px 0 0; padding:0 9px 7px; min-height:28px; border:0; background:transparent; }
+window.forge-window.reference-shell .term-chat-root .reference-composer-controls { margin:0; padding:0 10px; min-height:28px; border:0; background:transparent; }
 window.forge-window.reference-shell .reference-composer-controls button { min-height:24px; padding:0 5px; margin:0; border:1px solid #d4e0f0; border-radius:7px; background:#f7faff; color:#6e829f; font-size:10px; font-weight:400; }
 window.forge-window.reference-shell .reference-composer-controls .chat-submit { min-height:26px; min-width:26px; padding:0; margin:0; background:@ACCENT@; color:white; border:1px solid #527de0; }
 window.forge-window.reference-shell .reference-composer-controls .chat-stop { margin:0; padding:0; min-height:26px; }
@@ -229,8 +229,8 @@ window.forge-window.reference-shell .reference-composer-controls button:disabled
 .reference-tools-popover > contents { background:#f9fbff; color:#657b9a; border:1px solid #cbd9ec; border-radius:10px; padding:6px; }
 .reference-tools-popover button { min-height:26px; padding:0 8px; background:transparent; font-size:10px; }
 
-window.forge-window.reference-shell .reference-mode-switch { padding:0; min-height:28px; }
-window.forge-window.reference-shell .reference-mode-switch button { min-height:26px; padding:0 6px; margin:0; }
+window.forge-window.reference-shell .reference-mode-switch { padding:0; min-height:@MODE_HEIGHT@px; }
+window.forge-window.reference-shell .reference-mode-switch button { min-height:@MODE_HEIGHT@px; min-width:@MODE_MIN_WIDTH@px; padding:0; border-width:0; margin:0; }
 window.forge-window.reference-shell .reference-header-actions { margin:0; padding:0; }
 window.forge-window.reference-shell .reference-canvas-header .reference-header-action { min-width:24px; min-height:24px; padding:0; margin:0; border:0; background:transparent; }
 window.forge-window.reference-shell .reference-inspector-tabs button { min-width:48px; padding:0; margin:0; }

@@ -150,7 +150,6 @@ impl UiState {
                 .as_ref()
                 .and_then(super::PaneNode::from_widget)
                 .map_or(0, |node| node.leaves().len()),
-            ..Default::default()
         });
         self.window.set_title(Some(&content.window_title));
         if !self.bottom_bar.get_visible() {

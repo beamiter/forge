@@ -1027,8 +1027,8 @@ impl UiState {
         let (mut new_config, _themes, new_keybindings) = load_config();
         new_config.terminal_mode = new_config.terminal_mode.public_presentation();
         new_config.tab_placement = crate::config::TabPlacement::Sidebar;
-        new_config.sidebar_width = jterm_core::reference_shell::NAVIGATION_WIDTH as u32;
-        new_config.ai_panel_width = jterm_core::reference_shell::INSPECTOR_WIDTH as u32;
+        new_config.sidebar_width = jterm_core::developer_workspace::NAVIGATION_WIDTH as u32;
+        new_config.ai_panel_width = jterm_core::developer_workspace::INSPECTOR_WIDTH as u32;
         // `load_config` re-read the file. Prove it read the same bytes this
         // reload validated, and that it read them at all, before any of them
         // reaches a live setting.

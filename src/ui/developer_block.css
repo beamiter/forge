@@ -4,7 +4,7 @@ window.forge-window.reference-shell .developer-block-canvas,
 window.forge-window.reference-shell .developer-block-canvas .block-scroll,
 window.forge-window.reference-shell .developer-block-canvas .block-list { background:#091323; color:#d5deec; }
 window.forge-window.reference-shell .developer-block-canvas .block-scroll { margin:0; border:0; border-radius:0; }
-window.forge-window.reference-shell .developer-block-canvas .block-list { padding:12px 12px 0; }
+window.forge-window.reference-shell .developer-block-canvas .block-list { padding:12px @CARD_INSET@px 0; }
 window.forge-window.reference-shell .developer-block-canvas .developer-command-card {
   padding:0; border:0; border-radius:0; outline:0; background:transparent;
   box-shadow:none; min-height:0; transition:background-color 100ms ease, border-color 100ms ease, box-shadow 100ms ease;
@@ -43,11 +43,11 @@ window.forge-window.reference-shell .developer-live-toolbar button { min-width:2
 
 /* New Block dock only. Native prompt clip is the sole editor; while a command
    runs, it returns to its card and the footer states that input authority. */
-window.forge-window.reference-shell .reference-developer-active .reference-canvas-header { min-height:41px; }
+window.forge-window.reference-shell .reference-developer-active .reference-canvas-header { min-height:@HEADER_INNER_HEIGHT@px; }
 window.forge-window.reference-shell .developer-docked-input .chat-canvas { background:#091323; }
 window.forge-window.reference-shell .developer-docked-input .chat-live-anchor { padding:0; margin:0; border:0; min-height:0; background:transparent; box-shadow:none; }
 window.forge-window.reference-shell .developer-docked-input .chat-dock,
-window.forge-window.reference-shell .developer-docked-input .chat-dock.chat-dock-compact { margin:0 12px 8px; padding:7px 0; min-height:52px; border:1px solid #293c57; border-radius:12px; background:#172338; box-shadow:none; }
+window.forge-window.reference-shell .developer-docked-input .chat-dock.chat-dock-compact { margin:0 @COMPOSER_INSET@px @COMPOSER_BOTTOM@px; padding:7px 0; min-height:@BLOCK_DOCK_INNER_HEIGHT@px; border:1px solid #293c57; border-radius:12px; background:#172338; box-shadow:none; }
 window.forge-window.reference-shell .developer-docked-input .chat-composer,
 window.forge-window.reference-shell .developer-docked-input .chat-composer.block-compact { margin:0; padding:0; min-height:0; border:0; background:transparent; box-shadow:none; }
 window.forge-window.reference-shell .developer-docked-input .chat-composer-card:focus-within { border-color:#4199ff; box-shadow:0 0 0 1px alpha(#4199ff,.12); }
@@ -62,3 +62,15 @@ window.forge-window.reference-shell .developer-docked-input .reference-composer-
 window.forge-window.reference-shell .developer-docked-input .reference-composer-controls .chat-stop { color:#ff8d95; }
 window.forge-window.reference-shell .developer-dock-input-hint { margin:0 12px 4px; color:#91a4bf; font-size:12px; }
 window.forge-window.reference-shell .developer-block-canvas .sticky-running-header { background:#172338; border:1px solid #293c57; color:#91a4bf; }
+
+/* A card's existing context actions retain their real signals and owners, but
+   cannot inherit bold Main text or the platform's light popup surface. */
+.developer-block-menu { background:transparent; }
+.developer-block-menu, .developer-block-menu label, .developer-block-menu button { font-family:"DejaVu Sans",sans-serif; font-size:12px; font-weight:400; color:#d5deec; }
+.developer-block-menu > contents { background:#1c293a; border:1px solid #344864; border-radius:12px; padding:8px; }
+.developer-block-menu button { min-height:28px; padding:0 8px; border:0; border-radius:6px; background:transparent; background-image:none; box-shadow:none; }
+.developer-block-menu button:hover, .developer-block-menu button:focus-visible { background:#283d6f; outline:1px solid #496bba; }
+.developer-block-menu button:disabled { color:#91a4bf; opacity:1; filter:none; }
+.developer-block-menu viewport, .developer-block-menu scrolledwindow { background:transparent; }
+window.forge-window.reference-shell .developer-block-canvas .block-selection-hint { font-family:"DejaVu Sans",sans-serif; font-size:10px; font-weight:400; color:#91a4bf; }
+window.forge-window.reference-shell .developer-block-canvas .block-review-selection { font-family:"DejaVu Sans",sans-serif; font-size:12px; font-weight:400; color:#a9c9fa; }

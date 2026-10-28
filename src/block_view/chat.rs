@@ -18,10 +18,11 @@ pub(super) const fn card_extra_height(is_background: bool) -> i32 {
     SHELL_ROLE_HEIGHT_PX + if is_background { 0 } else { COMMAND_GAP_PX }
 }
 
-/// Reserve a compact home for the companion, growing for everything the real
-/// shell draws, including wrapped commands and completion menus.
+/// A one-line empty editor grows for everything the real shell draws,
+/// including wrapped commands and completion menus. The companion is an
+/// independently guarded overlay, never a reserved native input row.
 pub(super) fn composer_rows(input: i64, drawn: i64, viewport: i64) -> i64 {
-    input.max(drawn).clamp(2.min(viewport), viewport.max(1))
+    input.max(drawn).clamp(1, viewport.max(1))
 }
 
 pub(super) fn surface(state: BlockState, integrated: bool) -> ChatSurface {
@@ -353,7 +354,10 @@ impl ChatPresentation {
         composer_viewport.set_propagate_natural_height(true);
         composer_viewport.set_min_content_height(0);
         composer_viewport.set_hexpand(true);
-        composer_viewport.set_vexpand(false);
+        // The dock itself never expands into history. Within its shared
+        // minimum frame, let the editor own spare pixels above the fixed
+        // footer instead of leaving a mode-dependent blank band below tools.
+        composer_viewport.set_vexpand(true);
         composer_viewport.set_focusable(false);
         composer_viewport.set_overflow(gtk4::Overflow::Hidden);
         composer_viewport.add_css_class("chat-composer-viewport");
@@ -681,6 +685,26 @@ pub(super) fn viewport_height_for(vte: &Terminal) -> Option<i32> {
             let mut height = widget.height();
             let dock = widget.last_child()?;
             if dock.is_visible() {
+                // Reference Chat paints padding and a border around the whole
+                // editor/tools frame. Reserve that actual fixed chrome too:
+                // leaving it in the grid budget hides the final multiline
+                // caret row behind the footer. This depends on CSS, never on
+                // the editor's current multiline allocation.
+                if vte.has_css_class("chat-live-terminal") {
+                    #[allow(deprecated)]
+                    let (padding, border, margin) = {
+                        let style = dock.style_context();
+                        (style.padding(), style.border(), style.margin())
+                    };
+                    height -= i32::from(
+                        padding.top()
+                            + padding.bottom()
+                            + border.top()
+                            + border.bottom()
+                            + margin.top()
+                            + margin.bottom(),
+                    );
+                }
                 // Reserve fixed natural chrome, never the current history page
                 // size: a tall dock must not feed its own allocation back into
                 // the PTY grid. GTK still owes the history scroller its minimum

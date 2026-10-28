@@ -12,14 +12,14 @@
 terminal_mode = "block"
 opacity = 0.95                 # 0.01 .. 1.0
 scrollback = 5000             # 0 .. 1000000
-font = "JetBrainsMono Nerd Font Mono 14"
+font = "JetBrainsMono Nerd Font Mono 12px"
 # Family used for icon glyphs `font` does not cover (Nerd Font powerline
 # separators, devicons, codicons). Unset auto-picks an installed Nerd Font;
 # set "none" to leave those glyphs to fontconfig's own fallback.
 # icon_font = "Symbols Nerd Font Mono"
 font_scale = 1.0              # 主内容区，0.1 .. 10.0
-# chrome_font_scale = 1.0     # 顶部栏 + 侧栏，0.1 .. 10.0；缺省沿用旧 font_scale
-# chrome_font_size = "14"     # 侧顶栏基础字号；点数或 "17px"，缺省从 font 固定初值
+# chrome_font_scale = 1.0     # 顶部栏 + 侧栏独立默认1.0，0.1 .. 10.0
+# chrome_font_size = "14"     # 侧顶栏独立默认14pt；也可显式使用 "17px"
 
 # default, light, solarized-dark, solarized-light, gruvbox-dark,
 # gruvbox-light, dracula, nord

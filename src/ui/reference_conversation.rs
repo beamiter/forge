@@ -3,11 +3,11 @@
 //! opt-in and uses these same widgets as future observed agent messages.
 use gtk4::prelude::*;
 use gtk4::Orientation;
+use jterm_core::developer_workspace as token;
 use jterm_core::reference_conversation::{
     CodeDiff, Conversation, DiffKind, Inspector, Message, Part, Role, Step, StepState,
     FIXTURE_DATE_SEPARATOR, FIXTURE_LABEL, METADATA_ICON_KEYS,
 };
-use jterm_core::reference_shell as token;
 
 fn text(value: &str, class: &str) -> gtk4::Label {
     let label = gtk4::Label::new(Some(value));

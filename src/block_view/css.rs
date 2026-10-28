@@ -519,10 +519,15 @@ pub(crate) fn block_css(config: &Config) -> String {
             box-shadow: inset 0 1px rgba({fg_r},{fg_g},{fg_b},0.04);
         }}
         .term-chat-root .chat-live-anchor {{
-            border-width: 0;
+            /* Keep horizontal chrome identical to the running seat: the
+               retained anchor is also the real column-budget authority. */
+            border-top-width: 0;
+            border-bottom-width: 0;
             outline-width: 0;
-            margin: 0;
-            padding: 0;
+            margin-top: 0;
+            margin-bottom: 0;
+            padding-top: 0;
+            padding-bottom: 0;
             min-height: 0;
             background-color: transparent;
             box-shadow: none;

@@ -827,7 +827,11 @@ pub(crate) const DEFAULT_TAB_WIDTH: u32 = 180;
 // A Nerd Font by default: a plain `Monospace` covers no icon glyph, and the
 // per-glyph fallback that follows is fontconfig's global sort, which hands
 // prompt and statusline icons to whichever font claims the Private Use Area.
-pub(crate) const DEFAULT_FONT_DESC: &str = "JetBrainsMono Nerd Font Mono 14";
+pub(crate) const DEFAULT_FONT_DESC: &str =
+    jterm_core::developer_workspace::DEFAULT_CONTENT_FONT_DESC;
+// UI roles retain their previous nominal point size independently of Main.
+pub(crate) const DEFAULT_CHROME_FONT_SIZE: &str =
+    jterm_core::developer_workspace::DEFAULT_UI_FONT_SIZE;
 
 #[derive(Clone)]
 pub struct Config {
@@ -1019,7 +1023,7 @@ impl Config {
             icon_font: None,
             default_font_scale: 1.0,
             chrome_font_scale: 1.0,
-            chrome_font_size: crate::font::unscaled_font_size(DEFAULT_FONT_DESC),
+            chrome_font_size: DEFAULT_CHROME_FONT_SIZE.to_string(),
             theme_name: theme.name.clone(),
             foreground: theme.foreground,
             background: theme.background,
@@ -2903,6 +2907,16 @@ pub(crate) fn remote_host_to_toml(h: &RemoteHost) -> toml::Value {
 // load_config
 // ---------------------------------------------------------------------------
 
+fn resolve_font_roles(main: Option<String>, chrome: Option<String>) -> (String, String) {
+    (
+        main.unwrap_or_else(|| DEFAULT_FONT_DESC.to_string()),
+        chrome
+            .filter(|size| gtk4::pango::FontDescription::from_string(size).size() > 0)
+            .map(|size| crate::font::unscaled_font_size(&size))
+            .unwrap_or_else(|| DEFAULT_CHROME_FONT_SIZE.to_string()),
+    )
+}
+
 pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let (fc, persistence_revision) = load_file_config();
     let themes = builtin_themes();
@@ -2927,14 +2941,16 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         0.1,
         10.0,
     );
-    // An old single-scale config keeps exactly the same initial appearance.
-    let chrome_font_scale =
-        crate::font_zoom::initial_chrome_scale(fc.chrome_font_scale, default_font_scale);
-    let font_desc = resolve_setting_text(env_string("FORGE_FONT"), fc.font, MAX_FONT_DESC_BYTES)
-        .unwrap_or_else(|| DEFAULT_FONT_DESC.to_string());
-    let chrome_font_size = resolve_setting_text(None, fc.chrome_font_size, MAX_FONT_DESC_BYTES)
-        .map(|size| crate::font::unscaled_font_size(&size))
-        .unwrap_or_else(|| crate::font::unscaled_font_size(&font_desc));
+    // Omitted UI settings are independent defaults. Explicit UI zoom remains
+    // authoritative; an old Main-only scale no longer implicitly scales UI.
+    let chrome_font_scale = crate::font_zoom::initial_chrome_scale(
+        fc.chrome_font_scale,
+        jterm_core::developer_workspace::DEFAULT_UI_FONT_SCALE,
+    );
+    let (font_desc, chrome_font_size) = resolve_font_roles(
+        resolve_setting_text(env_string("FORGE_FONT"), fc.font, MAX_FONT_DESC_BYTES),
+        resolve_setting_text(None, fc.chrome_font_size, MAX_FONT_DESC_BYTES),
+    );
     // Left unset so `crate::font` can pick whichever icon font is installed.
     let icon_font = resolve_setting_text(
         env_string("FORGE_ICON_FONT"),
@@ -3359,6 +3375,40 @@ pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn main_default_is_absolute_pixels_and_ui_default_stays_points() {
+        let config = Config::safe_defaults();
+        let main = gtk4::pango::FontDescription::from_string(&config.font_desc);
+        let ui = gtk4::pango::FontDescription::from_string(&config.chrome_font_size);
+        assert_eq!(main.size(), 12 * gtk4::pango::SCALE);
+        assert!(main.is_size_absolute());
+        assert_eq!(ui.size(), 14 * gtk4::pango::SCALE);
+        assert!(!ui.is_size_absolute());
+        assert_eq!(
+            resolve_font_roles(None, None),
+            (
+                DEFAULT_FONT_DESC.to_string(),
+                DEFAULT_CHROME_FONT_SIZE.to_string()
+            )
+        );
+        for desc in [
+            DEFAULT_FONT_DESC,
+            "User Family Bold 13.5",
+            "User Family 14px",
+        ] {
+            let (main, ui) = resolve_font_roles(Some(desc.into()), None);
+            assert_eq!(main, desc, "explicit Main value and unit stay intact");
+            assert_eq!(ui, "14", "omitted UI never inherits a smaller Main default");
+        }
+        for ui in ["13.5", "17px"] {
+            let (main, resolved_ui) =
+                resolve_font_roles(Some("User Family 14px".into()), Some(ui.into()));
+            assert_eq!(main, "User Family 14px");
+            assert_eq!(resolved_ui, ui, "explicit UI value and unit stay intact");
+        }
+        assert_eq!(resolve_font_roles(None, Some("Monospace".into())).1, "14");
+    }
 
     #[test]
     fn vim9_settings_load_independently_from_terminal_and_workbench_defaults() {

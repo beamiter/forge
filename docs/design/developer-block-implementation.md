@@ -74,3 +74,41 @@ receives SIGINT. Both show a fresh empty prompt while the existing readiness
 guards remain HasInput (`dirty=true`, `synced=true`, empty shadow). This is an
 observed pre-dock readiness failure, retained in the paired evidence. It is not
 worked around by treating HasInput as Ready or weakening submission guards.
+
+Follow-up after the publishable c36 checkpoint: new Block alone uses a one-row
+visible prompt floor, growing for all native drawn lines and completion UI.
+Chat retains its two-row policy. A proven native cursor-row rewind below the
+old origin now translates the absolute cursor high-water into the independently
+measured displayed row domain, preserving its relative extent. This affects
+only Block's visual projection: no PTY size, VTE feed/reset, bytes or history
+identity changes. Its native resize and default-font geometry are pending
+verification on the corresponding new binary. The existing card context menu
+also receives a scoped dark sans-serif UI style, retaining original actions.
+
+The 3e9 native capture proves the compact prompt uses one actual 27px row at
+Main14pt, and a short running surface remains 127px after 1672→1356 resize.
+Physical sizes remain 27×89 then 18×60, with a real completed command and Ready
+prompt. Targeted native five and pure developer four/mode one also pass on
+frozen lib-test5a50454a (source770, app3e9), without relabeling earlier results.
+
+Real pointer Copy/F10/More-ShowOutput now all execute in the 3e9 action driver,
+with exact six-row native restoration. The same trace exposed a model bug:
+the menu changed only the widget, leaving the collapsed estimated height122
+beside actual expanded254. The follow-up `FoldLayoutSync` updates the exact
+record/index/visibility at the menu action and samples its real allocation on
+a bounded second frame, including selected-card chrome. It neither changes
+follow intent nor focuses the terminal. A new native More-button test requires
+actual height == model == document span after both fold and expansion, exact
+output/source preservation and unchanged reading intent. This follow-up is
+not covered by the preceding 3e9 test result until its own artifact is run.
+
+Native fallback remains a separate gate from shell-reported command metadata.
+At cf15941, the default-font/source-last control passes exact commands with
+Bash history enabled; disabling history in that private fixture makes the
+first post-resize short command become the truncation sentinel. New Block's
+fixed physical grid was still using the legacy compact-grid row-delta anchor
+policy. The next candidate shares one fixed-grid decision between backend
+capture and verified submission, with coordinate-only diagnostics. It keeps
+all capture bounds, exactness provenance and approval/input guards. Real
+metadata-disabled initial/restore/running/edit cases must pass before this is
+called a fix; existing history-enabled results do not satisfy that fallback.
