@@ -47,6 +47,14 @@ window.reference-shell decoration { border: 0; padding: 0; margin: 0; border-rad
 .reference-shell .reference-inspector-tabs button { font-size: 10px; color: #8fa5c5; padding: 0 8px; min-height: 27px; border-radius: 6px; }
 .reference-shell .reference-inspector-tabs button:checked { color: #e2ecff; background: #233555; box-shadow: inset 0 -2px #6898f5; }
 .reference-shell .reference-agent-card { margin: 0 @INSPECTOR_CARD_MARGIN@px 14px; padding: 13px 13px 7px; border-radius: 12px; border: 1px solid #314056; background: #1c293a; }
+.reference-shell .reference-agent-card.reference-rich-inspector { padding: 13px 16px 7px 14px; border-color: transparent; border-radius: 0; background: transparent; }
+.reference-shell .reference-rich-inspector .reference-inspector-metadata { padding: 11px 9px 12px; border: 1px solid #293c57; border-radius: 7px; background: #111d30; }
+.reference-shell .reference-rich-inspector .reference-inspector-current,
+.reference-shell .reference-rich-inspector .reference-inspector-empty-card { padding: 0 11px; border: 1px solid #293c57; border-radius: 7px; background: #17253a; }
+.reference-shell .reference-rich-inspector .reference-inspector-icon-tile { border-radius: 6px; background: #20324b; color: #8fa9cd; }
+.reference-shell .reference-rich-inspector .reference-inspector-terminal-section { border-top: 1px solid #26354b; padding: 18px 0 12px; }
+.reference-shell .reference-rich-inspector .reference-inspector-output { background: #080e19; border-color: #293c57; border-radius: 7px; }
+.reference-shell .reference-rich-inspector .reference-inspector-output-empty .reference-terminal-body { padding: 0; }
 .reference-shell .reference-card-title { color: #d4e1f6; font-weight: 600; font-size: 11px; }
 .reference-shell .reference-muted { color: #879bb9; font-size: 10px; }
 .reference-shell .reference-metadata { color: #b4c8e5; font-size: 9px; }

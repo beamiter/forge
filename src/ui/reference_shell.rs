@@ -1247,12 +1247,34 @@ pub(crate) fn install(
                     let text = widget.downcast_ref::<gtk4::Label>().map(|label|label.text().to_string())
                         .or_else(||button.and_then(|button|button.label()).map(|value|value.to_string()));
                     let content = button.and_then(|button|button.child());
-                    measured.push(serde_json::json!({"bounds":bounds(&widget),"label":text,"visible":widget.is_visible(),"mapped":widget.is_mapped(),"opacity":widget.opacity(),"color":widget.color().to_string(),"content_bounds":content.as_ref().and_then(&bounds),"content_color":content.as_ref().map(|widget|widget.color().to_string()),"classes":widget.css_classes().iter().map(|value|value.as_str()).collect::<Vec<_>>()}));
+                    measured.push(serde_json::json!({"bounds":bounds(&widget),"label":text,"visible":widget.is_visible(),"mapped":widget.is_mapped(),"opacity":widget.opacity(),"color":widget.color().to_string(),"content_bounds":content.as_ref().and_then(bounds),"content_color":content.as_ref().map(|widget|widget.color().to_string()),"classes":widget.css_classes().iter().map(|value|value.as_str()).collect::<Vec<_>>()}));
                     child = widget.next_sibling();
                 }
                 measured
             };
+            let composer_buttons = || {
+                let mut measured = Vec::new();
+                let mut pending = widget_with_class(ui.window.upcast_ref(), "reference-composer-controls").into_iter().collect::<Vec<_>>();
+                while let Some(widget) = pending.pop() {
+                    let mut child = widget.first_child();
+                    while let Some(next) = child {
+                        child = next.next_sibling();
+                        pending.push(next);
+                    }
+                    let Some(button) = widget.downcast_ref::<gtk4::Button>() else { continue; };
+                    let mut captions = Vec::new();
+                    let mut content = button.first_child().into_iter().collect::<Vec<_>>();
+                    while let Some(widget) = content.pop() {
+                        if let Some(label) = widget.downcast_ref::<gtk4::Label>() { captions.push(label.text().to_string()); }
+                        let mut child = widget.first_child();
+                        while let Some(next) = child { child = next.next_sibling(); content.push(next); }
+                    }
+                    measured.push(serde_json::json!({"bounds":bounds(&widget),"captions":captions,"tooltip":button.tooltip_text().map(|value|value.to_string()),"classes":button.css_classes().iter().map(|value|value.as_str()).collect::<Vec<_>>(),"mapped":button.is_mapped(),"sensitive":button.is_sensitive(),"focused":button.has_focus()}));
+                }
+                measured
+            };
             let snapshot = serde_json::json!({
+                "composer_buttons":composer_buttons(),
                 "logical_window": {"width":ui.window.width(),"height":ui.window.height()},
                 "dpr":ui.window.scale_factor(),
                 "window_active":ui.window.is_active(),
@@ -1275,6 +1297,7 @@ pub(crate) fn install(
                 "navigation_status":widget_with_class(ui.window.upcast_ref(), "reference-navigation-status").and_then(|w| bounds(&w)),
                 "spaces":widget_with_class(ui.window.upcast_ref(), "reference-spaces").and_then(|w| bounds(&w)),
                 "inspector_progress":widget_with_class(ui.window.upcast_ref(), "reference-inspector-progress").and_then(|w| bounds(&w)),
+                "inspector_agent_heading":widget_with_class(ui.window.upcast_ref(), "reference-inspector-agent-heading").and_then(|w| bounds(&w)),
                 "inspector_metadata":widget_with_class(ui.window.upcast_ref(), "reference-inspector-metadata").and_then(|w| bounds(&w)),
                 "inspector_metadata_cells":child_bounds("reference-inspector-metadata"),
                 "inspector_current_heading":widget_with_class(ui.window.upcast_ref(), "reference-inspector-current-heading").and_then(|w| bounds(&w)),
@@ -1283,6 +1306,7 @@ pub(crate) fn install(
                 "inspector_queue":widget_with_class(ui.window.upcast_ref(), "reference-inspector-queue").and_then(|w| bounds(&w)),
                 "inspector_queue_rows":child_bounds("reference-inspector-queue"),
                 "inspector_output_heading":widget_with_class(ui.window.upcast_ref(), "reference-inspector-output-heading").and_then(|w| bounds(&w)),
+                "inspector_terminal_section":widget_with_class(ui.window.upcast_ref(), "reference-inspector-terminal-section").and_then(|w| bounds(&w)),
                 "inspector_output":widget_with_class(ui.window.upcast_ref(), "reference-inspector-output").and_then(|w| bounds(&w)),
                 "tools":widget_with_class(ui.window.upcast_ref(), "reference-tools").and_then(|w| bounds(&w)),
                 "composer":widget_with_class(ui.window.upcast_ref(), "chat-dock").or_else(|| widget_with_class(ui.window.upcast_ref(), "reference-block-composer")).and_then(|w| bounds(&w)),

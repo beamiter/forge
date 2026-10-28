@@ -522,3 +522,285 @@ fn production_top_tabs_bound_viewport_minimum_across_font_extremes() {
         failures.len()
     );
 }
+
+/// Exercise the production Inspector renderer with explicitly synthetic model
+/// data. This stays in the existing test-only module: no product fixture
+/// override, alternate renderer, CSS copy or PTY is introduced.
+#[test]
+#[ignore = "requires an isolated GTK display; optional FORGE_INSPECTOR_LONG_LABEL_EVIDENCE directory"]
+fn inspector_extreme_labels_keep_one_line_and_reachable_full_tooltips() {
+    use std::cell::Cell;
+    use std::path::PathBuf;
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
+
+    fn pump_until(mut ready: impl FnMut() -> bool) {
+        let context = gtk::glib::MainContext::default();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !ready() {
+            assert!(Instant::now() < deadline, "native frame barrier timed out");
+            for _ in 0..128 {
+                if !context.iteration(false) {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn after_paint(window: &gtk::Window) {
+        let painted = Rc::new(Cell::new(0));
+        let observed = painted.clone();
+        let clock = window.frame_clock().expect("mapped native frame clock");
+        let handler = clock.connect_after_paint(move |_| observed.set(observed.get() + 1));
+        let observed = painted.clone();
+        let tick = window.add_tick_callback(move |widget, _| {
+            widget.queue_draw();
+            gtk::glib::ControlFlow::Continue
+        });
+        window.queue_allocate();
+        window.queue_draw();
+        pump_until(|| observed.get() >= 3);
+        tick.remove();
+        clock.disconnect(handler);
+    }
+
+    fn find(root: &gtk::Widget, class: &str) -> gtk::Widget {
+        fn search(root: &gtk::Widget, class: &str) -> Option<gtk::Widget> {
+            if root.has_css_class(class) {
+                return Some(root.clone());
+            }
+            let mut child = root.first_child();
+            while let Some(widget) = child {
+                if let Some(found) = search(&widget, class) {
+                    return Some(found);
+                }
+                child = widget.next_sibling();
+            }
+            None
+        }
+        search(root, class).unwrap_or_else(|| panic!("missing production component {class}"))
+    }
+
+    fn bounds(widget: &gtk::Widget, relative: &impl IsA<gtk::Widget>) -> [f32; 4] {
+        let rect = widget.compute_bounds(relative).expect("native bounds");
+        [rect.x(), rect.y(), rect.width(), rect.height()]
+    }
+
+    gtk::init().expect("isolated native GTK display");
+    gtk::Settings::default()
+        .unwrap()
+        .set_property("gtk-xft-dpi", 96 * 1024);
+    super::reference_shell::install_css();
+    let role_fonts = gtk::CssProvider::new();
+    role_fonts.load_from_string(&super::reference_shell::role_font_css(1.0, 1.0));
+    gtk::style_context_add_provider_for_display(
+        &gtk::gdk::Display::default().unwrap(),
+        &role_fonts,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 21,
+    );
+    let evidence = std::env::var_os("FORGE_INSPECTOR_LONG_LABEL_EVIDENCE").map(PathBuf::from);
+    if let Some(path) = &evidence {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let mut cases = Vec::new();
+    for height in [844, 607] {
+        let mut normal_badge_width = None;
+        for (case, long_title, long_status) in [
+            ("normal", false, false),
+            ("long-title", true, false),
+            ("long-status", false, true),
+            ("both-long", true, true),
+        ] {
+            let mut model = jterm_core::reference_conversation::acceptance_fixture().inspector;
+            if long_title {
+                model.title = format!(
+                    "Visual acceptance fixture long title {}",
+                    "native label 界🙂 ".repeat(30)
+                );
+            }
+            if long_status {
+                model.badge = format!(
+                    "Running · fixture · long state {}",
+                    "native status 界🙂 ".repeat(30)
+                );
+            }
+            let full_title = model.title.clone();
+            let full_badge = model.badge.clone();
+            let overview = super::reference_conversation::inspector(&model, true);
+            let scroll = ScrolledWindow::new();
+            scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+            scroll.set_child(Some(&overview));
+            scroll.set_vexpand(true);
+            let shell = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            shell.add_css_class("reference-inspector");
+            shell.append(&scroll);
+            let window = gtk::Window::new();
+            window.add_css_class("forge-window");
+            window.add_css_class("reference-shell");
+            window.set_title(Some("Visual acceptance fixture — Inspector label stress"));
+            window.set_decorated(false);
+            window.set_default_size(298, height);
+            window.set_child(Some(&shell));
+            window.present();
+            // Widget::width is the CSS content width (253px here), while
+            // compute_bounds also includes the 32px padding/border. Wait for
+            // actual mapping and assert the allocation after native paint.
+            pump_until(|| window.is_mapped() && overview.is_mapped());
+            after_paint(&window);
+
+            let heading = find(overview.upcast_ref(), "reference-inspector-agent-heading");
+            let title = find(&heading, "reference-card-title")
+                .downcast::<Label>()
+                .unwrap();
+            let badge = find(&heading, "reference-neutral-badge")
+                .downcast::<Label>()
+                .unwrap();
+            let icon = heading.first_child().expect("native vector icon tile");
+            let hr = bounds(&heading, &window);
+            let tr = bounds(title.upcast_ref(), &window);
+            let br = bounds(badge.upcast_ref(), &window);
+            let ir = bounds(&icon, &window);
+            let name = format!("{case}-{height}");
+            let mut result = serde_json::json!({
+                "case":name,"fixture_only":true,"production_state":false,
+                "window":[window.width(),window.height()],"heading":hr,
+                "overview_content_width":overview.width(),
+                "overview_border_box":bounds(overview.upcast_ref(),&window),
+                "icon":{"bounds":ir,"mapped":icon.is_mapped()},
+                "title":{"bounds":tr,"input_chars":full_title.chars().count(),
+                    "font":title.pango_context().font_description().map(|value|value.to_string()),
+                    "lines":title.layout().line_count(),"ellipsized":title.layout().is_ellipsized(),
+                    "mapped":title.is_mapped(),"full_tooltip":title.tooltip_text().as_deref()==Some(full_title.as_str())},
+                "badge":{"bounds":br,"input_chars":full_badge.chars().count(),
+                    "font":badge.pango_context().font_description().map(|value|value.to_string()),
+                    "lines":badge.layout().line_count(),"ellipsized":badge.layout().is_ellipsized(),
+                    "mapped":badge.is_mapped(),"full_tooltip":badge.tooltip_text().as_deref()==Some(full_badge.as_str())},
+            });
+            if let Some(path) = &evidence {
+                std::fs::write(
+                    path.join(format!("{name}.before.json")),
+                    serde_json::to_vec_pretty(&result).unwrap(),
+                )
+                .unwrap();
+            }
+            assert_eq!([window.width(), window.height()], [298, height], "{result}");
+            assert_eq!(hr[3], 22.0, "{result}");
+            assert_eq!(hr[2], 253.0, "{result}");
+            assert!(
+                icon.is_mapped() && ir[2] >= 22.0 && ir[3] >= 22.0,
+                "{result}"
+            );
+            assert!(
+                ir[1] >= hr[1] && ir[1] + ir[3] <= hr[1] + hr[3] + 0.1,
+                "{result}"
+            );
+            for (label, full) in [(&title, &full_title), (&badge, &full_badge)] {
+                assert!(label.is_mapped() && label.is_visible(), "{result}");
+                assert!(!label.wraps(), "{result}");
+                assert_eq!(label.layout().line_count(), 1, "{result}");
+                assert_eq!(label.tooltip_text().as_deref(), Some(full.as_str()));
+                let lr = bounds(label.upcast_ref(), &window);
+                assert!(lr[2] >= 5.0 && lr[3] <= 22.0, "{result}");
+                // Pango's logical text box belongs to the content allocation,
+                // unlike the CSS border boxes above. Even an ellipsis must
+                // fit rather than being hidden by a shrunken label surface.
+                let (_, logical) = label.layout().pixel_extents();
+                assert!(
+                    logical.width() <= label.width() + 1 && logical.height() <= label.height() + 1,
+                    "native text clipped inside label content: {result}"
+                );
+            }
+            assert!(
+                tr[0] >= hr[0] && br[0] + br[2] <= hr[0] + hr[2] + 0.1,
+                "{result}"
+            );
+            assert!(
+                tr[0] + tr[2] <= br[0] + 0.1,
+                "title/badge overlap: {result}"
+            );
+            assert!(ir[0] + ir[2] <= tr[0] + 0.1, "icon/title overlap: {result}");
+            if case == "normal" {
+                assert!(
+                    !badge.layout().is_ellipsized(),
+                    "normal state lost: {result}"
+                );
+                normal_badge_width = Some(br[2]);
+            } else {
+                assert!(
+                    br[2] + 1.0 >= normal_badge_width.unwrap(),
+                    "long title must not squeeze away the normal status slot: {result}"
+                );
+            }
+            if long_title {
+                assert!(title.layout().is_ellipsized(), "{result}");
+            }
+            if long_status {
+                assert!(badge.layout().is_ellipsized(), "{result}");
+            }
+
+            let output = find(overview.upcast_ref(), "reference-inspector-output");
+            let queue = find(overview.upcast_ref(), "reference-inspector-queue");
+            let output_outer = bounds(&output, &window);
+            assert_eq!(output_outer[3], 199.0, "pane changed: {result}");
+            let mut row_count = 0;
+            let mut child = queue.first_child();
+            while let Some(row) = child {
+                row_count += 1;
+                assert_eq!(bounds(&row, &window)[3], 24.0);
+                child = row.next_sibling();
+            }
+            assert_eq!(row_count, 5);
+            let adjustment = scroll.vadjustment();
+            let maximum = (adjustment.upper() - adjustment.page_size()).max(0.0);
+            if height == 607 {
+                assert!(
+                    maximum > 0.0,
+                    "short inspector must retain its full scroll document"
+                );
+            }
+            adjustment.set_value(maximum);
+            after_paint(&window);
+            let viewport = scroll.child().expect("native Inspector viewport");
+            let visible_height = adjustment.page_size() as f32;
+            let last = queue.last_child().unwrap();
+            let qr = bounds(&last, &viewport);
+            let or = bounds(&output, &viewport);
+            assert!(qr[1] >= -1.0 && qr[1] + qr[3] <= visible_height + 1.0);
+            assert!(or[1] >= -1.0 && or[1] + or[3] <= visible_height + 1.0);
+            result["bottom_reachability"] = serde_json::json!({
+                "adjustment":[adjustment.value(),adjustment.upper(),adjustment.page_size()],
+                "fifth_queue_row":qr,"terminal_pane":or,"queue_count":row_count,
+            });
+            adjustment.set_value(0.0);
+            after_paint(&window);
+            let top = bounds(&heading, &viewport);
+            assert!(top[1] >= -1.0 && top[1] + top[3] <= visible_height + 1.0);
+            assert_eq!(title.tooltip_text().as_deref(), Some(full_title.as_str()));
+            assert_eq!(badge.tooltip_text().as_deref(), Some(full_badge.as_str()));
+            result["passed"] = true.into();
+            println!("INSPECTOR_LONG_LABEL {result}");
+            if let Some(path) = &evidence {
+                std::fs::write(
+                    path.join(format!("{name}.json")),
+                    serde_json::to_vec_pretty(&result).unwrap(),
+                )
+                .unwrap();
+                // A private external capture runner can preserve actual native
+                // pixels. This optional hook is test-only and time bounded.
+                if std::env::var_os("FORGE_INSPECTOR_LONG_LABEL_CAPTURE").is_some() {
+                    pump_until(|| path.join(format!("{name}.captured")).exists());
+                }
+            }
+            cases.push(result);
+            window.close();
+        }
+    }
+    if let Some(path) = &evidence {
+        std::fs::write(
+            path.join("result.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({"passed":true,"cases":cases})).unwrap(),
+        )
+        .unwrap();
+    }
+}

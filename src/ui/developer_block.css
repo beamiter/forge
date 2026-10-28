@@ -10,8 +10,11 @@ window.forge-window.reference-shell .developer-block-canvas .developer-command-c
   box-shadow:none; min-height:0; transition:background-color 100ms ease, border-color 100ms ease, box-shadow 100ms ease;
 }
 window.forge-window.reference-shell .developer-block-canvas .developer-card-body { border:1px solid #293c57; border-radius:10px; background:#0e1621; padding:0; }
-window.forge-window.reference-shell .developer-block-canvas .developer-command-card.block-success .developer-card-body { border-color:alpha(#39dda0,.30); }
-window.forge-window.reference-shell .developer-block-canvas .developer-command-card.block-failed .developer-card-body { border-color:alpha(#ff646f,.68); background:#141923; box-shadow:0 0 6px alpha(#ff646f,.07); }
+/* Completion belongs to the compact status badge; ordinary card frames share
+   the reference's quiet navy edge. These state layers change paint only. */
+window.forge-window.reference-shell .developer-block-canvas .developer-command-card.block-hovered .developer-card-body { border-color:#3a506e; background:#101b2b; }
+window.forge-window.reference-shell .developer-block-canvas .developer-command-card:focus-within .developer-card-body { outline:1px solid #6288bb; outline-offset:-1px; }
+window.forge-window.reference-shell .developer-block-canvas .developer-command-card.block-selection-active .developer-card-body { box-shadow:inset 0 0 0 1px alpha(#4199ff,.45); }
 window.forge-window.reference-shell .developer-block-canvas .developer-command-card.block-selected .developer-card-body { outline:1px solid #4199ff; outline-offset:-1px; }
 window.forge-window.reference-shell .developer-block-canvas .developer-command-header { background:alpha(#101c30,.65); border-bottom:1px solid #24334a; }
 window.forge-window.reference-shell .developer-block-canvas .developer-command-header button { min-height:22px; min-width:22px; padding:0 3px; border-radius:5px; color:#91a4bf; }

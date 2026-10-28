@@ -13,6 +13,7 @@ import json
 import os
 import re
 import subprocess
+import tarfile
 import tempfile
 import textwrap
 
@@ -30,6 +31,31 @@ def item(source, signature):
     return textwrap.dedent(source[line:opening + closing.end()])
 
 
+def default_font_literal(root, config):
+    """Follow the checkout's canonical literal or packaged shared-core token."""
+    declarations = re.findall(r'\bconst\s+DEFAULT_FONT_DESC\s*:\s*&str\s*=\s*("(?:[^"\\\n]|\\.)*"|[^;]+)\s*;', config)
+    assert len(declarations) == 1, "Expected one DEFAULT_FONT_DESC declaration"
+    expression = declarations[0].strip()
+    if re.fullmatch(r'"(?:[^"\\\n]|\\.)*"', expression):
+        return expression, "src/config.rs::DEFAULT_FONT_DESC"
+    shared = re.fullmatch(r'jterm_core::([a-z][a-z0-9_]*)::([A-Z][A-Z0-9_]*)', expression)
+    assert shared, f"Unsupported canonical font expression: {expression}"
+    archive = root / "packaging/jterm-core-src.tar.gz"
+    expected = (root / "packaging/jterm-core-src.tar.gz.sha256").read_text().split()[0]
+    assert re.fullmatch(r'[a-fA-F0-9]{64}', expected), "Invalid packaged-core SHA256"
+    actual = hashlib.sha256(archive.read_bytes()).hexdigest()
+    assert actual == expected.lower(), "Packaged-core source archive SHA256 mismatch"
+    member_name = f"src/{shared[1]}.rs"
+    with tarfile.open(archive, "r:gz") as bundle:
+        member = bundle.getmember(member_name)
+        assert member.isfile() and member.size <= 256 * 1024, member_name
+        canonical = bundle.extractfile(member).read().decode("utf-8")
+    values = re.findall(r'\bconst\s+' + re.escape(shared[2])
+                        + r'\s*:\s*&str\s*=\s*("(?:[^"\\\n]|\\.)*")\s*;', canonical)
+    assert len(values) == 1, f"Expected one canonical font token: {expression}"
+    return values[0], f"{archive}#{member_name}::{shared[2]} (SHA256 {actual})"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT)
@@ -37,7 +63,8 @@ def main():
     source = (args.root / "src/font.rs").read_text()
     helper = item(source, "pub(crate) fn effective_font_size_css(")
     config = (args.root / "src/config.rs").read_text()
-    default = re.search(r'const DEFAULT_FONT_DESC: &str = ("[^"\n]*");', config).group(1)
+    default, default_source = default_font_literal(args.root, config)
+    print(f"Canonical font default: {default} from {default_source}", flush=True)
     library = ctypes.util.find_library("pango-1.0")
     if not library:
         raise SystemExit("Native Pango runtime required; run in the GTK development environment")
@@ -99,13 +126,40 @@ fn native_pango_units_styles_fractions_and_zoom() {
         ("Monospace, Serif 13.5", 1.025, 13.8375, "pt"),
         ("Monospace 14", 0.1, 1.4, "pt"),
         ("Monospace 14", 10.0, 140.0, "pt"),
-        ("Monospace", 1.0, 14.0, "pt"),
     ] {
         let value = effective_font_size_css(desc, scale);
         let size: f64 = value.strip_suffix(unit).unwrap().parse().unwrap();
         assert!((size - expected).abs() < 1e-9, "{desc}, {scale}: {value}");
     }
 }
+#[test]
+fn native_pango_missing_size_uses_canonical_default_and_unit() {
+    let canonical = FontDescription::from_string(config::DEFAULT_FONT_DESC);
+    assert!(canonical.size() > 0, "canonical default must define a native Pango size");
+    let unit = if canonical.is_size_absolute() { "px" } else { "pt" };
+    for desc in ["Monospace", "Monospace Bold Italic"] {
+        for scale in [1.0, 0.75, 1.5, 2.0, f64::NAN, f64::INFINITY, 0.0, -1.0] {
+            let scale_or_one = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+            let css = effective_font_size_css(desc, scale);
+            let size: f64 = css.strip_suffix(unit).expect("canonical Pango unit retained").parse().unwrap();
+            let expected_size = f64::from(canonical.size()) / f64::from(gtk::pango::SCALE) * scale_or_one;
+            assert!((size - expected_size).abs() < 1e-9, "{desc}, {scale}: {css}");
+            // CSS uses an explicit pt suffix; Pango's description syntax
+            // spells points without that suffix, while retaining px.
+            let pango_size = if canonical.is_size_absolute() { css.as_str() } else { css.strip_suffix("pt").unwrap() };
+            let actual = FontDescription::from_string(&format!("Monospace {pango_size}"));
+            let mut expected = FontDescription::from_string(config::DEFAULT_FONT_DESC);
+            if canonical.is_size_absolute() {
+                expected.set_absolute_size(f64::from(canonical.size()) * scale_or_one);
+            } else {
+                expected.set_size((f64::from(canonical.size()) * scale_or_one) as i32);
+            }
+            assert_eq!(actual.size(), expected.size(), "native Pango size: {desc}, {scale}");
+            assert_eq!(actual.is_size_absolute(), expected.is_size_absolute(), "native Pango unit: {desc}, {scale}");
+        }
+    }
+}
+
 #[test]
 fn native_pango_fallback_is_finite_and_reset_is_exact() {
     for scale in [f64::NAN, f64::INFINITY, 0.0, -1.0] {

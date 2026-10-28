@@ -303,45 +303,47 @@ pub(crate) fn inspector(model: &Inspector, is_fixture: bool) -> gtk4::Box {
     root.add_css_class("reference-rich-inspector");
     root.set_vexpand(true);
     let heading = gtk4::Box::new(Orientation::Horizontal, 6);
-    heading.set_height_request(14);
-    heading.append(&super::reference_shell::vector_icon(
+    heading.add_css_class("reference-inspector-agent-heading");
+    heading.set_height_request(22);
+    heading.set_margin_top(9);
+    heading.append(&inspector_icon(
         jterm_core::reference_icons::Icon::Agent,
-        14,
+        22,
     ));
     let title = text(&model.title, "reference-card-title");
+    title.set_wrap(false);
+    title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    title.set_width_chars(1);
     title.set_hexpand(true);
     heading.append(&title);
-    heading.append(&text(&model.badge, "reference-neutral-badge"));
+    let badge = text(&model.badge, "reference-neutral-badge");
+    badge.set_wrap(false);
+    badge.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    heading.append(&badge);
     root.append(&heading);
     root.append(&text(&model.subtitle, "reference-muted"));
-    let progress_row = gtk4::Box::new(Orientation::Horizontal, 6);
-    progress_row.set_height_request(12);
-    // GTK's compact title/subtitle baseline starts nine pixels before the
-    // other adapters; align the actual progress bar to the shared y158.
-    progress_row.set_margin_top(token::INSPECTOR_PROGRESS_EXTRA_TOP as i32 + 9);
-    let progress = gtk4::ProgressBar::new();
-    progress.add_css_class("reference-inspector-progress");
-    progress.set_hexpand(true);
-    progress.set_valign(gtk4::Align::Center);
-    progress.set_fraction(if model.total == 0 {
-        0.0
-    } else {
-        model.completed as f64 / model.total as f64
-    });
-    progress_row.append(&progress);
-    progress_row.append(&text(
-        &if model.total == 0 {
-            "No task selected".into()
-        } else {
-            format!("{} / {}", model.completed, model.total)
-        },
-        "reference-muted",
-    ));
-    root.append(&progress_row);
+    // An idle workspace has no task progress to report. The same component
+    // renders observed task progress and the explicitly labeled fixture.
+    if model.total > 0 {
+        let progress_row = gtk4::Box::new(Orientation::Horizontal, 6);
+        progress_row.set_height_request(12);
+        progress_row.set_margin_top(18);
+        let progress = gtk4::ProgressBar::new();
+        progress.add_css_class("reference-inspector-progress");
+        progress.set_hexpand(true);
+        progress.set_valign(gtk4::Align::Center);
+        progress.set_fraction(model.completed as f64 / model.total as f64);
+        progress_row.append(&progress);
+        progress_row.append(&text(
+            &format!("{} / {}", model.completed, model.total),
+            "reference-muted",
+        ));
+        root.append(&progress_row);
+    }
     let metadata = gtk4::Grid::new();
     metadata.set_column_spacing(14);
-    metadata.set_row_spacing(0);
-    metadata.set_margin_top(10);
+    metadata.set_row_spacing(3);
+    metadata.set_margin_top(23);
     metadata.add_css_class("reference-inspector-metadata");
     for (row, (name, value)) in model.metadata.iter().enumerate() {
         let key = text(name, "reference-muted");
@@ -360,34 +362,34 @@ pub(crate) fn inspector(model: &Inspector, is_fixture: bool) -> gtk4::Box {
     root.append(&metadata);
     let current_heading = text("CURRENT STEP", "reference-section-label");
     current_heading.add_css_class("reference-inspector-current-heading");
-    current_heading.set_margin_top(6);
-    current_heading.set_margin_bottom(7);
+    current_heading.set_margin_top(21);
+    current_heading.set_margin_bottom(12);
     root.append(&current_heading);
     let current = if let Some(step) = &model.current_step {
         step_row(step, true)
     } else {
-        let card = gtk4::Box::new(Orientation::Vertical, 0);
-        card.add_css_class("reference-current-step");
-        card.append(&text(
+        let card = inspector_empty_card(
             "Select a task to see its current step",
-            "reference-muted",
-        ));
+            jterm_core::reference_icons::Icon::History,
+        );
+        card.add_css_class("reference-current-step");
         card
     };
-    current.set_height_request(token::INSPECTOR_CURRENT_HEIGHT as i32);
+    current.set_height_request(59);
     current.add_css_class("reference-inspector-current");
     root.append(&current);
     let queue_heading = text("TASK QUEUE", "reference-section-label");
     queue_heading.add_css_class("reference-inspector-queue-heading");
-    // Separate semantic groups instead of packing the queue against Current
-    // Step and leaving the same space unused before the terminal output.
-    queue_heading.set_margin_top(12);
-    queue_heading.set_margin_bottom(6);
+    queue_heading.set_margin_top(22);
+    queue_heading.set_margin_bottom(12);
     root.append(&queue_heading);
     let queue = gtk4::Box::new(Orientation::Vertical, token::INSPECTOR_QUEUE_GAP as i32);
     queue.add_css_class("reference-inspector-queue");
     if model.queue.is_empty() {
-        queue.append(&text("No queued task selected", "reference-muted"));
+        let empty =
+            inspector_empty_card("No queued tasks", jterm_core::reference_icons::Icon::Files);
+        empty.set_height_request(58);
+        queue.append(&empty);
     }
     for step in &model.queue {
         let row = step_row(step, false);
@@ -399,8 +401,18 @@ pub(crate) fn inspector(model: &Inspector, is_fixture: bool) -> gtk4::Box {
     let fill = gtk4::Box::new(Orientation::Vertical, 0);
     fill.set_vexpand(true);
     root.append(&fill);
+    let terminal_section = gtk4::Box::new(Orientation::Vertical, 8);
+    terminal_section.add_css_class("reference-inspector-terminal-section");
+    // Only the inter-section fill grows. The centered empty output's child
+    // must not make this whole section share the spare vertical space.
+    terminal_section.set_vexpand(false);
     let output_heading = gtk4::Box::new(Orientation::Horizontal, 6);
     output_heading.add_css_class("reference-inspector-output-heading");
+    output_heading.set_height_request(12);
+    output_heading.append(&super::reference_shell::vector_icon(
+        jterm_core::reference_icons::Icon::Terminal,
+        12,
+    ));
     let title = text("Terminal output", "reference-section-label");
     title.set_hexpand(true);
     output_heading.append(&title);
@@ -408,14 +420,49 @@ pub(crate) fn inspector(model: &Inspector, is_fixture: bool) -> gtk4::Box {
         if is_fixture { "Fixture" } else { "No task" },
         "reference-muted",
     ));
-    root.append(&output_heading);
+    terminal_section.append(&output_heading);
     let output = gtk4::Box::new(Orientation::Vertical, 0);
     output.add_css_class("reference-rich-terminal");
     output.add_css_class("reference-inspector-output");
     let body = text(&model.output, "reference-terminal-body");
     body.set_selectable(true);
-    output.append(&body);
-    output.set_height_request(token::INSPECTOR_OUTPUT_HEIGHT as i32);
-    root.append(&output);
+    if model.total == 0 && !is_fixture {
+        output.add_css_class("reference-inspector-output-empty");
+        output.set_valign(gtk4::Align::Fill);
+        let content = gtk4::Box::new(Orientation::Vertical, 8);
+        content.set_valign(gtk4::Align::Center);
+        content.set_vexpand(true);
+        let icon =
+            super::reference_shell::vector_icon(jterm_core::reference_icons::Icon::Terminal, 22);
+        icon.set_halign(gtk4::Align::Center);
+        content.append(&icon);
+        body.set_xalign(0.5);
+        content.append(&body);
+        output.append(&content);
+    } else {
+        output.append(&body);
+    }
+    output.set_height_request(199);
+    terminal_section.append(&output);
+    root.append(&terminal_section);
     root
+}
+
+fn inspector_icon(icon: jterm_core::reference_icons::Icon, size: i32) -> gtk4::CenterBox {
+    let tile = gtk4::CenterBox::new();
+    tile.add_css_class("reference-inspector-icon-tile");
+    tile.set_size_request(size, size);
+    tile.set_valign(gtk4::Align::Center);
+    tile.set_center_widget(Some(&super::reference_shell::vector_icon(icon, 14)));
+    tile
+}
+
+fn inspector_empty_card(message: &str, icon: jterm_core::reference_icons::Icon) -> gtk4::Box {
+    let card = gtk4::Box::new(Orientation::Horizontal, 12);
+    card.add_css_class("reference-inspector-empty-card");
+    card.append(&inspector_icon(icon, 28));
+    let label = text(message, "reference-muted");
+    label.set_hexpand(true);
+    card.append(&label);
+    card
 }
