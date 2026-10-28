@@ -3,7 +3,10 @@
 This archive contains a prebuilt `forge` binary plus its desktop metadata,
 shell integrations, example workflows, documented configuration, and welcome
 notebook. It installs into the current user's `~/.local` prefix; root access is
-not required, and an existing `config.toml` is never overwritten.
+not required. Existing configs are adopted unchanged. Later installs compare the
+bundled fields with `.config.toml.installed-defaults`; only template field
+changes cause a private backup and replacement. Value changes keep your config.
+Use `--no-config` to skip configuration updates.
 
 ## License
 

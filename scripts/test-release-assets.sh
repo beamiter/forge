@@ -122,6 +122,8 @@ installed_config="${config_home}/forge/config.toml"
 assert_file "installed release binary" "${installed_binary}"
 assert_file "installed release support tool" "${installed_support}"
 assert_file "installed release config" "${installed_config}"
+cmp "${bundle}/share/doc/forge/config.toml.example" "${installed_config%/*}/.config.toml.installed-defaults" \
+    || fail "initial install did not record its template"
 cmp -- "${bundle}/bin/forge" "${installed_binary}" \
     || fail "installed release binary differs from the bundle"
 cmp -- "${bundle}/bin/forge-support-bundle" "${installed_support}" \
