@@ -207,6 +207,80 @@ pub(crate) fn effective_font_size_css(desc: &str, scale: f64) -> String {
     format!("{}{unit}", size * scale)
 }
 
+/// Scale authored UI roles relative to the existing nominal 14pt default.
+/// Resolve both sizes in the same live context: Pango owns point/pixel and
+/// display resolution, so neither a guessed DPI nor a device-scale factor is
+/// applied here. The caller passes the already-frozen independent chrome size.
+pub(crate) fn reference_ui_role_multiplier(
+    chrome_size: &str,
+    chrome_scale: f64,
+    context: &gtk::pango::Context,
+) -> f64 {
+    reference_size_role_multiplier(chrome_size, "14", chrome_scale, context)
+}
+
+/// Rich Content follows the same Main size and scale as its native PTY.
+/// Preserve the authored hierarchy at Config's actual default size; the
+/// reference capture's explicitly configured 11pt is not the product default.
+pub(crate) fn reference_content_role_multiplier(
+    content_desc: &str,
+    content_scale: f64,
+    context: &gtk::pango::Context,
+) -> f64 {
+    reference_size_role_multiplier(
+        content_desc,
+        crate::config::DEFAULT_FONT_DESC,
+        content_scale,
+        context,
+    )
+}
+
+fn reference_size_role_multiplier(
+    configured_desc: &str,
+    nominal_desc: &str,
+    requested_scale: f64,
+    context: &gtk::pango::Context,
+) -> f64 {
+    use gtk::pango::prelude::FontExt;
+
+    let scale = if requested_scale.is_finite() && requested_scale > 0.0 {
+        requested_scale
+    } else {
+        1.0
+    };
+    let set_size = |font: &mut FontDescription, size: &FontDescription| {
+        if size.size() > 0 {
+            if size.is_size_absolute() {
+                font.set_absolute_size(f64::from(size.size()));
+            } else {
+                font.set_size(size.size());
+            }
+        }
+    };
+    let mut nominal = context
+        .font_description()
+        .unwrap_or_else(|| FontDescription::from_string("sans-serif"));
+    set_size(&mut nominal, &FontDescription::from_string(nominal_desc));
+    let mut configured = nominal.clone();
+    set_size(
+        &mut configured,
+        &FontDescription::from_string(configured_desc),
+    );
+    let resolved = |description: &FontDescription| {
+        context
+            .load_font(description)
+            .map(|font| font.describe_with_absolute_size().size())
+            .filter(|size| *size > 0)
+            .map(f64::from)
+    };
+    match (resolved(&configured), resolved(&nominal)) {
+        (Some(configured), Some(nominal)) => scale * configured / nominal,
+        // Retain the prior role scale until a normal appearance update has a
+        // usable font context; do not invent a point-to-pixel conversion.
+        _ => scale,
+    }
+}
+
 /// Edit one property without losing the user's size unit, style or weight.
 pub(crate) fn font_description_with_family(desc: &str, family: &str) -> String {
     let mut font = FontDescription::from_string(desc);
@@ -325,6 +399,118 @@ pub(crate) fn menu_theme_css(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a real GTK/Pango display context"]
+    fn reference_content_absolute_size_uses_config_default_and_native_context() {
+        use gtk::pango::prelude::FontExt;
+
+        gtk::init().unwrap();
+        let window = gtk::Window::new();
+        window.present();
+        let context = window.pango_context();
+        let config = Config::safe_defaults();
+        let nominal = FontDescription::from_string(&config.font_desc);
+        assert_eq!(nominal.size(), 14 * gtk::pango::SCALE);
+        assert!(!nominal.is_size_absolute());
+        let nominal_px = f64::from(
+            context
+                .load_font(&nominal)
+                .unwrap()
+                .describe_with_absolute_size()
+                .size(),
+        ) / f64::from(gtk::pango::SCALE);
+        assert_eq!(
+            reference_content_role_multiplier(&config.font_desc, 1.0, &context),
+            1.0
+        );
+        for (size, absolute, scale) in [
+            (14.0, false, 1.0),
+            (28.0, false, 1.0),
+            (13.5, false, 1.3),
+            (14.0, true, 1.0),
+            (28.0, true, 1.0),
+            (18.25, true, 1.3),
+        ] {
+            let unit = if absolute { "px" } else { "" };
+            let factor = reference_content_role_multiplier(
+                &format!("Monospace {size}{unit}"),
+                scale,
+                &context,
+            );
+            let expected = if absolute {
+                size / nominal_px
+            } else {
+                size / 14.0
+            } * scale;
+            assert!((factor - expected).abs() < 0.001, "{factor} vs {expected}");
+            eprintln!("reference-content-native: size={size}{unit} scale={scale} nominal_px={nominal_px} factor={factor} widget_scale={}", window.scale_factor());
+        }
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires a real GTK/Pango display context"]
+    fn reference_ui_absolute_size_uses_native_context_without_dpr_multiplier() {
+        use gtk::pango::prelude::FontExt;
+
+        gtk::init().unwrap();
+        let window = gtk::Window::new();
+        window.present();
+        let context = window.pango_context();
+        let mut nominal = context.font_description().unwrap();
+        nominal.set_size(14 * gtk::pango::SCALE);
+        let nominal_px = f64::from(
+            context
+                .load_font(&nominal)
+                .unwrap()
+                .describe_with_absolute_size()
+                .size(),
+        ) / f64::from(gtk::pango::SCALE);
+        assert_eq!(reference_ui_role_multiplier("14", 1.0, &context), 1.0);
+        for (size, absolute, scale) in [
+            (14.0, false, 1.0),
+            (28.0, false, 1.0),
+            (13.5, false, 1.3),
+            (14.0, true, 1.0),
+            (28.0, true, 1.0),
+            (18.25, true, 1.3),
+        ] {
+            let unit = if absolute { "px" } else { "" };
+            let factor = reference_ui_role_multiplier(&format!("{size}{unit}"), scale, &context);
+            let expected = if absolute {
+                size / nominal_px
+            } else {
+                size / 14.0
+            } * scale;
+            assert!((factor - expected).abs() < 0.001, "{factor} vs {expected}");
+            eprintln!("reference-ui-native: size={size}{unit} scale={scale} nominal_px={nominal_px} factor={factor} widget_scale={}", window.scale_factor());
+        }
+        // These are the unchanged loader's frozen legacy point/pixel strings.
+        // Editing Main Content afterward cannot alter this helper's inputs.
+        for legacy in ["Monospace 14", "Monospace 16px"] {
+            let mut config = Config::safe_defaults();
+            config.font_desc = legacy.into();
+            config.chrome_font_size = unscaled_font_size(legacy);
+            config.chrome_font_scale = crate::font_zoom::initial_chrome_scale(None, 1.5);
+            let before = reference_ui_role_multiplier(
+                &config.chrome_font_size,
+                config.chrome_font_scale,
+                &context,
+            );
+            config.font_desc = "Monospace 32".into();
+            config.default_font_scale = 1.8;
+            assert_eq!(
+                reference_ui_role_multiplier(
+                    &config.chrome_font_size,
+                    config.chrome_font_scale,
+                    &context
+                ),
+                before
+            );
+        }
+        window.close();
+    }
 
     #[test]
     fn default_fallback_is_narrow_and_keeps_the_saved_default() {

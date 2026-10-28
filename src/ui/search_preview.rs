@@ -65,6 +65,10 @@ struct PreviewControls {
     worker: Worker,
     owner: Weak<TermView>,
     closed: Cell<bool>,
+    dialog: glib::WeakRef<adw::Dialog>,
+    mapped_frames: Cell<u8>,
+    map_tick: RefCell<Option<gtk4::TickCallbackId>>,
+    close_pending: Cell<bool>,
     generation: Cell<u64>,
     matches: RefCell<Option<Matches>>,
     current: Cell<usize>,
@@ -81,6 +85,39 @@ struct PreviewControls {
     rejected_replies: Cell<usize>,
 }
 impl PreviewControls {
+    /// Retire application work before requesting a native close. On Adwaita
+    /// 1.5, force_close before the second map tick emits no closed signal.
+    fn retire(&self) -> bool {
+        if self.closed.replace(true) {
+            return false;
+        }
+        self.generation.set(0);
+        self.worker.stop();
+        self.clear("");
+        true
+    }
+    fn request_close(&self) {
+        if !self.retire() {
+            return;
+        }
+        let Some(dialog) = self.dialog.upgrade() else {
+            return;
+        };
+        if self.mapped_frames.get() >= 3 {
+            dialog.force_close();
+        } else {
+            // Keep GTK's mapping lifecycle alive, but never paint a retired
+            // empty modal. The bounded map callback performs the native close
+            // after Adwaita's two opening ticks, irrespective of callback order.
+            self.close_pending.set(true);
+            dialog.set_opacity(0.0);
+            // A retired entry must not regain focus during hide/remap and
+            // publish its cached selection to PRIMARY while we finish mapping.
+            dialog.set_can_focus(false);
+            dialog.set_can_target(false);
+            dialog.set_focus(None::<&gtk4::Widget>);
+        }
+    }
     fn clear(&self, message: &str) {
         self.matches.borrow_mut().take();
         self.displayed_document.set(None);
@@ -326,6 +363,10 @@ fn present_exact_preview(
         worker,
         owner: Rc::downgrade(&owner),
         closed: Cell::new(false),
+        dialog: dialog.downgrade(),
+        mapped_frames: Cell::new(0),
+        map_tick: RefCell::new(None),
+        close_pending: Cell::new(false),
         generation: Cell::new(0),
         matches: RefCell::new(None),
         current: Cell::new(0),
@@ -386,19 +427,20 @@ fn present_exact_preview(
     next.connect_clicked(move |_| controls_next.navigate(false));
     let controls_closed = controls.clone();
     dialog.connect_closed(move |_| {
+        // A direct native close remains an independent retirement boundary.
+        // Keep it valid for header controls and parent/window teardown too.
         controls_closed.closed.set(true);
+        controls_closed.generation.set(0);
+        controls_closed.close_pending.set(false);
         controls_closed.worker.stop();
         controls_closed.clear("");
     });
     let keys = gtk4::EventControllerKey::new();
     keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
     let controls_keys = controls.clone();
-    let dialog_weak = dialog.downgrade();
     keys.connect_key_pressed(move |_, key, _, modifiers| {
         if key == gtk4::gdk::Key::Escape {
-            if let Some(dialog) = dialog_weak.upgrade() {
-                dialog.force_close();
-            }
+            controls_keys.request_close();
             return true.into();
         }
         if key == gtk4::gdk::Key::Return || key == gtk4::gdk::Key::KP_Enter {
@@ -417,8 +459,42 @@ fn present_exact_preview(
     // the seed, publishing it to PRIMARY. SearchEntry's own focus override
     // deliberately does not select, so let the initial map use that wrapper.
     dialog.set_focus(Some(&entry));
+    let controls_unmap = controls.clone();
+    dialog.connect_unmap(move |_| {
+        controls_unmap.mapped_frames.set(0);
+        if let Some(tick) = controls_unmap.map_tick.borrow_mut().take() {
+            tick.remove();
+        }
+    });
     let entry_on_map = entry.downgrade();
+    let controls_map = controls.clone();
     dialog.connect_map(move |dialog| {
+        controls_map.mapped_frames.set(0);
+        if let Some(tick) = controls_map.map_tick.borrow_mut().take() {
+            tick.remove();
+        }
+        let controls_weak = Rc::downgrade(&controls_map);
+        let tick = dialog.add_tick_callback(move |dialog, _| {
+            let Some(controls) = controls_weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            controls.mapped_frames.set(controls.mapped_frames.get() + 1);
+            if controls.mapped_frames.get() < 3 {
+                return glib::ControlFlow::Continue;
+            }
+            // Three mapped frames permit Adwaita's two internal map ticks even
+            // when our callback runs first. This callback then always retires.
+            controls.map_tick.borrow_mut().take();
+            if controls.close_pending.get() {
+                // Only the actual native closed signal confirms completion.
+                dialog.force_close();
+            }
+            glib::ControlFlow::Break
+        });
+        *controls_map.map_tick.borrow_mut() = Some(tick);
+        if controls_map.closed.get() {
+            return;
+        }
         let Some(entry) = entry_on_map.upgrade() else {
             return;
         };

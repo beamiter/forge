@@ -608,8 +608,8 @@ pub fn run() -> glib::ExitCode {
         } else {
             load_config()
         };
-        // The public workspace exposes Block (the continuous real terminal)
-        // and Chat. Retain internal legacy modes for managed/old sessions.
+        // New public Block uses native command cards over the existing PTY.
+        // Explicit legacy Unified sessions retain their continuous backend.
         if !launch.safe_mode {
             config.terminal_mode = config.terminal_mode.public_presentation();
         }

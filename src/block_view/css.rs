@@ -1336,6 +1336,9 @@ pub(crate) fn block_css(config: &Config) -> String {
             font-size: 0.85em;
             padding-right: 8px;
         }}
+        .developer-block-canvas .developer-running-command {{
+            font-family: {font_stack}; font-size: {font_size};
+        }}
         .block-output {{
             background-color: {bg_hex};
             color: {fg_hex};

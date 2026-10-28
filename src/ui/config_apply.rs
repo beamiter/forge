@@ -782,8 +782,16 @@ impl UiState {
         self.scrollbar_css.load_from_string(&css);
         self.reference_font_css
             .load_from_string(&super::reference_shell::role_font_css(
-                config.chrome_font_scale,
-                self.font_scale.get(),
+                crate::font::reference_ui_role_multiplier(
+                    &config.chrome_font_size,
+                    config.chrome_font_scale,
+                    &self.window.pango_context(),
+                ),
+                crate::font::reference_content_role_multiplier(
+                    &config.font_desc,
+                    self.font_scale.get(),
+                    &self.window.pango_context(),
+                ),
             ));
         self.ai_panel.apply_theme_colors();
     }

@@ -316,6 +316,7 @@ pub(super) struct ChatPresentation {
     current: Cell<ChatSurface>,
     reparenting: Cell<bool>,
     running_command: glib::WeakRef<gtk4::Label>,
+    block_input_hint: Option<glib::WeakRef<gtk4::Label>>,
     command_generation: Cell<u64>,
     displayed_stop_target: Cell<Option<StopTarget>>,
 }
@@ -358,6 +359,18 @@ impl ChatPresentation {
         composer_viewport.add_css_class("chat-composer-viewport");
         composer_viewport.set_child(Some(&composer));
         dock.append(&composer_viewport);
+        let block_input_hint = if root.has_css_class("developer-block-canvas") {
+            let hint = gtk4::Label::new(Some("Input belongs to the running command"));
+            hint.add_css_class("developer-dock-input-hint");
+            hint.set_xalign(0.0);
+            hint.set_can_target(false);
+            hint.set_focusable(false);
+            hint.set_visible(false);
+            dock.append(&hint);
+            Some(hint)
+        } else {
+            None
+        };
         let terminal = active.active_vte.downgrade();
         let (controls, status) = crate::ui::reference_shell::composer_controls(move || {
             if let Some(terminal) = terminal.upgrade() {
@@ -420,6 +433,7 @@ impl ChatPresentation {
         active.widget().prepend(&running_command);
         Self {
             running_command: running_command.downgrade(),
+            block_input_hint: block_input_hint.map(|hint| hint.downgrade()),
             dock: dock.downgrade(),
             composer: composer.downgrade(),
             composer_viewport: composer_viewport.downgrade(),
@@ -564,11 +578,19 @@ impl ChatPresentation {
             self.displayed_stop_target.set(None);
         }
         if let Some(command) = self.running_command.upgrade() {
-            command.set_visible(surface == ChatSurface::Running);
+            command
+                .set_visible(surface == ChatSurface::Running && active.developer_header.is_none());
             if surface == ChatSurface::Prompt {
                 command.set_text("");
                 command.set_tooltip_text(None);
             }
+        }
+        if let Some(hint) = self
+            .block_input_hint
+            .as_ref()
+            .and_then(|hint| hint.upgrade())
+        {
+            hint.set_visible(surface == ChatSurface::Running);
         }
         let decorated = matches!(surface, ChatSurface::Prompt | ChatSurface::Running);
         dock.set_visible(decorated);

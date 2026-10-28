@@ -42,6 +42,10 @@ mod click_cursor;
 mod command_row;
 mod cross_selection;
 mod css;
+mod developer_block;
+#[cfg(test)]
+mod developer_dock_tests;
+mod docked_input;
 
 /// Reuse the existing bounded, sanitized HEAD cache for chrome context.
 pub(crate) fn reference_workspace_branch(cwd: &str) -> Option<String> {
@@ -11632,7 +11636,7 @@ fn pty_grid_size(vte: &Terminal, scroll: &ScrolledWindow) -> (u16, u16) {
 /// Chat's scroller stays mapped in passthrough/fullscreen; its dock can change
 /// the history page size independently of the actual terminal canvas.
 fn viewport_height_px(vte: &Terminal, scroll: &ScrolledWindow) -> i32 {
-    if vte.has_css_class("chat-live-terminal") {
+    if vte.has_css_class("chat-live-terminal") || vte.has_css_class("docked-live-terminal") {
         chat::viewport_height_for(vte).unwrap_or_else(|| scroll.vadjustment().page_size() as i32)
     } else {
         scroll.vadjustment().page_size() as i32
@@ -11644,6 +11648,17 @@ fn viewport_rows_for(vte: &Terminal, scroll: &ScrolledWindow) -> Option<i64> {
     let page = viewport_height_px(vte, scroll);
     if page <= 1 {
         return None;
+    }
+    if vte.has_css_class("developer-live-terminal") {
+        // The Block prompt clip and running output card are two seats for the
+        // same grid. Reserve the running header/border in BOTH seats: deriving
+        // winsize from whether that header is currently visible would send an
+        // unsolicited SIGWINCH at every CommandStart/PromptEnd transition.
+        // Visible rows are independently bounded below; they never set PTY rows.
+        let usable =
+            (page - developer_block::HEADER_HEIGHT - 2 - blocks::terminal_vertical_insets(vte))
+                .max(cell_h);
+        return Some((usable / cell_h).max(1) as i64);
     }
     let holder = vte
         .ancestor(gtk4::Box::static_type())
@@ -14159,7 +14174,11 @@ impl TermView {
     /// ParserConfig at pane construction and are NOT affected.
     pub(crate) fn reload_config(&self, config: &Config) {
         let density_changed = self.config.borrow().block_compact != config.block_compact;
+        let pane_mode = self.config.borrow().terminal_mode.clone();
         *self.config.borrow_mut() = config.clone();
+        // This configuration belongs to an already-running backend. A global
+        // presentation preference cannot change its history or PTY identity.
+        self.config.borrow_mut().terminal_mode = pane_mode;
         if density_changed {
             self.apply_block_density(config.block_compact);
         }
@@ -14252,6 +14271,9 @@ impl TermView {
     where
         F: FnOnce(&[&str], Option<&str>, &[(&str, &str)], bool) -> io::Result<OwnedPty>,
     {
+        let mut pane_config = config.clone();
+        pane_config.terminal_mode = mode.clone();
+        let config = &pane_config;
         // Detect jsh shell for session_id passing.
         let is_jsh = shell_argv_uses_jsh(shell_argv);
 
@@ -14308,17 +14330,31 @@ impl TermView {
         root.set_focusable(true);
         root.add_css_class("term-view-root");
         let chat_mode = matches!(mode, crate::config::TerminalMode::Chat);
-        if chat_mode {
-            // Only Chat opts into the nonblocking immediate-action boundary.
-            // Failure leaves its buttons fail-closed and native keys usable.
+        let block_mode = matches!(mode, crate::config::TerminalMode::Block);
+        let docked_input = chat_mode || block_mode;
+        if matches!(mode, crate::config::TerminalMode::Block) {
+            root.add_css_class("developer-block-canvas");
+        }
+        if docked_input {
+            // Both native docks share one nonblocking authority boundary.
+            // Failure keeps native keys usable and immediate buttons closed.
             if let Err(error) = pty.enable_immediate_controls() {
-                log::warn!("Chat buttons unavailable; use native keyboard: {error}");
+                log::warn!("Native dock buttons unavailable; use keyboard: {error}");
             }
+        }
+        if chat_mode {
             root.add_css_class("term-chat-root");
         }
         // Stays hidden until this pane's tab is split.
         let pane_header = crate::ui::PaneHeader::new();
         root.append(pane_header.widget());
+        let developer_toolbar = if matches!(mode, crate::config::TerminalMode::Block) {
+            let (bar, count, search, follow) = developer_block::live_toolbar();
+            root.append(&bar);
+            Some((count, search, follow))
+        } else {
+            None
+        };
 
         // Block list inside a scrolled window
         let block_list = gtk4::Box::new(Orientation::Vertical, 0);
@@ -14326,6 +14362,8 @@ impl TermView {
         block_list.add_css_class("block-list");
         if chat_mode {
             block_list.add_css_class("chat-transcript");
+        } else if matches!(mode, crate::config::TerminalMode::Block) {
+            block_list.add_css_class("developer-block-transcript");
         }
 
         let block_scroll = ScrolledWindow::new();
@@ -14357,6 +14395,9 @@ impl TermView {
         )));
         let active_vte = active.borrow().active_vte.clone();
         let input_feedback = input_feedback::InputFeedback::new(&active_vte);
+        if docked_input {
+            active_vte.add_css_class("docked-live-terminal");
+        }
         if chat_mode {
             active_vte.add_css_class("chat-live-terminal");
             apply_terminal_theme(&active_vte, config);
@@ -14424,6 +14465,24 @@ impl TermView {
         // just getting back to the live surface.
         jump_fab.set_focusable(true);
         jump_fab.set_focus_on_click(false);
+        if let Some((_, search, follow)) = &developer_toolbar {
+            let jump = jump_fab.downgrade();
+            follow.connect_clicked(move |_| {
+                if let Some(jump) = jump.upgrade() {
+                    jump.emit_clicked();
+                }
+            });
+            let terminal = active_vte.downgrade();
+            search.connect_clicked(move |button| {
+                if let Some(terminal) = terminal.upgrade() {
+                    terminal.grab_focus();
+                }
+                crate::ui::reference_shell::trigger_existing_action(
+                    button.upcast_ref(),
+                    crate::keybindings::Action::ToggleSearch,
+                );
+            });
+        }
 
         // ── Sticky running-command header ─────────────────────────────────
         // When a command is running and the user has scrolled up into history,
@@ -14463,7 +14522,7 @@ impl TermView {
         )]);
         sticky_stop_btn.add_css_class("sticky-header-control");
         sticky_stop_btn.add_css_class("flat");
-        if chat_mode {
+        if docked_input {
             sticky_stop_btn.add_css_class("chat-sticky-stop");
             sticky_stop_btn.add_css_class("chat-command-control");
             sticky_stop_btn.set_tooltip_text(Some(
@@ -14551,6 +14610,13 @@ impl TermView {
                 &active.borrow(),
                 config.block_compact,
             )))
+        } else if block_mode {
+            Some(docked_input::for_block(
+                &root,
+                &scroll_overlay,
+                &active.borrow(),
+                config.block_compact,
+            ))
         } else {
             root.append(&scroll_overlay);
             None
@@ -14636,6 +14702,53 @@ impl TermView {
 
         let block_data_rc: Rc<RefCell<VecDeque<BlockData>>> =
             Rc::new(RefCell::new(VecDeque::new()));
+        let developer_count_refresh: Option<Rc<dyn Fn()>> =
+            if let Some((label, _, _)) = &developer_toolbar {
+                let pending = Rc::new(Cell::new(false));
+                let data = block_data_rc.clone();
+                let weak = label.downgrade();
+                let active = Rc::downgrade(&active);
+                let refresh: Rc<dyn Fn()> = Rc::new(move || {
+                    if pending.replace(true) {
+                        return;
+                    }
+                    let pending = pending.clone();
+                    let weak = weak.clone();
+                    let data = data.clone();
+                    let active = active.clone();
+                    glib::idle_add_local_once(move || {
+                        pending.set(false);
+                        if let Some(label) = weak.upgrade() {
+                            let completed = data
+                                .borrow()
+                                .iter()
+                                .filter(|record| !record.is_background())
+                                .count();
+                            let running = active.upgrade().is_some_and(|active| {
+                                active
+                                    .borrow()
+                                    .developer_header
+                                    .as_ref()
+                                    .is_some_and(|header| header.is_running_command())
+                            });
+                            label.set_text(&format!(
+                                "Live · {} commands",
+                                completed + usize::from(running)
+                            ));
+                        }
+                    });
+                });
+                let model = block_list.observe_children();
+                let changed = refresh.clone();
+                model.connect_items_changed(move |_, _, _, _| changed());
+                unsafe {
+                    label.set_data("forge-developer-document-observer", model);
+                }
+                Some(refresh)
+            } else {
+                None
+            };
+
         let block_document_index: Rc<RefCell<BlockDocumentIndex>> =
             Rc::new(RefCell::new(BlockDocumentIndex::default()));
         let finished_blocks_rc: Rc<RefCell<Vec<FinishedBlock>>> = Rc::new(RefCell::new(Vec::new()));
@@ -14804,6 +14917,11 @@ impl TermView {
                 let Some(active_block) = active_for_layout.upgrade() else {
                     return;
                 };
+                if let Ok(active) = active_block.try_borrow() {
+                    if let Some(header) = &active.developer_header {
+                        header.sync(bstate.get() == BlockState::CollectingOutput);
+                    }
+                }
                 // Resolve once so docking and the row budget agree throughout
                 // an already confirmed shell prompt's SIGWINCH redraw.
                 let chat_surface = chat_presentation
@@ -15114,6 +15232,38 @@ impl TermView {
         let alt_screen_callbacks: AltScreenCallbacks = Rc::new(RefCell::new(vec![]));
         let command_started_callbacks: CommandStartedCallbacks = Rc::new(RefCell::new(vec![]));
         let command_finished_callbacks: CommandFinishedCallbacks = Rc::new(RefCell::new(vec![]));
+        if matches!(mode, crate::config::TerminalMode::Block) {
+            let weak = Rc::downgrade(&active);
+            command_started_callbacks
+                .borrow_mut()
+                .push(Box::new(move |event| {
+                    if let Some(active) = weak.upgrade() {
+                        if let Some(header) = &active.borrow().developer_header {
+                            header.begin(&event.command);
+                        }
+                    }
+                }));
+            let weak = Rc::downgrade(&active);
+            command_finished_callbacks
+                .borrow_mut()
+                .push(Box::new(move |_| {
+                    if let Some(active) = weak.upgrade() {
+                        if let Some(header) = &active.borrow().developer_header {
+                            header.finish();
+                        }
+                    }
+                }));
+        }
+        if let Some(refresh) = &developer_count_refresh {
+            let changed = refresh.clone();
+            command_started_callbacks
+                .borrow_mut()
+                .push(Box::new(move |_| changed()));
+            let changed = refresh.clone();
+            command_finished_callbacks
+                .borrow_mut()
+                .push(Box::new(move |_| changed()));
+        }
         if let Some(chat) = &chat_presentation {
             let chat = chat.clone();
             command_started_callbacks
@@ -15920,6 +16070,7 @@ impl TermView {
             });
         }
         let sticky_timer_id = {
+            let developer = matches!(mode, crate::config::TerminalMode::Block);
             let chat_presentation = chat_presentation.clone();
             let chat_bstate = bstate.clone();
             let chat_pty = pty.clone();
@@ -15980,6 +16131,14 @@ impl TermView {
                             .then(|| chat_pty.foreground_token())
                             .flatten(),
                     );
+                }
+                if developer && !user_scrolled.get() {
+                    sticky_target.set(None);
+                    sticky.set_visible(false);
+                    sticky_jump_bottom.set_visible(false);
+                    sticky_stop.set_visible(false);
+                    sticky_organism.set_visible(false);
+                    return glib::ControlFlow::Continue;
                 }
                 let following = !user_scrolled.get();
                 // Only a pill that is due needs the geometry: where the live
@@ -16729,7 +16888,7 @@ impl TermView {
             live_scrollbar.add_controller(scrollbar_scroll);
         }
 
-        let selection_root: &gtk4::Widget = if chat_mode {
+        let selection_root: &gtk4::Widget = if docked_input {
             root.upcast_ref()
         } else {
             block_scroll.upcast_ref()
@@ -19129,9 +19288,20 @@ impl TermView {
         self.dynamic_colors.set(Default::default());
         let config = self.config.borrow();
         apply_terminal_theme(&self.active_vte, &config);
+        let developer = self.root.has_css_class("developer-block-canvas");
+        if developer {
+            developer_block::terminal_colors(&self.active_vte);
+        }
         for block in self.finished_blocks.borrow().iter() {
             apply_snapshot_theme_to_vte(&block.command_vte, &config);
             apply_snapshot_theme_to_vte(&block.output_vte, &config);
+            if developer {
+                developer_block::terminal_colors(&block.command_vte);
+                block
+                    .command_vte
+                    .set_color_background(&gtk4::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
+                developer_block::terminal_colors(&block.output_vte);
+            }
         }
         install_block_css(&config);
         (self.failure_marker_redraw)();
@@ -19186,16 +19356,23 @@ impl TermView {
             Some(serde_json::json!({"record_id":record.id,"offset":adjustment.value()-prefix as f64}))
         });
         let finished = self.finished_blocks.borrow();
-        let mut visible: Vec<_> = self.visible_indices.borrow().iter().copied().collect();
-        visible.sort_unstable();
-        let outputs: Vec<_> = visible.into_iter().filter_map(|item| finished.get(item)).filter(|card| card.output_vte.is_mapped()).map(|card| {
+        let outputs: Vec<_> = finished.iter().filter(|card| card.output_vte.is_mapped()).map(|card| {
             let adjustment = card.output_vte.vadjustment();
-            serde_json::json!({"id":card.id,"adjustment":adjustment.map(|a|(a.lower(),a.value(),a.upper(),a.page_size()))})
+            serde_json::json!({"id":card.id,"adjustment":adjustment.map(|a|(a.lower(),a.value(),a.upper(),a.page_size())),"exit_code":data.iter().find(|record|record.id==card.id).and_then(|record|record.exit_code),"duration_ms":data.iter().find(|record|record.id==card.id).and_then(|record|record.duration_ms),"height":card.widget().height(),"height_request":card.widget().height_request(),"estimated_height":data.iter().find(|record|record.id==card.id).map(|record|record.estimated_height),"developer":card.widget().has_css_class("developer-command-card"),"rows":card.output_vte.row_count(),"columns":card.output_vte.column_count(),"cell":[card.output_vte.char_width(),card.output_vte.char_height()]})
         }).collect();
         serde_json::json!({"frame_time":self.root.frame_clock().map(|clock|clock.frame_time()),
             "adjustment":[adjustment.lower(),adjustment.value(),adjustment.upper(),adjustment.page_size()],
-            "reading_anchor":anchor,"index_stale":index.stale,"outputs":outputs,
+            "reading_anchor":anchor,"index_stale":index.stale,"outputs":outputs,"record_count":data.len(),"visible_indices_cache_len":self.visible_indices.borrow().len(),
             "follow":self.scroll_debouncer.reference_state(),"terminal_has_focus":self.active_vte.has_focus(),
+            "live_grid":[self.active_vte.column_count(),self.active_vte.row_count()],
+            "child_winsize":self.pty_winsize.child_winsize(),
+            "live_clip_height":self.active.borrow().live_clip().height(),
+            "live_cell":[self.active_vte.char_width(),self.active_vte.char_height()],
+            "live_has_selection":self.active_vte.has_selection(),
+            "block_state":format!("{:?}", self.bstate.get()),
+            "prompt_anchor":self.current_prompt_anchor(),
+            "live_cursor":self.active_vte.cursor_position(),
+            "input_guards":{"dirty":self.idle_input_dirty.get(),"submitted":self.submission_pending.get(),"typeahead":self.pending_typeahead.get(),"synced":self.pty_synced.get(),"shadow_empty":self.typed_cmd.borrow().trim().is_empty()},
             "prompt_status":format!("{:?}",self.command_prompt_status()),
             "native_focus_reveal":self.block_scroll.child().and_downcast::<gtk4::Viewport>().map(|viewport|viewport.is_scroll_to_focus())})
     }

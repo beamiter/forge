@@ -1228,7 +1228,7 @@ fn advance_displayed_generation(
     next
 }
 
-fn output_display_text(text: &str) -> &str {
+pub(super) fn output_display_text(text: &str) -> &str {
     let text = if let Some(stripped) = text.strip_prefix("\r\n") {
         stripped
     } else if let Some(stripped) = text.strip_prefix('\n') {
@@ -1688,6 +1688,13 @@ pub(crate) fn estimated_finished_block_height_for_rows(
             config.finished_block_max_expanded_rows as i64,
         )
     };
+    if matches!(config.terminal_mode, crate::config::TerminalMode::Block) {
+        return super::developer_block::estimated_height(
+            estimated_cell_height_px(config),
+            command_rows,
+            visible_output_rows,
+        );
+    }
     finished_block_height_for_rows(
         estimated_cell_height_px(config),
         command_rows,
@@ -1852,7 +1859,11 @@ fn finished_snapshot_stream(display_text: &str) -> Vec<u8> {
 }
 
 fn hide_chat_snapshot_cursor(vte: &vte4::Terminal) {
-    if vte.has_css_class("chat-command-terminal") || vte.has_css_class("chat-output-terminal") {
+    if vte.has_css_class("chat-command-terminal")
+        || vte.has_css_class("chat-output-terminal")
+        || vte.has_css_class("developer-command-terminal")
+        || vte.has_css_class("developer-output-terminal")
+    {
         vte.feed(b"\x1b[?25l");
     }
 }
@@ -2399,6 +2410,7 @@ impl FinishedBlock {
             }
             reused.remove_css_class("block-compact");
             reused.remove_css_class("chat-pair");
+            reused.remove_css_class("developer-command-card");
             reused
         } else {
             let b = gtk4::Box::new(Orientation::Vertical, 0);
@@ -3083,6 +3095,7 @@ impl FinishedBlock {
             let visual_rows_cache_for_refit = visual_rows_cache.clone();
             let compact_for_refit = compact.clone();
             let max_expanded_cap_for_refit = max_expanded_cap;
+            let developer = matches!(config.terminal_mode, crate::config::TerminalMode::Block);
             Rc::new(move || {
                 let (Some(output_vte), Some(expand_btn), Some(jump_btn)) = (
                     output_vte.upgrade(),
@@ -3196,6 +3209,13 @@ impl FinishedBlock {
                 } else {
                     output_visual_row_count(&cmd_for_refit, command_cols.unwrap_or(eff_cols)).max(1)
                 };
+                if developer {
+                    return Some(super::developer_block::estimated_height(
+                        cell_height,
+                        command_rows,
+                        if has_output { visible_rows } else { 0 },
+                    ));
+                }
                 Some(finished_block_height_for_rows(
                     cell_height,
                     command_rows,
@@ -3822,7 +3842,12 @@ impl FinishedBlock {
                     let anchor = result
                         .as_ref()
                         .and_then(|row| row.first_child())
-                        .unwrap_or_else(|| cmd_row.clone().upcast::<gtk4::Widget>());
+                        .unwrap_or_else(|| {
+                            cmd_row
+                                .parent()
+                                .filter(|parent| parent.has_css_class("developer-command-header"))
+                                .unwrap_or_else(|| cmd_row.clone().upcast::<gtk4::Widget>())
+                        });
                     let handles = build_filter_row(parent, &anchor);
                     *built.borrow_mut() = handles;
                 }
@@ -3905,7 +3930,129 @@ impl FinishedBlock {
         // Constructors do not receive provenance. Old/restored records and
         // direct callers start uncertain until the owner supplies metadata.
         block.set_command_provenance(false, false);
+        if matches!(config.terminal_mode, crate::config::TerminalMode::Block) {
+            block.set_developer_layout(exit_code, duration_ms);
+        }
         block
+    }
+
+    /// Reorganize this real record's existing native renderers. No new PTY,
+    /// no inserted prompt/output text and no shell command is executed here.
+    fn set_developer_layout(&self, exit_code: Option<i32>, duration_ms: Option<u64>) {
+        let Some(command) = self
+            .command_vte
+            .parent()
+            .and_then(|widget| widget.parent())
+            .and_downcast::<super::command_row::CommandRow>()
+        else {
+            return;
+        };
+        self.widget.add_css_class("developer-command-card");
+        self.widget.set_margin_start(0);
+        self.widget.set_margin_end(0);
+        self.widget.set_margin_top(0);
+        self.widget.set_margin_bottom(0);
+        self.content.add_css_class("developer-card-body");
+        self.content.set_overflow(gtk4::Overflow::Hidden);
+        // Include the inter-card gap in the outer wrapper's measured height.
+        // An external outer margin is omitted by widget.height() and would be
+        // lost when parking the card or reconciling the document index.
+        self.content
+            .set_margin_bottom(super::developer_block::CARD_GAP);
+        self.header_row.add_css_class("developer-command-header");
+        self.header_row.set_margin_start(16);
+        self.header_row.set_margin_end(12);
+        self.header_row.set_margin_top(0);
+        self.header_row.set_margin_bottom(0);
+        self.header_row
+            .set_height_request(super::developer_block::HEADER_HEIGHT);
+        self.header_row.set_spacing(8);
+        self.status_icon.set_visible(false);
+        self.action_box.set_visible(false);
+        let mut child = self.header_row.first_child();
+        let mut review = None;
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            if widget.has_css_class("block-review-button") {
+                review = Some(widget.clone());
+            }
+            if [
+                "block-exit-bad",
+                "block-exit-unknown",
+                "block-exit-interrupted",
+                "block-collapse-btn",
+            ]
+            .iter()
+            .any(|class| widget.has_css_class(class))
+            {
+                widget.set_visible(false);
+            }
+        }
+        let after = review.as_ref().and_then(|widget| widget.prev_sibling());
+        if let Some(review) = review {
+            self.header_row.remove(&review);
+        }
+        self.content.remove(&command);
+        self.header_row.insert_child_after(&command, after.as_ref());
+        command.set_hexpand(true);
+        command.set_valign(gtk4::Align::Center);
+        if let Some(chevron) = self.command_vte.prev_sibling() {
+            chevron.set_visible(false);
+        }
+        super::command_row::fit(&command, &self.command_vte, self.cols, &self.cmd_text);
+        let icon = crate::ui::reference_shell::vector_icon(
+            jterm_core::reference_icons::Icon::Terminal,
+            24,
+        );
+        icon.add_css_class("developer-command-icon");
+        icon.set_margin_end(8);
+        self.header_row.prepend(&icon);
+        let status = gtk4::Label::new(Some(
+            match BlockOutcome::classify(Some(&self.cmd_text), exit_code) {
+                BlockOutcome::Success => "Completed",
+                BlockOutcome::Failure(_) => "Failed",
+                BlockOutcome::Interrupted(_) => "Interrupted",
+                BlockOutcome::Background => "Output",
+                BlockOutcome::Unknown => "Unknown",
+            },
+        ));
+        status.add_css_class("developer-command-status");
+        status.set_valign(gtk4::Align::Center);
+        status.set_height_request(20);
+        status.set_accessible_role(gtk4::AccessibleRole::Status);
+        status.set_tooltip_text(Some(
+            &exit_code
+                .map(|code| format!("Observed shell exit status: {code}"))
+                .unwrap_or_else(|| "Shell completion status unavailable".into()),
+        ));
+        self.header_row
+            .insert_child_after(&status, self.more_btn.prev_sibling().as_ref());
+        if let Some(duration) = duration_ms {
+            let elapsed = gtk4::Label::new(Some(&format_block_duration(duration)));
+            elapsed.add_css_class("developer-command-elapsed");
+            elapsed.set_valign(gtk4::Align::Center);
+            self.header_row.insert_child_after(&elapsed, Some(&status));
+        }
+        self.command_vte.add_css_class("developer-command-terminal");
+        super::developer_block::terminal_colors(&self.command_vte);
+        self.command_vte
+            .set_color_background(&RGBA::new(0.0, 0.0, 0.0, 0.0));
+        self.output_vte.add_css_class("developer-output-terminal");
+        super::developer_block::terminal_colors(&self.output_vte);
+        if let Some(output) = self.output_vte.parent().and_downcast::<gtk4::Box>() {
+            output.add_css_class("developer-command-output");
+            output.set_margin_start(16);
+            output.set_margin_end(16);
+            output.set_margin_top(super::developer_block::OUTPUT_PADDING);
+            output.set_margin_bottom(super::developer_block::OUTPUT_PADDING);
+            let gutter = super::developer_block::line_gutter(
+                &self.output_vte,
+                self.full_output.clone(),
+                self.displayed_output.clone(),
+                self.displayed_generation.clone(),
+            );
+            output.prepend(&gutter);
+        }
     }
 
     pub(crate) const fn estimated_retained_bytes(&self) -> usize {
@@ -4096,6 +4243,10 @@ impl FinishedBlock {
     /// Switch this card between the normal and compact densities in place and
     /// return the height its virtualization placeholder must contribute.
     pub(crate) fn set_compact(&self, compact: bool) -> i32 {
+        if self.widget.has_css_class("developer-command-card") {
+            self.compact.set(compact);
+            return self.virtualized_height.get().max(1);
+        }
         let previous = self.compact.replace(compact);
         if previous != compact {
             let delta = finished_card_vchrome_px(compact)
@@ -4529,6 +4680,7 @@ impl FinishedBlock {
 pub(crate) struct ActiveBlock {
     pub(crate) widget: gtk4::Box,
     pub(crate) active_vte: Terminal,
+    pub(super) developer_header: Option<super::developer_block::RunningHeader>,
     /// The measured wrapper around the live VTE. It carries the terminal's
     /// requested pixel size — see [`ActiveBlock::set_live_geometry`], which
     /// keeps the grid at the full viewport while the card shows less.
@@ -4642,7 +4794,7 @@ fn sync_live_scrollbar_visibility(
     clip: &gtk4::Overlay,
     overflows: bool,
 ) -> i32 {
-    if vte.has_css_class("chat-live-terminal") {
+    if vte.has_css_class("chat-live-terminal") || vte.has_css_class("docked-live-terminal") {
         scrollbar.set_visible(true);
         let natural = scrollbar.measure(Orientation::Horizontal, -1).1;
         let minimum = vte.measure(Orientation::Horizontal, -1).0;
@@ -4684,7 +4836,18 @@ impl ActiveBlock {
         // prevents GTK from adding document slack to its grid.
         widget.set_vexpand(false);
 
+        let developer_header = if matches!(config.terminal_mode, crate::config::TerminalMode::Block)
+        {
+            let header = super::developer_block::RunningHeader::new();
+            widget.prepend(&header.root);
+            Some(header)
+        } else {
+            None
+        };
         let active_vte = create_active_terminal(config);
+        if developer_header.is_some() {
+            super::developer_block::terminal_colors(&active_vte);
+        }
         active_vte.set_hexpand(true);
         active_vte.set_vexpand(false);
         let vte_overlay = gtk4::Overlay::new();
@@ -4807,7 +4970,10 @@ impl ActiveBlock {
         // focus-in fcitx/ibus need. `map` is the first valid point to focus.
         let first_map = Cell::new(true);
         active_vte.connect_map(move |terminal| {
-            if !terminal.has_css_class("chat-live-terminal") || first_map.replace(false) {
+            if !(terminal.has_css_class("chat-live-terminal")
+                || terminal.has_css_class("docked-live-terminal"))
+                || first_map.replace(false)
+            {
                 terminal.grab_focus();
             }
         });
@@ -4815,6 +4981,7 @@ impl ActiveBlock {
         ActiveBlock {
             widget,
             active_vte,
+            developer_header,
             vte_overlay,
             live_spacer,
             live_clip,
@@ -4875,7 +5042,9 @@ impl ActiveBlock {
         let grid_rows = grid_rows.max(1);
         let visible_rows = visible_rows.clamp(1, grid_rows);
         let clip_width = self.live_clip.width();
-        let gutter = if self.active_vte.has_css_class("chat-live-terminal") {
+        let gutter = if self.active_vte.has_css_class("chat-live-terminal")
+            || self.active_vte.has_css_class("docked-live-terminal")
+        {
             let overflows = self
                 .active_vte
                 .vadjustment()

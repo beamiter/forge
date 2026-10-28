@@ -4850,6 +4850,7 @@ impl UiState {
         let chrome_size = f64::from(chrome_desc.size()) / f64::from(gtk4::pango::SCALE);
         let chrome_size_adj = Adjustment::new(chrome_size, 6.0, 72.0, 0.25, 4.0, 0.0);
         let chrome_size_row = adw::SpinRow::new(Some(&chrome_size_adj), 0.25, 2);
+        chrome_size_row.set_use_markup(false);
         chrome_size_row.set_title("Sidebar & Top Bar Font Size");
         chrome_size_row.set_subtitle(if chrome_desc.is_size_absolute() {
             "Pixels"
@@ -4860,6 +4861,7 @@ impl UiState {
         let chrome_scale_adj =
             Adjustment::new(config.chrome_font_scale, 0.1, 10.0, 0.025, 0.1, 0.0);
         let chrome_scale_row = adw::SpinRow::new(Some(&chrome_scale_adj), 0.025, 3);
+        chrome_scale_row.set_use_markup(false);
         chrome_scale_row.set_title("Sidebar & Top Bar Font Scale");
         group.add(&chrome_scale_row);
 
@@ -5200,7 +5202,7 @@ impl UiState {
         terminal_mode_row.connect_selected_notify(move |row| {
             ui.config.borrow_mut().terminal_mode = match row.selected() {
                 1 => crate::config::TerminalMode::Chat,
-                _ => crate::config::TerminalMode::Unified,
+                _ => crate::config::TerminalMode::Block,
             };
             ui.persist_config();
         });

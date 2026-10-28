@@ -53,7 +53,10 @@ pub(crate) fn role_font_css(chrome_scale: f64, content_scale: f64) -> String {
     let chrome_scale = valid_scale(chrome_scale);
     let content_scale = valid_scale(content_scale);
     let mut css = String::new();
-    for rule in include_str!("reference_shell.css").split('}') {
+    for rule in include_str!("reference_shell.css")
+        .split('}')
+        .chain(include_str!("developer_block.css").split('}'))
+    {
         let Some((selectors, body)) = rule.split_once('{') else {
             continue;
         };
@@ -157,7 +160,8 @@ fn reference_role_fonts(ui: &UiState) -> serde_json::Value {
         .and_then(|diff| widget_with_class(&diff, "reference-code-action"))
         .and_then(|button| button.compute_bounds(&ui.window))
         .map(|r| serde_json::json!([r.x(), r.y(), r.width(), r.height()]));
-    serde_json::json!({"roles":roles,"copy_action_xywh":copy,"chrome_scale":ui.config.borrow().chrome_font_scale,"content_scale":ui.font_scale.get()})
+    let config = ui.config.borrow();
+    serde_json::json!({"roles":roles,"copy_action_xywh":copy,"chrome_size":config.chrome_font_size,"chrome_scale":config.chrome_font_scale,"chrome_role_multiplier":crate::font::reference_ui_role_multiplier(&config.chrome_font_size,config.chrome_font_scale,&ui.window.pango_context()),"content_desc":config.font_desc,"content_scale":ui.font_scale.get(),"content_role_multiplier":crate::font::reference_content_role_multiplier(&config.font_desc,ui.font_scale.get(),&ui.window.pango_context())})
 }
 
 /// Shared vector paths, painted by Cairo rather than font-dependent glyphs.
@@ -241,6 +245,12 @@ fn ui_for_widget(widget: &gtk4::Widget) -> Option<Rc<UiState>> {
     unsafe {
         root.data::<std::rc::Weak<UiState>>(REFERENCE_UI_KEY)
             .and_then(|weak| weak.as_ref().upgrade())
+    }
+}
+
+pub(crate) fn trigger_existing_action(widget: &gtk4::Widget, action: crate::keybindings::Action) {
+    if let Some(ui) = ui_for_widget(widget) {
+        ui.execute_action(action);
     }
 }
 
@@ -705,8 +715,20 @@ pub(crate) fn install(
         send.add_css_class("chat-submit");
         actions.append(&send);
         footer.append(&actions);
-        footer.set_visible(ui.config.borrow().terminal_mode != TerminalMode::Chat);
+        footer.set_visible(matches!(
+            ui.config.borrow().terminal_mode,
+            TerminalMode::Vte | TerminalMode::Unified
+        ));
         center.append(&footer);
+        if ui.config.borrow().terminal_mode == TerminalMode::Block {
+            center.add_css_class("reference-developer-active");
+            if let Some(header) =
+                widget_with_class_any(center.upcast_ref(), "reference-canvas-header")
+            {
+                header.set_height_request(42);
+            }
+        }
+        let center_for_switch = center.downgrade();
         let ui_for_switch = Rc::downgrade(ui);
         ui.notebook.connect_switch_page(move |_, page, _| {
             // A view remains attached to its original live PTY. Only inspect
@@ -724,7 +746,37 @@ pub(crate) fn install(
                 }
                 false
             }
-            footer.set_visible(!chat_in(page));
+            footer.set_visible(!chat_in(page) && !developer_in(page));
+            fn developer_in(widget: &gtk4::Widget) -> bool {
+                if widget.has_css_class("developer-block-canvas") {
+                    return true;
+                }
+                let mut child = widget.first_child();
+                while let Some(widget) = child {
+                    if developer_in(&widget) {
+                        return true;
+                    }
+                    child = widget.next_sibling();
+                }
+                false
+            }
+            if let Some(center) = center_for_switch.upgrade() {
+                let developer = developer_in(page);
+                if developer {
+                    center.add_css_class("reference-developer-active");
+                } else {
+                    center.remove_css_class("reference-developer-active");
+                }
+                if let Some(header) =
+                    widget_with_class_any(center.upcast_ref(), "reference-canvas-header")
+                {
+                    header.set_height_request(if developer {
+                        42
+                    } else {
+                        token::CANVAS_HEADER_HEIGHT as i32
+                    });
+                }
+            }
             if let Some(ui) = ui_for_switch.upgrade() {
                 ui.reference_inspector.queue_allocate();
             }
@@ -786,10 +838,7 @@ pub(crate) fn install(
     modes.set_valign(gtk4::Align::Center);
     modes.set_height_request(token::MODE_CONTROL_HEIGHT as i32);
     let mut group: Option<gtk4::ToggleButton> = None;
-    for (title, mode) in [
-        ("Block", TerminalMode::Unified),
-        ("Chat", TerminalMode::Chat),
-    ] {
+    for (title, mode) in [("Block", TerminalMode::Block), ("Chat", TerminalMode::Chat)] {
         let button = gtk4::ToggleButton::with_label(title);
         button.set_focus_on_click(false);
         if let Some(first) = &group {
@@ -1369,20 +1418,24 @@ pub(crate) fn install_css() {
     fn hex(color: [u8; 3]) -> String {
         format!("#{:02x}{:02x}{:02x}", color[0], color[1], color[2])
     }
-    let css = include_str!("reference_shell.css")
-        .replace("@TITLEBAR@", &hex(token::color::TITLEBAR))
-        .replace("@RAIL@", &hex(token::color::RAIL))
-        .replace("@NAVIGATION@", &hex(token::color::NAVIGATION))
-        .replace("@INSPECTOR@", &hex(token::color::INSPECTOR))
-        .replace("@INSPECTOR_CARD@", &hex(token::color::INSPECTOR_CARD))
-        .replace("@CANVAS@", &hex(token::color::CANVAS))
-        .replace("@CANVAS_COOL@", &hex(token::color::CANVAS_COOL))
-        .replace("@ACCENT@", &hex(token::color::ACCENT))
-        .replace(
-            "@PROFILE_BACKGROUND@",
-            &hex(token::color::PROFILE_BACKGROUND),
-        )
-        .replace("@PROFILE_BORDER@", &hex(token::color::PROFILE_BORDER));
+    let css = format!(
+        "{}\n{}",
+        include_str!("reference_shell.css"),
+        include_str!("developer_block.css")
+    )
+    .replace("@TITLEBAR@", &hex(token::color::TITLEBAR))
+    .replace("@RAIL@", &hex(token::color::RAIL))
+    .replace("@NAVIGATION@", &hex(token::color::NAVIGATION))
+    .replace("@INSPECTOR@", &hex(token::color::INSPECTOR))
+    .replace("@INSPECTOR_CARD@", &hex(token::color::INSPECTOR_CARD))
+    .replace("@CANVAS@", &hex(token::color::CANVAS))
+    .replace("@CANVAS_COOL@", &hex(token::color::CANVAS_COOL))
+    .replace("@ACCENT@", &hex(token::color::ACCENT))
+    .replace(
+        "@PROFILE_BACKGROUND@",
+        &hex(token::color::PROFILE_BACKGROUND),
+    )
+    .replace("@PROFILE_BORDER@", &hex(token::color::PROFILE_BORDER));
     let provider = gtk4::CssProvider::new();
     provider.load_from_string(&css);
     if let Some(display) = gtk4::gdk::Display::default() {

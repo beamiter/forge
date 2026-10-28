@@ -34,13 +34,13 @@ pub enum TerminalMode {
 }
 
 impl TerminalMode {
-    /// Public Block uses the existing continuous native surface; private
-    /// compatibility variants remain readable in old sessions and configs.
+    /// New public Block panes use the native command-card backend. Explicit
+    /// legacy Unified configuration remains continuous and keeps zone history.
     pub(crate) fn public_presentation(&self) -> Self {
-        if matches!(self, Self::Chat) {
-            Self::Chat
-        } else {
-            Self::Unified
+        match self {
+            Self::Chat => Self::Chat,
+            Self::Unified => Self::Unified,
+            Self::Block | Self::Vte => Self::Block,
         }
     }
 
@@ -4850,5 +4850,25 @@ session = "bad/session"
         let hosts = vec![valid; MAX_REMOTE_HOSTS + 1];
         assert!(checked_remote_host(&hosts, MAX_REMOTE_HOSTS - 1).is_ok());
         assert!(checked_remote_host(&hosts, MAX_REMOTE_HOSTS).is_err());
+    }
+}
+
+#[cfg(test)]
+mod developer_presentation_tests {
+    use super::TerminalMode;
+    #[test]
+    fn new_block_uses_cards_while_explicit_unified_keeps_its_backend() {
+        assert_eq!(
+            TerminalMode::Block.public_presentation(),
+            TerminalMode::Block
+        );
+        assert_eq!(TerminalMode::Chat.public_presentation(), TerminalMode::Chat);
+        assert_eq!(
+            TerminalMode::parse("unified")
+                .unwrap()
+                .public_presentation(),
+            TerminalMode::Unified
+        );
+        assert_eq!(TerminalMode::parse("vte"), Some(TerminalMode::Vte));
     }
 }

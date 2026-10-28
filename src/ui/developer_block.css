@@ -1,0 +1,64 @@
+/* Reference v2: only the native Block canvas. Chat and legacy Unified retain
+   their own presentation. Geometry never changes with completion state. */
+window.forge-window.reference-shell .developer-block-canvas,
+window.forge-window.reference-shell .developer-block-canvas .block-scroll,
+window.forge-window.reference-shell .developer-block-canvas .block-list { background:#091323; color:#d5deec; }
+window.forge-window.reference-shell .developer-block-canvas .block-scroll { margin:0; border:0; border-radius:0; }
+window.forge-window.reference-shell .developer-block-canvas .block-list { padding:12px 12px 0; }
+window.forge-window.reference-shell .developer-block-canvas .developer-command-card {
+  padding:0; border:0; border-radius:0; outline:0; background:transparent;
+  box-shadow:none; min-height:0; transition:background-color 100ms ease, border-color 100ms ease, box-shadow 100ms ease;
+}
+window.forge-window.reference-shell .developer-block-canvas .developer-card-body { border:1px solid #293c57; border-radius:10px; background:#0e1621; padding:0; }
+window.forge-window.reference-shell .developer-block-canvas .developer-command-card.block-success .developer-card-body { border-color:alpha(#39dda0,.30); }
+window.forge-window.reference-shell .developer-block-canvas .developer-command-card.block-failed .developer-card-body { border-color:alpha(#ff646f,.68); background:#141923; box-shadow:0 0 6px alpha(#ff646f,.07); }
+window.forge-window.reference-shell .developer-block-canvas .developer-command-card.block-selected .developer-card-body { outline:1px solid #4199ff; outline-offset:-1px; }
+window.forge-window.reference-shell .developer-block-canvas .developer-command-header { background:alpha(#101c30,.65); border-bottom:1px solid #24334a; }
+window.forge-window.reference-shell .developer-block-canvas .developer-command-header button { min-height:22px; min-width:22px; padding:0 3px; border-radius:5px; color:#91a4bf; }
+window.forge-window.reference-shell .developer-block-canvas .developer-command-header button:hover { background:#253852; }
+window.forge-window.reference-shell .developer-block-canvas .developer-command-header button:focus-visible { outline:1px solid #4199ff; }
+window.forge-window.reference-shell .developer-block-canvas .developer-command-icon { color:#a9c9fa; background:#20385d; border:1px solid #496bba; border-radius:6px; padding:0; }
+window.forge-window.reference-shell .developer-block-canvas .developer-command-status { font-size:10px; border-radius:5px; padding:2px 7px; background:#263349; color:#91a4bf; }
+window.forge-window.reference-shell .developer-block-canvas .block-success .developer-command-status { color:#39dda0; background:alpha(#39dda0,.12); }
+window.forge-window.reference-shell .developer-block-canvas .block-failed .developer-command-status { color:#ff646f; background:alpha(#ff646f,.12); }
+window.forge-window.reference-shell .developer-block-canvas .developer-command-elapsed { font-size:9px; color:#91a4bf; }
+window.forge-window.reference-shell .developer-block-canvas .developer-command-terminal { background:transparent; padding:0; margin:0; }
+window.forge-window.reference-shell .developer-block-canvas .developer-command-output { background:#0e1621; }
+window.forge-window.reference-shell .developer-block-canvas .developer-output-gutter { color:#637d9c; }
+window.forge-window.reference-shell .developer-block-canvas .block-active { margin:0; padding:0; background:#0e1621; border:1px solid #293c57; border-radius:10px; outline:0; box-shadow:none; }
+window.forge-window.reference-shell .reference-developer-active .reference-canvas-header { background:#101c30; border-color:#293c57; color:#d5deec; }
+window.forge-window.reference-shell .reference-developer-active .reference-canvas-title { color:#d5deec; }
+window.forge-window.reference-shell .reference-developer-active .reference-canvas-subtitle { color:#91a4bf; }
+window.forge-window.reference-shell .reference-developer-active .reference-canvas-header button { color:#91a4bf; }
+window.forge-window.reference-shell .reference-developer-active .reference-block-composer { background:#172338; border-color:#293c57; color:#91a4bf; box-shadow:none; }
+window.forge-window.reference-shell .reference-developer-active .reference-block-composer button,
+window.forge-window.reference-shell .reference-developer-active .reference-block-composer label { color:#91a4bf; }
+window.forge-window.reference-shell .developer-block-canvas .block-active.developer-running { border-color:#4199ff; box-shadow:0 0 7px alpha(#4199ff,.18); }
+window.forge-window.reference-shell .developer-block-canvas .developer-running-header .developer-command-status { color:#4199ff; background:alpha(#4199ff,.12); }
+window.forge-window.reference-shell .developer-block-canvas .developer-running-command { color:#d5deec; }
+
+window.forge-window.reference-shell .developer-live-toolbar { background:#101c30; border-bottom:1px solid #293c57; padding:0 12px; color:#91a4bf; }
+window.forge-window.reference-shell .developer-live-toolbar label { font-size:12px; color:#91a4bf; }
+window.forge-window.reference-shell .developer-live-toolbar button { min-width:24px; min-height:24px; padding:0; color:#91a4bf; }
+
+/* New Block dock only. Native prompt clip is the sole editor; while a command
+   runs, it returns to its card and the footer states that input authority. */
+window.forge-window.reference-shell .reference-developer-active .reference-canvas-header { min-height:41px; }
+window.forge-window.reference-shell .developer-docked-input .chat-canvas { background:#091323; }
+window.forge-window.reference-shell .developer-docked-input .chat-live-anchor { padding:0; margin:0; border:0; min-height:0; background:transparent; box-shadow:none; }
+window.forge-window.reference-shell .developer-docked-input .chat-dock,
+window.forge-window.reference-shell .developer-docked-input .chat-dock.chat-dock-compact { margin:0 12px 8px; padding:7px 0; min-height:52px; border:1px solid #293c57; border-radius:12px; background:#172338; box-shadow:none; }
+window.forge-window.reference-shell .developer-docked-input .chat-composer,
+window.forge-window.reference-shell .developer-docked-input .chat-composer.block-compact { margin:0; padding:0; min-height:0; border:0; background:transparent; box-shadow:none; }
+window.forge-window.reference-shell .developer-docked-input .chat-composer-card:focus-within { border-color:#4199ff; box-shadow:0 0 0 1px alpha(#4199ff,.12); }
+window.forge-window.reference-shell .developer-docked-input .reference-composer-controls { min-height:28px; margin-top:0; padding:0 10px; background:transparent; }
+window.forge-window.reference-shell .developer-docked-input .reference-composer-controls button,
+window.forge-window.reference-shell .developer-docked-input .reference-composer-controls menubutton > button,
+window.forge-window.reference-shell .developer-docked-input .reference-unavailable-tool { min-height:26px; padding:0 6px; border:1px solid #344864; border-radius:7px; background:#19283c; color:#91a4bf; }
+window.forge-window.reference-shell .developer-docked-input .reference-unavailable-tool button { border:0; padding:0; background:transparent; }
+window.forge-window.reference-shell .developer-docked-input .reference-composer-controls label { color:#91a4bf; }
+window.forge-window.reference-shell .developer-docked-input .reference-composer-controls button:disabled { opacity:1; filter:none; color:#91a4bf; }
+window.forge-window.reference-shell .developer-docked-input .reference-composer-controls .chat-submit { background:#366fdd; border-color:#4c8af2; color:#eff6ff; }
+window.forge-window.reference-shell .developer-docked-input .reference-composer-controls .chat-stop { color:#ff8d95; }
+window.forge-window.reference-shell .developer-dock-input-hint { margin:0 12px 4px; color:#91a4bf; font-size:12px; }
+window.forge-window.reference-shell .developer-block-canvas .sticky-running-header { background:#172338; border:1px solid #293c57; color:#91a4bf; }
