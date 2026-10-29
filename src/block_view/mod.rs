@@ -841,10 +841,9 @@ impl TypedShadowFidelity {
     }
 }
 
-/// Stand-in command line for a shell that told us it *had* a command but could
-/// not fit it in its OSC 133 packet, and whose echo the VTE read missed. Kept
-/// distinct from the "(command capture unavailable)" placeholder: this one is a
-/// bounded-packet outcome, not a capture race.
+/// Stand-in for an explicit shell truncation report or a measured command /
+/// shadow byte cap. A refused native range has no measured command length and
+/// uses the separate unavailable placeholder instead.
 const TRUNCATED_COMMAND_PLACEHOLDER: &str = "(command too long for shell integration)";
 const UNAVAILABLE_COMMAND_PLACEHOLDER: &str = "(command capture unavailable)";
 const MAX_COMMAND_CAPTURE_BYTES: usize = jterm_core::review_input::MAX_REVIEW_INPUT_BYTES;
@@ -8943,8 +8942,12 @@ impl ReaderCtx {
                 .capture_text_range(start_row, start_col, cmd_end_row, cmd_end_col)
                 .map(|text| bounded_command_text(&text))
                 .unwrap_or_default()
-        } else {
+        } else if meta.command_truncated {
             TRUNCATED_COMMAND_PLACEHOLDER.to_string()
+        } else {
+            // A rejected native range may be inverted after reflow or exceed
+            // the extraction budget. Neither proves the command was too long.
+            UNAVAILABLE_COMMAND_PLACEHOLDER.to_string()
         };
         let deferred = self.post_prompt_bytes_rc.borrow_mut().take_vec();
         if !deferred.is_empty() {
@@ -25261,6 +25264,18 @@ mod tests {
     }
 
     #[test]
+    fn measured_command_byte_overflow_still_reports_truncation() {
+        let at_limit = "x".repeat(MAX_COMMAND_CAPTURE_BYTES);
+        assert_eq!(super::bounded_command_text(&at_limit), at_limit);
+        let over_limit = "界".repeat(MAX_COMMAND_CAPTURE_BYTES / "界".len() + 1);
+        assert!(over_limit.len() > MAX_COMMAND_CAPTURE_BYTES);
+        assert_eq!(
+            super::bounded_command_text(&over_limit),
+            TRUNCATED_COMMAND_PLACEHOLDER
+        );
+    }
+
+    #[test]
     fn command_capture_range_is_rejected_before_a_large_vte_allocation() {
         assert!(command_capture_range_is_bounded(10, 10, 120));
         assert!(!command_capture_range_is_bounded(10, 9, 120));
@@ -31673,11 +31688,88 @@ mod tests {
                 .map(|fan_out| fan_out.event.clone())
                 .collect::<Vec<_>>(),
             vec![CommandStartedEvent {
-                command: TRUNCATED_COMMAND_PLACEHOLDER.to_string(),
+                command: UNAVAILABLE_COMMAND_PLACEHOLDER.to_string(),
                 // This shell reported no cwd, so the pane's own answer fills in.
                 cwd: Some(HARNESS_CWD.to_string()),
             }]
         );
+    }
+
+    #[test]
+    fn refused_native_capture_preserves_shell_metadata_and_reason_provenance() {
+        for inverted in [true, false] {
+            for (command, truncated, expected, source) in [
+                (
+                    None,
+                    false,
+                    UNAVAILABLE_COMMAND_PLACEHOLDER,
+                    super::CommandTextSource::Screen,
+                ),
+                (
+                    None,
+                    true,
+                    TRUNCATED_COMMAND_PLACEHOLDER,
+                    super::CommandTextSource::ScreenAfterTruncation,
+                ),
+                (
+                    Some("printf exact"),
+                    false,
+                    "printf exact",
+                    super::CommandTextSource::ShellReported,
+                ),
+                (
+                    Some("untrusted prefix"),
+                    true,
+                    TRUNCATED_COMMAND_PLACEHOLDER,
+                    super::CommandTextSource::ScreenAfterTruncation,
+                ),
+            ] {
+                let harness = ReaderHarness::new();
+                let (anchor_row, end_row) = if inverted { (9, 3) } else { (0, 2499) };
+                if !inverted {
+                    harness.backend.set_row_count(2600);
+                    harness.backend.set_columns(100, 120);
+                }
+                harness.backend.render_row(anchor_row, "$ ");
+                harness.feed_all([
+                    ParserEvent::PromptStart,
+                    bytes("$ "),
+                    ParserEvent::PromptEnd,
+                ]);
+                harness.backend.render_row(end_row, "native tail");
+                harness.backend.take_calls();
+
+                harness.feed(ParserEvent::CommandStart(CommandMeta {
+                    command: command.map(str::to_string),
+                    command_truncated: truncated,
+                    ..CommandMeta::default()
+                }));
+
+                let calls = harness.backend.take_calls();
+                assert!(
+                    !calls
+                        .iter()
+                        .any(|call| matches!(call, Call::Query(Query::CaptureTextRange { .. }))),
+                    "a refused range must never be read"
+                );
+                assert_eq!(
+                    calls
+                        .iter()
+                        .filter(|call| matches!(
+                            call,
+                            Call::Query(Query::CommandCaptureAnchor { .. })
+                        ))
+                        .count(),
+                    1
+                );
+                assert_eq!(harness.ctx.engine.borrow().pending_command_source, source);
+                assert_eq!(harness.bstate.get(), BlockState::CollectingOutput);
+                let started = harness.commands_started.borrow();
+                assert_eq!(started.len(), 1);
+                assert_eq!(started[0].event.command, expected);
+                assert!(harness.commands_finished.borrow().is_empty());
+            }
+        }
     }
 
     /// The anchor captured at PromptEnd is a *text-buffer* row, and the buffer
