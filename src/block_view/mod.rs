@@ -9684,7 +9684,7 @@ fn notification_allowed(last: Option<std::time::Instant>, now: std::time::Instan
 /// Signal subscriptions exist only until this one deferred focus request is
 /// consumed. Neither the idle nor the observers keep a pane/window alive.
 struct DeferredLiveFocus {
-    target: glib::WeakRef<Terminal>,
+    target: glib::WeakRef<gtk4::Widget>,
     window: glib::WeakRef<gtk4::Window>,
     initial_owner: glib::WeakRef<gtk4::Widget>,
     superseded: Rc<Cell<bool>>,
@@ -9704,11 +9704,12 @@ impl Drop for DeferredLiveFocus {
 }
 
 impl DeferredLiveFocus {
-    fn new(target: &Terminal) -> Option<Self> {
+    fn new(target: &impl IsA<gtk4::Widget>) -> Option<Self> {
+        let target = target.as_ref();
         if !target.has_focus() || !target.is_mapped() {
             return None;
         }
-        Self::capture(target, target.upcast_ref())
+        Self::capture(target, target)
     }
 
     /// Clipboard requests may originate on this pane's completed history or
@@ -9724,7 +9725,8 @@ impl DeferredLiveFocus {
         Self::capture(target, &owner)
     }
 
-    fn capture(target: &Terminal, owner: &gtk4::Widget) -> Option<Self> {
+    fn capture(target: &impl IsA<gtk4::Widget>, owner: &gtk4::Widget) -> Option<Self> {
+        let target = target.as_ref();
         let window = target.root().and_downcast::<gtk4::Window>()?;
         let initial_owner = owner.downgrade();
         let superseded = Rc::new(Cell::new(false));
@@ -9790,7 +9792,7 @@ impl DeferredLiveFocus {
 /// intervening owner: even an owner that disappears before idle retires this
 /// request. A temporary unroot/remap in the same window remains eligible;
 /// moving to another root, staying hidden, or disposal does not.
-pub(crate) fn restore_live_focus_deferred(target: &Terminal) {
+pub(crate) fn restore_live_focus_deferred(target: &impl IsA<gtk4::Widget>) {
     if let Some(request) = DeferredLiveFocus::new(target) {
         request.defer();
     }
@@ -15223,6 +15225,20 @@ impl TermView {
                 } else {
                     compact_card_rows
                 };
+                let editor_budget = chat_surface
+                    .filter(|surface| surface.composer_docked())
+                    .map(|_| {
+                        chat::editor_height_budget(
+                            cell_h,
+                            blocks::terminal_vertical_insets(&vte),
+                            viewport_rows,
+                            viewport_height_px(&vte, &scroll),
+                        )
+                    });
+                let compact_rows = |input, drawn, viewport| {
+                    let rows = compact_rows(input, drawn, viewport);
+                    editor_budget.map_or(rows, |budget| rows.max(budget.minimum_rows))
+                };
                 let target_rows = if idle && !prompt_at_grid_top && !chat_passthrough {
                     compact_rows(input_rows, 1, viewport_rows)
                 } else {
@@ -15362,6 +15378,11 @@ impl TermView {
                             } else {
                                 1
                             };
+                            let drawn = if editor_budget.is_some() {
+                                chat::editor_caret_rows(&vte).map_or(drawn, |rows| drawn.max(rows))
+                            } else {
+                                drawn
+                            };
                             let rows = compact_rows(input_rows, drawn, viewport_rows);
                             // Preserve the compact input height across
                             // CommandStart. Until output begins, VTE's cursor and
@@ -15382,6 +15403,9 @@ impl TermView {
                 if let Ok(live) = active_block.try_borrow() {
                     live.set_live_geometry(cell_h, target_rows, visible_rows);
                 };
+                if let (Some(chat), Some(budget)) = (&chat_presentation, editor_budget) {
+                    chat.size_editor(&vte, budget);
+                }
 
                 // Re-fit already-visible finished blocks to the resized pane.
                 // Blocks that scroll off and back are handled by their own map
@@ -19693,31 +19717,59 @@ impl TermView {
                 "gtk_scale_factor":self.active_vte.scale_factor(),
             })
         });
-        #[allow(deprecated)]
         let native_geometry = {
             let clip = self.active.borrow().live_clip();
             let vte = &self.active_vte;
-            let cursor = vte.cursor_position();
             let top = vte.vadjustment().map(|value| value.value()).unwrap_or(0.0);
-            let style = vte.style_context();
-            let padding = style.padding();
-            let border = style.border();
-            let point = vte.compute_point(
-                &clip,
-                &gtk4::graphene::Point::new(
-                    (cursor.0 * vte.char_width()) as f32
-                        + f32::from(padding.left() + border.left()),
-                    ((cursor.1 as f64 - top) * vte.char_height() as f64) as f32
-                        + f32::from(padding.top() + border.top()),
-                ),
-            );
+            let calibrated_caret = chat::editor_caret_point(vte);
+            let point = calibrated_caret.and_then(|(_, point)| vte.compute_point(&clip, &point));
             let bounds =
                 |rect: gtk4::graphene::Rect| [rect.x(), rect.y(), rect.width(), rect.height()];
+            let mut pending = vec![self.root.clone().upcast::<gtk4::Widget>()];
+            let mut dock_bounds = None;
+            while let Some(widget) = pending.pop() {
+                if widget.has_css_class("chat-dock") && widget.is_mapped() {
+                    dock_bounds = widget.compute_bounds(&self.root).map(bounds);
+                    break;
+                }
+                let mut child = widget.first_child();
+                while let Some(widget) = child {
+                    child = widget.next_sibling();
+                    pending.push(widget);
+                }
+            }
+            let mut parent = vte.parent();
+            let mut editor = None;
+            while let Some(widget) = parent {
+                if widget.has_css_class("chat-composer-viewport") {
+                    editor = widget.downcast::<gtk4::ScrolledWindow>().ok();
+                    break;
+                }
+                parent = widget.parent();
+            }
+            let editor_geometry = editor.filter(|editor| editor.is_mapped()).map(|editor| {
+                let viewport_bounds = editor.compute_bounds(&self.root);
+                let intersection = viewport_bounds
+                    .and_then(|viewport| clip.compute_bounds(&self.root)?.intersection(&viewport))
+                    .and_then(|visible| vte.compute_bounds(&self.root)?.intersection(&visible));
+                let adjustment = editor.vadjustment();
+                serde_json::json!({
+                    "viewport":viewport_bounds.map(bounds),
+                    "actual_editable_clip":intersection.map(bounds),
+                    "maximum_content_height":editor.max_content_height(),
+                    "adjustment":[adjustment.lower(),adjustment.value(),adjustment.upper(),adjustment.page_size()],
+                    "visible_native_rows":intersection.map(|rect|((rect.height() as i32-blocks::terminal_vertical_insets(vte)).max(0)/(vte.char_height().max(1) as i32)) as i64),
+                    "cursor_in_viewport":point.and_then(|point|clip.compute_point(&editor,&point)).map(|point|[point.x(),point.y(),vte.char_width() as f32,vte.char_height() as f32]),
+                })
+            });
             serde_json::json!({
                 "clip":clip.compute_bounds(&self.root).map(bounds),
                 "native":vte.compute_bounds(&clip).map(bounds),
                 "native_top_row":top,
+                "native_screen_origin":calibrated_caret.map(|(origin,_)|origin),
                 "cursor_cell":point.map(|p|[p.x(),p.y(),vte.char_width() as f32,vte.char_height() as f32]),
+                "editor":editor_geometry,
+                "composer_dock":dock_bounds,
             })
         };
         let outputs: Vec<_> = finished.iter().filter(|card| card.output_vte.is_mapped()).map(|card| {
@@ -33303,18 +33355,22 @@ mod tests {
             let replies = Rc::new(RefCell::new(Vec::<String>::new()));
             let seen = replies.clone();
             native.connect_commit(move |_, text, _| seen.borrow_mut().push(text.to_string()));
-            for count in [4, 80] {
+            for count in [1, 4, 10, 80] {
                 native.reset(true, true);
-                *view.typed_cmd.borrow_mut() = (0..count)
+                let expected_input = (0..count)
                     .map(|i| format!("line-{i:03}"))
                     .collect::<Vec<_>>()
                     .join("\n");
                 let output = format!(
                     "\x1b[2J\x1b[H\x1b]133;A\x07> \x1b]133;B\x07{}",
-                    view.typed_cmd.borrow().replace('\n', "\r\n")
+                    expected_input.replace('\n', "\r\n")
                 );
                 view.pty.write_test_slave(output.as_bytes());
                 settle();
+                // OSC PromptEnd intentionally clears the editor shadow. Seed
+                // this geometry fixture after those real parser transitions;
+                // keep the original coalesced native prompt/text bytes above.
+                *view.typed_cmd.borrow_mut() = expected_input.clone();
                 for (width, height) in [(1129, 844), (813, 607), (1129, 844)] {
                     window.set_default_size(width, height);
                     settle();
@@ -33334,6 +33390,13 @@ mod tests {
                         native.column_count(),
                         i64::from(view.pty.test_slave_winsize().0)
                     );
+                    assert_eq!(
+                        *view.typed_cmd.borrow(),
+                        expected_input,
+                        "editor height and resize never alter input bytes before the CPR oracle"
+                    );
+                    let shadow_before_oracle = view.typed_cmd.borrow().clone();
+                    let native_text_before_oracle = native.text_format(vte4::Format::Text);
                     replies.borrow_mut().clear();
                     // The terminal itself answers screen-relative CPR. Do not
                     // mix absolute ring cursor rows with rebased adjustment.
@@ -33350,6 +33413,21 @@ mod tests {
                             Some((row.parse::<i64>().ok()?, col.parse::<i64>().ok()?))
                         })
                         .expect("native screen-relative CPR response");
+                    // This synthetic DSR feed invokes the application's same
+                    // commit observer as native keyboard input. Preserve its
+                    // evidence, then restore only this explicitly seeded test
+                    // shadow for the next resize; neither terminal nor PTY is
+                    // written/reset here. Production byte integrity is also
+                    // exercised separately through the actual Bash process.
+                    eprintln!(
+                        "{mode:?} {count} rows: CPR oracle shadow effect={:?}",
+                        *view.typed_cmd.borrow()
+                    );
+                    assert_eq!(
+                        native.text_format(vte4::Format::Text),
+                        native_text_before_oracle
+                    );
+                    *view.typed_cmd.borrow_mut() = shadow_before_oracle;
                     #[allow(deprecated)]
                     let (padding, border) = {
                         let style = native.style_context();
@@ -33366,6 +33444,46 @@ mod tests {
                     let viewport = native
                         .ancestor(gtk4::ScrolledWindow::static_type())
                         .unwrap();
+                    let editor = viewport.downcast_ref::<gtk4::ScrolledWindow>().unwrap();
+                    if let Some(adapter) = editor.child().and_downcast::<gtk4::Viewport>() {
+                        eprintln!(
+                            "{mode:?} {count} rows: editor adjustment={:?}, adapter adjustment={:?}, shared={}, scroll_to_focus={}, child_bounds={:?}",
+                            (editor.vadjustment().value(), editor.vadjustment().upper(), editor.vadjustment().page_size()),
+                            adapter.vadjustment().map(|value|(value.value(),value.upper(),value.page_size())),
+                            adapter.vadjustment().as_ref()==Some(&editor.vadjustment()),
+                            adapter.is_scroll_to_focus(),
+                            adapter.child().and_then(|child|child.compute_bounds(&adapter)),
+                        );
+                    }
+                    let budget = super::chat::editor_height_budget(
+                        native.char_height() as i32,
+                        super::blocks::terminal_vertical_insets(&native),
+                        super::viewport_rows_for(&native, &view.block_scroll).unwrap(),
+                        super::viewport_height_px(&native, &view.block_scroll),
+                    );
+                    assert!(
+                        viewport.height() <= budget.maximum_height + 1,
+                        "{mode:?} {count} lines: actual editor {} exceeds canvas-derived cap {}",
+                        viewport.height(),
+                        budget.maximum_height
+                    );
+                    if count == 1 {
+                        let visible = clip
+                            .compute_bounds(&viewport)
+                            .unwrap()
+                            .intersection(&gtk4::graphene::Rect::new(
+                                0.0,
+                                0.0,
+                                viewport.width() as f32,
+                                viewport.height() as f32,
+                            ))
+                            .unwrap();
+                        assert!(
+                            visible.height() >= super::chat::EDITOR_MIN_HEIGHT_PX as f32,
+                            "{mode:?}: the real clip/viewport intersection is {}px, not dock decoration",
+                            visible.height()
+                        );
+                    }
                     let editor = native.compute_point(&viewport, &cursor).unwrap();
                     assert!(
                         local.y() >= -1.0
@@ -34160,6 +34278,45 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires DISPLAY; real GtkText ownership and remapping"]
+    fn deferred_live_focus_preserves_actual_gtk_text_owner_and_newer_owner() {
+        use gtk4::prelude::*;
+        gtk4::init().unwrap();
+        let entry = gtk4::Entry::new();
+        let other = gtk4::Entry::new();
+        other.set_can_focus(false);
+        let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        root.append(&entry);
+        root.append(&other);
+        let window = gtk4::Window::builder().child(&root).build();
+        window.present();
+        chat_display_settle();
+        assert!(entry.grab_focus());
+        let owner = GtkWindowExt::focus(&window).expect("Entry has a real native owner");
+        assert!(&owner == entry.upcast_ref::<gtk4::Widget>() || owner.is_ancestor(&entry));
+        super::restore_live_focus_deferred(&owner);
+        GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+        entry.set_visible(false);
+        entry.set_visible(true);
+        GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+        drain_native_focus_idle();
+        assert_eq!(GtkWindowExt::focus(&window).as_ref(), Some(&owner));
+
+        super::restore_live_focus_deferred(&owner);
+        other.set_can_focus(true);
+        assert!(other.grab_focus());
+        let newer = GtkWindowExt::focus(&window).unwrap();
+        assert_ne!(owner, newer);
+        GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+        drain_native_focus_idle();
+        assert!(
+            GtkWindowExt::focus(&window).is_none(),
+            "a retired newer owner still supersedes restoration"
+        );
+        window.close();
+    }
+
+    #[test]
     #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
     fn deferred_live_focus_restores_empty_owner_after_prompt_end_and_alt_exit() {
         use gtk4::prelude::*;
@@ -34423,10 +34580,11 @@ mod tests {
         chat_display_settle();
         let large = chat.pty.test_slave_winsize();
         let viewport = chat_display_widget(chat.root.upcast_ref(), "chat-composer-viewport");
-        assert!(
-            viewport.height() > 300,
-            "exercise a genuinely tall composer"
-        );
+        // The previous product contract allowed this editor to exceed 300px.
+        // The bounded editor now keeps history available even for 80 rows;
+        // retain the tail/caret and input-integrity assertions below.
+        assert!(viewport.height() >= super::chat::EDITOR_MIN_HEIGHT_PX);
+        assert!(viewport.height() <= super::chat::EDITOR_MAX_HEIGHT_PX);
         window.set_default_size(1200, 360);
         chat_display_settle();
         assert!(

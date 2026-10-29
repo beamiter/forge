@@ -5,6 +5,9 @@ window.reference-shell decoration { border: 0; padding: 0; margin: 0; border-rad
 .reference-shell .reference-toolbar { padding: 0 10px; min-height: @TITLEBAR_HEIGHT@px; }
 .reference-shell .reference-toolbar button { color: #c5d1e5; min-height: 26px; min-width: 22px; padding: 0 5px; border-radius: 7px; }
 .reference-shell .reference-toolbar .window-control { min-width: 16px; min-height: 16px; padding: 0; border: 1px solid #35445d; }
+.reference-shell .reference-toolbar button.reference-inspector-toggle { min-width: 26px; min-height: 26px; padding: 0; border: 1px solid transparent; }
+.reference-shell .reference-toolbar button.reference-inspector-toggle:checked { color: #dce7ff; background: #283d6f; border-color: #466296; }
+.reference-shell .reference-inspector-drawer { box-shadow: -6px 0 18px alpha(#030914,.25); }
 .reference-shell .reference-product { font-size: 12px; font-weight: 700; margin: 0 10px 0 4px; }
 .reference-shell .reference-toolbar-path { font-size: 10px; color: #a7b8d3; }
 .reference-shell .reference-search { border: 1px solid #303d54; background: #192437; margin: 0; padding: 0 8px; min-height: @SEARCH_INNER_HEIGHT@px; border-radius: 7px; color: #a9bad2; }

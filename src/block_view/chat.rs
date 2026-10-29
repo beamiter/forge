@@ -9,7 +9,7 @@ use gtk4::{glib, Orientation};
 use jterm_core::chat_mode::{resolve_surface, ChatSessionState, ChatSurface};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use vte4::Terminal;
+use vte4::{Terminal, TerminalExt};
 
 pub(super) const COMMAND_GAP_PX: i32 = 8;
 /// Native role icon sets the minimum height of every observed Shell header.
@@ -23,6 +23,126 @@ pub(super) const fn card_extra_height(is_background: bool) -> i32 {
 /// independently guarded overlay, never a reserved native input row.
 pub(super) fn composer_rows(input: i64, drawn: i64, viewport: i64) -> i64 {
     input.max(drawn).clamp(1, viewport.max(1))
+}
+
+pub(super) const EDITOR_MIN_HEIGHT_PX: i32 = 72;
+pub(super) const EDITOR_MAX_HEIGHT_PX: i32 = 220;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct EditorHeightBudget {
+    pub minimum_rows: i64,
+    pub maximum_height: i32,
+}
+
+/// Budget the real native editor, rather than adding decorative dock padding.
+/// The source is the independently measured canvas budget used by the PTY;
+/// the current dock allocation must never become an input to this function.
+pub(super) fn editor_height_budget(
+    cell_height: i32,
+    terminal_insets: i32,
+    available_rows: i64,
+    available_height: i32,
+) -> EditorHeightBudget {
+    let cell = cell_height.max(1);
+    let insets = terminal_insets.max(0);
+    let available_rows = available_rows.clamp(1, i32::MAX as i64);
+    let cap = (available_height.max(0).saturating_mul(2) / 5)
+        .min(EDITOR_MAX_HEIGHT_PX)
+        .max(cell.saturating_add(insets));
+    let cap_rows = i64::from((cap.saturating_sub(insets) / cell).max(1)).min(available_rows);
+    let preferred_rows = i64::from(
+        EDITOR_MIN_HEIGHT_PX
+            .saturating_sub(insets)
+            .saturating_add(cell - 1)
+            / cell,
+    )
+    .max(1);
+    EditorHeightBudget {
+        minimum_rows: preferred_rows.min(cap_rows),
+        maximum_height: (cap_rows as i32)
+            .saturating_mul(cell)
+            .saturating_add(insets),
+    }
+}
+
+fn screen_caret_row(cursor_row: i64, displayed_origin: i64, native_rows: i64) -> Option<i64> {
+    let row = cursor_row.checked_sub(displayed_origin)?;
+    (0..native_rows).contains(&row).then_some(row)
+}
+
+/// Cursor positions use absolute ring rows; VTE's adjustment can be rebased.
+/// Reuse the existing displayed-text/ring calibration, and decline to invent
+/// coordinates while history is being read or no screen origin is provable.
+pub(super) fn editor_caret_point(terminal: &Terminal) -> Option<(i64, gtk4::graphene::Point)> {
+    let (origin, row) = editor_screen_caret(terminal)?;
+    let cursor = terminal.cursor_position();
+    #[allow(deprecated)]
+    let (padding, border) = {
+        let style = terminal.style_context();
+        (style.padding(), style.border())
+    };
+    Some((
+        origin,
+        gtk4::graphene::Point::new(
+            (cursor.0 * terminal.char_width()) as f32 + f32::from(padding.left() + border.left()),
+            (row * terminal.char_height()) as f32 + f32::from(padding.top() + border.top()),
+        ),
+    ))
+}
+
+fn editor_screen_caret(terminal: &Terminal) -> Option<(i64, i64)> {
+    let origin = super::displayed_live_origin(terminal)?;
+    let row = screen_caret_row(terminal.cursor_position().1, origin, terminal.row_count())?;
+    Some((origin, row))
+}
+
+/// Include a blank trailing caret row as well as the prompt's drawn text.
+/// The extent is admitted only in the independently calibrated screen domain.
+pub(super) fn editor_caret_rows(terminal: &Terminal) -> Option<i64> {
+    editor_screen_caret(terminal).map(|(_, row)| row.saturating_add(1))
+}
+
+/// Reveal the native caret inside the bounded editor without moving history
+/// or scrolling the terminal's own ring. Coordinates come from the actual VTE
+/// allocation and its adjustment, including the terminal's computed CSS box.
+fn reveal_editor_caret(terminal: &Terminal, viewport: &gtk4::ScrolledWindow) {
+    if !viewport.is_mapped() || viewport.height() <= 0 {
+        return;
+    }
+    let Some((_, point)) = editor_caret_point(terminal) else {
+        return;
+    };
+    let Some(point) = terminal.compute_point(viewport, &point) else {
+        return;
+    };
+    let adjustment = viewport.vadjustment();
+    let next = caret_scroll_value(
+        adjustment.value(),
+        point.y() as f64,
+        terminal.char_height().max(1) as f64,
+        viewport.height() as f64,
+        adjustment.lower(),
+        adjustment.upper(),
+    );
+    if (next - adjustment.value()).abs() > f64::EPSILON {
+        adjustment.set_value(next);
+    }
+}
+
+fn caret_scroll_value(
+    current: f64,
+    caret_top: f64,
+    caret_height: f64,
+    viewport_height: f64,
+    lower: f64,
+    upper: f64,
+) -> f64 {
+    let displacement = if caret_top < 0.0 {
+        caret_top
+    } else {
+        (caret_top + caret_height - viewport_height).max(0.0)
+    };
+    (current + displacement).clamp(lower, (upper - viewport_height).max(lower))
 }
 
 pub(super) fn surface(state: BlockState, integrated: bool) -> ChatSurface {
@@ -320,6 +440,7 @@ pub(super) struct ChatPresentation {
     block_input_hint: Option<glib::WeakRef<gtk4::Label>>,
     command_generation: Cell<u64>,
     displayed_stop_target: Cell<Option<StopTarget>>,
+    reveal_editor: Rc<dyn Fn()>,
 }
 
 impl ChatPresentation {
@@ -362,6 +483,41 @@ impl ChatPresentation {
         composer_viewport.set_overflow(gtk4::Overflow::Hidden);
         composer_viewport.add_css_class("chat-composer-viewport");
         composer_viewport.set_child(Some(&composer));
+        // Native focus belongs to the tall VTE, not to its enclosing child
+        // widget bounds. Reveal only the caret, never that entire grid.
+        if let Some(viewport) = composer_viewport.child().and_downcast::<gtk4::Viewport>() {
+            viewport.set_scroll_to_focus(false);
+        }
+        // GtkViewport emits adjustment::changed while thawing notifications at
+        // the end of size_allocate, after allocating its child. Setting value
+        // there queues an allocation inside the allocation being completed:
+        // the numeric value can change while the child's transform stays old.
+        // Coalesce one idle after that stack returns; there is no polling tick.
+        let reveal_pending = Rc::new(Cell::new(false));
+        let terminal = active.active_vte.downgrade();
+        let editor = composer_viewport.downgrade();
+        let reveal_editor: Rc<dyn Fn()> = Rc::new(move || {
+            if reveal_pending.replace(true) {
+                return;
+            }
+            let pending = reveal_pending.clone();
+            let terminal = terminal.clone();
+            let editor = editor.clone();
+            glib::idle_add_local_once(move || {
+                pending.set(false);
+                if let (Some(terminal), Some(editor)) = (terminal.upgrade(), editor.upgrade()) {
+                    if terminal.is_mapped() && terminal.is_ancestor(&editor) {
+                        reveal_editor_caret(&terminal, &editor);
+                    }
+                }
+            });
+        });
+        let reveal = reveal_editor.clone();
+        composer_viewport
+            .vadjustment()
+            .connect_changed(move |_| reveal());
+        let reveal = reveal_editor.clone();
+        active.active_vte.connect_cursor_moved(move |_| reveal());
         dock.append(&composer_viewport);
         let block_input_hint = if root.has_css_class("developer-block-canvas") {
             let hint = gtk4::Label::new(Some("Input belongs to the running command"));
@@ -456,6 +612,7 @@ impl ChatPresentation {
             reparenting: Cell::new(false),
             command_generation: Cell::new(0),
             displayed_stop_target: Cell::new(None),
+            reveal_editor,
         }
     }
 
@@ -518,6 +675,18 @@ impl ChatPresentation {
             } else {
                 composer.remove_css_class("block-compact");
             }
+        }
+    }
+
+    pub(super) fn size_editor(&self, _terminal: &Terminal, budget: EditorHeightBudget) {
+        let Some(viewport) = self.composer_viewport.upgrade() else {
+            return;
+        };
+        if self.current.get().composer_docked() {
+            if viewport.max_content_height() != budget.maximum_height {
+                viewport.set_max_content_height(budget.maximum_height);
+            }
+            (self.reveal_editor)();
         }
     }
 
@@ -734,6 +903,57 @@ pub(super) fn viewport_height_for(vte: &Terminal) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn real_editor_minimum_uses_native_cell_height_and_bounded_canvas_budget() {
+        for cell in [13, 19, 21, 28, 42, 84] {
+            for insets in [0, 2, 10] {
+                let budget = editor_height_budget(cell, insets, 40, 800);
+                let minimum = budget.minimum_rows as i32 * cell + insets;
+                assert!(minimum >= EDITOR_MIN_HEIGHT_PX);
+                assert!(minimum - cell < EDITOR_MIN_HEIGHT_PX);
+                assert!(budget.maximum_height >= minimum);
+                assert!(budget.maximum_height <= EDITOR_MAX_HEIGHT_PX);
+            }
+        }
+        assert_eq!(
+            editor_height_budget(21, 0, 30, 600),
+            EditorHeightBudget {
+                minimum_rows: 4,
+                maximum_height: 210,
+            }
+        );
+        let short = editor_height_budget(21, 2, 4, 100);
+        assert_eq!(short.minimum_rows, 1);
+        assert_eq!(short.maximum_height, 23);
+        assert_eq!(editor_height_budget(21, 2, 1, 0), short);
+        // No previous editor/dock allocation participates in either bound.
+        assert_eq!(editor_height_budget(21, 0, 30, 300).maximum_height, 105);
+    }
+
+    #[test]
+    fn bounded_editor_reveals_caret_without_changing_native_ring_or_history() {
+        assert_eq!(caret_scroll_value(0.0, 10.0, 21.0, 84.0, 0.0, 300.0), 0.0);
+        assert_eq!(caret_scroll_value(0.0, 100.0, 21.0, 84.0, 0.0, 300.0), 37.0);
+        assert_eq!(
+            caret_scroll_value(90.0, -21.0, 21.0, 84.0, 0.0, 300.0),
+            69.0
+        );
+        assert_eq!(
+            caret_scroll_value(210.0, 80.0, 21.0, 84.0, 0.0, 300.0),
+            216.0
+        );
+        assert_eq!(caret_scroll_value(0.0, 100.0, 21.0, 84.0, 0.0, 20.0), 0.0);
+    }
+
+    #[test]
+    fn editor_caret_coordinates_require_a_proven_screen_origin() {
+        assert_eq!(screen_caret_row(209, 209, 25), Some(0));
+        assert_eq!(screen_caret_row(107, 100, 25), Some(7));
+        assert_eq!(screen_caret_row(7, 3, 25), Some(4));
+        assert_eq!(screen_caret_row(107, 110, 25), None);
+        assert_eq!(screen_caret_row(200, 100, 25), None);
+    }
 
     #[test]
     fn completion_presentation_survives_normal_and_coalesced_commands() {

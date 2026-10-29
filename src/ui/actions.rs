@@ -698,20 +698,22 @@ impl UiState {
         if tasks || chats {
             self.side_stack
                 .set_visible_child_name(if tasks { "tasks" } else { "chats" });
-            if self.ai_paned.end_child().is_none() {
+            if self.reference_inspector.parent().is_none() {
                 self.ai_paned.set_end_child(Some(&self.reference_inspector));
                 // Attaching after both panels were closed loses the Paned
                 // position; reapply the configured share like the AI path
                 // does (the tasks panel has no width config of its own).
-                self.ai_panel_width_restoring.set(true);
-                let requested_width = self.config.borrow().ai_panel_width;
-                apply_ai_panel_width(&self.ai_paned, requested_width);
-                let paned = self.ai_paned.clone();
-                let restoring = self.ai_panel_width_restoring.clone();
-                glib::idle_add_local_once(move || {
-                    apply_ai_panel_width(&paned, requested_width);
-                    glib::idle_add_local_once(move || restoring.set(false));
-                });
+                if !super::reference_shell::sync_inspector(self, false) {
+                    self.ai_panel_width_restoring.set(true);
+                    let requested_width = self.config.borrow().ai_panel_width;
+                    apply_ai_panel_width(&self.ai_paned, requested_width);
+                    let paned = self.ai_paned.clone();
+                    let restoring = self.ai_panel_width_restoring.clone();
+                    glib::idle_add_local_once(move || {
+                        apply_ai_panel_width(&paned, requested_width);
+                        glib::idle_add_local_once(move || restoring.set(false));
+                    });
+                }
             }
         } else {
             // Closing an optional feature returns to the neutral inspector;
@@ -722,10 +724,11 @@ impl UiState {
             ) {
                 self.side_stack.set_visible_child_name("overview");
             }
-            if self.ai_paned.end_child().is_none() {
+            if self.reference_inspector.parent().is_none() {
                 self.ai_paned.set_end_child(Some(&self.reference_inspector));
             }
         }
+        super::reference_shell::sync_inspector(self, false);
     }
 
     /// Show or hide the right-side AI chat panel. Persists the choice in
@@ -738,6 +741,7 @@ impl UiState {
         }
         self.set_ai_panel_visible(next, true);
         if self.ai_panel_visible.get() {
+            super::reference_shell::sync_inspector(self, true);
             self.ai_panel.focus_input();
         } else {
             self.focus_current_terminal();
@@ -753,6 +757,7 @@ impl UiState {
             return;
         }
         self.set_ai_panel_visible(true, true);
+        super::reference_shell::sync_inspector(self, true);
         self.ai_panel.focus_input();
     }
 
@@ -760,6 +765,9 @@ impl UiState {
     /// Paned. The idle retry covers startup, config reload, and re-showing the
     /// panel before the current layout pass has completed.
     pub(crate) fn restore_ai_panel_width(&self) {
+        if super::reference_shell::sync_inspector(self, false) {
+            return;
+        }
         if !self.ai_panel_visible.get() {
             return;
         }
@@ -781,6 +789,9 @@ impl UiState {
     /// Copy the currently allocated AI width into Config. Callers decide when
     /// to flush Config so drag notifications can be debounced into one write.
     pub(crate) fn capture_ai_panel_width(&self) -> bool {
+        if self.window.has_css_class("reference-shell") {
+            return false;
+        }
         if !self.ai_panel_visible.get() || self.ai_panel_width_restoring.get() {
             return false;
         }

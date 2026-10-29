@@ -232,6 +232,7 @@ impl UiState {
         self.agent_tasks.borrow_mut().panel_visible = visible;
         self.sync_side_panel();
         if visible {
+            super::reference_shell::sync_inspector(self, true);
             // Opening the panel (for example from the attention badge) shows
             // the ordinary views, never a hidden-tasks list left from before.
             self.tasks_panel.leave_hidden();

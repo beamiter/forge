@@ -9,6 +9,127 @@ use gtk4::{glib, Orientation};
 use jterm_core::developer_workspace as token;
 use std::rc::Rc;
 
+const INSPECTOR_CHROME_KEY: &str = "forge-reference-inspector-chrome";
+
+/// Window-owned visibility intent, independent of the optional AI/Tasks pages.
+/// The same inspector widget moves into a narrow-window drawer; its selected
+/// page, scroll position and domain objects therefore survive every toggle.
+struct InspectorChrome {
+    requested: std::cell::Cell<Option<bool>>,
+    actual: std::cell::Cell<bool>,
+    button: glib::WeakRef<gtk4::ToggleButton>,
+    frame: glib::WeakRef<gtk4::Overlay>,
+}
+
+impl InspectorChrome {
+    fn sync(&self, ui: &Rc<UiState>, width: i32, height: i32) {
+        let Some(frame) = self.frame.upgrade() else {
+            return;
+        };
+        let layout = token::Layout::for_size(width as f32, height as f32 + token::TITLEBAR_HEIGHT);
+        let inline = layout.inspector.is_some();
+        let usable = width >= 360 && height >= 120;
+        let inspector = &ui.reference_inspector;
+        let focus = gtk4::prelude::RootExt::focus(&ui.window);
+        let focused_inside = focus.as_ref().is_some_and(|focus| {
+            focus == inspector.upcast_ref::<gtk4::Widget>() || focus.is_ancestor(inspector)
+        });
+        if focused_inside && !inline && self.requested.get().is_none() {
+            // A responsive resize must not hide the user's focused editor.
+            self.requested.set(Some(true));
+        }
+        let visible = usable && self.requested.get().unwrap_or(inline);
+        let drawer = visible && !inline;
+        let in_drawer = inspector.parent().as_ref() == Some(frame.upcast_ref());
+        if drawer != in_drawer {
+            if in_drawer {
+                frame.remove_overlay(inspector);
+            } else if ui.ai_paned.end_child().as_ref() == Some(inspector.upcast_ref()) {
+                ui.ai_paned.set_end_child(None::<&gtk4::Widget>);
+            }
+            if drawer {
+                inspector.set_halign(gtk4::Align::End);
+                inspector.set_valign(gtk4::Align::Fill);
+                frame.add_overlay(inspector);
+                frame.set_measure_overlay(inspector, false);
+                inspector.add_css_class("reference-inspector-drawer");
+            } else {
+                inspector.set_halign(gtk4::Align::Fill);
+                inspector.remove_css_class("reference-inspector-drawer");
+                ui.ai_paned.set_end_child(Some(inspector));
+            }
+        }
+        inspector.set_width_request(if drawer {
+            (token::INSPECTOR_WIDTH as i32).min((width - 32).max(0))
+        } else {
+            token::INSPECTOR_WIDTH as i32
+        });
+        inspector.set_visible(visible);
+        if drawer != in_drawer && visible && focused_inside {
+            if let Some(focus) = &focus {
+                // Reparenting can synchronously assign GTK's scroll container
+                // as a fallback owner. Finish this same-window transfer before
+                // arming the existing guard; later user focus choices still win.
+                if focus.is_mapped() && focus.root().as_ref() == Some(ui.window.upcast_ref()) {
+                    focus.grab_focus();
+                    crate::block_view::restore_live_focus_deferred(focus);
+                }
+            }
+        }
+        if visible && inline {
+            ui.ai_paned
+                .set_position((ui.ai_paned.width() - token::INSPECTOR_WIDTH as i32).max(0));
+        }
+        self.actual.set(visible);
+        if let Some(button) = self.button.upgrade() {
+            let title = if visible {
+                "Hide right sidebar"
+            } else {
+                "Show right sidebar"
+            };
+            button.set_active(visible);
+            button.set_sensitive(usable);
+            button.set_tooltip_text(Some(if usable {
+                title
+            } else {
+                "Right sidebar needs a larger window"
+            }));
+            button.update_property(&[gtk4::accessible::Property::Label(title)]);
+            button.update_state(&[gtk4::accessible::State::Expanded(Some(visible))]);
+        }
+        if focused_inside && !visible {
+            ui.focus_current_terminal();
+        }
+    }
+}
+
+/// Optional AI/Tasks content shares the inspector slot, but its legacy width
+/// preference must never become a second writer of the common shell geometry.
+/// Only an explicit user Open action requests visibility; background syncing
+/// leaves a deliberately hidden inspector hidden.
+pub(crate) fn sync_inspector(ui: &UiState, reveal: bool) -> bool {
+    if !ui.window.has_css_class("reference-shell") {
+        return false;
+    }
+    let controller = unsafe {
+        ui.window
+            .data::<std::rc::Weak<InspectorChrome>>(INSPECTOR_CHROME_KEY)
+            .and_then(|ptr| ptr.as_ref().upgrade())
+    };
+    if let Some(controller) = controller {
+        if let (Some(frame), Some(ui)) = (
+            controller.frame.upgrade(),
+            ui_for_widget(ui.window.upcast_ref()),
+        ) {
+            if reveal {
+                controller.requested.set(Some(true));
+            }
+            controller.sync(&ui, frame.width(), frame.height());
+        }
+    }
+    true
+}
+
 fn active_mode(ui: &UiState) -> Option<TerminalMode> {
     ui.current_pane_leaf().map(|leaf| match leaf {
         super::PaneLeaf::Block(view) => view.terminal_mode(),
@@ -856,7 +977,23 @@ pub(crate) fn inspector(stack: &gtk4::Stack) -> gtk4::Box {
     });
     agent.set_active(true);
     root.append(&tabs);
-    root.append(stack);
+    // Live AI/Tasks pages contain native editors and legacy controls whose
+    // minimum size can exceed the inspector contract. Keep those widgets and
+    // their focus/drafts intact inside a bounded, scrollable host; the Paned
+    // must not steal canvas width when a page changes or a long label arrives.
+    let pages = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Automatic)
+        .vscrollbar_policy(gtk4::PolicyType::Automatic)
+        .min_content_width(0)
+        .max_content_width(1)
+        .propagate_natural_width(false)
+        .propagate_natural_height(false)
+        .hexpand(true)
+        .vexpand(true)
+        .child(stack)
+        .build();
+    pages.add_css_class("reference-inspector-pages");
+    root.append(&pages);
     root
 }
 
@@ -1102,6 +1239,18 @@ pub(crate) fn install(
     toolbar.append(&modes);
     sessions.set_valign(gtk4::Align::Center);
     toolbar.append(sessions);
+    let inspector_toggle = gtk4::ToggleButton::new();
+    inspector_toggle.set_child(Some(&vector_icon(
+        jterm_core::reference_icons::Icon::PanelRight,
+        16,
+    )));
+    inspector_toggle.add_css_class("reference-inspector-toggle");
+    inspector_toggle.set_size_request(token::CONTROL_HEIGHT as i32, token::CONTROL_HEIGHT as i32);
+    inspector_toggle.set_valign(gtk4::Align::Center);
+    inspector_toggle.set_focus_on_click(false);
+    inspector_toggle.set_tooltip_text(Some("Hide right sidebar"));
+    inspector_toggle.update_property(&[gtk4::accessible::Property::Label("Hide right sidebar")]);
+    toolbar.append(&inspector_toggle);
     add.set_valign(gtk4::Align::Center);
     let header_root = ui
         .notebook
@@ -1472,6 +1621,28 @@ pub(crate) fn install(
     let frame = gtk4::Overlay::new();
     frame.set_child(Some(&body));
     frame.set_vexpand(true);
+    let inspector_chrome = Rc::new(InspectorChrome {
+        requested: std::cell::Cell::new(None),
+        actual: std::cell::Cell::new(false),
+        button: inspector_toggle.downgrade(),
+        frame: frame.downgrade(),
+    });
+    unsafe {
+        ui.window
+            .set_data(INSPECTOR_CHROME_KEY, Rc::downgrade(&inspector_chrome));
+    }
+    let chrome_for_click = inspector_chrome.clone();
+    let ui_for_inspector = Rc::downgrade(ui);
+    inspector_toggle.connect_clicked(move |_| {
+        if let (Some(ui), Some(frame)) =
+            (ui_for_inspector.upgrade(), chrome_for_click.frame.upgrade())
+        {
+            chrome_for_click
+                .requested
+                .set(Some(!chrome_for_click.actual.get()));
+            chrome_for_click.sync(&ui, frame.width(), frame.height());
+        }
+    });
     let observer = gtk4::DrawingArea::new();
     observer.set_can_target(false);
     observer.set_focusable(false);
@@ -1485,6 +1656,7 @@ pub(crate) fn install(
     let path_for_resize = path.clone();
     let top_for_geometry = top.clone();
     let rail_for_geometry = rail.clone();
+    let chrome_for_resize = inspector_chrome.clone();
     observer.connect_resize(move |_, width, height| {
         let Some(ui) = ui_for_resize.upgrade() else {
             return;
@@ -1494,14 +1666,8 @@ pub(crate) fn install(
         palette_for_resize.set_width_request(if layout.inspector.is_some() { token::SEARCH_WIDTH as i32 } else { 180 });
         ui.sidebar
             .set_visible(layout.navigation.is_some() && ui.config.borrow().sidebar_visible);
-        ui.reference_inspector
-            .set_visible(layout.inspector.is_some());
+        chrome_for_resize.sync(&ui, width, height);
         content.set_position(token::NAVIGATION_WIDTH as i32);
-        if layout.inspector.is_some() {
-            let available = ui.ai_paned.width();
-            ui.ai_paned
-                .set_position((available - token::INSPECTOR_WIDTH as i32).max(0));
-        }
         if let Some(destination) = std::env::var_os("FORGE_REFERENCE_GEOMETRY") {
             let ui = Rc::downgrade(&ui);
             let top_for_geometry = top_for_geometry.clone();
@@ -1586,6 +1752,9 @@ pub(crate) fn install(
                 "composer":widget_with_class(ui.window.upcast_ref(), "chat-dock").or_else(|| widget_with_class(ui.window.upcast_ref(), "reference-block-composer")).and_then(|w| bounds(&w)),
             });
             snapshot["active_backend"] = serde_json::json!(active_mode(&ui).map(|mode| mode.as_str()));
+            snapshot["inspector_visible"] = serde_json::json!(ui.reference_inspector.is_mapped());
+            snapshot["inspector_drawer"] = serde_json::json!(ui.reference_inspector.has_css_class("reference-inspector-drawer"));
+            snapshot["inspector_toggle"] = widget_with_class_any(ui.window.upcast_ref(), "reference-inspector-toggle").map(|w| serde_json::json!({"bounds":bounds(&w),"tooltip":w.tooltip_text().map(|v|v.to_string()),"mapped":w.is_mapped(),"active":w.downcast_ref::<gtk4::ToggleButton>().map(|b|b.is_active())})).unwrap_or(serde_json::Value::Null);
             snapshot["native_grid_input"] = serde_json::json!(native_grid_input(&ui));
             snapshot["legacy_tools_visible"] = serde_json::json!(widget_with_class_any(ui.window.upcast_ref(), "reference-native-tools").is_some_and(|w| w.is_mapped()));
             if let Ok(bytes) = serde_json::to_vec_pretty(&snapshot) { let _ = std::fs::write(destination, bytes); }
@@ -1761,6 +1930,19 @@ pub(crate) fn install(
                             snapshot["tools_open"] = serde_json::json!(widget_with_class(ui.window.upcast_ref(), "reference-tools-popover").is_some());
                             snapshot["focused_widget"] = serde_json::json!(gtk4::prelude::RootExt::focus(&ui.window).map(|widget|widget.widget_name().to_string()));
                             snapshot["reference_role_fonts"] = reference_role_fonts(&ui);
+                            let toggle = widget_with_class_any(ui.window.upcast_ref(), "reference-inspector-toggle")
+                                .and_then(|widget| widget.downcast::<gtk4::ToggleButton>().ok());
+                            snapshot["reference_inspector"] = serde_json::json!({
+                                "visible":ui.reference_inspector.is_mapped(),
+                                "drawer":ui.reference_inspector.has_css_class("reference-inspector-drawer"),
+                                "bounds":ui.reference_inspector.compute_bounds(&ui.window).map(|r|[r.x(),r.y(),r.width(),r.height()]),
+                                "selected_page":ui.side_stack.visible_child_name().map(|v|v.to_string()),
+                                "focus_in_panel":gtk4::prelude::RootExt::focus(&ui.window).is_some_and(|w|w == *ui.reference_inspector.upcast_ref::<gtk4::Widget>() || w.is_ancestor(&ui.reference_inspector)),
+                                "focused_object":gtk4::prelude::RootExt::focus(&ui.window).map(|w|format!("{:p}",w.as_ptr())),
+                                "focused_type":gtk4::prelude::RootExt::focus(&ui.window).map(|w|w.type_().name().to_string()),
+                                "center":ui.notebook.parent().and_then(|w|w.compute_bounds(&ui.window)).map(|r|[r.x(),r.y(),r.width(),r.height()]),
+                                "toggle":toggle.map(|button|serde_json::json!({"bounds":button.compute_bounds(&ui.window).map(|r|[r.x(),r.y(),r.width(),r.height()]),"tooltip":button.tooltip_text().map(|v|v.to_string()),"active":button.is_active(),"sensitive":button.is_sensitive()})),
+                            });
                             snapshot["native_surface"] = native_surface_geometry(&ui);
                             snapshot["navigation_scroll"] = widget_with_class(ui.window.upcast_ref(), "reference-navigation-viewport")
                                 .and_then(|widget| widget.downcast::<gtk4::ScrolledWindow>().ok())

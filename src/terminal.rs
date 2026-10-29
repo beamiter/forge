@@ -174,7 +174,16 @@ pub(crate) fn apply_terminal_theme(terminal: &Terminal, config: &Config) {
         || terminal.has_css_class("chat-output-terminal")
     {
         terminal.set_color_foreground(&RGBA::new(0.145, 0.204, 0.294, 1.0));
-        terminal.set_color_background(&RGBA::new(0.0, 0.0, 0.0, 0.0));
+        // The host paints the light paper, so leave its alpha transparent.
+        // Its RGB still matters to ANSI inverse video: Readline uses SGR7
+        // for an active pasted region, whose foreground becomes this color.
+        let paper = jterm_core::reference_shell::color::COMPOSER;
+        terminal.set_color_background(&RGBA::new(
+            f32::from(paper[0]) / 255.0,
+            f32::from(paper[1]) / 255.0,
+            f32::from(paper[2]) / 255.0,
+            0.0,
+        ));
         terminal.set_color_cursor(Some(&RGBA::new(0.325, 0.475, 0.82, 1.0)));
     }
 }
