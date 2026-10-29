@@ -69,6 +69,7 @@ struct PreviewControls {
     mapped_frames: Cell<u8>,
     map_tick: RefCell<Option<gtk4::TickCallbackId>>,
     close_pending: Cell<bool>,
+    close_idle_pending: Cell<bool>,
     generation: Cell<u64>,
     matches: RefCell<Option<Matches>>,
     current: Cell<usize>,
@@ -117,6 +118,34 @@ impl PreviewControls {
             dialog.set_can_target(false);
             dialog.set_focus(None::<&gtk4::Widget>);
         }
+    }
+    /// Finish the mapped-frame barrier outside the frame's tick dispatch.
+    /// Adwaita1.5 can retain an opening tick across unmap, then add another on
+    /// remap. A native close inside our third tick is reopened by the remaining
+    /// internal tick later in that same frame. One coalesced idle lets every
+    /// opening callback finish without raising the existing frame threshold.
+    fn close_after_map_dispatch(self: &Rc<Self>) {
+        if self.close_idle_pending.replace(true) {
+            return;
+        }
+        let controls = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            let Some(controls) = controls.upgrade() else {
+                return;
+            };
+            controls.close_idle_pending.set(false);
+            let Some(dialog) = controls.dialog.upgrade() else {
+                return;
+            };
+            // A hidden/destroyed host or a new mapping has not crossed the
+            // native-ready barrier. Its next real map owns another request.
+            if controls.close_pending.get()
+                && dialog.is_mapped()
+                && controls.mapped_frames.get() >= 3
+            {
+                dialog.force_close();
+            }
+        });
     }
     fn clear(&self, message: &str) {
         self.matches.borrow_mut().take();
@@ -367,6 +396,7 @@ fn present_exact_preview(
         mapped_frames: Cell::new(0),
         map_tick: RefCell::new(None),
         close_pending: Cell::new(false),
+        close_idle_pending: Cell::new(false),
         generation: Cell::new(0),
         matches: RefCell::new(None),
         current: Cell::new(0),
@@ -474,7 +504,7 @@ fn present_exact_preview(
             tick.remove();
         }
         let controls_weak = Rc::downgrade(&controls_map);
-        let tick = dialog.add_tick_callback(move |dialog, _| {
+        let tick = dialog.add_tick_callback(move |_dialog, _| {
             let Some(controls) = controls_weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
@@ -487,7 +517,7 @@ fn present_exact_preview(
             controls.map_tick.borrow_mut().take();
             if controls.close_pending.get() {
                 // Only the actual native closed signal confirms completion.
-                dialog.force_close();
+                controls.close_after_map_dispatch();
             }
             glib::ControlFlow::Break
         });
