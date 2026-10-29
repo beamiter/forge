@@ -36,28 +36,33 @@ Installer/README synchronization is a separate parent commit.
 
 ## Shared geometry contract
 
-The next layout commit uses the same shell geometry for Block and Chat:
-titlebar55px, rail53px, navigation191px (center starts at244px), inspector298px
-(at1672px it starts at1374px), center header42px and Live row36px. Block cards
-keep12px center inset and10px gap. The Block composer keeps its68px minimum and
-8px bottom inset. Native content may grow instead of clipping text or input.
-Ember, Frost and shared-core source are outside this Forge-only change.
+The current contract is the original common shell for both Block and Chat:
+titlebar42px, rail55px, navigation237px (center starts at292px), inspector306px,
+center header49px, composer80px minimum with28px horizontal and11px bottom
+insets. At1356×704 the composer is320/613/702/80. `developer_workspace` delegates
+its outer metrics and Layout to `reference_shell`; there is no second active
+shell geometry. The newer Block raster supplies only the dark command canvas:
+Live36px, card inset12px and gap10px. Native Main remains12 logical pixels.
+
+The earlier55/53/191/298 shell and68px dock below are historical validation
+stages only, retained to preserve their input/caret evidence. They are superseded
+as layout targets. Native content still grows naturally when configured fonts
+or multiline input require it; nothing crops input to force the minimum.
 
 The separately reviewed Chat visible-row floor changes from two to one. It
 still grows for all native multiline/wrapped/completion content, bounded by
 the viewport. It does not change PTY-grid calculation or create another input
-owner. The shared68px footer remains a minimum; larger explicit fonts and long
+owner. The canonical80px footer remains a minimum; larger explicit fonts and long
 input may grow naturally. Four-line/long input caret, Enter, IME and physical
 grid checks must run on the combined native geometry artifact before claiming
 this floor change accepted.
 
-Both adapters now consume the additive `jterm_core::developer_workspace`
-contract, while the original four-adapter tokens remain unchanged. The
-native CSS accounts for border/padding inside each requested width. Search
-uses484×36px/top10 with a smaller request in narrow windows; mode controls
-use72×34px/top11. Inspector tabs are42px and the rounded card's outer inset
-is7px. The Chat dock retains its light colors and Block its navy colors;
-both share68px minimum,28px tools and8px bottom inset through prompt/running.
+Both adapters consume the canonical metrics through `developer_workspace`.
+Native CSS accounts for border/padding inside every request. Search is362×28px
+at top8, mode controls52×28px at top7, Inspector tabs49px and its outer inset14px.
+Chat keeps its light canvas and Block its navy canvas; their outer geometry,
+fixed28px controls, model120px and send28px slots are shared. Larger UI role
+scales grow the same controls; smaller UI fonts retain minimum hit areas.
 
 The 8eaf/font-only artifact was built against core84:27 pure checks and two
 real Pango role/context checks passed. Its third native default-font comparison

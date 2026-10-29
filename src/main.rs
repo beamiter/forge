@@ -1206,7 +1206,8 @@ pub fn run() -> glib::ExitCode {
         let reference_inspector = ui::reference_shell::inspector(&side_stack);
         let ai_paned = gtk4::Paned::new(Orientation::Horizontal);
         ai_paned.set_vexpand(true);
-        ai_paned.set_wide_handle(true);
+        ai_paned.set_wide_handle(false);
+        ai_paned.add_css_class("reference-layout-paned");
         ai_paned.set_start_child(Some(&right_col));
         ai_paned.set_resize_start_child(true);
         ai_paned.set_resize_end_child(false);
@@ -1220,7 +1221,8 @@ pub fn run() -> glib::ExitCode {
 
         let content_box = gtk4::Paned::new(Orientation::Horizontal);
         content_box.set_vexpand(true);
-        content_box.set_wide_handle(true);
+        content_box.set_wide_handle(false);
+        content_box.add_css_class("reference-layout-paned");
         content_box.set_start_child(Some(&sidebar));
         content_box.set_end_child(Some(&ai_paned));
         content_box.set_resize_start_child(false);

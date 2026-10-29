@@ -9,6 +9,20 @@ use gtk4::{glib, Orientation};
 use jterm_core::developer_workspace as token;
 use std::rc::Rc;
 
+fn active_mode(ui: &UiState) -> Option<TerminalMode> {
+    ui.current_pane_leaf().map(|leaf| match leaf {
+        super::PaneLeaf::Block(view) => view.terminal_mode(),
+        super::PaneLeaf::Vte(_) => TerminalMode::Vte,
+    })
+}
+
+fn native_grid_input(ui: &UiState) -> bool {
+    ui.current_pane_leaf().is_some_and(|leaf| match leaf {
+        super::PaneLeaf::Block(view) => !view.has_input_dock(),
+        super::PaneLeaf::Vte(_) => true,
+    })
+}
+
 fn product_identity(product: &str, size: i32) -> gtk4::Image {
     thread_local! {
         static CACHE: std::cell::RefCell<std::collections::HashMap<String, gtk4::gdk::Texture>> = std::cell::RefCell::new(std::collections::HashMap::new());
@@ -85,9 +99,12 @@ pub(crate) fn role_font_css(chrome_scale: f64, content_scale: f64) -> String {
             ]
             .iter()
             .any(|scope| selector.contains(scope));
-            // Native composer/input sizing retains its existing controller.
-            // Only semantic message roles join Content's stylesheet authority.
-            if native_input && !rich_content {
+            // The native editor keeps its existing font authority. Footer
+            // labels are GUI chrome; semantic messages alone follow Content.
+            let composer_chrome = selector.contains(".reference-composer-controls")
+                || selector.contains(".reference-unavailable-tool")
+                || selector.contains(".reference-model-selector");
+            if native_input && !rich_content && !composer_chrome {
                 continue;
             }
             let scale = if rich_content {
@@ -114,6 +131,8 @@ fn reference_role_fonts(ui: &UiState) -> serde_json::Value {
             let (ink, logical) = label.layout().pixel_extents();
             roles.insert(name.to_string(), serde_json::json!({
                 "text": label.text().to_string(),
+                "color":label.color().to_string(),
+                "classes":label.css_classes().iter().map(|value|value.as_str()).collect::<Vec<_>>(),
                 "font_description":font.as_ref().map(ToString::to_string),
                 "font_size_pango_units":font.as_ref().map(|font|font.size()),
                 "font_size_absolute":font.as_ref().map(|font|font.is_size_absolute()),
@@ -127,6 +146,7 @@ fn reference_role_fonts(ui: &UiState) -> serde_json::Value {
         ("canvas_title", "reference-canvas-title"),
         ("canvas_subtitle", "reference-canvas-subtitle"),
         ("agent_title", "reference-card-title"),
+        ("agent_badge", "reference-neutral-badge"),
         ("metadata_label", "reference-inspector-metadata-label"),
         ("metadata_value", "reference-inspector-metadata-value"),
         ("toolbar_product", "reference-product"),
@@ -162,6 +182,23 @@ fn reference_role_fonts(ui: &UiState) -> serde_json::Value {
         .map(|r| serde_json::json!([r.x(), r.y(), r.width(), r.height()]));
     let config = ui.config.borrow();
     serde_json::json!({"roles":roles,"copy_action_xywh":copy,"chrome_size":config.chrome_font_size,"chrome_scale":config.chrome_font_scale,"chrome_role_multiplier":crate::font::reference_ui_role_multiplier(&config.chrome_font_size,config.chrome_font_scale,&ui.window.pango_context()),"content_desc":config.font_desc,"content_scale":ui.font_scale.get(),"content_role_multiplier":crate::font::reference_content_role_multiplier(&config.font_desc,ui.font_scale.get(),&ui.window.pango_context())})
+}
+
+/// GTK4 renders a native widget snapshot after adding this API translation;
+/// event dispatch subtracts it. Keep the raw value and positive client origin
+/// so opt-in evidence can normalize a measured native surface without guessing.
+fn native_surface_geometry(ui: &UiState) -> serde_json::Value {
+    let (x, y) = ui.window.surface_transform();
+    serde_json::json!({
+        "raw_native_surface_transform":[x,y],
+        "snapshot_translation":[x,y],
+        "widget_origin_in_surface":[x,y],
+        "widget_logical":{"width":ui.window.width(),"height":ui.window.height()},
+        "surface_logical":ui.window.surface().map(|surface|serde_json::json!({
+            "width":surface.width(),"height":surface.height(),"scale_factor":surface.scale_factor()
+        })),
+        "frame_time":ui.window.frame_clock().map(|clock|clock.frame_time()),
+    })
 }
 
 /// Shared vector paths, painted by Cairo rather than font-dependent glyphs.
@@ -212,6 +249,18 @@ pub(crate) fn icon_label(key: &str, value: &str) -> gtk4::Box {
     row
 }
 
+fn composer_icon_label(key: &str, value: &str) -> gtk4::Box {
+    let row = gtk4::Box::new(Orientation::Horizontal, 4);
+    row.add_css_class("reference-composer-icon-label");
+    let glyph = vector_icon(jterm_core::reference_icons::Icon::from_key(key), 12);
+    glyph.add_css_class("reference-composer-glyph");
+    row.append(&glyph);
+    if !value.is_empty() {
+        row.append(&label(value, "reference-icon-label"));
+    }
+    row
+}
+
 /// Keep real disabled semantics while drawing a readable muted label outside
 /// the theme's insensitive alpha. The overlay never receives input itself.
 pub(crate) fn unavailable_tool(key: &str, title: &str) -> gtk4::Overlay {
@@ -219,7 +268,7 @@ pub(crate) fn unavailable_tool(key: &str, title: &str) -> gtk4::Overlay {
     root.add_css_class("reference-unavailable-tool");
     root.set_tooltip_text(Some("Unavailable — this composer tool is not connected"));
     let button = gtk4::Button::new();
-    let measure = icon_label(key, title);
+    let measure = composer_icon_label(key, title);
     measure.set_opacity(0.0);
     button.set_child(Some(&measure));
     button.set_sensitive(false);
@@ -229,7 +278,7 @@ pub(crate) fn unavailable_tool(key: &str, title: &str) -> gtk4::Overlay {
         if title.is_empty() { "Add" } else { title }
     ))]);
     root.set_child(Some(&button));
-    let visible = icon_label(key, title);
+    let visible = composer_icon_label(key, title);
     visible.set_can_target(false);
     visible.set_halign(gtk4::Align::Center);
     visible.set_valign(gtk4::Align::Center);
@@ -277,6 +326,57 @@ fn guard_tools_focus(tools: &gtk4::MenuButton, popup: &gtk4::Popover) {
     click.set_propagation_phase(gtk4::PropagationPhase::Capture);
     click.connect_pressed(move |_, _, _, _| begin());
     tools.add_controller(click);
+
+    // Escape/dismissal returns shell input to the same active leaf. A menu
+    // action or outside click that has already focused another control wins.
+    // Run once before the history guard restores native focus reveal, so
+    // merely closing Tools does not scroll the reader back to the editor.
+    let owner: Rc<std::cell::RefCell<Option<glib::WeakRef<vte4::Terminal>>>> =
+        Rc::new(std::cell::RefCell::new(None));
+    let generation = Rc::new(std::cell::Cell::new(0u64));
+    let weak = tools.downgrade();
+    let saved_owner = owner.clone();
+    let open_generation = generation.clone();
+    popup.connect_show(move |_| {
+        open_generation.set(open_generation.get().wrapping_add(1));
+        *saved_owner.borrow_mut() = weak
+            .upgrade()
+            .and_then(|tools| ui_for_widget(tools.upcast_ref()))
+            .and_then(|ui| ui.current_terminal())
+            .filter(|terminal| terminal.is_mapped())
+            .map(|terminal| terminal.downgrade());
+    });
+    let weak = tools.downgrade();
+    let popup_weak = popup.downgrade();
+    popup.connect_closed(move |_| {
+        let Some(tools) = weak.upgrade() else { return };
+        let saved_owner = owner.borrow_mut().take();
+        let ticket = generation.get();
+        let generation = generation.clone();
+        let popup_weak = popup_weak.clone();
+        tools.add_tick_callback(move |tools, _| {
+            if generation.get() != ticket
+                || popup_weak.upgrade().is_some_and(|popup| popup.is_mapped())
+            {
+                return glib::ControlFlow::Break;
+            }
+            let Some(ui) = ui_for_widget(tools.upcast_ref()) else {
+                return glib::ControlFlow::Break;
+            };
+            let Some(terminal) = saved_owner.as_ref().and_then(glib::WeakRef::upgrade) else {
+                return glib::ControlFlow::Break;
+            };
+            if !terminal.is_mapped()
+                || ui.current_terminal().as_ref() != Some(&terminal)
+                || !gtk4::prelude::RootExt::focus(&ui.window)
+                    .is_some_and(|focused| focused.is_ancestor(tools))
+            {
+                return glib::ControlFlow::Break;
+            }
+            ui.focus_current_terminal();
+            glib::ControlFlow::Break
+        });
+    });
 }
 
 /// A popup may return focus to history without rounding the reader's
@@ -359,31 +459,39 @@ fn tool_menu_row(icon: &str, name: &str, detail: &str) -> gtk4::Button {
 /// input owner and append their existing, generation-bound send/stop controls.
 pub(crate) fn composer_controls(on_terminal: impl Fn() + 'static) -> (gtk4::Box, gtk4::Label) {
     let on_terminal: Rc<dyn Fn()> = Rc::new(on_terminal);
-    let controls = gtk4::Box::new(Orientation::Horizontal, token::METADATA_GAP as i32);
+    let controls = gtk4::Box::new(Orientation::Horizontal, 0);
     controls.add_css_class("chat-controls");
     controls.add_css_class("reference-composer-controls");
+    controls.add_css_class("reference-fixed-controls");
     controls.set_valign(gtk4::Align::End);
     // Extra pixels in the minimum dock belong above this fixed28px footer,
     // including when the native editor is seated in a running command card.
     controls.set_vexpand(true);
     let group = gtk4::Box::new(Orientation::Horizontal, token::METADATA_GAP as i32);
+    group.add_css_class("reference-composer-left-group");
     for (key, title) in [
         ("plus", ""),
         ("attach", "Attach"),
         ("image", "Image"),
         ("code", "Code"),
     ] {
-        group.append(&unavailable_tool(key, title));
+        let tool = unavailable_tool(key, title);
+        tool.add_css_class(&format!("reference-composer-{key}"));
+        tool.add_css_class("reference-sized-control");
+        group.append(&tool);
     }
     let terminal = gtk4::Button::new();
-    terminal.set_child(Some(&icon_label("terminal", "Terminal")));
+    terminal.set_child(Some(&composer_icon_label("terminal", "Terminal")));
     terminal.add_css_class("flat");
+    terminal.add_css_class("reference-composer-terminal");
+    terminal.add_css_class("reference-sized-control");
     terminal.set_focus_on_click(false);
     terminal.set_tooltip_text(Some("Focus the current native shell editor"));
     let terminal_action = on_terminal.clone();
     terminal.connect_clicked(move |_| terminal_action());
     group.append(&terminal);
     let scroll = gtk4::ScrolledWindow::new();
+    scroll.add_css_class("reference-composer-left-scroll");
     scroll.set_policy(gtk4::PolicyType::External, gtk4::PolicyType::Never);
     scroll.set_propagate_natural_width(true);
     scroll.set_min_content_width(0);
@@ -395,17 +503,21 @@ pub(crate) fn composer_controls(on_terminal: impl Fn() + 'static) -> (gtk4::Box,
     tools.set_direction(gtk4::ArrowType::Up);
     tools.set_always_show_arrow(false);
     tools.add_css_class("reference-tools");
+    tools.add_css_class("reference-composer-tools");
+    tools.add_css_class("reference-sized-control");
     tools.add_css_class("flat");
     let tool_label = gtk4::Box::new(Orientation::Horizontal, 4);
-    tool_label.append(&vector_icon(jterm_core::reference_icons::Icon::Grid, 14));
+    tool_label.add_css_class("reference-composer-icon-label");
+    let grid = vector_icon(jterm_core::reference_icons::Icon::Grid, 12);
+    grid.add_css_class("reference-composer-glyph");
+    tool_label.append(&grid);
     let name = label("Tools", "reference-tools-title");
     name.set_width_chars(0);
     name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     tool_label.append(&name);
-    tool_label.append(&vector_icon(
-        jterm_core::reference_icons::Icon::ChevronDown,
-        12,
-    ));
+    let chevron = vector_icon(jterm_core::reference_icons::Icon::ChevronDown, 12);
+    chevron.add_css_class("reference-composer-glyph");
+    tool_label.append(&chevron);
     tools.set_child(Some(&tool_label));
     tools.set_tooltip_text(Some("Tools"));
     let popover = gtk4::Popover::new();
@@ -456,8 +568,10 @@ pub(crate) fn composer_controls(on_terminal: impl Fn() + 'static) -> (gtk4::Box,
     popover.set_child(Some(&list));
     tools.set_popover(Some(&popover));
     guard_tools_focus(&tools, &popover);
-    controls.append(&tools);
+    group.append(&tools);
     let fill = gtk4::Box::new(Orientation::Horizontal, 0);
+    fill.add_css_class("reference-composer-gap");
+    fill.set_width_request(token::METADATA_GAP as i32);
     fill.set_hexpand(true);
     controls.append(&fill);
     let model = disabled(
@@ -465,7 +579,9 @@ pub(crate) fn composer_controls(on_terminal: impl Fn() + 'static) -> (gtk4::Box,
         "No agent model is selected for this shell conversation",
     );
     model.add_css_class("reference-model-selector");
+    model.add_css_class("reference-sized-control");
     model.set_width_request(token::COMPOSER_MODEL_MIN_WIDTH as i32);
+    model.set_margin_end(token::METADATA_GAP as i32);
     controls.append(&model);
     let status = label("Shell", "chat-input-hint");
     status.set_width_chars(1);
@@ -475,6 +591,152 @@ pub(crate) fn composer_controls(on_terminal: impl Fn() + 'static) -> (gtk4::Box,
     status.set_visible(false);
     controls.append(&status);
     (controls, status)
+}
+
+/// Observe the whole fixed footer, never a zero-width spacer. The original
+/// buttons and their input-authority callbacks remain owned by `controls`.
+pub(crate) fn composer_controls_frame(controls: &gtk4::Box) -> gtk4::Overlay {
+    let frame = gtk4::Overlay::new();
+    frame.set_child(Some(controls));
+    frame.set_vexpand(true);
+    frame.set_valign(gtk4::Align::End);
+    let observer = gtk4::DrawingArea::new();
+    observer.set_can_target(false);
+    observer.set_focusable(false);
+    frame.add_overlay(&observer);
+    frame.set_measure_overlay(&observer, false);
+    let row = controls.downgrade();
+    observer.connect_resize(move |_, _, _| {
+        if let Some(row) = row.upgrade() {
+            refresh_composer_row(&row);
+        }
+    });
+    let row = controls.downgrade();
+    frame.connect_map(move |_| {
+        if let Some(row) = row.upgrade() {
+            refresh_composer_row(&row);
+        }
+    });
+    frame
+}
+
+fn refresh_composer_row(row: &gtk4::Box) {
+    let scale = ui_for_widget(row.upcast_ref())
+        .map_or(1.0, |ui| {
+            let config = ui.config.borrow();
+            crate::font::reference_ui_role_multiplier(
+                &config.chrome_font_size,
+                config.chrome_font_scale,
+                &row.pango_context(),
+            )
+        })
+        .max(1.0);
+    let px = |value: f32| (f64::from(value) * scale).round() as i32;
+    let mut ancestor = row.parent();
+    let mut composer_width = None;
+    while let Some(widget) = ancestor {
+        if widget.has_css_class("chat-dock") || widget.has_css_class("reference-block-composer") {
+            composer_width = row
+                .root()
+                .and_downcast::<gtk4::Window>()
+                .and_then(|window| widget.compute_bounds(&window))
+                .map(|bounds| f64::from(bounds.width()) / scale);
+            break;
+        }
+        ancestor = widget.parent();
+    }
+    let width = composer_width.filter(|width| *width > 0.0);
+    let mut pending = vec![row.clone().upcast::<gtk4::Widget>()];
+    while let Some(widget) = pending.pop() {
+        let mut child = widget.first_child();
+        while let Some(next) = child {
+            child = next.next_sibling();
+            pending.push(next);
+        }
+        let dimension = [
+            ("reference-composer-plus", token::COMPOSER_PLUS_WIDTH),
+            ("reference-composer-attach", token::COMPOSER_ATTACH_WIDTH),
+            ("reference-composer-image", token::COMPOSER_IMAGE_WIDTH),
+            ("reference-composer-code", token::COMPOSER_CODE_WIDTH),
+            (
+                "reference-composer-terminal",
+                token::COMPOSER_TERMINAL_WIDTH,
+            ),
+            ("reference-composer-tools", token::COMPOSER_TOOLS_WIDTH),
+            ("reference-model-selector", token::COMPOSER_MODEL_MIN_WIDTH),
+            ("chat-command-control", token::COMPOSER_SEND_WIDTH),
+            ("chat-submit", token::COMPOSER_SEND_WIDTH),
+            ("reference-native-tools-close", token::COMPOSER_SEND_WIDTH),
+        ]
+        .into_iter()
+        .find_map(|(class, width)| widget.has_css_class(class).then_some(width));
+        if let Some(dimension) = dimension {
+            widget.add_css_class("reference-sized-control");
+            widget.set_size_request(px(dimension), px(token::CONTROL_HEIGHT));
+        }
+        if let Some(width) = width {
+            if ["attach", "image", "code"]
+                .iter()
+                .any(|key| widget.has_css_class(&format!("reference-composer-{key}")))
+            {
+                widget.set_visible(width >= f64::from(token::COMPOSER_SECONDARY_MIN_WIDTH));
+            } else if widget.has_css_class("reference-composer-terminal") {
+                widget.set_visible(width >= f64::from(token::COMPOSER_TERMINAL_MIN_AVAILABLE));
+            } else if widget.has_css_class("reference-model-selector") {
+                widget.set_visible(width >= f64::from(token::COMPOSER_MODEL_MIN_AVAILABLE));
+            }
+        }
+        if widget.has_css_class("reference-model-selector") {
+            widget.set_margin_end(px(token::METADATA_GAP));
+        }
+        if widget.has_css_class("reference-composer-gap") {
+            widget.set_width_request(px(token::METADATA_GAP));
+        }
+        if widget.has_css_class("reference-composer-glyph") {
+            if let Some(glyph) = widget.downcast_ref::<gtk4::DrawingArea>() {
+                let size = px(jterm_core::reference_popup::FOOTER_ICON_SIZE);
+                glyph.set_content_width(size);
+                glyph.set_content_height(size);
+            }
+        }
+        if let Some(group) = widget.downcast_ref::<gtk4::Box>() {
+            if widget.has_css_class("reference-composer-left-group") {
+                group.set_spacing(px(token::METADATA_GAP));
+            } else if widget.has_css_class("reference-composer-icon-label") {
+                group.set_spacing(px(jterm_core::reference_popup::FOOTER_ICON_LABEL_GAP));
+            }
+        }
+        if widget.has_css_class("reference-composer-left-scroll") {
+            if let Some(scroll) = widget.downcast_ref::<gtk4::ScrolledWindow>() {
+                let full = token::COMPOSER_PLUS_WIDTH
+                    + token::COMPOSER_ATTACH_WIDTH
+                    + token::COMPOSER_IMAGE_WIDTH
+                    + token::COMPOSER_CODE_WIDTH
+                    + token::COMPOSER_TERMINAL_WIDTH
+                    + token::COMPOSER_TOOLS_WIDTH
+                    + 5.0 * token::METADATA_GAP;
+                scroll.set_max_content_width(px(full));
+            }
+        }
+    }
+    row.set_height_request(px(token::CONTROL_HEIGHT));
+}
+
+/// A UI font change can retain the same allocation. Refresh once from the
+/// existing config-apply path as well as on real layout changes, without a
+/// permanent frame timer or any terminal/input work.
+pub(crate) fn refresh_composer_control_geometry(root: &gtk4::Widget) {
+    if root.has_css_class("reference-composer-controls") {
+        if let Some(row) = root.downcast_ref::<gtk4::Box>() {
+            refresh_composer_row(row);
+        }
+        return;
+    }
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        refresh_composer_control_geometry(&widget);
+    }
 }
 
 fn widget_with_class(root: &gtk4::Widget, class: &str) -> Option<gtk4::Widget> {
@@ -681,58 +943,59 @@ pub(crate) fn install(
     unsafe {
         ui.window.set_data(REFERENCE_UI_KEY, Rc::downgrade(ui));
     }
-    // A traditional terminal keeps stdin in its real grid. This footer uses
-    // the same composer shell, with unavailable send/attachment actions
-    // explicitly disabled instead of inventing a second shell editor.
+    let legacy_tools_visible = Rc::new(std::cell::Cell::new(false));
+    let legacy_tools_footer = gtk4::Box::new(Orientation::Vertical, 0);
+    legacy_tools_footer.add_css_class("reference-block-composer");
+    legacy_tools_footer.add_css_class("reference-native-tools");
+    // A hidden native-grid tools strip must never compete for vertical space.
+    legacy_tools_footer.set_vexpand(false);
+    legacy_tools_footer.set_visible(false);
+    // Native-grid input has no second composer. Keep only an optional,
+    // closable tools strip; the actual Chat/Block editor docks are unchanged.
     if let Some(center) = ui.notebook.parent().and_downcast::<gtk4::Box>() {
-        let footer = gtk4::Box::new(Orientation::Vertical, 0);
-        footer.add_css_class("reference-block-composer");
-        footer.set_height_request(token::COMPOSER_HEIGHT as i32);
-        let input = gtk4::Button::new();
-        input.add_css_class("reference-terminal-input");
-        input.set_height_request(42);
-        input.set_focus_on_click(false);
-        input.set_tooltip_text(Some(
-            "Focus the real terminal above; shell input stays in this session",
-        ));
-        let prompt = gtk4::Box::new(Orientation::Horizontal, 8);
-        prompt.set_valign(gtk4::Align::Start);
-        prompt.set_margin_top(6);
-        prompt.append(&label(">", "reference-quiet-prompt"));
-        let hint = label("Type in the terminal above…", "reference-quiet-placeholder");
-        hint.set_hexpand(true);
-        prompt.append(&hint);
-        input.set_child(Some(&prompt));
-        let ui_for_input = Rc::downgrade(ui);
-        input.connect_clicked(move |_| {
-            if let Some(terminal) = ui_for_input.upgrade().and_then(|ui| ui.current_terminal()) {
-                terminal.grab_focus();
-            }
-        });
-        footer.append(&input);
+        let footer = legacy_tools_footer.clone();
         let ui_for_terminal = Rc::downgrade(ui);
         let (actions, _) = composer_controls(move || {
-            if let Some(terminal) = ui_for_terminal
-                .upgrade()
-                .and_then(|ui| ui.current_terminal())
-            {
-                terminal.grab_focus();
+            if let Some(ui) = ui_for_terminal.upgrade() {
+                ui.focus_current_terminal();
             }
         });
-        let send = gtk4::Button::new();
-        send.set_child(Some(&vector_icon(
-            jterm_core::reference_icons::Icon::Send,
-            16,
+        actions.set_vexpand(false);
+        let close_tools = gtk4::Button::new();
+        close_tools.set_child(Some(&vector_icon(
+            jterm_core::reference_icons::Icon::Close,
+            12,
         )));
-        send.set_sensitive(false);
-        send.set_tooltip_text(Some("Use Enter in the real terminal to submit shell input"));
-        send.add_css_class("chat-submit");
-        actions.append(&send);
-        footer.append(&actions);
-        footer.set_visible(matches!(
-            ui.config.borrow().terminal_mode,
-            TerminalMode::Vte | TerminalMode::Unified
+        close_tools.set_focus_on_click(false);
+        close_tools.set_size_request(token::CONTROL_HEIGHT as i32, token::CONTROL_HEIGHT as i32);
+        close_tools.add_css_class("reference-native-tools-close");
+        close_tools.add_css_class("reference-sized-control");
+        close_tools.set_tooltip_text(Some(
+            "Hide terminal tools; input stays in the terminal grid",
         ));
+        let footer_for_close = footer.downgrade();
+        let visible_for_close = legacy_tools_visible.clone();
+        let ui_for_close = Rc::downgrade(ui);
+        close_tools.connect_clicked(move |_| {
+            visible_for_close.set(false);
+            if let Some(footer) = footer_for_close.upgrade() {
+                footer.set_visible(false);
+            }
+            if let Some(ui) = ui_for_close.upgrade() {
+                if let Some(toggle) =
+                    widget_with_class_any(ui.window.upcast_ref(), "reference-native-tools-toggle")
+                        .and_then(|widget| widget.downcast::<gtk4::CheckButton>().ok())
+                {
+                    toggle.set_active(false);
+                }
+                ui.focus_current_terminal();
+            }
+        });
+        actions.append(&close_tools);
+        let controls_frame = composer_controls_frame(&actions);
+        controls_frame.set_vexpand(false);
+        footer.append(&controls_frame);
+        footer.set_visible(false);
         center.append(&footer);
         if ui.config.borrow().terminal_mode == TerminalMode::Block {
             center.add_css_class("reference-developer-active");
@@ -742,55 +1005,6 @@ pub(crate) fn install(
                 header.set_height_request(token::CANVAS_HEADER_HEIGHT as i32);
             }
         }
-        let center_for_switch = center.downgrade();
-        let ui_for_switch = Rc::downgrade(ui);
-        ui.notebook.connect_switch_page(move |_, page, _| {
-            // A view remains attached to its original live PTY. Only inspect
-            // its existing CSS identity when switching tabs.
-            fn chat_in(widget: &gtk4::Widget) -> bool {
-                if widget.has_css_class("term-chat-root") {
-                    return true;
-                }
-                let mut child = widget.first_child();
-                while let Some(current) = child {
-                    if chat_in(&current) {
-                        return true;
-                    }
-                    child = current.next_sibling();
-                }
-                false
-            }
-            footer.set_visible(!chat_in(page) && !developer_in(page));
-            fn developer_in(widget: &gtk4::Widget) -> bool {
-                if widget.has_css_class("developer-block-canvas") {
-                    return true;
-                }
-                let mut child = widget.first_child();
-                while let Some(widget) = child {
-                    if developer_in(&widget) {
-                        return true;
-                    }
-                    child = widget.next_sibling();
-                }
-                false
-            }
-            if let Some(center) = center_for_switch.upgrade() {
-                let developer = developer_in(page);
-                if developer {
-                    center.add_css_class("reference-developer-active");
-                } else {
-                    center.remove_css_class("reference-developer-active");
-                }
-                if let Some(header) =
-                    widget_with_class_any(center.upcast_ref(), "reference-canvas-header")
-                {
-                    header.set_height_request(token::CANVAS_HEADER_HEIGHT as i32);
-                }
-            }
-            if let Some(ui) = ui_for_switch.upgrade() {
-                ui.reference_inspector.queue_allocate();
-            }
-        });
     }
     top.add_css_class("reference-titlebar");
     top.set_height_request(token::TITLEBAR_HEIGHT as i32);
@@ -851,6 +1065,11 @@ pub(crate) fn install(
     let mut group: Option<gtk4::ToggleButton> = None;
     for (title, mode) in [("Block", TerminalMode::Block), ("Chat", TerminalMode::Chat)] {
         let button = gtk4::ToggleButton::with_label(title);
+        button.add_css_class(if mode == TerminalMode::Chat {
+            "reference-mode-chat"
+        } else {
+            "reference-mode-block"
+        });
         button.set_width_request(token::MODE_CONTROL_MIN_WIDTH as i32);
         button.set_focus_on_click(false);
         if let Some(first) = &group {
@@ -862,14 +1081,20 @@ pub(crate) fn install(
             (mode == TerminalMode::Chat)
                 == (ui.config.borrow().terminal_mode == TerminalMode::Chat),
         );
-        button.set_tooltip_text(Some(
-            "Presentation for newly opened terminals; running sessions are retained",
-        ));
+        button.set_tooltip_text(Some(&format!(
+            "Open a new {title} tab; existing terminal sessions are retained"
+        )));
         let ui = Rc::downgrade(ui);
         button.connect_clicked(move |_| {
             if let Some(ui) = ui.upgrade() {
+                if active_mode(&ui).is_some_and(|active| {
+                    (active == TerminalMode::Chat) == (mode == TerminalMode::Chat)
+                }) {
+                    return;
+                }
                 ui.config.borrow_mut().terminal_mode = mode.clone();
                 ui.persist_config();
+                ui.execute_action(crate::keybindings::Action::NewTab);
             }
         });
         modes.append(&button);
@@ -1071,7 +1296,8 @@ pub(crate) fn install(
     status_scroll.set_propagate_natural_width(false);
     status_scroll.set_max_content_width(1);
     status_scroll.set_min_content_width(0);
-    status_scroll.set_height_request(token::NAVIGATION_STATUS_HEIGHT as i32);
+    // Include the existing one-pixel top stroke inside the49px border box.
+    status_scroll.set_height_request((token::NAVIGATION_STATUS_HEIGHT - 1.0) as i32);
     ui.bottom_bar.set_valign(gtk4::Align::Start);
     ui.bottom_bar_left.set_visible(false);
     ui.bottom_bar_right.set_visible(false);
@@ -1083,6 +1309,28 @@ pub(crate) fn install(
     ui.bottom_bar.append(&local);
     status_scroll.set_child(Some(&ui.bottom_bar));
     ui.sidebar.append(&status_scroll);
+
+    // Keep the public sidebar/controller and bottom status in place. Only
+    // the navigation document scrolls when a short window cannot fit all
+    // workspace/recent/space rows; its minimum must not resize the window.
+    let navigation_document = gtk4::Box::new(Orientation::Vertical, 0);
+    navigation_document.add_css_class("reference-navigation-document");
+    navigation_document.set_vexpand(true);
+    while let Some(child) = ui.sidebar.first_child() {
+        if child == status_scroll.clone().upcast::<gtk4::Widget>() {
+            break;
+        }
+        ui.sidebar.remove(&child);
+        navigation_document.append(&child);
+    }
+    let navigation_scroll = gtk4::ScrolledWindow::new();
+    navigation_scroll.add_css_class("reference-navigation-viewport");
+    navigation_scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::External);
+    navigation_scroll.set_min_content_height(0);
+    navigation_scroll.set_propagate_natural_height(false);
+    navigation_scroll.set_vexpand(true);
+    navigation_scroll.set_child(Some(&navigation_document));
+    ui.sidebar.prepend(&navigation_scroll);
 
     let rail = gtk4::Box::new(Orientation::Vertical, 8);
     rail.add_css_class("reference-rail");
@@ -1153,10 +1401,32 @@ pub(crate) fn install(
     vim.set_child(Some(&icon_label("code", "Vim workspace")));
     ui.agent_toggle
         .set_child(Some(&icon_label("agent", "Shell Agent")));
+    let show_tools = gtk4::CheckButton::with_label("Show terminal tools");
+    show_tools.add_css_class("reference-native-tools-toggle");
+    show_tools.set_tooltip_text(Some(
+        "Optional compact tools for native terminal input; no second composer",
+    ));
+    let footer_for_toggle = legacy_tools_footer.downgrade();
+    let visible_for_toggle = legacy_tools_visible.clone();
+    let ui_for_toggle = Rc::downgrade(ui);
+    show_tools.connect_toggled(move |toggle| {
+        visible_for_toggle.set(toggle.is_active());
+        if let (Some(ui), Some(footer)) = (ui_for_toggle.upgrade(), footer_for_toggle.upgrade()) {
+            let native_grid = native_grid_input(&ui);
+            footer.set_visible(toggle.is_active() && native_grid);
+        }
+    });
+    show_tools.connect_map(|toggle| {
+        let native_grid =
+            ui_for_widget(toggle.upcast_ref()).is_some_and(|ui| native_grid_input(&ui));
+        toggle.set_sensitive(native_grid);
+    });
+    capability_list.append(&show_tools);
     capability_list.append(vim);
     capability_list.append(&ui.agent_toggle);
     popover.set_child(Some(&capability_list));
     capabilities.set_popover(Some(&popover));
+    guard_tools_focus(&capabilities, &popover);
     capabilities.add_css_class("reference-header-action");
     capabilities.set_size_request(
         token::HEADER_ACTION_SIZE as i32,
@@ -1220,17 +1490,17 @@ pub(crate) fn install(
             return;
         };
         let layout = token::Layout::for_size(width as f32, height as f32 + token::TITLEBAR_HEIGHT);
-        path_for_resize.set_visible(width >= 1078);
-        palette_for_resize.set_width_request(if width >= 1078 { token::SEARCH_WIDTH as i32 } else { 180 });
+        path_for_resize.set_visible(layout.inspector.is_some());
+        palette_for_resize.set_width_request(if layout.inspector.is_some() { token::SEARCH_WIDTH as i32 } else { 180 });
         ui.sidebar
             .set_visible(layout.navigation.is_some() && ui.config.borrow().sidebar_visible);
         ui.reference_inspector
             .set_visible(layout.inspector.is_some());
-        content.set_position(token::NAVIGATION_WIDTH as i32 - 1);
+        content.set_position(token::NAVIGATION_WIDTH as i32);
         if layout.inspector.is_some() {
             let available = ui.ai_paned.width();
             ui.ai_paned
-                .set_position((available - token::INSPECTOR_WIDTH as i32 - 1).max(0));
+                .set_position((available - token::INSPECTOR_WIDTH as i32).max(0));
         }
         if let Some(destination) = std::env::var_os("FORGE_REFERENCE_GEOMETRY") {
             let ui = Rc::downgrade(&ui);
@@ -1269,18 +1539,20 @@ pub(crate) fn install(
                         let mut child = widget.first_child();
                         while let Some(next) = child { child = next.next_sibling(); content.push(next); }
                     }
-                    measured.push(serde_json::json!({"bounds":bounds(&widget),"captions":captions,"tooltip":button.tooltip_text().map(|value|value.to_string()),"classes":button.css_classes().iter().map(|value|value.as_str()).collect::<Vec<_>>(),"mapped":button.is_mapped(),"sensitive":button.is_sensitive(),"focused":button.has_focus()}));
+                    let capsule = widget.parent().filter(|parent| parent.has_css_class("reference-sized-control")).unwrap_or_else(|| widget.clone());
+                    measured.push(serde_json::json!({"capsule_bounds":bounds(&capsule),"bounds":bounds(&widget),"captions":captions,"tooltip":button.tooltip_text().map(|value|value.to_string()),"classes":button.css_classes().iter().map(|value|value.as_str()).collect::<Vec<_>>(),"mapped":button.is_mapped(),"sensitive":button.is_sensitive(),"focused":button.has_focus()}));
                 }
                 measured
             };
-            let snapshot = serde_json::json!({
+            let mut snapshot = serde_json::json!({
                 "composer_buttons":composer_buttons(),
                 "logical_window": {"width":ui.window.width(),"height":ui.window.height()},
+                "native_surface":native_surface_geometry(&ui),
                 "dpr":ui.window.scale_factor(),
                 "window_active":ui.window.is_active(),
                 "terminal_has_focus":ui.current_terminal().map(|terminal| terminal.has_focus()),
                 "prompt_status":ui.current_term_view().map(|view| format!("{:?}", view.command_prompt_status())),
-                "presentation":if ui.config.borrow().terminal_mode == TerminalMode::Chat {"Chat"} else {"Block"},
+                "presentation":active_mode(&ui).map(|mode| mode.presentation_label()),
                 "titlebar":bounds(top_for_geometry.upcast_ref()),
                 "center_header":widget_with_class(ui.window.upcast_ref(), "reference-canvas-header").and_then(|w| bounds(&w)),
                 "search":widget_with_class(ui.window.upcast_ref(), "reference-search").and_then(|w| bounds(&w)),
@@ -1295,6 +1567,8 @@ pub(crate) fn install(
                 "inspector_card":widget_with_class(ui.window.upcast_ref(), "reference-agent-card").and_then(|w| bounds(&w)),
                 "center":ui.notebook.parent().and_then(|p| bounds(&p)),
                 "navigation_status":widget_with_class(ui.window.upcast_ref(), "reference-navigation-status").and_then(|w| bounds(&w)),
+                "navigation_viewport":widget_with_class(ui.window.upcast_ref(), "reference-navigation-viewport").and_then(|w| bounds(&w)),
+                "navigation_document":widget_with_class(ui.window.upcast_ref(), "reference-navigation-document").and_then(|w| bounds(&w)),
                 "spaces":widget_with_class(ui.window.upcast_ref(), "reference-spaces").and_then(|w| bounds(&w)),
                 "inspector_progress":widget_with_class(ui.window.upcast_ref(), "reference-inspector-progress").and_then(|w| bounds(&w)),
                 "inspector_agent_heading":widget_with_class(ui.window.upcast_ref(), "reference-inspector-agent-heading").and_then(|w| bounds(&w)),
@@ -1311,6 +1585,9 @@ pub(crate) fn install(
                 "tools":widget_with_class(ui.window.upcast_ref(), "reference-tools").and_then(|w| bounds(&w)),
                 "composer":widget_with_class(ui.window.upcast_ref(), "chat-dock").or_else(|| widget_with_class(ui.window.upcast_ref(), "reference-block-composer")).and_then(|w| bounds(&w)),
             });
+            snapshot["active_backend"] = serde_json::json!(active_mode(&ui).map(|mode| mode.as_str()));
+            snapshot["native_grid_input"] = serde_json::json!(native_grid_input(&ui));
+            snapshot["legacy_tools_visible"] = serde_json::json!(widget_with_class_any(ui.window.upcast_ref(), "reference-native-tools").is_some_and(|w| w.is_mapped()));
             if let Ok(bytes) = serde_json::to_vec_pretty(&snapshot) { let _ = std::fs::write(destination, bytes); }
             });
         }
@@ -1321,6 +1598,60 @@ pub(crate) fn install(
     ui.tab_placement.set(TabPlacement::Sidebar);
     ui.apply_tab_placement();
     ui.apply_sidebar_view(SidebarView::Tabs, false);
+    // The selected presentation belongs to the active pane, not to the
+    // preference used by a later tab. Resolve it after Notebook's switch
+    // handler and after split-pane focus changes; never re-create a live PTY.
+    let ui_for_presentation = Rc::downgrade(ui);
+    let footer_for_presentation = legacy_tools_footer.downgrade();
+    let refresh_presentation: Rc<dyn Fn()> = Rc::new(move || {
+        let Some(ui) = ui_for_presentation.upgrade() else {
+            return;
+        };
+        let Some(mode) = active_mode(&ui) else { return };
+        let chat = mode == TerminalMode::Chat;
+        for (class, selected) in [
+            ("reference-mode-chat", chat),
+            ("reference-mode-block", !chat),
+        ] {
+            if let Some(button) = widget_with_class_any(ui.window.upcast_ref(), class)
+                .and_then(|w| w.downcast::<gtk4::ToggleButton>().ok())
+            {
+                button.set_active(selected);
+            }
+        }
+        if let Some(button) =
+            widget_with_class_any(ui.window.upcast_ref(), "reference-navigation-active")
+        {
+            if let Some(title) = widget_with_class_any(&button, "reference-icon-label")
+                .and_then(|w| w.downcast::<gtk4::Label>().ok())
+            {
+                title.set_text(mode.presentation_label());
+            }
+        }
+        if let Some(center) = ui.notebook.parent() {
+            if mode == TerminalMode::Block {
+                center.add_css_class("reference-developer-active");
+            } else {
+                center.remove_css_class("reference-developer-active");
+            }
+        }
+        let native_grid = native_grid_input(&ui);
+        if let Some(footer) = footer_for_presentation.upgrade() {
+            footer.set_visible(native_grid && legacy_tools_visible.get());
+        }
+        ui.reference_inspector.queue_allocate();
+    });
+    let refresh = refresh_presentation.clone();
+    ui.notebook.connect_switch_page(move |_, _, _| {
+        let refresh = refresh.clone();
+        glib::idle_add_local_once(move || refresh());
+    });
+    let refresh = refresh_presentation.clone();
+    ui.window.connect_focus_widget_notify(move |_| {
+        let refresh = refresh.clone();
+        glib::idle_add_local_once(move || refresh());
+    });
+    glib::idle_add_local_once(move || refresh_presentation());
     let context_path = context_label(&ui.side_stack);
     let ui_for_context = Rc::downgrade(ui);
     let refresh_context: Rc<dyn Fn()> = Rc::new(move || {
@@ -1430,6 +1761,15 @@ pub(crate) fn install(
                             snapshot["tools_open"] = serde_json::json!(widget_with_class(ui.window.upcast_ref(), "reference-tools-popover").is_some());
                             snapshot["focused_widget"] = serde_json::json!(gtk4::prelude::RootExt::focus(&ui.window).map(|widget|widget.widget_name().to_string()));
                             snapshot["reference_role_fonts"] = reference_role_fonts(&ui);
+                            snapshot["native_surface"] = native_surface_geometry(&ui);
+                            snapshot["navigation_scroll"] = widget_with_class(ui.window.upcast_ref(), "reference-navigation-viewport")
+                                .and_then(|widget| widget.downcast::<gtk4::ScrolledWindow>().ok())
+                                .map(|scroll| {
+                                    let adjustment = scroll.vadjustment();
+                                    serde_json::json!({"adjustment":[adjustment.lower(),adjustment.value(),adjustment.upper(),adjustment.page_size()],
+                                        "viewport":bounds("reference-navigation-viewport"),"document":bounds("reference-navigation-document"),
+                                        "spaces":bounds("reference-spaces"),"status":bounds("reference-navigation-status")})
+                                }).unwrap_or(serde_json::Value::Null);
                             let _ = writeln!(file, "{snapshot}");
                         }
                     }
@@ -1510,6 +1850,14 @@ pub(crate) fn install_css() {
         ("@COMPOSER_INSET@", token::COMPOSER_INSET),
         ("@COMPOSER_BOTTOM@", token::COMPOSER_BOTTOM),
         ("@COMPOSER_INNER_HEIGHT@", token::COMPOSER_HEIGHT - 2.0),
+        (
+            "@LEGACY_COMPOSER_INNER_HEIGHT@",
+            token::COMPOSER_HEIGHT - token::COMPOSER_CONTROL_BOTTOM - 1.0,
+        ),
+        (
+            "@LEGACY_CONTROL_BOTTOM_PADDING@",
+            token::COMPOSER_CONTROL_BOTTOM - 1.0,
+        ),
         ("@BLOCK_DOCK_INNER_HEIGHT@", token::COMPOSER_HEIGHT - 16.0),
         ("@CARD_INSET@", token::CARD_HORIZONTAL_INSET),
     ]
@@ -1551,6 +1899,11 @@ mod role_font_tests {
             ),
             (
                 "window.forge-window.reference-shell .reference-toolbar label",
+                10.0,
+                13.0,
+            ),
+            (
+                "window.forge-window.reference-shell .reference-composer-controls.reference-fixed-controls label",
                 10.0,
                 13.0,
             ),

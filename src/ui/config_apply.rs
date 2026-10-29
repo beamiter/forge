@@ -793,6 +793,8 @@ impl UiState {
                     &self.window.pango_context(),
                 ),
             ));
+        drop(config);
+        super::reference_shell::refresh_composer_control_geometry(self.window.upcast_ref());
         self.ai_panel.apply_theme_colors();
     }
 

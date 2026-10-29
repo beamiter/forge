@@ -16,14 +16,16 @@ window.forge-window.reference-shell .developer-block-canvas .developer-command-c
 window.forge-window.reference-shell .developer-block-canvas .developer-command-card:focus-within .developer-card-body { outline:1px solid #6288bb; outline-offset:-1px; }
 window.forge-window.reference-shell .developer-block-canvas .developer-command-card.block-selection-active .developer-card-body { box-shadow:inset 0 0 0 1px alpha(#4199ff,.45); }
 window.forge-window.reference-shell .developer-block-canvas .developer-command-card.block-selected .developer-card-body { outline:1px solid #4199ff; outline-offset:-1px; }
-window.forge-window.reference-shell .developer-block-canvas .developer-command-header { background:alpha(#101c30,.65); border-bottom:1px solid #24334a; }
+window.forge-window.reference-shell .developer-block-canvas .developer-command-header { background:linear-gradient(180deg,#132037,#101b2e); border-bottom:1px solid #24334a; }
 window.forge-window.reference-shell .developer-block-canvas .developer-command-header button { min-height:22px; min-width:22px; padding:0 3px; border-radius:5px; color:#91a4bf; }
 window.forge-window.reference-shell .developer-block-canvas .developer-command-header button:hover { background:#253852; }
 window.forge-window.reference-shell .developer-block-canvas .developer-command-header button:focus-visible { outline:1px solid #4199ff; }
 window.forge-window.reference-shell .developer-block-canvas .developer-command-icon { color:#a9c9fa; background:#20385d; border:1px solid #496bba; border-radius:6px; padding:0; }
-window.forge-window.reference-shell .developer-block-canvas .developer-command-status { font-size:10px; border-radius:5px; padding:2px 7px; background:#263349; color:#91a4bf; }
-window.forge-window.reference-shell .developer-block-canvas .block-success .developer-command-status { color:#39dda0; background:alpha(#39dda0,.12); }
-window.forge-window.reference-shell .developer-block-canvas .block-failed .developer-command-status { color:#ff646f; background:alpha(#ff646f,.12); }
+window.forge-window.reference-shell .developer-block-canvas .developer-command-status { font-size:10px; border-radius:5px; padding:3px 7px; background:#1c2b40; color:#91a4bf; }
+window.forge-window.reference-shell .developer-block-canvas .developer-command-status label { font-size:10px; font-weight:700; color:inherit; }
+window.forge-window.reference-shell .developer-block-canvas .block-success .developer-command-status { color:#39dda0; background:#12352e; }
+window.forge-window.reference-shell .developer-block-canvas .block-failed .developer-command-status { color:#ff646f; background:#3b222e; }
+window.forge-window.reference-shell .developer-block-canvas .block-failed .developer-command-icon { color:#ff9b9f; background:#3c2632; border-color:#765057; }
 window.forge-window.reference-shell .developer-block-canvas .developer-command-elapsed { font-size:9px; color:#91a4bf; }
 window.forge-window.reference-shell .developer-block-canvas .developer-command-terminal { background:transparent; padding:0; margin:0; }
 window.forge-window.reference-shell .developer-block-canvas .developer-command-output { background:#0e1621; }
@@ -37,7 +39,7 @@ window.forge-window.reference-shell .reference-developer-active .reference-block
 window.forge-window.reference-shell .reference-developer-active .reference-block-composer button,
 window.forge-window.reference-shell .reference-developer-active .reference-block-composer label { color:#91a4bf; }
 window.forge-window.reference-shell .developer-block-canvas .block-active.developer-running { border-color:#4199ff; box-shadow:0 0 7px alpha(#4199ff,.18); }
-window.forge-window.reference-shell .developer-block-canvas .developer-running-header .developer-command-status { color:#4199ff; background:alpha(#4199ff,.12); }
+window.forge-window.reference-shell .developer-block-canvas .developer-running-header .developer-command-status { color:#4199ff; background:#152f50; }
 window.forge-window.reference-shell .developer-block-canvas .developer-running-command { color:#d5deec; }
 
 window.forge-window.reference-shell .developer-live-toolbar { background:#101c30; border-bottom:1px solid #293c57; padding:0 12px; color:#91a4bf; }
@@ -54,7 +56,7 @@ window.forge-window.reference-shell .developer-docked-input .chat-dock.chat-dock
 window.forge-window.reference-shell .developer-docked-input .chat-composer,
 window.forge-window.reference-shell .developer-docked-input .chat-composer.block-compact { margin:0; padding:0; min-height:0; border:0; background:transparent; box-shadow:none; }
 window.forge-window.reference-shell .developer-docked-input .chat-composer-card:focus-within { border-color:#4199ff; box-shadow:0 0 0 1px alpha(#4199ff,.12); }
-window.forge-window.reference-shell .developer-docked-input .reference-composer-controls { min-height:28px; margin-top:0; padding:0 10px; background:transparent; }
+window.forge-window.reference-shell .developer-docked-input .reference-composer-controls { min-height:28px; margin-top:0; padding:0 9px 0 11px; background:transparent; }
 window.forge-window.reference-shell .developer-docked-input .reference-composer-controls button,
 window.forge-window.reference-shell .developer-docked-input .reference-composer-controls menubutton > button,
 window.forge-window.reference-shell .developer-docked-input .reference-unavailable-tool { min-height:26px; padding:0 6px; border:1px solid #344864; border-radius:7px; background:#19283c; color:#91a4bf; }

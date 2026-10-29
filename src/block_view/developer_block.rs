@@ -189,6 +189,26 @@ pub(super) fn terminal_colors(terminal: &Terminal) {
     ));
 }
 
+/// Compact native status metadata. Callers supply only an observed outcome;
+/// a missing or neutral result deliberately has no success symbol.
+pub(super) fn status_badge(
+    text: &str,
+    icon: Option<jterm_core::reference_icons::Icon>,
+) -> gtk4::Box {
+    let badge = gtk4::Box::new(Orientation::Horizontal, 4);
+    badge.add_css_class("developer-command-status");
+    badge.set_valign(gtk4::Align::Center);
+    badge.set_height_request(20);
+    badge.set_accessible_role(gtk4::AccessibleRole::Status);
+    if let Some(icon) = icon {
+        badge.append(&crate::ui::reference_shell::vector_icon(icon, 12));
+    }
+    let label = gtk4::Label::new(Some(text));
+    label.set_wrap(false);
+    badge.append(&label);
+    badge
+}
+
 /// The current command's real lifecycle header. Its terminal remains the
 /// original ActiveBlock; this component has no input and launches no process.
 pub(super) struct RunningHeader {
@@ -220,11 +240,7 @@ impl RunningHeader {
         title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         title.add_css_class("developer-running-command");
         root.append(&title);
-        let status = gtk4::Label::new(Some("Running"));
-        status.add_css_class("developer-command-status");
-        status.set_valign(gtk4::Align::Center);
-        status.set_height_request(20);
-        status.set_accessible_role(gtk4::AccessibleRole::Status);
+        let status = status_badge("Running", Some(jterm_core::reference_icons::Icon::History));
         root.append(&status);
         let elapsed = gtk4::Label::new(None);
         elapsed.add_css_class("developer-command-elapsed");

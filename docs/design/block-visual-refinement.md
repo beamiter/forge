@@ -5,6 +5,68 @@ This bounded local batch uses the self-viewed native reference
 `dc81db85112b6804424a2cdbbd94e232ca2335be2e0b36a620756f6725e26bf1`).
 It is not final1:1 acceptance and does not implement running-output separation.
 
+The active outer geometry now comes from the original common1356×704 shell:
+42px titlebar,55px rail,237px navigation,306px Inspector,49px header and80px
+composer inset28px/bottom11px. The earlier68px/1672 captures documented below
+remain historical evidence; they are not a second pending layout. The Block
+raster continues to define only the dark native command cards. Current
+canonical geometry and fixed control bounds require new same-source screenshots.
+
+## Final surface pass
+
+The separate `work/forge-ui-final-20261028` branch starts at the stable
+`f20aa105` product. The uncommitted native-feed experiment and the withdrawn
+source-registration guard are preserved in task evidence and are excluded.
+
+The common Inspector already matches Anvil's authored title11px/600 and
+section8px/700 roles, so those typography tokens are unchanged. The Block status badge uses the same
+12px native Check/Close/History vectors,4px inner gap,10px/700 label and quiet
+green/red/blue fills as Anvil, driven by observed outcomes. Neutral or unknown
+outcomes do not receive a success symbol. Header surfaces gain a subtle navy
+gradient and failed terminal icons receive a muted red tint. Ordinary card
+borders remain navy. The existing Block More button uses the shared16px
+horizontal ellipsis vector; its action owner and signals are retained. Chat
+messages, terminal fonts, input, footer and all PTY paths are unchanged. Native
+screenshots and geometry checks are required before this pass can be marked
+validated. Running echo separation and live output gutters remain unfinished
+functionality.
+
+The populated Current Step card now centers its state symbol and two-line
+content inside the existing59px frame. Only the `details=true` renderer branch
+changes: title and detail stay on one line with end ellipsis and their original
+complete tooltips. Queue rows, message steps and all Inspector outer bounds
+retain their existing behavior.
+
+This UI-only pass builds on `f20aa105`; its fresh app ELF is
+`1f090b6e11c7e08480522a00623174217e8050b6c90be38beb3ed54174ae6598`.
+Format, offline locked check and release passed. Real Block commands exercised
+success, failure and Running states; native focus, same shell/TTY/grid and
+short Inspector scrolling checks passed. Chat1672/1356/1000/700 logical widths
+kept the original font/geometry assertions and actual keyboard proof.
+The actual command-header pixel bands remain40px for all three outcomes;
+the full native PNGs include CSD and are not guessed client crops.
+
+The first More test opened the genuine menu but failed before Copy when
+full-screen OCR did not recognize its small text. That PNG, TSV and failed
+driver remain intact. A bounded menu ROI oracle then passed the exact six-file
+clipboard assertion, real F10 collapse, native More Show Output, exact restored
+allocation/model height and700px real-state checks. No product behavior or
+assertion was weakened for the oracle correction.
+
+The unchanged eight-case long-label test was freshly compiled into test ELF
+`cffa6095509e670a67d4845485e24a4188b58772ad81b4089565542b9eb168a1`
+and passed with eight actual component PNGs. This test executable is distinct
+from the full app. Its original single-line/ellipsis/full-tooltip,22px heading,
+non-overlap,199px pane, five24px queue rows and short-window reachability
+assertions remain intact. Current evidence is under
+`evidence/forge/ui-final-surfaces/current-step-centered` and
+`evidence/forge/ui-final-surfaces/block-interactions-oracle-v2`.
+
+These are bounded UI checks, not final1:1 acceptance or a physical Fcitx/Wayland
+IME claim. The saved native-feed experiment, withdrawn lifetime guard and their
+old failures are excluded from this UI branch. Nothing in this pass implements
+running echo separation or live output gutters.
+
 The comparison baseline is runtimecd9/coref791/ELF2fd290, the Block and Chat
 1672×941 native PNGs in `evidence/forge/density-v3-final-native`. Their major
 bounds remain fixed:55px titlebar, centerx244, inspectorx1374/w298,42px center
@@ -126,3 +188,7 @@ and frozen binaries remain preserved. The final audited test uses actual
 outer bounds for22/253/199/24px visual targets, keeps Pango content getters
 for text layout, and uses the native adjustment page size for reachability.
 No product code or expected visual dimensions were changed to pass it.
+
+Fresh configurations render the shared shell at opacity1.0 so semantic surface colors are not dimmed by a transparent top-level window. Explicit file/environment opacity and saved user preferences retain their existing priority and are not migrated or overwritten.
+
+The original sidebar controller and fixed49px bottom status remain the outer box. Its navigation/recent/spaces document now has one native vertical viewport, so short windows retain exact requested size and all rows remain reachable by scrolling. This one-time shell arrangement does not rebuild session widgets or change the PTY/history viewport.

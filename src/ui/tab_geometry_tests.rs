@@ -604,7 +604,9 @@ fn inspector_extreme_labels_keep_one_line_and_reachable_full_tooltips() {
         std::fs::create_dir_all(path).unwrap();
     }
     let mut cases = Vec::new();
-    for height in [844, 607] {
+    // Original common shell:704 -42titlebar -49Inspector tabs =613.
+    // The explicit480px case retains the strong scroll reachability check.
+    for height in [613, 480] {
         let mut normal_badge_width = None;
         for (case, long_title, long_status) in [
             ("normal", false, false),
@@ -640,11 +642,11 @@ fn inspector_extreme_labels_keep_one_line_and_reachable_full_tooltips() {
             window.add_css_class("reference-shell");
             window.set_title(Some("Visual acceptance fixture — Inspector label stress"));
             window.set_decorated(false);
-            window.set_default_size(298, height);
+            window.set_default_size(306, height);
             window.set_child(Some(&shell));
             window.present();
-            // Widget::width is the CSS content width (253px here), while
-            // compute_bounds also includes the 32px padding/border. Wait for
+            // Widget::width is the CSS content width (251px here), while
+            // compute_bounds also includes the28px padding/border. Wait for
             // actual mapping and assert the allocation after native paint.
             pump_until(|| window.is_mapped() && overview.is_mapped());
             after_paint(&window);
@@ -684,11 +686,11 @@ fn inspector_extreme_labels_keep_one_line_and_reachable_full_tooltips() {
                 )
                 .unwrap();
             }
-            assert_eq!([window.width(), window.height()], [298, height], "{result}");
-            assert_eq!(hr[3], 22.0, "{result}");
-            assert_eq!(hr[2], 253.0, "{result}");
+            assert_eq!([window.width(), window.height()], [306, height], "{result}");
+            assert_eq!(hr[3], 18.0, "{result}");
+            assert_eq!(hr[2], 251.0, "{result}");
             assert!(
-                icon.is_mapped() && ir[2] >= 22.0 && ir[3] >= 22.0,
+                icon.is_mapped() && ir[2] >= 14.0 && ir[3] >= 14.0,
                 "{result}"
             );
             assert!(
@@ -701,7 +703,7 @@ fn inspector_extreme_labels_keep_one_line_and_reachable_full_tooltips() {
                 assert_eq!(label.layout().line_count(), 1, "{result}");
                 assert_eq!(label.tooltip_text().as_deref(), Some(full.as_str()));
                 let lr = bounds(label.upcast_ref(), &window);
-                assert!(lr[2] >= 5.0 && lr[3] <= 22.0, "{result}");
+                assert!(lr[2] >= 5.0 && lr[3] <= 18.0, "{result}");
                 // Pango's logical text box belongs to the content allocation,
                 // unlike the CSS border boxes above. Even an ellipsis must
                 // fit rather than being hidden by a shrunken label surface.
@@ -742,7 +744,7 @@ fn inspector_extreme_labels_keep_one_line_and_reachable_full_tooltips() {
             let output = find(overview.upcast_ref(), "reference-inspector-output");
             let queue = find(overview.upcast_ref(), "reference-inspector-queue");
             let output_outer = bounds(&output, &window);
-            assert_eq!(output_outer[3], 199.0, "pane changed: {result}");
+            assert_eq!(output_outer[3], 140.0, "pane changed: {result}");
             let mut row_count = 0;
             let mut child = queue.first_child();
             while let Some(row) = child {
@@ -753,7 +755,7 @@ fn inspector_extreme_labels_keep_one_line_and_reachable_full_tooltips() {
             assert_eq!(row_count, 5);
             let adjustment = scroll.vadjustment();
             let maximum = (adjustment.upper() - adjustment.page_size()).max(0.0);
-            if height == 607 {
+            if height == 480 {
                 assert!(
                     maximum > 0.0,
                     "short inspector must retain its full scroll document"

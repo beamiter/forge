@@ -10,7 +10,7 @@
 # 本地新建/恢复的 pane 应用此设置，运行中的 PTY 保持原会话。
 # 历史配置值仍可读取并映射到公开的 Block/Chat 显示模式。
 terminal_mode = "block"
-opacity = 0.95                 # 0.01 .. 1.0
+opacity = 1.0                  # 0.01 .. 1.0; explicit preferences remain authoritative
 scrollback = 5000             # 0 .. 1000000
 font = "JetBrainsMono Nerd Font Mono 12px"
 # Family used for icon glyphs `font` does not cover (Nerd Font powerline

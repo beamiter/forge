@@ -3967,6 +3967,11 @@ impl FinishedBlock {
         self.header_row
             .set_height_request(super::developer_block::HEADER_HEIGHT);
         self.header_row.set_spacing(8);
+        self.more_btn
+            .set_child(Some(&crate::ui::reference_shell::vector_icon(
+                jterm_core::reference_icons::Icon::More,
+                16,
+            )));
         self.status_icon.set_visible(false);
         self.action_box.set_visible(false);
         let mut child = self.header_row.first_child();
@@ -4007,19 +4012,19 @@ impl FinishedBlock {
         icon.add_css_class("developer-command-icon");
         icon.set_margin_end(8);
         self.header_row.prepend(&icon);
-        let status = gtk4::Label::new(Some(
+        let (status_text, status_icon) =
             match BlockOutcome::classify(Some(&self.cmd_text), exit_code) {
-                BlockOutcome::Success => "Completed",
-                BlockOutcome::Failure(_) => "Failed",
-                BlockOutcome::Interrupted(_) => "Interrupted",
-                BlockOutcome::Background => "Output",
-                BlockOutcome::Unknown => "Unknown",
-            },
-        ));
-        status.add_css_class("developer-command-status");
-        status.set_valign(gtk4::Align::Center);
-        status.set_height_request(20);
-        status.set_accessible_role(gtk4::AccessibleRole::Status);
+                BlockOutcome::Success => {
+                    ("Completed", Some(jterm_core::reference_icons::Icon::Check))
+                }
+                BlockOutcome::Failure(_) => {
+                    ("Failed", Some(jterm_core::reference_icons::Icon::Close))
+                }
+                BlockOutcome::Interrupted(_) => ("Interrupted", None),
+                BlockOutcome::Background => ("Output", None),
+                BlockOutcome::Unknown => ("Unknown", None),
+            };
+        let status = super::developer_block::status_badge(status_text, status_icon);
         status.set_tooltip_text(Some(
             &exit_code
                 .map(|code| format!("Observed shell exit status: {code}"))

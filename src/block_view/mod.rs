@@ -17579,6 +17579,19 @@ impl TermView {
         self.root.clone().upcast()
     }
 
+    /// A pane retains the presentation it was launched with when defaults change.
+    pub(crate) fn terminal_mode(&self) -> crate::config::TerminalMode {
+        self.config.borrow().terminal_mode.clone()
+    }
+
+    /// Chat and command-card panes already own their native input/tools dock.
+    pub(crate) fn has_input_dock(&self) -> bool {
+        matches!(
+            self.terminal_mode(),
+            crate::config::TerminalMode::Block | crate::config::TerminalMode::Chat
+        )
+    }
+
     /// Attach a pass-through body to the live VTE overlay.  Repeating this for
     /// the same body acts as a move; a widget owned by another container is
     /// rejected instead of being silently reparented.

@@ -382,6 +382,10 @@ impl ChatPresentation {
             }
         });
         let stop = gtk4::Button::from_icon_name("process-stop-symbolic");
+        let stop_icon =
+            crate::ui::reference_shell::vector_icon(jterm_core::reference_icons::Icon::Close, 12);
+        stop_icon.add_css_class("reference-composer-glyph");
+        stop.set_child(Some(&stop_icon));
         stop.add_css_class("flat");
         stop.set_tooltip_text(Some(
             "Interrupt immediately when idle; if unavailable, use Ctrl+C on the keyboard",
@@ -395,17 +399,19 @@ impl ChatPresentation {
         stop.add_css_class("chat-command-control");
         controls.append(&stop);
         let submit = gtk4::Button::from_icon_name("go-up-symbolic");
-        submit.set_child(Some(&crate::ui::reference_shell::vector_icon(
-            jterm_core::reference_icons::Icon::Send,
-            16,
-        )));
+        let submit_icon =
+            crate::ui::reference_shell::vector_icon(jterm_core::reference_icons::Icon::Send, 12);
+        submit_icon.add_css_class("reference-composer-glyph");
+        submit.set_child(Some(&submit_icon));
         submit.add_css_class("chat-submit");
         submit.add_css_class("chat-command-control");
         submit.set_tooltip_text(Some("Send Enter immediately when idle. Finish or cancel text composition before using Send; if unavailable or using enhanced keys, use the keyboard"));
         submit.update_property(&[gtk4::accessible::Property::Label("Submit shell input")]);
         submit.set_focus_on_click(false);
         controls.append(&submit);
-        dock.append(&controls);
+        dock.append(&crate::ui::reference_shell::composer_controls_frame(
+            &controls,
+        ));
         canvas.append(&dock);
         // Observe the stable Chat canvas, not only history adjustments: the
         // independently docked live editor can be allocated after history has

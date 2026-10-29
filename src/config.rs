@@ -1017,7 +1017,7 @@ impl Config {
         let theme = &themes[0];
         Self {
             vim9: jterm_core::vim9::Vim9UiConfig::default(),
-            window_opacity: 0.95,
+            window_opacity: 1.0,
             terminal_scrollback_lines: 5_000,
             font_desc: DEFAULT_FONT_DESC.to_string(),
             icon_font: None,
@@ -2930,7 +2930,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .unwrap_or(&themes[0]);
 
     // Priority: env var > config file > theme default
-    let window_opacity = finite_clamp_f64(env_f64("FORGE_OPACITY").or(fc.opacity), 0.95, 0.01, 1.0);
+    let window_opacity = finite_clamp_f64(env_f64("FORGE_OPACITY").or(fc.opacity), 1.0, 0.01, 1.0);
     let terminal_scrollback_lines = env_u32("FORGE_SCROLLBACK")
         .or(fc.scrollback)
         .unwrap_or(5000)
@@ -4756,7 +4756,7 @@ session = "bad/session"
         config.apply_safe_mode();
 
         assert!(matches!(config.terminal_mode, TerminalMode::Vte));
-        assert_eq!(config.window_opacity, 0.95);
+        assert_eq!(config.window_opacity, 1.0);
         assert_eq!(config.terminal_scrollback_lines, 5_000);
         assert_eq!(config.font_desc, DEFAULT_FONT_DESC);
         assert_eq!(config.default_font_scale, 1.0);
