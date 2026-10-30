@@ -9,10 +9,19 @@ pub(super) const GUTTER_WIDTH: i32 = 24;
 pub(super) const GUTTER_GAP: i32 = 16;
 pub(super) const OUTPUT_PADDING: i32 = 6;
 
+/// Rows the Block composer always keeps when idle: a prompt plus one command
+/// line leaves no visible room to type into, so the editor reserves three full
+/// lines of text (fewer only when the whole pane is shorter than that).
+pub(super) const BLOCK_INPUT_MIN_ROWS: i64 = 3;
+
 /// The companion is not a reserved row in Block's real shell editor. Grow for
-/// every line the native prompt/completion UI actually draws; never crop it.
+/// every line the native prompt/completion UI actually draws; never crop it,
+/// and never shrink below [`BLOCK_INPUT_MIN_ROWS`].
 pub(super) fn composer_rows(input: i64, drawn: i64, viewport: i64) -> i64 {
-    input.max(drawn).clamp(1, viewport.max(1))
+    let viewport = viewport.max(1);
+    input
+        .max(drawn)
+        .clamp(BLOCK_INPUT_MIN_ROWS.min(viewport), viewport)
 }
 
 /// libvte can renumber absolute ring rows when a real grid resize rewraps a
@@ -337,11 +346,19 @@ pub(super) fn live_toolbar() -> (gtk4::Box, gtk4::Label, gtk4::Button, gtk4::But
 mod tests {
     use super::*;
     #[test]
-    fn block_input_rows_follow_native_drawn_content_without_a_companion_floor() {
-        assert_eq!(composer_rows(1, 1, 30), 1);
+    fn block_input_rows_keep_three_lines_and_follow_native_drawn_content() {
+        // An empty prompt, a one-line prompt and a two-line prompt all leave
+        // three full lines of room to type into.
+        assert_eq!(composer_rows(1, 1, 30), BLOCK_INPUT_MIN_ROWS);
+        assert_eq!(composer_rows(1, 2, 30), BLOCK_INPUT_MIN_ROWS);
+        assert_eq!(composer_rows(2, 1, 30), BLOCK_INPUT_MIN_ROWS);
+        // Beyond the floor the editor follows typed and drawn content.
         assert_eq!(composer_rows(4, 1, 30), 4);
         assert_eq!(composer_rows(1, 12, 30), 12);
         assert_eq!(composer_rows(1, 100, 30), 30);
+        // A pane shorter than the floor never asks for more than it has.
+        assert_eq!(composer_rows(1, 1, 2), 2);
+        assert_eq!(composer_rows(1, 1, 0), 1);
     }
     #[test]
     fn ring_rebase_preserves_relative_extent_and_requires_cursor_domain_proof() {

@@ -6,6 +6,12 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- The Block workspace's bottom input now always reserves three full lines of
+  text while idle instead of collapsing to the prompt's one or two rows. It
+  still grows for multiline commands, completion menus and anything else the
+  shell draws, and shrinks only when the pane itself is shorter than three
+  rows.
+
 - Both workspace sidebars now have visible draggable dividers. Widths persist
   independently, survive hide/show and narrow windows, and restore when space
   returns; the right-hand drawer has its own resize edge. Native F8/arrow-key
