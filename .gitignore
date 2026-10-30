@@ -15,3 +15,12 @@ flatpak-repo/
 *.flatpak
 flatpak-smoke-logs/
 .cargo/config.toml
+
+# Rebuildable native offscreen QA caches (contact sheet/measurements are kept).
+/tools/eva-native-render/target
+/qa/eva-native/.cache
+# Reproducible per-frame exports; keep native-contact-sheet.png and measurements.
+/qa/eva-native/frames.json
+/qa/eva-native/*-96dpi.png
+/qa/eva-native/*-144dpi.png
+/qa/eva-native/*-192dpi.png

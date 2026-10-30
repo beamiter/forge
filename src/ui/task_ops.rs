@@ -1231,6 +1231,7 @@ impl UiState {
     /// Push the composed panel state. Rows are rebuilt from the domain every
     /// time; the panel never holds its own task copies.
     pub(crate) fn sync_tasks_panel(&self) {
+        {let d=self.agent_tasks.borrow();crate::eva_companion::observe_task(self.window.upcast_ref(),d.task_manager.tasks().iter().find(|t|Some(t.id)==d.selected_task));}
         let policy = self.task_prompt_policy();
         let native_ai_enabled = policy.share_command_context;
         let mut agent_terminals = HashSet::new();

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Execute the checkout's font-size helper against installed native Pango.
 
-No Cargo dependencies or display are needed. The existing GTK display CI job
+Cargo resolves the exact pinned shared source; no display is needed. The existing GTK display CI job
 provides Pango; the FFI boundary calls the same parser/getters as gtk-rs. Optional
 --root checks a sibling frontend's identical helper without modifying it.
 """
@@ -13,7 +13,6 @@ import json
 import os
 import re
 import subprocess
-import tarfile
 import tempfile
 import textwrap
 
@@ -32,7 +31,7 @@ def item(source, signature):
 
 
 def default_font_literal(root, config):
-    """Follow the checkout's canonical literal or packaged shared-core token."""
+    """Follow the checkout's canonical literal or exact resolved shared-core token."""
     declarations = re.findall(r'\bconst\s+DEFAULT_FONT_DESC\s*:\s*&str\s*=\s*("(?:[^"\\\n]|\\.)*"|[^;]+)\s*;', config)
     assert len(declarations) == 1, "Expected one DEFAULT_FONT_DESC declaration"
     expression = declarations[0].strip()
@@ -40,20 +39,14 @@ def default_font_literal(root, config):
         return expression, "src/config.rs::DEFAULT_FONT_DESC"
     shared = re.fullmatch(r'jterm_core::([a-z][a-z0-9_]*)::([A-Z][A-Z0-9_]*)', expression)
     assert shared, f"Unsupported canonical font expression: {expression}"
-    archive = root / "packaging/jterm-core-src.tar.gz"
-    expected = (root / "packaging/jterm-core-src.tar.gz.sha256").read_text().split()[0]
-    assert re.fullmatch(r'[a-fA-F0-9]{64}', expected), "Invalid packaged-core SHA256"
-    actual = hashlib.sha256(archive.read_bytes()).hexdigest()
-    assert actual == expected.lower(), "Packaged-core source archive SHA256 mismatch"
+    core = Path(subprocess.check_output(
+        ['python3', str(root / 'scripts/shared-core-path.py'), str(root)], text=True).strip())
     member_name = f"src/{shared[1]}.rs"
-    with tarfile.open(archive, "r:gz") as bundle:
-        member = bundle.getmember(member_name)
-        assert member.isfile() and member.size <= 256 * 1024, member_name
-        canonical = bundle.extractfile(member).read().decode("utf-8")
+    canonical = (core / member_name).read_text()
     values = re.findall(r'\bconst\s+' + re.escape(shared[2])
                         + r'\s*:\s*&str\s*=\s*("(?:[^"\\\n]|\\.)*")\s*;', canonical)
     assert len(values) == 1, f"Expected one canonical font token: {expression}"
-    return values[0], f"{archive}#{member_name}::{shared[2]} (SHA256 {actual})"
+    return values[0], f"resolved jterm_core/{member_name}::{shared[2]} (SHA256 {hashlib.sha256(canonical.encode()).hexdigest()})"
 
 
 def main():

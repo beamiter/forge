@@ -1,0 +1,26 @@
+   Compiling companion-protocol v0.1.0 (https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa56954)
+   Compiling eva-character-atlas v0.1.0 (https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa56954)
+   Compiling eva-gtk-native-render v0.1.0 (<workspace>/forge/tools/eva-native-render)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.39s
+     Running unittests src/main.rs (eva-workspace/forge/tools/eva-native-render/target/debug/deps/eva_gtk_native_render-ed69b6d8887d8ac0)
+
+running 4 tests
+test scope_rules::tests::archived_management_never_requires_adopting_target ... ok
+test scope_rules::tests::changed_pane_project_revision_and_host_invalidate_review ... ok
+test geometry::measured_native_100_150_200_percent_admissions_use_real_host_selector ... ok
+test paint::tests::all_skins_poses_have_native_safe_markup ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+    Checking companion-protocol v0.1.0 (https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa56954)
+    Checking eva-character-atlas v0.1.0 (https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa56954)
+    Checking companion-core v0.1.0 (https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa56954)
+    Checking companion-client v0.1.0 (https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa56954)
+    Checking jterm_core v0.2.0 (https://github.com/beamiter/jterm_core.git?rev=974ccad203375032fe87706caecab39ad516c238#974ccad2)
+    Checking forge v0.2.0 (<workspace>/forge)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 30.29s
+    Checking anvil v0.2.0 (<workspace>/anvil)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 18.12s
+
+    Checking forge v0.2.0 (<workspace>/forge)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.50s

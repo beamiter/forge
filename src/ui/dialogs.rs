@@ -121,6 +121,7 @@ mod organism_preview {
     const FRAME_INTERVAL: Duration = Duration::from_millis(100);
 
     fn motion_for_selection(selected: u32, animations: bool) -> OrganismMotion {
+        if crate::eva_companion::shared_mode_requested(){return OrganismMotion::Static;}
         match selected {
             1 => OrganismMotion::Full,
             2 => OrganismMotion::Calm,
@@ -131,6 +132,7 @@ mod organism_preview {
     }
 
     fn motion_description(selected: u32, animations: Option<bool>) -> &'static str {
+        if crate::eva_companion::shared_mode_requested(){return "Shared Eva: static preview only; appearance and motion live in the Eva card.";}
         match selected {
             1 => "Full: animated movement and quiet hover greetings.",
             2 => "Calm: still poses and quiet hover greetings.",
@@ -404,6 +406,7 @@ mod organism_preview {
         }
 
         fn is_active(&self) -> bool {
+            if crate::eva_companion::shared_mode_requested(){return false;}
             self.group.upgrade().is_some_and(|group| {
                 presentation_active(
                     self.visible.get(),
@@ -4940,6 +4943,9 @@ impl UiState {
         command_history_row.set_sensitive(!safe_mode);
         terminal_group.add(&command_history_row);
 
+        let eva_row=adw::SwitchRow::builder().title("Shared Eva Companion").subtitle("One Eva across applications. Restart required; daemon must be running.").active(config.eva_companion_enabled).build();
+        eva_row.set_sensitive(!safe_mode);terminal_group.add(&eva_row);
+        {let ui=self.clone();eva_row.connect_active_notify(move |row|{ui.config.borrow_mut().eva_companion_enabled=row.is_active();ui.persist_config();});}
         let ascii_organism_row = adw::SwitchRow::builder()
             .title("ASCII Organism")
             .subtitle(organism_enabled_description(

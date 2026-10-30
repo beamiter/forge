@@ -1,0 +1,9684 @@
+{
+  "claims": "Native offscreen text shaping/draw only; NOT display/IPC/compositor/IME/GPU acceptance",
+  "scales_percent": [
+    100,
+    150,
+    200
+  ],
+  "contact_sheet_cells_nonoverlapping": true,
+  "all_measured_admissions_avoid_input_and_approval": true,
+  "frames": [
+    {
+      "skin": "cat",
+      "pose": "idle",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 经典猫团子 · 安静等待 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cat-idle-96dpi.png"
+    },
+    {
+      "skin": "fox",
+      "pose": "idle",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 像素小狐狸 · 安静等待 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "fox-idle-96dpi.png"
+    },
+    {
+      "skin": "robot",
+      "pose": "idle",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 胶囊机器人 · 安静等待 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "robot-idle-96dpi.png"
+    },
+    {
+      "skin": "ghost",
+      "pose": "idle",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 软糯幽灵 · 安静等待 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "ghost-idle-96dpi.png"
+    },
+    {
+      "skin": "cursor",
+      "pose": "idle",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 极简光标精灵 · 安静等待 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cursor-idle-96dpi.png"
+    },
+    {
+      "skin": "beetle",
+      "pose": "idle",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 机械小甲虫 · 安静等待 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "beetle-idle-96dpi.png"
+    },
+    {
+      "skin": "night",
+      "pose": "idle",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 安静等待 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "night-idle-96dpi.png"
+    },
+    {
+      "skin": "stardust",
+      "pose": "idle",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 星尘团子 · 安静等待 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "stardust-idle-96dpi.png"
+    },
+    {
+      "skin": "cat",
+      "pose": "blink",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 经典猫团子 · 短暂眨眼 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cat-blink-96dpi.png"
+    },
+    {
+      "skin": "fox",
+      "pose": "blink",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 像素小狐狸 · 短暂眨眼 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "fox-blink-96dpi.png"
+    },
+    {
+      "skin": "robot",
+      "pose": "blink",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 胶囊机器人 · 短暂眨眼 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "robot-blink-96dpi.png"
+    },
+    {
+      "skin": "ghost",
+      "pose": "blink",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 软糯幽灵 · 短暂眨眼 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "ghost-blink-96dpi.png"
+    },
+    {
+      "skin": "cursor",
+      "pose": "blink",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 极简光标精灵 · 短暂眨眼 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cursor-blink-96dpi.png"
+    },
+    {
+      "skin": "beetle",
+      "pose": "blink",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 机械小甲虫 · 短暂眨眼 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "beetle-blink-96dpi.png"
+    },
+    {
+      "skin": "night",
+      "pose": "blink",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 夜行小猫 · 短暂眨眼 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "night-blink-96dpi.png"
+    },
+    {
+      "skin": "stardust",
+      "pose": "blink",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 星尘团子 · 短暂眨眼 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "stardust-blink-96dpi.png"
+    },
+    {
+      "skin": "cat",
+      "pose": "peek",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 经典猫团子 · 好奇探头 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cat-peek-96dpi.png"
+    },
+    {
+      "skin": "fox",
+      "pose": "peek",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 像素小狐狸 · 好奇探头 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "fox-peek-96dpi.png"
+    },
+    {
+      "skin": "robot",
+      "pose": "peek",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 胶囊机器人 · 好奇探头 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "robot-peek-96dpi.png"
+    },
+    {
+      "skin": "ghost",
+      "pose": "peek",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 软糯幽灵 · 好奇探头 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "ghost-peek-96dpi.png"
+    },
+    {
+      "skin": "cursor",
+      "pose": "peek",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 极简光标精灵 · 好奇探头 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cursor-peek-96dpi.png"
+    },
+    {
+      "skin": "beetle",
+      "pose": "peek",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 机械小甲虫 · 好奇探头 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "beetle-peek-96dpi.png"
+    },
+    {
+      "skin": "night",
+      "pose": "peek",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 好奇探头 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "night-peek-96dpi.png"
+    },
+    {
+      "skin": "stardust",
+      "pose": "peek",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 星尘团子 · 好奇探头 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "stardust-peek-96dpi.png"
+    },
+    {
+      "skin": "cat",
+      "pose": "sit",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 经典猫团子 · 放松落座 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cat-sit-96dpi.png"
+    },
+    {
+      "skin": "fox",
+      "pose": "sit",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 像素小狐狸 · 放松落座 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "fox-sit-96dpi.png"
+    },
+    {
+      "skin": "robot",
+      "pose": "sit",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 胶囊机器人 · 放松落座 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "robot-sit-96dpi.png"
+    },
+    {
+      "skin": "ghost",
+      "pose": "sit",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 软糯幽灵 · 放松落座 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "ghost-sit-96dpi.png"
+    },
+    {
+      "skin": "cursor",
+      "pose": "sit",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 极简光标精灵 · 放松落座 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cursor-sit-96dpi.png"
+    },
+    {
+      "skin": "beetle",
+      "pose": "sit",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 机械小甲虫 · 放松落座 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "beetle-sit-96dpi.png"
+    },
+    {
+      "skin": "night",
+      "pose": "sit",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 放松落座 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "night-sit-96dpi.png"
+    },
+    {
+      "skin": "stardust",
+      "pose": "sit",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 星尘团子 · 放松落座 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "stardust-sit-96dpi.png"
+    },
+    {
+      "skin": "cat",
+      "pose": "curl_up",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 经典猫团子 · 蜷起休息；任务状态不变 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cat-curl_up-96dpi.png"
+    },
+    {
+      "skin": "fox",
+      "pose": "curl_up",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 像素小狐狸 · 蜷起休息；任务状态不变 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "fox-curl_up-96dpi.png"
+    },
+    {
+      "skin": "robot",
+      "pose": "curl_up",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 胶囊机器人 · 蜷起休息；任务状态不变 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "robot-curl_up-96dpi.png"
+    },
+    {
+      "skin": "ghost",
+      "pose": "curl_up",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 软糯幽灵 · 蜷起休息；任务状态不变 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "ghost-curl_up-96dpi.png"
+    },
+    {
+      "skin": "cursor",
+      "pose": "curl_up",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 极简光标精灵 · 蜷起休息；任务状态不变 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cursor-curl_up-96dpi.png"
+    },
+    {
+      "skin": "beetle",
+      "pose": "curl_up",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 机械小甲虫 · 蜷起休息；任务状态不变 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "beetle-curl_up-96dpi.png"
+    },
+    {
+      "skin": "night",
+      "pose": "curl_up",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 蜷起休息；任务状态不变 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "night-curl_up-96dpi.png"
+    },
+    {
+      "skin": "stardust",
+      "pose": "curl_up",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 星尘团子 · 蜷起休息；任务状态不变 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "stardust-curl_up-96dpi.png"
+    },
+    {
+      "skin": "cat",
+      "pose": "stretch",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 经典猫团子 · 舒展身体 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cat-stretch-96dpi.png"
+    },
+    {
+      "skin": "fox",
+      "pose": "stretch",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 像素小狐狸 · 舒展身体 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "fox-stretch-96dpi.png"
+    },
+    {
+      "skin": "robot",
+      "pose": "stretch",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 胶囊机器人 · 舒展身体 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "robot-stretch-96dpi.png"
+    },
+    {
+      "skin": "ghost",
+      "pose": "stretch",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 软糯幽灵 · 舒展身体 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "ghost-stretch-96dpi.png"
+    },
+    {
+      "skin": "cursor",
+      "pose": "stretch",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 极简光标精灵 · 舒展身体 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cursor-stretch-96dpi.png"
+    },
+    {
+      "skin": "beetle",
+      "pose": "stretch",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 机械小甲虫 · 舒展身体 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "beetle-stretch-96dpi.png"
+    },
+    {
+      "skin": "night",
+      "pose": "stretch",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 舒展身体 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "night-stretch-96dpi.png"
+    },
+    {
+      "skin": "stardust",
+      "pose": "stretch",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 星尘团子 · 舒展身体 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "stardust-stretch-96dpi.png"
+    },
+    {
+      "skin": "cat",
+      "pose": "retreat",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 经典猫团子 · 正在让路 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cat-retreat-96dpi.png"
+    },
+    {
+      "skin": "fox",
+      "pose": "retreat",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 像素小狐狸 · 正在让路 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "fox-retreat-96dpi.png"
+    },
+    {
+      "skin": "robot",
+      "pose": "retreat",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 胶囊机器人 · 正在让路 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "robot-retreat-96dpi.png"
+    },
+    {
+      "skin": "ghost",
+      "pose": "retreat",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 软糯幽灵 · 正在让路 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "ghost-retreat-96dpi.png"
+    },
+    {
+      "skin": "cursor",
+      "pose": "retreat",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 极简光标精灵 · 正在让路 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cursor-retreat-96dpi.png"
+    },
+    {
+      "skin": "beetle",
+      "pose": "retreat",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 机械小甲虫 · 正在让路 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "beetle-retreat-96dpi.png"
+    },
+    {
+      "skin": "night",
+      "pose": "retreat",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 夜行小猫 · 正在让路 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "night-retreat-96dpi.png"
+    },
+    {
+      "skin": "stardust",
+      "pose": "retreat",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 星尘团子 · 正在让路 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "stardust-retreat-96dpi.png"
+    },
+    {
+      "skin": "cat",
+      "pose": "walk",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 经典猫团子 · 向安全锚点随行 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cat-walk-96dpi.png"
+    },
+    {
+      "skin": "fox",
+      "pose": "walk",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 像素小狐狸 · 向安全锚点随行 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "fox-walk-96dpi.png"
+    },
+    {
+      "skin": "robot",
+      "pose": "walk",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 胶囊机器人 · 向安全锚点随行 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "robot-walk-96dpi.png"
+    },
+    {
+      "skin": "ghost",
+      "pose": "walk",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 软糯幽灵 · 向安全锚点随行 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "ghost-walk-96dpi.png"
+    },
+    {
+      "skin": "cursor",
+      "pose": "walk",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 极简光标精灵 · 向安全锚点随行 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cursor-walk-96dpi.png"
+    },
+    {
+      "skin": "beetle",
+      "pose": "walk",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 机械小甲虫 · 向安全锚点随行 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "beetle-walk-96dpi.png"
+    },
+    {
+      "skin": "night",
+      "pose": "walk",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 向安全锚点随行 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "night-walk-96dpi.png"
+    },
+    {
+      "skin": "stardust",
+      "pose": "walk",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 星尘团子 · 向安全锚点随行 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "stardust-walk-96dpi.png"
+    },
+    {
+      "skin": "cat",
+      "pose": "listen",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 经典猫团子 · 正在倾听 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cat-listen-96dpi.png"
+    },
+    {
+      "skin": "fox",
+      "pose": "listen",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 像素小狐狸 · 正在倾听 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "fox-listen-96dpi.png"
+    },
+    {
+      "skin": "robot",
+      "pose": "listen",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 胶囊机器人 · 正在倾听 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "robot-listen-96dpi.png"
+    },
+    {
+      "skin": "ghost",
+      "pose": "listen",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 软糯幽灵 · 正在倾听 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "ghost-listen-96dpi.png"
+    },
+    {
+      "skin": "cursor",
+      "pose": "listen",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 极简光标精灵 · 正在倾听 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cursor-listen-96dpi.png"
+    },
+    {
+      "skin": "beetle",
+      "pose": "listen",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 机械小甲虫 · 正在倾听 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "beetle-listen-96dpi.png"
+    },
+    {
+      "skin": "night",
+      "pose": "listen",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 正在倾听 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "night-listen-96dpi.png"
+    },
+    {
+      "skin": "stardust",
+      "pose": "listen",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 星尘团子 · 正在倾听 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "stardust-listen-96dpi.png"
+    },
+    {
+      "skin": "cat",
+      "pose": "speak",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 经典猫团子 · 正在表达（非唇同步） · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cat-speak-96dpi.png"
+    },
+    {
+      "skin": "fox",
+      "pose": "speak",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 像素小狐狸 · 正在表达（非唇同步） · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "fox-speak-96dpi.png"
+    },
+    {
+      "skin": "robot",
+      "pose": "speak",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 胶囊机器人 · 正在表达（非唇同步） · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "robot-speak-96dpi.png"
+    },
+    {
+      "skin": "ghost",
+      "pose": "speak",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 软糯幽灵 · 正在表达（非唇同步） · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "ghost-speak-96dpi.png"
+    },
+    {
+      "skin": "cursor",
+      "pose": "speak",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 极简光标精灵 · 正在表达（非唇同步） · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cursor-speak-96dpi.png"
+    },
+    {
+      "skin": "beetle",
+      "pose": "speak",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 机械小甲虫 · 正在表达（非唇同步） · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "beetle-speak-96dpi.png"
+    },
+    {
+      "skin": "night",
+      "pose": "speak",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 正在表达（非唇同步） · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "night-speak-96dpi.png"
+    },
+    {
+      "skin": "stardust",
+      "pose": "speak",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 星尘团子 · 正在表达（非唇同步） · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "stardust-speak-96dpi.png"
+    },
+    {
+      "skin": "cat",
+      "pose": "guard_failure",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 经典猫团子 · 任务失败，安静守候 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cat-guard_failure-96dpi.png"
+    },
+    {
+      "skin": "fox",
+      "pose": "guard_failure",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 像素小狐狸 · 任务失败，安静守候 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "fox-guard_failure-96dpi.png"
+    },
+    {
+      "skin": "robot",
+      "pose": "guard_failure",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 胶囊机器人 · 任务失败，安静守候 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "robot-guard_failure-96dpi.png"
+    },
+    {
+      "skin": "ghost",
+      "pose": "guard_failure",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 软糯幽灵 · 任务失败，安静守候 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "ghost-guard_failure-96dpi.png"
+    },
+    {
+      "skin": "cursor",
+      "pose": "guard_failure",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 极简光标精灵 · 任务失败，安静守候 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cursor-guard_failure-96dpi.png"
+    },
+    {
+      "skin": "beetle",
+      "pose": "guard_failure",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 机械小甲虫 · 任务失败，安静守候 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "beetle-guard_failure-96dpi.png"
+    },
+    {
+      "skin": "night",
+      "pose": "guard_failure",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 任务失败，安静守候 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "night-guard_failure-96dpi.png"
+    },
+    {
+      "skin": "stardust",
+      "pose": "guard_failure",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 星尘团子 · 任务失败，安静守候 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "stardust-guard_failure-96dpi.png"
+    },
+    {
+      "skin": "cat",
+      "pose": "celebrate_briefly",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 经典猫团子 · 已收到成功回执，短暂庆祝 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cat-celebrate_briefly-96dpi.png"
+    },
+    {
+      "skin": "fox",
+      "pose": "celebrate_briefly",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 像素小狐狸 · 已收到成功回执，短暂庆祝 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "fox-celebrate_briefly-96dpi.png"
+    },
+    {
+      "skin": "robot",
+      "pose": "celebrate_briefly",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 胶囊机器人 · 已收到成功回执，短暂庆祝 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "robot-celebrate_briefly-96dpi.png"
+    },
+    {
+      "skin": "ghost",
+      "pose": "celebrate_briefly",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 软糯幽灵 · 已收到成功回执，短暂庆祝 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "ghost-celebrate_briefly-96dpi.png"
+    },
+    {
+      "skin": "cursor",
+      "pose": "celebrate_briefly",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 极简光标精灵 · 已收到成功回执，短暂庆祝 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cursor-celebrate_briefly-96dpi.png"
+    },
+    {
+      "skin": "beetle",
+      "pose": "celebrate_briefly",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 机械小甲虫 · 已收到成功回执，短暂庆祝 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "beetle-celebrate_briefly-96dpi.png"
+    },
+    {
+      "skin": "night",
+      "pose": "celebrate_briefly",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 已收到成功回执，短暂庆祝 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "night-celebrate_briefly-96dpi.png"
+    },
+    {
+      "skin": "stardust",
+      "pose": "celebrate_briefly",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 星尘团子 · 已收到成功回执，短暂庆祝 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "stardust-celebrate_briefly-96dpi.png"
+    },
+    {
+      "skin": "cat",
+      "pose": "look_at",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 经典猫团子 · 看向已授权的目标 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cat-look_at-96dpi.png"
+    },
+    {
+      "skin": "fox",
+      "pose": "look_at",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 像素小狐狸 · 看向已授权的目标 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "fox-look_at-96dpi.png"
+    },
+    {
+      "skin": "robot",
+      "pose": "look_at",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 胶囊机器人 · 看向已授权的目标 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "robot-look_at-96dpi.png"
+    },
+    {
+      "skin": "ghost",
+      "pose": "look_at",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 软糯幽灵 · 看向已授权的目标 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "ghost-look_at-96dpi.png"
+    },
+    {
+      "skin": "cursor",
+      "pose": "look_at",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 极简光标精灵 · 看向已授权的目标 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cursor-look_at-96dpi.png"
+    },
+    {
+      "skin": "beetle",
+      "pose": "look_at",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 机械小甲虫 · 看向已授权的目标 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "beetle-look_at-96dpi.png"
+    },
+    {
+      "skin": "night",
+      "pose": "look_at",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 夜行小猫 · 看向已授权的目标 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "night-look_at-96dpi.png"
+    },
+    {
+      "skin": "stardust",
+      "pose": "look_at",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 星尘团子 · 看向已授权的目标 · neutral",
+      "dpi": 96,
+      "width_px": 200,
+      "height_px": 264,
+      "admitted_rect": [
+        774,
+        448,
+        202,
+        266
+      ],
+      "input_rect": [
+        0,
+        730,
+        1000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        120.0,
+        55.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "stardust-look_at-96dpi.png"
+    },
+    {
+      "skin": "cat",
+      "pose": "idle",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 经典猫团子 · 安静等待 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cat-idle-144dpi.png"
+    },
+    {
+      "skin": "fox",
+      "pose": "idle",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 像素小狐狸 · 安静等待 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "fox-idle-144dpi.png"
+    },
+    {
+      "skin": "robot",
+      "pose": "idle",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 胶囊机器人 · 安静等待 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "robot-idle-144dpi.png"
+    },
+    {
+      "skin": "ghost",
+      "pose": "idle",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 软糯幽灵 · 安静等待 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "ghost-idle-144dpi.png"
+    },
+    {
+      "skin": "cursor",
+      "pose": "idle",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 极简光标精灵 · 安静等待 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cursor-idle-144dpi.png"
+    },
+    {
+      "skin": "beetle",
+      "pose": "idle",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 机械小甲虫 · 安静等待 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "beetle-idle-144dpi.png"
+    },
+    {
+      "skin": "night",
+      "pose": "idle",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 安静等待 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "night-idle-144dpi.png"
+    },
+    {
+      "skin": "stardust",
+      "pose": "idle",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 星尘团子 · 安静等待 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "stardust-idle-144dpi.png"
+    },
+    {
+      "skin": "cat",
+      "pose": "blink",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 经典猫团子 · 短暂眨眼 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "fox",
+      "pose": "blink",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 像素小狐狸 · 短暂眨眼 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "robot",
+      "pose": "blink",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 胶囊机器人 · 短暂眨眼 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "ghost",
+      "pose": "blink",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 软糯幽灵 · 短暂眨眼 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cursor",
+      "pose": "blink",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 极简光标精灵 · 短暂眨眼 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "beetle",
+      "pose": "blink",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 机械小甲虫 · 短暂眨眼 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "night",
+      "pose": "blink",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 夜行小猫 · 短暂眨眼 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "stardust",
+      "pose": "blink",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 星尘团子 · 短暂眨眼 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cat",
+      "pose": "peek",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 经典猫团子 · 好奇探头 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "fox",
+      "pose": "peek",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 像素小狐狸 · 好奇探头 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "robot",
+      "pose": "peek",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 胶囊机器人 · 好奇探头 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "ghost",
+      "pose": "peek",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 软糯幽灵 · 好奇探头 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cursor",
+      "pose": "peek",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 极简光标精灵 · 好奇探头 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "beetle",
+      "pose": "peek",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 机械小甲虫 · 好奇探头 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "night",
+      "pose": "peek",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 好奇探头 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "stardust",
+      "pose": "peek",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 星尘团子 · 好奇探头 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cat",
+      "pose": "sit",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 经典猫团子 · 放松落座 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "fox",
+      "pose": "sit",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 像素小狐狸 · 放松落座 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "robot",
+      "pose": "sit",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 胶囊机器人 · 放松落座 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "ghost",
+      "pose": "sit",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 软糯幽灵 · 放松落座 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cursor",
+      "pose": "sit",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 极简光标精灵 · 放松落座 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "beetle",
+      "pose": "sit",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 机械小甲虫 · 放松落座 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "night",
+      "pose": "sit",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 放松落座 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "stardust",
+      "pose": "sit",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 星尘团子 · 放松落座 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cat",
+      "pose": "curl_up",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 经典猫团子 · 蜷起休息；任务状态不变 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "fox",
+      "pose": "curl_up",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 像素小狐狸 · 蜷起休息；任务状态不变 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "robot",
+      "pose": "curl_up",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 胶囊机器人 · 蜷起休息；任务状态不变 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "ghost",
+      "pose": "curl_up",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 软糯幽灵 · 蜷起休息；任务状态不变 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cursor",
+      "pose": "curl_up",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 极简光标精灵 · 蜷起休息；任务状态不变 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "beetle",
+      "pose": "curl_up",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 机械小甲虫 · 蜷起休息；任务状态不变 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "night",
+      "pose": "curl_up",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 蜷起休息；任务状态不变 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "stardust",
+      "pose": "curl_up",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 星尘团子 · 蜷起休息；任务状态不变 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cat",
+      "pose": "stretch",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 经典猫团子 · 舒展身体 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "fox",
+      "pose": "stretch",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 像素小狐狸 · 舒展身体 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "robot",
+      "pose": "stretch",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 胶囊机器人 · 舒展身体 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "ghost",
+      "pose": "stretch",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 软糯幽灵 · 舒展身体 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cursor",
+      "pose": "stretch",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 极简光标精灵 · 舒展身体 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "beetle",
+      "pose": "stretch",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 机械小甲虫 · 舒展身体 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "night",
+      "pose": "stretch",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 舒展身体 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "stardust",
+      "pose": "stretch",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 星尘团子 · 舒展身体 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cat",
+      "pose": "retreat",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 经典猫团子 · 正在让路 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "fox",
+      "pose": "retreat",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 像素小狐狸 · 正在让路 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "robot",
+      "pose": "retreat",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 胶囊机器人 · 正在让路 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "ghost",
+      "pose": "retreat",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 软糯幽灵 · 正在让路 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cursor",
+      "pose": "retreat",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 极简光标精灵 · 正在让路 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "beetle",
+      "pose": "retreat",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 机械小甲虫 · 正在让路 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "night",
+      "pose": "retreat",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 夜行小猫 · 正在让路 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "stardust",
+      "pose": "retreat",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 星尘团子 · 正在让路 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cat",
+      "pose": "walk",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 经典猫团子 · 向安全锚点随行 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "fox",
+      "pose": "walk",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 像素小狐狸 · 向安全锚点随行 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "robot",
+      "pose": "walk",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 胶囊机器人 · 向安全锚点随行 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "ghost",
+      "pose": "walk",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 软糯幽灵 · 向安全锚点随行 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cursor",
+      "pose": "walk",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 极简光标精灵 · 向安全锚点随行 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "beetle",
+      "pose": "walk",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 机械小甲虫 · 向安全锚点随行 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "night",
+      "pose": "walk",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 向安全锚点随行 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "stardust",
+      "pose": "walk",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 星尘团子 · 向安全锚点随行 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cat",
+      "pose": "listen",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 经典猫团子 · 正在倾听 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "fox",
+      "pose": "listen",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 像素小狐狸 · 正在倾听 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "robot",
+      "pose": "listen",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 胶囊机器人 · 正在倾听 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "ghost",
+      "pose": "listen",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 软糯幽灵 · 正在倾听 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cursor",
+      "pose": "listen",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 极简光标精灵 · 正在倾听 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "beetle",
+      "pose": "listen",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 机械小甲虫 · 正在倾听 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "night",
+      "pose": "listen",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 正在倾听 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "stardust",
+      "pose": "listen",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 星尘团子 · 正在倾听 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cat",
+      "pose": "speak",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 经典猫团子 · 正在表达（非唇同步） · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "fox",
+      "pose": "speak",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 像素小狐狸 · 正在表达（非唇同步） · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "robot",
+      "pose": "speak",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 胶囊机器人 · 正在表达（非唇同步） · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "ghost",
+      "pose": "speak",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 软糯幽灵 · 正在表达（非唇同步） · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cursor",
+      "pose": "speak",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 极简光标精灵 · 正在表达（非唇同步） · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "beetle",
+      "pose": "speak",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 机械小甲虫 · 正在表达（非唇同步） · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "night",
+      "pose": "speak",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 正在表达（非唇同步） · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "stardust",
+      "pose": "speak",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 星尘团子 · 正在表达（非唇同步） · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cat",
+      "pose": "guard_failure",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 经典猫团子 · 任务失败，安静守候 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "fox",
+      "pose": "guard_failure",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 像素小狐狸 · 任务失败，安静守候 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "robot",
+      "pose": "guard_failure",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 胶囊机器人 · 任务失败，安静守候 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "ghost",
+      "pose": "guard_failure",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 软糯幽灵 · 任务失败，安静守候 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cursor",
+      "pose": "guard_failure",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 极简光标精灵 · 任务失败，安静守候 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "beetle",
+      "pose": "guard_failure",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 机械小甲虫 · 任务失败，安静守候 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "night",
+      "pose": "guard_failure",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 任务失败，安静守候 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "stardust",
+      "pose": "guard_failure",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 星尘团子 · 任务失败，安静守候 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cat",
+      "pose": "celebrate_briefly",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 经典猫团子 · 已收到成功回执，短暂庆祝 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "fox",
+      "pose": "celebrate_briefly",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 像素小狐狸 · 已收到成功回执，短暂庆祝 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "robot",
+      "pose": "celebrate_briefly",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 胶囊机器人 · 已收到成功回执，短暂庆祝 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "ghost",
+      "pose": "celebrate_briefly",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 软糯幽灵 · 已收到成功回执，短暂庆祝 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cursor",
+      "pose": "celebrate_briefly",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 极简光标精灵 · 已收到成功回执，短暂庆祝 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "beetle",
+      "pose": "celebrate_briefly",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 机械小甲虫 · 已收到成功回执，短暂庆祝 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "night",
+      "pose": "celebrate_briefly",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 已收到成功回执，短暂庆祝 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "stardust",
+      "pose": "celebrate_briefly",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 星尘团子 · 已收到成功回执，短暂庆祝 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cat",
+      "pose": "look_at",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 经典猫团子 · 看向已授权的目标 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "fox",
+      "pose": "look_at",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 像素小狐狸 · 看向已授权的目标 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "robot",
+      "pose": "look_at",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 胶囊机器人 · 看向已授权的目标 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "ghost",
+      "pose": "look_at",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 软糯幽灵 · 看向已授权的目标 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cursor",
+      "pose": "look_at",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 极简光标精灵 · 看向已授权的目标 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "beetle",
+      "pose": "look_at",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 机械小甲虫 · 看向已授权的目标 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "night",
+      "pose": "look_at",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 夜行小猫 · 看向已授权的目标 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "stardust",
+      "pose": "look_at",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 星尘团子 · 看向已授权的目标 · neutral",
+      "dpi": 144,
+      "width_px": 320,
+      "height_px": 374,
+      "admitted_rect": [
+        1154,
+        738,
+        322,
+        376
+      ],
+      "input_rect": [
+        0,
+        1130,
+        1500,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        180.0,
+        82.5
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cat",
+      "pose": "idle",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 经典猫团子 · 安静等待 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cat-idle-192dpi.png"
+    },
+    {
+      "skin": "fox",
+      "pose": "idle",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 像素小狐狸 · 安静等待 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "fox-idle-192dpi.png"
+    },
+    {
+      "skin": "robot",
+      "pose": "idle",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 胶囊机器人 · 安静等待 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "robot-idle-192dpi.png"
+    },
+    {
+      "skin": "ghost",
+      "pose": "idle",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 软糯幽灵 · 安静等待 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "ghost-idle-192dpi.png"
+    },
+    {
+      "skin": "cursor",
+      "pose": "idle",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 极简光标精灵 · 安静等待 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "cursor-idle-192dpi.png"
+    },
+    {
+      "skin": "beetle",
+      "pose": "idle",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 机械小甲虫 · 安静等待 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "beetle-idle-192dpi.png"
+    },
+    {
+      "skin": "night",
+      "pose": "idle",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 安静等待 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "night-idle-192dpi.png"
+    },
+    {
+      "skin": "stardust",
+      "pose": "idle",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 星尘团子 · 安静等待 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": "stardust-idle-192dpi.png"
+    },
+    {
+      "skin": "cat",
+      "pose": "blink",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 经典猫团子 · 短暂眨眼 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "fox",
+      "pose": "blink",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 像素小狐狸 · 短暂眨眼 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "robot",
+      "pose": "blink",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 胶囊机器人 · 短暂眨眼 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "ghost",
+      "pose": "blink",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 软糯幽灵 · 短暂眨眼 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cursor",
+      "pose": "blink",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 极简光标精灵 · 短暂眨眼 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "beetle",
+      "pose": "blink",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 机械小甲虫 · 短暂眨眼 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "night",
+      "pose": "blink",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 夜行小猫 · 短暂眨眼 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "stardust",
+      "pose": "blink",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 星尘团子 · 短暂眨眼 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cat",
+      "pose": "peek",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 经典猫团子 · 好奇探头 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "fox",
+      "pose": "peek",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 像素小狐狸 · 好奇探头 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "robot",
+      "pose": "peek",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 胶囊机器人 · 好奇探头 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "ghost",
+      "pose": "peek",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 软糯幽灵 · 好奇探头 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cursor",
+      "pose": "peek",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 极简光标精灵 · 好奇探头 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "beetle",
+      "pose": "peek",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 机械小甲虫 · 好奇探头 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "night",
+      "pose": "peek",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 好奇探头 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "stardust",
+      "pose": "peek",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 星尘团子 · 好奇探头 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cat",
+      "pose": "sit",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 经典猫团子 · 放松落座 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "fox",
+      "pose": "sit",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 像素小狐狸 · 放松落座 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "robot",
+      "pose": "sit",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 胶囊机器人 · 放松落座 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "ghost",
+      "pose": "sit",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 软糯幽灵 · 放松落座 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cursor",
+      "pose": "sit",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 极简光标精灵 · 放松落座 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "beetle",
+      "pose": "sit",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 机械小甲虫 · 放松落座 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "night",
+      "pose": "sit",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 放松落座 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "stardust",
+      "pose": "sit",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 星尘团子 · 放松落座 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cat",
+      "pose": "curl_up",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 经典猫团子 · 蜷起休息；任务状态不变 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "fox",
+      "pose": "curl_up",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 像素小狐狸 · 蜷起休息；任务状态不变 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "robot",
+      "pose": "curl_up",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 胶囊机器人 · 蜷起休息；任务状态不变 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "ghost",
+      "pose": "curl_up",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 软糯幽灵 · 蜷起休息；任务状态不变 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cursor",
+      "pose": "curl_up",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 极简光标精灵 · 蜷起休息；任务状态不变 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "beetle",
+      "pose": "curl_up",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 机械小甲虫 · 蜷起休息；任务状态不变 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "night",
+      "pose": "curl_up",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 蜷起休息；任务状态不变 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "stardust",
+      "pose": "curl_up",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 星尘团子 · 蜷起休息；任务状态不变 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cat",
+      "pose": "stretch",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 经典猫团子 · 舒展身体 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "fox",
+      "pose": "stretch",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 像素小狐狸 · 舒展身体 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "robot",
+      "pose": "stretch",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 胶囊机器人 · 舒展身体 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "ghost",
+      "pose": "stretch",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 软糯幽灵 · 舒展身体 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cursor",
+      "pose": "stretch",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 极简光标精灵 · 舒展身体 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "beetle",
+      "pose": "stretch",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 机械小甲虫 · 舒展身体 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "night",
+      "pose": "stretch",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 舒展身体 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "stardust",
+      "pose": "stretch",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 星尘团子 · 舒展身体 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cat",
+      "pose": "retreat",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 经典猫团子 · 正在让路 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "fox",
+      "pose": "retreat",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 像素小狐狸 · 正在让路 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "robot",
+      "pose": "retreat",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 胶囊机器人 · 正在让路 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "ghost",
+      "pose": "retreat",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 软糯幽灵 · 正在让路 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cursor",
+      "pose": "retreat",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 极简光标精灵 · 正在让路 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "beetle",
+      "pose": "retreat",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 机械小甲虫 · 正在让路 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "night",
+      "pose": "retreat",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 夜行小猫 · 正在让路 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "stardust",
+      "pose": "retreat",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 2,
+      "alt": "Eva · 星尘团子 · 正在让路 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cat",
+      "pose": "walk",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 经典猫团子 · 向安全锚点随行 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "fox",
+      "pose": "walk",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 像素小狐狸 · 向安全锚点随行 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "robot",
+      "pose": "walk",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 胶囊机器人 · 向安全锚点随行 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "ghost",
+      "pose": "walk",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 软糯幽灵 · 向安全锚点随行 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cursor",
+      "pose": "walk",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 极简光标精灵 · 向安全锚点随行 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "beetle",
+      "pose": "walk",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 机械小甲虫 · 向安全锚点随行 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "night",
+      "pose": "walk",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 向安全锚点随行 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "stardust",
+      "pose": "walk",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 星尘团子 · 向安全锚点随行 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cat",
+      "pose": "listen",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 经典猫团子 · 正在倾听 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "fox",
+      "pose": "listen",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 像素小狐狸 · 正在倾听 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "robot",
+      "pose": "listen",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 胶囊机器人 · 正在倾听 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "ghost",
+      "pose": "listen",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 软糯幽灵 · 正在倾听 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cursor",
+      "pose": "listen",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 极简光标精灵 · 正在倾听 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "beetle",
+      "pose": "listen",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 机械小甲虫 · 正在倾听 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "night",
+      "pose": "listen",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 正在倾听 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "stardust",
+      "pose": "listen",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 星尘团子 · 正在倾听 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cat",
+      "pose": "speak",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 经典猫团子 · 正在表达（非唇同步） · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "fox",
+      "pose": "speak",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 像素小狐狸 · 正在表达（非唇同步） · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "robot",
+      "pose": "speak",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 胶囊机器人 · 正在表达（非唇同步） · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "ghost",
+      "pose": "speak",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 软糯幽灵 · 正在表达（非唇同步） · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cursor",
+      "pose": "speak",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 极简光标精灵 · 正在表达（非唇同步） · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "beetle",
+      "pose": "speak",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 机械小甲虫 · 正在表达（非唇同步） · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "night",
+      "pose": "speak",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 正在表达（非唇同步） · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "stardust",
+      "pose": "speak",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 星尘团子 · 正在表达（非唇同步） · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cat",
+      "pose": "guard_failure",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 经典猫团子 · 任务失败，安静守候 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "fox",
+      "pose": "guard_failure",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 像素小狐狸 · 任务失败，安静守候 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "robot",
+      "pose": "guard_failure",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 胶囊机器人 · 任务失败，安静守候 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "ghost",
+      "pose": "guard_failure",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 软糯幽灵 · 任务失败，安静守候 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cursor",
+      "pose": "guard_failure",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 极简光标精灵 · 任务失败，安静守候 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "beetle",
+      "pose": "guard_failure",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 机械小甲虫 · 任务失败，安静守候 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "night",
+      "pose": "guard_failure",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 任务失败，安静守候 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "stardust",
+      "pose": "guard_failure",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 星尘团子 · 任务失败，安静守候 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cat",
+      "pose": "celebrate_briefly",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 经典猫团子 · 已收到成功回执，短暂庆祝 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "fox",
+      "pose": "celebrate_briefly",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 像素小狐狸 · 已收到成功回执，短暂庆祝 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "robot",
+      "pose": "celebrate_briefly",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 胶囊机器人 · 已收到成功回执，短暂庆祝 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "ghost",
+      "pose": "celebrate_briefly",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 软糯幽灵 · 已收到成功回执，短暂庆祝 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cursor",
+      "pose": "celebrate_briefly",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 极简光标精灵 · 已收到成功回执，短暂庆祝 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "beetle",
+      "pose": "celebrate_briefly",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 机械小甲虫 · 已收到成功回执，短暂庆祝 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "night",
+      "pose": "celebrate_briefly",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 0,
+      "alt": "Eva · 夜行小猫 · 已收到成功回执，短暂庆祝 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "stardust",
+      "pose": "celebrate_briefly",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 星尘团子 · 已收到成功回执，短暂庆祝 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cat",
+      "pose": "look_at",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 经典猫团子 · 看向已授权的目标 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "fox",
+      "pose": "look_at",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 像素小狐狸 · 看向已授权的目标 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "robot",
+      "pose": "look_at",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 胶囊机器人 · 看向已授权的目标 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "ghost",
+      "pose": "look_at",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 软糯幽灵 · 看向已授权的目标 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "cursor",
+      "pose": "look_at",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 极简光标精灵 · 看向已授权的目标 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "beetle",
+      "pose": "look_at",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 机械小甲虫 · 看向已授权的目标 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "night",
+      "pose": "look_at",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 夜行小猫 · 看向已授权的目标 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    },
+    {
+      "skin": "stardust",
+      "pose": "look_at",
+      "seed": 7,
+      "elapsed_ms": 350,
+      "frame": 1,
+      "alt": "Eva · 星尘团子 · 看向已授权的目标 · neutral",
+      "dpi": 192,
+      "width_px": 440,
+      "height_px": 484,
+      "admitted_rect": [
+        1534,
+        1028,
+        442,
+        486
+      ],
+      "input_rect": [
+        0,
+        1530,
+        2000,
+        70
+      ],
+      "approval_rect": [
+        0,
+        0,
+        240.0,
+        110.0
+      ],
+      "native_backend": "Pango/Cairo offscreen",
+      "file": null
+    }
+  ]
+}

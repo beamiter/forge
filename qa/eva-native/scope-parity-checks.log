@@ -1,0 +1,22 @@
+   Compiling companion-protocol v0.1.0 (<workspace>/jcompanion/crates/companion-protocol)
+   Compiling eva-gtk-native-render v0.1.0 (<workspace>/forge/tools/eva-native-render)
+   Compiling eva-character-atlas v0.1.0 (<workspace>/jcompanion/crates/eva-character-atlas)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.16s
+     Running unittests src/main.rs (eva-workspace/forge/tools/eva-native-render/target/debug/deps/eva_gtk_native_render-50103090579a1195)
+
+running 4 tests
+test scope_rules::tests::archived_management_never_requires_adopting_target ... ok
+test scope_rules::tests::changed_pane_project_revision_and_host_invalidate_review ... ok
+test geometry::measured_native_100_150_200_percent_admissions_use_real_host_selector ... ok
+test paint::tests::all_skins_poses_have_native_safe_markup ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+    Checking companion-protocol v0.1.0 (<workspace>/jcompanion/crates/companion-protocol)
+    Checking companion-core v0.1.0 (<workspace>/jcompanion/crates/companion-core)
+    Checking companion-client v0.1.0 (<workspace>/jcompanion/crates/companion-client)
+    Checking jterm_core v0.2.0 (<workspace>/jterm_core)
+    Checking forge v0.2.0 (<workspace>/forge)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 18.27s
+    Checking anvil v0.2.0 (<workspace>/anvil)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 5.70s

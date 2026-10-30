@@ -1,3 +1,6 @@
+# Shared Eva setting; switching modes takes effect after restart.
+eva_companion_enabled = false
+
 # forge 配置示例
 # 复制到 ~/.config/forge/config.toml，或用 forge --config PATH 指定文件。
 # 修改后会自动热重载；也可按 Ctrl+Shift+R 手动重载。
@@ -251,3 +254,7 @@ buffer_tabs = false
 status_bar = false
 project_panel = false
 tool_panel = false
+
+# Cross-application Eva is explicit opt-in: launch with EVA_COMPANION_MODE=shared.
+# Shared mode disables this GUI's legacy ASCII body, including on IPC failure.
+# See docs/eva-companion.md for the coordinator, skins, controls and proof limits.

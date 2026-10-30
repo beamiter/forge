@@ -1,0 +1,16 @@
+    Updating crates.io index
+     Locking 12 packages to highest compatible versions
+   Compiling zmij v1.0.23
+   Compiling serde_core v1.0.229
+   Compiling serde_json v1.0.154
+   Compiling memchr v2.8.3
+   Compiling itoa v1.0.18
+   Compiling eva-character-atlas v0.1.0 (<workspace>/eva-character-atlas)
+   Compiling eva-gtk-native-render v0.1.0 (<workspace>/forge/tools/eva-native-render)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 14.28s
+     Running unittests src/main.rs (eva-workspace/forge/tools/eva-native-render/target/debug/deps/eva_gtk_native_render-76f0744914131154)
+
+running 1 test
+test paint::tests::all_skins_poses_have_native_safe_markup ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s

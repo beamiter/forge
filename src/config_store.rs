@@ -1090,6 +1090,7 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         "block_compact".into(),
         toml::Value::Boolean(config.block_compact),
     );
+    table.insert("eva_companion_enabled".into(),toml::Value::Boolean(config.eva_companion_enabled));
     table.insert(
         "ascii_organism_enabled".into(),
         toml::Value::Boolean(config.ascii_organism_enabled),

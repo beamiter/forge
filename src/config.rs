@@ -912,6 +912,7 @@ pub struct Config {
     /// Show the experimental no-LLM ASCII organism in local Block/Unified panes.
     /// The widget reacts only to local command lifecycle events and never runs a
     /// command or sends terminal contents elsewhere.
+    pub(crate) eva_companion_enabled: bool,
     pub(crate) ascii_organism_enabled: bool,
     /// Optional gentle breaks; one foreground clock for the whole window.
     pub(crate) ascii_organism_care_enabled: bool,
@@ -1058,6 +1059,7 @@ impl Config {
             scroll_reporting_enabled: true,
             focus_reporting_enabled: true,
             preserve_live_scrollback: false,
+            eva_companion_enabled: false,
             ascii_organism_enabled: false,
             ascii_organism_care_enabled: false,
             ascii_organism_motion: None,
@@ -1594,6 +1596,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "scroll_reporting_enabled",
     "focus_reporting_enabled",
     "preserve_live_scrollback",
+    "eva_companion_enabled",
     "ascii_organism_enabled",
     "ascii_organism_care_enabled",
     "ascii_organism_motion",
@@ -1739,7 +1742,8 @@ fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
         "scroll_reporting_enabled",
         "focus_reporting_enabled",
         "preserve_live_scrollback",
-        "ascii_organism_enabled",
+        "eva_companion_enabled",
+    "ascii_organism_enabled",
         "ascii_organism_care_enabled",
         "sidebar_visible",
         "ai_enabled",
@@ -2417,6 +2421,7 @@ struct FileConfig {
     scroll_reporting_enabled: Option<bool>,
     focus_reporting_enabled: Option<bool>,
     preserve_live_scrollback: Option<bool>,
+    eva_companion_enabled: Option<bool>,
     ascii_organism_enabled: Option<bool>,
     ascii_organism_care_enabled: Option<bool>,
     ascii_organism_motion: Option<String>,
@@ -2672,6 +2677,7 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
         preserve_live_scrollback: table
             .get("preserve_live_scrollback")
             .and_then(|v| v.as_bool()),
+        eva_companion_enabled: table.get("eva_companion_enabled").and_then(|v|v.as_bool()),
         ascii_organism_enabled: table
             .get("ascii_organism_enabled")
             .and_then(|v| v.as_bool()),
@@ -3081,6 +3087,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let command_correction_enabled = env_bool("FORGE_COMMAND_CORRECTION_ENABLED")
         .or(fc.command_correction_enabled)
         .unwrap_or(true);
+    let eva_companion_enabled = fc.eva_companion_enabled.unwrap_or(false);
     let ascii_organism_enabled = env_bool("FORGE_ASCII_ORGANISM_ENABLED")
         .or(fc.ascii_organism_enabled)
         .unwrap_or(true);
@@ -3182,6 +3189,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         scroll_reporting_enabled: fc.scroll_reporting_enabled.unwrap_or(true),
         focus_reporting_enabled: fc.focus_reporting_enabled.unwrap_or(true),
         preserve_live_scrollback: fc.preserve_live_scrollback.unwrap_or(false),
+        eva_companion_enabled,
         ascii_organism_enabled,
         ascii_organism_care_enabled,
         ascii_organism_motion,

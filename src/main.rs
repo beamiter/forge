@@ -623,6 +623,7 @@ pub fn run() -> glib::ExitCode {
         }));
 
         let window_opacity = Rc::new(Cell::new(config.window_opacity));
+        crate::eva_companion::configure(config.eva_companion_enabled);
         let config = Rc::new(RefCell::new(config));
         let available_themes = Rc::new(themes);
         let window = adw::ApplicationWindow::builder()
@@ -1790,6 +1791,7 @@ pub fn run() -> glib::ExitCode {
         let pending_for_press = pending_focus_shortcut.clone();
 
         key_controller.connect_key_pressed(move |_controller, keyval, keycode, state| {
+                if crate::eva_companion::owns_keyboard(ui_clone.window.upcast_ref()){return glib::Propagation::Proceed;}
             // Embedded Vim owns Quick Open before the shell's global
             // command-palette binding can consume this capture event.
             if crate::vim9_ide::native_dialog_owns_keyboard(&ui_clone.window)
@@ -2159,6 +2161,7 @@ pub fn run() -> glib::ExitCode {
                 }
             }
 
+            if crate::eva_companion::defer_close(window.upcast_ref()){return glib::Propagation::Stop;}
             // Save requested widths only; responsive clamps are not user edits.
             ui::reference_shell::finish_sidebar_resize(&ui_for_close_request);
             ui_for_close_request.flush_pending_config();
@@ -2249,7 +2252,10 @@ pub fn run() -> glib::ExitCode {
             app_clone.quit();
         });
 
-        window.set_content(Some(&toast_overlay));
+        let eva_overlay = gtk4::Overlay::new();
+        eva_overlay.set_child(Some(&toast_overlay));
+        crate::eva_companion::install(window.upcast_ref(), &eva_overlay, "forge");
+        window.set_content(Some(&eva_overlay));
         window.present();
 
         // Paned positions are meaningful only after the first allocation.

@@ -1,0 +1,29 @@
+     Locking 1 package to highest compatible version
+      Adding companion-protocol v0.1.0 (<workspace>/jcompanion/crates/companion-protocol)
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.27
+   Compiling serde_core v1.0.229
+   Compiling syn v3.0.9
+   Compiling serde v1.0.229
+   Compiling serde_derive v1.0.229
+   Compiling serde_json v1.0.154
+   Compiling eva-gtk-native-render v0.1.0 (<workspace>/forge/tools/eva-native-render)
+   Compiling companion-protocol v0.1.0 (<workspace>/jcompanion/crates/companion-protocol)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 19.68s
+     Running unittests src/main.rs (eva-workspace/forge/tools/eva-native-render/target/debug/deps/eva_gtk_native_render-c907a7f6aa581eaf)
+
+running 2 tests
+test geometry::measured_native_100_150_200_percent_admissions_use_real_host_selector ... ok
+test paint::tests::all_skins_poses_have_native_safe_markup ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+    Checking companion-protocol v0.1.0 (<workspace>/jcompanion/crates/companion-protocol)
+    Checking companion-core v0.1.0 (<workspace>/jcompanion/crates/companion-core)
+    Checking companion-client v0.1.0 (<workspace>/jcompanion/crates/companion-client)
+    Checking jterm_core v0.2.0 (<workspace>/jterm_core)
+    Checking forge v0.2.0 (<workspace>/forge)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 28.19s
+    Checking anvil v0.2.0 (<workspace>/anvil)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 27.35s

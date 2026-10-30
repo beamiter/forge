@@ -24,12 +24,7 @@
             pname = manifest.package.name;
             version = manifest.package.version;
             src = self;
-            # Cargo resolves the shared core relative to this application's
-            # unpacked source, preserving the same sibling layout as development.
-            postUnpack = ''
-              mkdir jterm_core
-              tar -xzf ${./packaging/jterm-core-src.tar.gz} -C jterm_core
-            '';
+            # Shared sources are immutable Git dependencies in Cargo.lock.
 
             cargoLock = {
               lockFile = ./Cargo.lock;
@@ -37,8 +32,12 @@
               # Nix needs an explicit hash per revision. Update these whenever
               # the jagent / jterm_core pins in Cargo.lock change.
               outputHashes = {
-                # f269c3c6afafcf9b6d60b3cccd741649fdb74576
+                # git+https://github.com/beamiter/jagent.git?rev=f269c3c6afafcf9b6d60b3cccd741649fdb74576#f269c3c6afafcf9b6d60b3cccd741649fdb74576
                 "jagent-0.7.0" = "sha256-2PO6UiTrhwa2JUBznPTXFV42KxJ3H8qctBTg7WNxZfA=";
+                # git+https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa569540091524d637a7115b64c587b9177a55b
+                "companion-client-0.1.0" = "sha256-yQQw/Viz2gzouHRdutU6TtVL3yqDI7koYbN/leWsf7I=";
+                # git+https://github.com/beamiter/jterm_core.git?rev=974ccad203375032fe87706caecab39ad516c238#974ccad203375032fe87706caecab39ad516c238
+                "jterm_core-0.2.0" = "sha256-r7/K+OkIztLzeEcHL9AOBnlysqDs3LMdWel/jiWfiHA=";
               };
             };
             strictDeps = true;
