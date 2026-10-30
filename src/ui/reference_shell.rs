@@ -960,6 +960,56 @@ pub(crate) fn refresh_composer_control_geometry(root: &gtk4::Widget) {
     }
 }
 
+/// The canvas header names the active pane like the reference breadcrumb:
+/// `Workspace  /  <tab title>` over `<Presentation> session · Local`, the
+/// same two lines Anvil shows. The labelled fixture keeps its authored text.
+pub(crate) fn sync_canvas_header(ui: &UiState, page: Option<&gtk4::Widget>) {
+    if jterm_core::reference_conversation::fixture_enabled() {
+        return;
+    }
+    let page = page.cloned().or_else(|| {
+        ui.notebook
+            .current_page()
+            .and_then(|index| ui.notebook.nth_page(Some(index)))
+    });
+    let tab = page
+        .as_ref()
+        .and_then(|page| crate::state::tab_label_text(&ui.notebook, page))
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "Terminal".to_string());
+    let presentation = page.as_ref().map_or("Terminal", |page| {
+        if widget_with_class_any(page, "developer-block-canvas").is_some() {
+            "Block"
+        } else if widget_with_class_any(page, "term-chat-root").is_some() {
+            "Chat"
+        } else {
+            "Terminal"
+        }
+    });
+    let location = if private_session(ui) {
+        "Private"
+    } else {
+        "Local"
+    };
+    let root = ui.window.upcast_ref::<gtk4::Widget>();
+    for (class, text) in [
+        ("reference-canvas-title", format!("Workspace  /  {tab}")),
+        (
+            "reference-canvas-subtitle",
+            format!("{presentation} session · {location}"),
+        ),
+    ] {
+        let Some(label) = widget_with_class_any(root, class).and_downcast::<gtk4::Label>() else {
+            continue;
+        };
+        if label.text().as_str() != text {
+            label.set_text(&text);
+            label.set_tooltip_text(Some(&text));
+        }
+    }
+}
+
 fn widget_with_class(root: &gtk4::Widget, class: &str) -> Option<gtk4::Widget> {
     if root.has_css_class(class) && root.is_mapped() {
         return Some(root.clone());

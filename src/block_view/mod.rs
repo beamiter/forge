@@ -14977,9 +14977,10 @@ impl TermView {
                                     .as_ref()
                                     .is_some_and(|header| header.is_running_command())
                             });
+                            let count = completed + usize::from(running);
                             label.set_text(&format!(
-                                "Live · {} commands",
-                                completed + usize::from(running)
+                                "Live · {count} {}",
+                                if count == 1 { "command" } else { "commands" }
                             ));
                         }
                     });

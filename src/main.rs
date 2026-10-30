@@ -692,8 +692,18 @@ pub fn run() -> glib::ExitCode {
         search_box.set_margin_top(2);
         search_box.set_margin_bottom(2);
 
+        // The hidden bar still reports its row's full minimum width (a
+        // GtkRevealer only collapses height), which held the whole center
+        // column at 433px and made GTK warn at the first measure of every
+        // launch. Let the row scroll instead of imposing that minimum; it
+        // keeps its natural width whenever the center can give it.
+        let search_scroll = ScrolledWindow::new();
+        search_scroll.set_policy(gtk4::PolicyType::External, gtk4::PolicyType::Never);
+        search_scroll.set_propagate_natural_width(true);
+        search_scroll.set_propagate_natural_height(true);
+        search_scroll.set_child(Some(&search_box));
         let search_bar = SearchBar::new();
-        search_bar.set_child(Some(&search_box));
+        search_bar.set_child(Some(&search_scroll));
         search_bar.set_show_close_button(false);
         search_bar.connect_entry(&search_entry);
 
@@ -1403,9 +1413,15 @@ pub fn run() -> glib::ExitCode {
         // Say so once, with the reason, rather than only in a log nobody has
         // enabled.
         if let Some(reason) = crate::config::load_error() {
-            let toast = adw::Toast::new(&format!("Configuration not loaded: {reason}"));
-            toast.set_timeout(0); // dismissed by hand: it is not a status blip
-            toast_overlay.add_toast(toast);
+            // A persistent toast sat on top of the composer until dismissed.
+            // A banner under the canvas header says the same thing, stays
+            // until dismissed by hand, and never covers the input row.
+            let banner = adw::Banner::new(&format!("Configuration not loaded: {reason}"));
+            banner.add_css_class("reference-config-banner");
+            banner.set_button_label(Some("Dismiss"));
+            banner.connect_button_clicked(|banner| banner.set_revealed(false));
+            banner.set_revealed(true);
+            right_col.insert_child_after(&banner, Some(&canvas_header));
         }
 
         // The agent Tasks panel stages actions; the app layer resolves them
@@ -2010,6 +2026,7 @@ pub fn run() -> glib::ExitCode {
             // Headers are only maintained for the visible tab, so the newly
             // selected one has to catch up before it is drawn.
             ui_for_switch.refresh_pane_headers_for(widget);
+            ui::reference_shell::sync_canvas_header(&ui_for_switch, Some(widget));
             focus_switched_page(
                 &ui_for_switch.search_bar,
                 &ui_for_switch.search_entry,

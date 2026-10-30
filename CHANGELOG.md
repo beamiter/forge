@@ -12,6 +12,13 @@ All notable user-visible and operational changes are recorded here.
   shell draws, and shrinks only when the pane itself is shorter than three
   rows.
 
+- The right Inspector's Files, AI assistant and Tasks pages now use the
+  workspace's navy surface and compact 11px chrome text instead of a light
+  panel with oversized type, so the file tree and assistant fit the column.
+  A configuration that fails to load is reported in a dismissible banner
+  under the canvas header rather than a toast over the input row, and the
+  canvas header names the active tab, matching Anvil.
+
 - Both workspace sidebars now have visible draggable dividers. Widths persist
   independently, survive hide/show and narrow windows, and restore when space
   returns; the right-hand drawer has its own resize edge. Native F8/arrow-key

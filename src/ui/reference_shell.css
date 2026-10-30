@@ -305,3 +305,88 @@ window.forge-window.reference-shell .reference-organism-speech button { padding:
    explicitly non-expanding, and can be hidden without reserving a blank band. */
 window.forge-window.reference-shell .reference-block-composer.reference-native-tools { min-height:28px; padding:6px 0; }
 window.forge-window.reference-shell .reference-native-tools .reference-composer-controls { margin-top:0; }
+
+/* Files tab: the retained native tree follows the inspector's navy surface and
+   compact chrome roles instead of Adwaita's light view defaults. Selection,
+   activation, drag-and-drop and the scan model are unchanged; paint only. */
+.reference-shell .reference-inspector .file-tree-box { border-top: 0; padding: 0; }
+.reference-shell .reference-inspector .file-tree-header { padding: 6px 6px 4px; border-bottom: 1px solid #253248; }
+.reference-shell .reference-inspector .file-tree-header button { min-width: 20px; min-height: 22px; padding: 0 1px; margin: 0; border: 0; border-radius: 6px; background: transparent; color: #9eb1ce; box-shadow: none; }
+.reference-shell .reference-inspector .file-tree-header button:hover { background: #273d70; color: #b9d2ff; }
+.reference-shell .reference-inspector .file-tree-header button:checked { background: #283d6f; color: #e3ecff; }
+.reference-shell .reference-inspector .file-tree-header button:disabled { color: #5f7191; background: transparent; opacity: 1; filter: none; }
+.reference-shell .reference-inspector .file-tree-header image { -gtk-icon-size: 12px; }
+.reference-shell .reference-inspector .file-tree-header dropdown { min-height: 22px; }
+.reference-shell .reference-inspector .file-tree-header dropdown > button { min-height: 20px; min-width: 0; padding: 0 4px; border: 1px solid #35445e; border-radius: 6px; background: #23324a; color: #c6d4eb; box-shadow: none; }
+.reference-shell .reference-inspector .file-tree-header dropdown > button:hover { background: #283d6f; }
+.reference-shell .reference-inspector .file-tree-header dropdown arrow { -gtk-icon-size: 10px; min-width: 10px; min-height: 10px; color: #9eb1ce; }
+.reference-shell .reference-inspector .file-tree-filter { margin: 2px 8px 4px; }
+.reference-shell .reference-inspector .file-tree-filter entry { min-height: 22px; padding: 0 6px; border: 1px solid #2b3b55; border-radius: 6px; background: #101c2e; color: #b5c5df; caret-color: #d4e2f8; box-shadow: none; }
+.reference-shell .reference-inspector .file-tree-filter entry text { color: #d4e2f8; caret-color: #d4e2f8; }
+.reference-shell .reference-inspector .file-tree-filter entry:focus-within { border-color: @ACCENT@; outline: 0; }
+.reference-shell .reference-inspector scrolledwindow > listview.file-tree,
+.reference-shell .reference-inspector listview.file-tree { padding: 4px 6px; background: transparent; color: #b6c3d8; }
+.reference-shell .reference-inspector listview.file-tree > row { min-height: 24px; padding: 0 4px; margin: 0; border-radius: 6px; background: transparent; color: #b6c3d8; outline: none; transition: none; }
+.reference-shell .reference-inspector listview.file-tree > row:hover { background: #1d2b41; }
+.reference-shell .reference-inspector listview.file-tree > row:selected { background: #283d6f; color: #eff4ff; }
+.reference-shell .reference-inspector listview.file-tree > row:focus-visible { outline: 2px solid #7da6ff; outline-offset: -2px; }
+.reference-shell .reference-inspector listview.file-tree treeexpander { padding: 0; }
+.reference-shell .reference-inspector listview.file-tree treeexpander > expander { color: #8f9db6; }
+.reference-shell .reference-inspector listview.file-tree image { -gtk-icon-size: 14px; color: #8f9db6; }
+.reference-shell .reference-inspector listview.file-tree > row:selected image,
+.reference-shell .reference-inspector listview.file-tree > row:selected expander { color: #c9d7f0; }
+.reference-shell .reference-inspector listview.file-tree .file-tree-drop-hover { background: alpha(@ACCENT@, .18); outline: 1px dashed alpha(@ACCENT@, .6); }
+.reference-shell .reference-inspector listview.file-tree button.flat { min-height: 20px; padding: 0 6px; border: 1px solid #344864; border-radius: 5px; background: #19283c; color: #a9c9fa; }
+window.forge-window.reference-shell .reference-inspector .file-tree-box label { font-family: "DejaVu Sans", sans-serif; font-size: 11px; font-weight: 400; }
+window.forge-window.reference-shell .reference-inspector .file-tree-box label.file-tree-root { font-size: 10px; color: #aebfda; opacity: 1; }
+window.forge-window.reference-shell .reference-inspector .file-tree-box .file-tree-header label { font-size: 10px; }
+window.forge-window.reference-shell .reference-inspector .file-tree-box entry,
+window.forge-window.reference-shell .reference-inspector .file-tree-box entry text { font-size: 10px; }
+window.forge-window.reference-shell .reference-inspector .file-tree-box label.error { color: #ff8d95; }
+
+/* Inspector-hosted AI assistant and Tasks pages: the same compact chrome
+   roles as the overview and Files pages, instead of the 14pt Main fallback
+   that made their titles and suggestion buttons overflow the 306px column. */
+.reference-shell .reference-inspector .ai-panel { padding: 0; }
+.reference-shell .reference-inspector .ai-panel .ai-panel-header { padding: 8px 10px 6px; border-bottom: 1px solid #253248; }
+.reference-shell .reference-inspector .ai-panel .ai-panel-composer { padding: 6px 8px 8px; border-top: 1px solid #253248; }
+.reference-shell .reference-inspector .ai-panel .ai-empty-state { padding: 12px 10px; }
+.reference-shell .reference-inspector .ai-panel .ai-empty-actions { margin-top: 8px; }
+.reference-shell .reference-inspector .ai-panel button { min-height: 24px; min-width: 0; padding: 0 8px; border-radius: 6px; }
+.reference-shell .reference-inspector .ai-panel button.ai-empty-action { min-height: 28px; }
+.reference-shell .reference-inspector .ai-panel button.ai-chat-header-button,
+.reference-shell .reference-inspector .ai-panel button.ai-send-button,
+.reference-shell .reference-inspector .ai-panel button.ai-context-clear { min-width: 24px; padding: 0 4px; }
+.reference-shell .reference-inspector .ai-panel textview,
+.reference-shell .reference-inspector .ai-panel textview text,
+.reference-shell .reference-inspector .ai-panel .ai-panel-input { background: #101c2e; color: #d4e2f8; caret-color: #d4e2f8; }
+.reference-shell .reference-inspector .ai-panel .ai-panel-input { border: 1px solid #2b3b55; border-radius: 8px; padding: 4px 6px; min-height: 0; }
+.reference-shell .reference-inspector .ai-panel entry,
+.reference-shell .reference-inspector .ai-panel searchentry { min-height: 22px; border: 1px solid #2b3b55; border-radius: 6px; background: #101c2e; color: #b5c5df; }
+.reference-shell .reference-inspector .ai-panel .card { background: @INSPECTOR_CARD@; border: 1px solid #314056; border-radius: 8px; padding: 8px; }
+.reference-shell .reference-inspector .ai-panel .ai-context-chip { padding: 0 6px; border: 1px solid #344864; border-radius: 6px; background: #19283c; }
+.reference-shell .reference-inspector .ai-panel scrolledwindow,
+.reference-shell .reference-inspector .ai-panel viewport,
+.reference-shell .reference-inspector .ai-panel listview,
+.reference-shell .reference-inspector .ai-panel list { background: transparent; }
+window.forge-window.reference-shell .reference-inspector .ai-panel label,
+window.forge-window.reference-shell .reference-inspector .ai-panel button,
+window.forge-window.reference-shell .reference-inspector .ai-panel textview,
+window.forge-window.reference-shell .reference-inspector .ai-panel text,
+window.forge-window.reference-shell .reference-inspector .ai-panel entry { font-family: "DejaVu Sans", sans-serif; font-size: 11px; font-weight: 400; }
+window.forge-window.reference-shell .reference-inspector .ai-panel label.ai-panel-title,
+window.forge-window.reference-shell .reference-inspector .ai-panel label.ai-empty-title,
+window.forge-window.reference-shell .reference-inspector .ai-panel label.heading { font-size: 12px; font-weight: 600; }
+window.forge-window.reference-shell .reference-inspector .ai-panel label.ai-panel-subtitle,
+window.forge-window.reference-shell .reference-inspector .ai-panel label.ai-input-hint,
+window.forge-window.reference-shell .reference-inspector .ai-panel label.caption,
+window.forge-window.reference-shell .reference-inspector .ai-panel label.dim-label,
+window.forge-window.reference-shell .reference-inspector .ai-panel label.task-reason { font-size: 9px; }
+window.forge-window.reference-shell .reference-inspector .ai-panel button label { font-size: 10px; }
+
+/* A failed configuration load is announced under the canvas header, never
+   over the composer. The row keeps the Block/Chat navy family. */
+.reference-shell banner.reference-config-banner > revealer > widget { background: #3b222e; color: #ffd0d4; padding: 6px 12px; }
+window.forge-window.reference-shell banner.reference-config-banner label { font-family: "DejaVu Sans", sans-serif; font-size: 11px; color: #ffd0d4; }
+.reference-shell banner.reference-config-banner button { min-height: 24px; padding: 0 8px; border: 1px solid #765057; border-radius: 6px; background: #3c2632; color: #ff9b9f; }
+window.forge-window.reference-shell banner.reference-config-banner button label { font-size: 10px; color: #ff9b9f; }

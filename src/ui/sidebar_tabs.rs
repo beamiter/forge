@@ -74,6 +74,8 @@ impl UiState {
     /// per-row state, leaving the widgets (and any in-flight click) alone.
     pub(crate) fn refresh_sidebar_tab_mirror(&self) {
         let rows = self.mirror_rows();
+        // Tab titles feed the canvas breadcrumb as well as the mirror rows.
+        super::reference_shell::sync_canvas_header(self, None);
 
         let mut existing: Vec<gtk4::Widget> = Vec::new();
         let mut child = self.sidebar_tab_mirror.first_child();
