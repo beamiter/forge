@@ -613,10 +613,7 @@ pub fn run() -> glib::ExitCode {
         if !launch.safe_mode {
             config.terminal_mode = config.terminal_mode.public_presentation();
         }
-        config.sidebar_visible = true;
         config.tab_placement = crate::config::TabPlacement::Sidebar;
-        config.sidebar_width = jterm_core::developer_workspace::NAVIGATION_WIDTH as u32;
-        config.ai_panel_width = jterm_core::developer_workspace::INSPECTOR_WIDTH as u32;
 
         // Cache shell selection once to avoid extra process probes per new tab.
         let shell_argv = Rc::new(RefCell::new(if launch.safe_mode {
@@ -1230,15 +1227,7 @@ pub fn run() -> glib::ExitCode {
         ui::configure_sidebar_layout(&sidebar_stack, &content_box);
         content_box.set_shrink_end_child(true);
         content_box.set_position(config.borrow().sidebar_width as i32);
-        let sidebar_last_width = Rc::new(Cell::new(config.borrow().sidebar_width));
-        let measured_sidebar_width = sidebar_last_width.clone();
-        content_box.connect_position_notify(move |paned| {
-            if paned.width() > 0 && paned.start_child().is_some_and(|child| child.is_visible()) {
-                let position = jterm_core::title_bar::sidebar_position(paned.position(), paned.width());
-                if position != paned.position() { paned.set_position(position); }
-                measured_sidebar_width.set(position as u32);
-            }
-        });
+
 
         // Main layout: draggable top bar + content box (vertical), with the
         // status bar spanning the full window width underneath both.
@@ -2109,12 +2098,6 @@ pub fn run() -> glib::ExitCode {
         let session_ids_for_close = ui.session_ids.clone();
         let ui_for_close_request = ui.clone();
         let app_for_close = app.clone();
-        let config_for_close = ui.config.clone();
-        let sidebar_for_close = sidebar.clone();
-        let paned_for_close = content_box.clone();
-        let ai_paned_for_close = ai_paned.clone();
-        let ai_panel_visible_for_close = ui.ai_panel_visible.clone();
-        let ai_panel_width_restoring_for_close = ui.ai_panel_width_restoring.clone();
         let ai_panel_for_close = ui.ai_panel.clone();
         let agent_session_for_close = ui.agent_session.clone();
         let command_suggestion_for_close = ui.command_suggestion.clone();
@@ -2159,24 +2142,8 @@ pub fn run() -> glib::ExitCode {
                 }
             }
 
-            // Persist the current sidebar geometry/state before teardown.
-            let width = if sidebar_for_close.is_visible() {
-                paned_for_close.position().clamp(120, 800) as u32
-            } else {
-                sidebar_last_width.get()
-            };
-            {
-                let mut config = config_for_close.borrow_mut();
-                config.sidebar_width = width;
-                config.sidebar_visible = sidebar_for_close.is_visible();
-                if ai_panel_visible_for_close.get() && !ai_panel_width_restoring_for_close.get() {
-                    let total_width = ai_paned_for_close.width();
-                    let position = ai_paned_for_close.position();
-                    if total_width > 0 && position >= 0 && position < total_width {
-                        config.ai_panel_width = (total_width - position).clamp(240, 1200) as u32;
-                    }
-                }
-            }
+            // Save requested widths only; responsive clamps are not user edits.
+            ui::reference_shell::finish_sidebar_resize(&ui_for_close_request);
             ui_for_close_request.flush_pending_config();
 
             // Stop and reap any in-flight provider processes before widgets

@@ -1339,6 +1339,7 @@ impl UiState {
         };
         drop(domain);
         self.tasks_panel.sync(sync);
+        super::reference_shell::refresh_task_overview(self);
     }
 }
 

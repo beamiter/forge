@@ -45,6 +45,7 @@ mod remote_fs;
 mod search;
 mod search_preview;
 mod session;
+mod sidebar_resize;
 mod sidebar_tabs;
 pub(crate) use sidebar_tabs::configure_layout as configure_sidebar_layout;
 #[cfg(test)]

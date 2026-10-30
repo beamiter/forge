@@ -89,6 +89,7 @@ pub(crate) fn show_command_palette(
     live_vte: Terminal,
 ) {
     let popover = gtk4::Popover::new();
+    popover.add_css_class("forge-popup");
     popover.set_parent(parent);
     popover.set_has_arrow(false);
     popover.set_autohide(true);

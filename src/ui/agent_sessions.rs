@@ -1653,6 +1653,7 @@ fn show_inner(
         .modal(true)
         .destroy_with_parent(true)
         .build();
+    crate::ui::reference_shell::style_workspace_dialog(&window);
     MANAGER_WINDOW.with(|slot| slot.borrow_mut().set(Some(&window)));
     let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
     root.set_margin_top(18);

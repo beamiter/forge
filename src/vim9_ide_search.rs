@@ -21,6 +21,7 @@ impl SearchOptions {
         menu.set_icon_name("preferences-other-symbolic");
         menu.set_tooltip_text(Some("Project search options"));
         let popover = gtk::Popover::new();
+        popover.add_css_class("forge-popup");
         let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
         content.set_margin_start(12);
         content.set_margin_end(12);

@@ -217,6 +217,8 @@ impl AiPanel {
         actions_box.append(&archive_chat_btn);
         actions_box.append(&delete_chat_btn);
         let actions_popover = Popover::new();
+        actions_popover.add_css_class("forge-popup");
+        actions_popover.add_css_class("terminal-context-menu");
         actions_popover.set_has_arrow(false);
         actions_popover.set_child(Some(&actions_box));
         let actions_btn = MenuButton::new();
@@ -894,6 +896,7 @@ impl AiPanel {
     fn show_rename_chat_dialog(&self) {
         let current = self.store.borrow().active_title().to_string();
         let dialog = adw::AlertDialog::new(Some("Rename chat"), None);
+        crate::ui::reference_shell::style_workspace_dialog(&dialog);
         dialog.add_responses(&[("cancel", "Cancel"), ("rename", "Rename")]);
         dialog.set_default_response(Some("rename"));
         dialog.set_close_response("cancel");
@@ -923,6 +926,7 @@ impl AiPanel {
                 "“{title}” and its saved messages will be permanently removed."
             )),
         );
+        crate::ui::reference_shell::style_workspace_dialog(&dialog);
         dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");

@@ -1038,7 +1038,7 @@ impl Config {
             // Recovery mode must never initiate update/network work.
             jsh_update_check: JshUpdateCheck::Never,
             sidebar_visible: true,
-            sidebar_width: 220,
+            sidebar_width: jterm_core::developer_workspace::NAVIGATION_WIDTH as u32,
             tab_width: DEFAULT_TAB_WIDTH,
             max_visible_blocks: 200,
             lazy_load_threshold: 1_000,
@@ -1073,7 +1073,7 @@ impl Config {
             ai_api_key_file: None,
             ai_api_key_file_configured: None,
             ai_panel_visible: false,
-            ai_panel_width: 360,
+            ai_panel_width: jterm_core::developer_workspace::INSPECTOR_WIDTH as u32,
             ai_model: "claude-sonnet-4-6".to_string(),
             ai_max_tokens: 1_024,
             ai_temperature: None,
@@ -3156,7 +3156,10 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
                 .unwrap_or_else(|| "daily".to_string()),
         ),
         sidebar_visible,
-        sidebar_width: fc.sidebar_width.unwrap_or(220).clamp(120, 800),
+        sidebar_width: fc
+            .sidebar_width
+            .unwrap_or(jterm_core::developer_workspace::NAVIGATION_WIDTH as u32)
+            .clamp(120, 800),
         tab_width: fc
             .tab_width
             .unwrap_or(DEFAULT_TAB_WIDTH)
@@ -3194,7 +3197,10 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         ai_api_key_file,
         ai_api_key_file_configured,
         ai_panel_visible: fc.ai_panel_visible.unwrap_or(false),
-        ai_panel_width: fc.ai_panel_width.unwrap_or(360).clamp(240, 1200),
+        ai_panel_width: fc
+            .ai_panel_width
+            .unwrap_or(jterm_core::developer_workspace::INSPECTOR_WIDTH as u32)
+            .clamp(240, 1200),
         ai_model,
         ai_temperature: env_f32("FORGE_AI_TEMPERATURE")
             .or(fc.ai_temperature)
@@ -3992,7 +3998,10 @@ open_palette = "F8"
 
         let (config, _, _) = load_safe_config();
         assert!(!config.ai_panel_visible);
-        assert_eq!(config.ai_panel_width, 360);
+        assert_eq!(
+            config.ai_panel_width,
+            jterm_core::developer_workspace::INSPECTOR_WIDTH as u32
+        );
     }
 
     #[test]

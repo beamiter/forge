@@ -1064,6 +1064,7 @@ impl AgentRuntime {
                 "{reason}. Verify the exact command below before continuing."
             )),
         );
+        crate::ui::reference_shell::style_workspace_dialog(&dialog);
         dialog.add_responses(&[("cancel", "Cancel"), ("run", "Run Command")]);
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");
@@ -1430,6 +1431,7 @@ fn show_agent_settings_dialog(ui: &UiState, cwd: &str, shell: &str) {
         .title("Shell Agent settings")
         .content_width(620)
         .build();
+    crate::ui::reference_shell::style_workspace_dialog(&dialog);
     let header = adw::HeaderBar::new();
 
     let overview = GBox::new(Orientation::Vertical, 8);

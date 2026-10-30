@@ -1432,6 +1432,7 @@ impl NotebookDialog {
             .content_width(900)
             .content_height(700)
             .build();
+        crate::ui::reference_shell::style_workspace_dialog(&dialog);
 
         let header = adw::HeaderBar::new();
         let stop_all_button = gtk4::Button::with_label("Stop All");

@@ -2762,6 +2762,7 @@ impl UiState {
             .transient_for(window)
             .modal(true)
             .build();
+        super::reference_shell::style_workspace_dialog(&dialog);
 
         dialog.add_response("cancel", "Cancel");
         dialog.add_response("close", close_label);
@@ -2786,7 +2787,12 @@ impl UiState {
     }
 
     pub(crate) fn toggle_sidebar(&self) {
-        self.set_sidebar_visible(!self.sidebar.is_visible(), true);
+        let visible = if self.window.has_css_class("reference-shell") {
+            !self.config.borrow().sidebar_visible
+        } else {
+            !self.sidebar.is_visible()
+        };
+        self.set_sidebar_visible(visible, true);
     }
 
     /// Apply sidebar visibility and optionally persist the user's choice.
@@ -2797,6 +2803,7 @@ impl UiState {
             self.config.borrow_mut().sidebar_visible = visible;
             self.persist_config();
         }
+        super::reference_shell::sync_inspector(self, false);
     }
 
     pub(crate) fn toggle_command_palette(&self) {
@@ -2818,6 +2825,8 @@ impl UiState {
             .content_width(480)
             .content_height(480)
             .build();
+
+        super::reference_shell::style_workspace_dialog(&dialog);
 
         let header_bar = adw::HeaderBar::new();
         let filter_entry = SearchEntry::new();
@@ -3032,6 +3041,8 @@ impl UiState {
             .content_width(480)
             .content_height(480)
             .build();
+
+        super::reference_shell::style_workspace_dialog(&dialog);
 
         let header_bar = adw::HeaderBar::new();
         let filter_entry = SearchEntry::new();
@@ -3303,6 +3314,8 @@ impl UiState {
             .content_height(480)
             .build();
 
+        super::reference_shell::style_workspace_dialog(&dialog);
+
         let header_bar = adw::HeaderBar::new();
         let filter_entry = SearchEntry::new();
         filter_entry.set_placeholder_text(Some("Filter history…"));
@@ -3572,6 +3585,8 @@ impl UiState {
             .content_width(720)
             .content_height(520)
             .build();
+
+        super::reference_shell::style_workspace_dialog(&dialog);
 
         let header_bar = adw::HeaderBar::new();
         let regex_toggle = gtk4::ToggleButton::builder()
@@ -4572,6 +4587,8 @@ impl UiState {
             .content_height(560)
             .build();
 
+        super::reference_shell::style_workspace_dialog(&dialog);
+
         let header_bar = adw::HeaderBar::new();
         let refresh_btn = gtk4::Button::from_icon_name("view-refresh-symbolic");
         refresh_btn.set_tooltip_text(Some("Refresh"));
@@ -4771,6 +4788,8 @@ impl UiState {
         }
 
         let dialog = adw::PreferencesDialog::new();
+
+        super::reference_shell::style_workspace_dialog(&dialog);
         dialog.set_title("Settings");
 
         let page = adw::PreferencesPage::new();
@@ -5523,6 +5542,7 @@ impl UiState {
                             "“{display}” will be removed from config.toml. Nothing on the destination is touched."
                         )),
                     );
+                    super::reference_shell::style_workspace_dialog(&dialog);
                     dialog.add_responses(&[("cancel", "Cancel"), ("remove", "Remove")]);
                     dialog.set_default_response(Some("cancel"));
                     dialog.set_close_response("cancel");
@@ -5643,6 +5663,8 @@ impl UiState {
             })
             .content_width(420)
             .build();
+
+        super::reference_shell::style_workspace_dialog(&dialog);
 
         let name_row = adw::EntryRow::new();
         name_row.set_title("Name (optional)");
@@ -5900,6 +5922,8 @@ impl UiState {
             let link_uri: Option<String> = crate::terminal::openable_link_at(&term, x, y);
 
             let popover = gtk4::Popover::new();
+            popover.add_css_class("forge-popup");
+            popover.add_css_class("terminal-context-menu");
             popover.set_parent(&term);
             popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
             popover.set_has_arrow(false);
@@ -6084,6 +6108,8 @@ impl UiState {
             .content_width(620)
             .content_height(480)
             .build();
+
+        super::reference_shell::style_workspace_dialog(&dialog);
 
         let header_bar = adw::HeaderBar::new();
         let filter_entry = SearchEntry::new();
@@ -6301,6 +6327,7 @@ impl UiState {
             .title(format!("Workflow: {}", wf.name))
             .content_width(520)
             .build();
+        super::reference_shell::style_workspace_dialog(&dialog);
 
         let header_bar = adw::HeaderBar::new();
         let body = gtk4::Box::new(Orientation::Vertical, 8);
@@ -6464,6 +6491,7 @@ impl UiState {
                     log::warn!("refusing unsafe or incomplete workflow render: {error}");
                     let alert =
                         adw::AlertDialog::new(Some("Command was not inserted"), Some(&error));
+                    super::reference_shell::style_workspace_dialog(&alert);
                     alert.add_response("ok", "OK");
                     alert.set_default_response(Some("ok"));
                     alert.present(Some(&dialog_for_run));
@@ -6531,6 +6559,8 @@ impl UiState {
             .content_width(640)
             .content_height(480)
             .build();
+
+        super::reference_shell::style_workspace_dialog(&dialog);
         let header_bar = adw::HeaderBar::new();
 
         let body = gtk4::Box::new(Orientation::Vertical, 8);

@@ -34,6 +34,7 @@ impl UiState {
 
     fn show_notebook_error(&self, message: &str) {
         let dialog = adw::AlertDialog::new(Some("Cannot open notebook"), Some(message));
+        crate::ui::reference_shell::style_workspace_dialog(&dialog);
         dialog.add_response("ok", "OK");
         dialog.set_default_response(Some("ok"));
         dialog.present(Some(&self.window));

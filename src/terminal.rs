@@ -983,6 +983,7 @@ pub(crate) fn show_rename_dialog(
     custom_title: Rc<Cell<bool>>,
 ) {
     let dialog = adw::AlertDialog::new(Some("Rename tab"), None);
+    crate::ui::reference_shell::style_workspace_dialog(&dialog);
     dialog.add_response("cancel", "Cancel");
     dialog.add_response("rename", "Rename");
     dialog.set_default_response(Some("rename"));
@@ -1020,6 +1021,7 @@ pub(crate) fn show_rename_dialog_with_strip(
     private_title: Rc<Cell<bool>>,
 ) {
     let dialog = adw::AlertDialog::new(Some("Rename tab"), None);
+    crate::ui::reference_shell::style_workspace_dialog(&dialog);
     dialog.add_response("cancel", "Cancel");
     dialog.add_response("rename", "Rename");
     dialog.set_default_response(Some("rename"));

@@ -8,8 +8,17 @@ use gtk4::prelude::*;
 use gtk4::{glib, Orientation};
 use jterm_core::developer_workspace as token;
 use std::rc::Rc;
+use vte4::TerminalExt;
 
 const INSPECTOR_CHROME_KEY: &str = "forge-reference-inspector-chrome";
+const OBSERVED_INSPECTOR_KEY: &str = "forge-observed-inspector-model";
+const REVIEW_TASK_KEY: &str = "forge-reference-review-task";
+
+#[derive(PartialEq, Eq)]
+struct ObservedInspector {
+    task: Option<crate::agent_task::TaskId>,
+    model: jterm_core::reference_conversation::Inspector,
+}
 
 /// Window-owned visibility intent, independent of the optional AI/Tasks pages.
 /// The same inspector widget moves into a narrow-window drawer; its selected
@@ -19,6 +28,8 @@ struct InspectorChrome {
     actual: std::cell::Cell<bool>,
     button: glib::WeakRef<gtk4::ToggleButton>,
     frame: glib::WeakRef<gtk4::Overlay>,
+    sizing: Rc<super::sidebar_resize::SidebarResize>,
+    drawer_grip: glib::WeakRef<gtk4::DrawingArea>,
 }
 
 impl InspectorChrome {
@@ -26,7 +37,22 @@ impl InspectorChrome {
         let Some(frame) = self.frame.upgrade() else {
             return;
         };
-        let layout = token::Layout::for_size(width as f32, height as f32 + token::TITLEBAR_HEIGHT);
+        let (navigation_width, inspector_width) = self.sizing.preferences();
+        let layout = token::Layout::for_size_with_sidebars(
+            width as f32,
+            height as f32 + token::TITLEBAR_HEIGHT,
+            if ui.config.borrow().sidebar_visible {
+                navigation_width as f32
+            } else {
+                0.0
+            },
+            if self.requested.get() == Some(false) {
+                0.0
+            } else {
+                inspector_width as f32
+            },
+        );
+        ui.sidebar.set_visible(layout.navigation.is_some());
         let inline = layout.inspector.is_some();
         let usable = width >= 360 && height >= 120;
         let inspector = &ui.reference_inspector;
@@ -59,12 +85,32 @@ impl InspectorChrome {
                 ui.ai_paned.set_end_child(Some(inspector));
             }
         }
-        inspector.set_width_request(if drawer {
-            (token::INSPECTOR_WIDTH as i32).min((width - 32).max(0))
-        } else {
-            token::INSPECTOR_WIDTH as i32
-        });
+        let drawer_width = (inspector_width as i32)
+            .clamp(
+                token::MIN_INSPECTOR_WIDTH as i32,
+                token::MAX_INSPECTOR_WIDTH as i32,
+            )
+            .min((width - 32).max(0));
+        if let Some(grip) = self
+            .drawer_grip
+            .upgrade()
+            .filter(|_| drawer && drawer != in_drawer)
+        {
+            // Put the six-pixel grip above the drawer, never above any
+            // other portion of the terminal canvas.
+            frame.remove_overlay(&grip);
+            frame.add_overlay(&grip);
+            frame.set_measure_overlay(&grip, false);
+        }
         inspector.set_visible(visible);
+        apply_inspector_geometry(
+            &frame,
+            inspector,
+            self.drawer_grip.upgrade().as_ref(),
+            drawer,
+            drawer_width,
+            drawer != in_drawer,
+        );
         if drawer != in_drawer && visible && focused_inside {
             if let Some(focus) = &focus {
                 // Reparenting can synchronously assign GTK's scroll container
@@ -76,10 +122,13 @@ impl InspectorChrome {
                 }
             }
         }
-        if visible && inline {
-            ui.ai_paned
-                .set_position((ui.ai_paned.width() - token::INSPECTOR_WIDTH as i32).max(0));
-        }
+        self.sizing.apply(
+            layout.navigation.map(|rect| rect.width.round() as i32),
+            layout
+                .inspector
+                .filter(|_| visible)
+                .map(|rect| rect.width.round() as i32),
+        );
         self.actual.set(visible);
         if let Some(button) = self.button.upgrade() {
             let title = if visible {
@@ -100,6 +149,43 @@ impl InspectorChrome {
         if focused_inside && !visible {
             ui.focus_current_terminal();
         }
+    }
+}
+
+/// Non-measuring overlays do not propagate their children's resize requests.
+/// Queue the host allocation when drawer geometry changes so its visible edge
+/// and the native drag target both use the requested width in the same frame.
+pub(super) fn apply_inspector_geometry(
+    frame: &gtk4::Overlay,
+    inspector: &gtk4::Box,
+    grip: Option<&gtk4::DrawingArea>,
+    drawer: bool,
+    drawer_width: i32,
+    reparented: bool,
+) {
+    let mut changed = reparented;
+    let width = if drawer {
+        drawer_width
+    } else {
+        token::MIN_INSPECTOR_WIDTH as i32
+    };
+    if inspector.width_request() != width {
+        inspector.set_width_request(width);
+        changed = true;
+    }
+    if let Some(grip) = grip {
+        let margin = (drawer_width - token::SIDEBAR_DIVIDER_WIDTH as i32).max(0);
+        if grip.margin_end() != margin {
+            grip.set_margin_end(margin);
+            changed = true;
+        }
+        if grip.is_visible() != drawer {
+            grip.set_visible(drawer);
+            changed = true;
+        }
+    }
+    if changed {
+        frame.queue_allocate();
     }
 }
 
@@ -128,6 +214,17 @@ pub(crate) fn sync_inspector(ui: &UiState, reveal: bool) -> bool {
         }
     }
     true
+}
+
+pub(crate) fn finish_sidebar_resize(ui: &UiState) {
+    let controller = unsafe {
+        ui.window
+            .data::<std::rc::Weak<InspectorChrome>>(INSPECTOR_CHROME_KEY)
+            .and_then(|ptr| ptr.as_ref().upgrade())
+    };
+    if let Some(controller) = controller {
+        controller.sizing.finish(true);
+    }
 }
 
 fn active_mode(ui: &UiState) -> Option<TerminalMode> {
@@ -191,6 +288,8 @@ pub(crate) fn role_font_css(chrome_scale: f64, content_scale: f64) -> String {
     for rule in include_str!("reference_shell.css")
         .split('}')
         .chain(include_str!("developer_block.css").split('}'))
+        .chain(include_str!("reference_popovers.css").split('}'))
+        .chain(include_str!("reference_dialogs.css").split('}'))
     {
         let Some((selectors, body)) = rule.split_once('{') else {
             continue;
@@ -642,6 +741,7 @@ pub(crate) fn composer_controls(on_terminal: impl Fn() + 'static) -> (gtk4::Box,
     tools.set_child(Some(&tool_label));
     tools.set_tooltip_text(Some("Tools"));
     let popover = gtk4::Popover::new();
+    popover.add_css_class("forge-popup");
     popover.add_css_class("reference-tools-popover");
     popover.set_position(gtk4::PositionType::Top);
     popover.set_has_arrow(false);
@@ -904,6 +1004,278 @@ fn icon(name: &str, description: &str) -> gtk4::Button {
     button
 }
 
+fn private_session(ui: &UiState) -> bool {
+    ui.notebook
+        .current_page()
+        .and_then(|index| ui.notebook.nth_page(Some(index)))
+        .as_ref()
+        .and_then(super::tab_private_title_cell)
+        .is_some_and(|flag| flag.get())
+}
+
+fn workspace_menu_snapshot(ui: &UiState) -> Vec<(String, Option<String>)> {
+    (0..ui.notebook.n_pages())
+        .filter_map(|index| {
+            let page = ui.notebook.nth_page(Some(index))?;
+            Some((
+                page.widget_name().to_string(),
+                super::tab_display_title(&ui.notebook, &page),
+            ))
+        })
+        .collect()
+}
+
+/// A remote pane may only contribute its reported remote directory. Looking
+/// up the local SSH client's process directory would describe another host.
+fn session_directory(ui: &UiState) -> Option<String> {
+    let terminal = ui.current_terminal()?;
+    context_directory(
+        private_session(ui),
+        ui.current_pane_leaf().is_some_and(|leaf| leaf.is_remote()),
+        terminal.current_directory_uri().as_deref(),
+        || crate::terminal::terminal_working_directory(&terminal).filter(|path| !path.is_empty()),
+    )
+}
+
+fn context_directory(
+    private: bool,
+    remote: bool,
+    reported_uri: Option<&str>,
+    local_directory: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    if private {
+        return None;
+    }
+    if !remote {
+        return local_directory();
+    }
+    let uri = reported_uri.filter(|uri| uri.len() <= 16 * 1024)?;
+    let (path, _) = glib::filename_from_uri(uri).ok()?;
+    let path = path.to_str()?;
+    (std::path::Path::new(path).is_absolute()
+        && jterm_core::execution_journal::is_valid_jsh_cwd(path))
+    .then(|| path.into())
+}
+
+fn set_context_value(stack: &gtk4::Stack, key: &str, value: &str) {
+    if let Some(page) = stack.child_by_name("context") {
+        if let Some(label) = widget_with_class_any(&page, &format!("reference-context-{key}"))
+            .and_then(|widget| widget.downcast::<gtk4::Label>().ok())
+        {
+            let safe = jterm_core::review_input::safe_inline_display(value, 1024);
+            if label.text().as_str() != safe {
+                label.set_text(&safe);
+                label.set_tooltip_text(Some(&safe));
+            }
+        }
+    }
+}
+
+fn context_action(title: &str, key: &'static str) -> gtk4::Button {
+    let button = gtk4::Button::with_label(title);
+    button.add_css_class(&format!("reference-context-{key}"));
+    button.connect_clicked(move |button| {
+        let Some(ui) = ui_for_widget(button.upcast_ref()) else {
+            return;
+        };
+        // Recheck at activation: a privacy toggle or tab switch can happen
+        // between the most recent heartbeat and the user's click.
+        if private_session(&ui) {
+            return;
+        }
+        match key {
+            "copy" => {
+                if let Some(directory) = session_directory(&ui) {
+                    button.clipboard().set_text(&directory);
+                }
+            }
+            "browse" => {
+                ui.file_tree_goto_current_cwd();
+                ui.apply_sidebar_view(SidebarView::Files, false);
+            }
+            _ => {}
+        }
+    });
+    button
+}
+
+fn agent_actions() -> gtk4::Box {
+    let actions = gtk4::Box::new(Orientation::Vertical, 6);
+    actions.add_css_class("reference-agent-actions");
+    for (title, action) in [
+        (
+            "Manage agent tasks",
+            crate::keybindings::Action::ToggleTasksPanel,
+        ),
+        ("Open AI assistant", crate::keybindings::Action::OpenAiPanel),
+        (
+            "Saved agent sessions",
+            crate::keybindings::Action::OpenAgentSessions,
+        ),
+    ] {
+        let button = gtk4::Button::with_label(title);
+        if action == crate::keybindings::Action::ToggleTasksPanel {
+            button.set_tooltip_text(Some("Open recorded tasks. Creating tasks requires agent_tasks_enabled = true in the config file."));
+        }
+        button.connect_clicked(move |button| {
+            let Some(ui) = ui_for_widget(button.upcast_ref()) else {
+                return;
+            };
+            if action == crate::keybindings::Action::ToggleTasksPanel {
+                if !ui.config.borrow().agent_tasks_enabled
+                    && ui.agent_tasks.borrow().task_manager.tasks().is_empty()
+                {
+                    ui.toggle_tasks_panel();
+                    return;
+                }
+                let displayed = {
+                    let domain = ui.agent_tasks.borrow();
+                    jterm_core::reference_conversation::observed_inspector_task(
+                        domain.task_manager.tasks(),
+                        domain.selected_task,
+                    )
+                    .map(|task| task.id)
+                };
+                if let Some(id) = displayed {
+                    ui.execute_task_panel_action(crate::agent_task_ui::TaskPanelAction::Select(id));
+                }
+                if !ui.agent_tasks.borrow().panel_visible {
+                    ui.toggle_tasks_panel();
+                }
+                ui.side_stack.set_visible_child_name("tasks");
+            } else if action == crate::keybindings::Action::OpenAiPanel {
+                if !ui.config.borrow().ai_enabled {
+                    ui.execute_action(crate::keybindings::Action::ToggleSettings);
+                    return;
+                }
+                // The explicit assistant action takes precedence over a task
+                // page without closing or discarding its live domain state.
+                ui.open_ai_panel();
+                ui.side_stack.set_visible_child_name("chats");
+            } else {
+                ui.execute_action(action);
+            }
+        });
+        actions.append(&button);
+    }
+    let review = gtk4::Button::with_label("Review task changes");
+    review.set_tooltip_text(Some(
+        "Review changes for the task displayed in this overview",
+    ));
+    review.add_css_class("reference-review-task");
+    review.set_sensitive(false);
+    review.connect_clicked(|button| {
+        let Some(ui) = ui_for_widget(button.upcast_ref()) else {
+            return;
+        };
+        if private_session(&ui) {
+            return;
+        }
+        let displayed = unsafe {
+            button
+                .data::<Option<crate::agent_task::TaskId>>(REVIEW_TASK_KEY)
+                .and_then(|target| *target.as_ref())
+        };
+        let displayed = {
+            let domain = ui.agent_tasks.borrow();
+            review_task_target(domain.task_manager.tasks(), displayed)
+        };
+        let Some(id) = displayed else {
+            return;
+        };
+        ui.execute_task_panel_action(crate::agent_task_ui::TaskPanelAction::Select(id));
+        if !ui.agent_tasks.borrow().panel_visible {
+            ui.toggle_tasks_panel();
+        }
+        ui.side_stack.set_visible_child_name("tasks");
+        ui.execute_task_panel_action(crate::agent_task_ui::TaskPanelAction::ReviewDiff(id));
+    });
+    actions.append(&review);
+    actions
+}
+
+fn review_task_target(
+    tasks: &[crate::agent_task::AgentTask],
+    displayed: Option<crate::agent_task::TaskId>,
+) -> Option<crate::agent_task::TaskId> {
+    displayed.filter(|id| {
+        tasks
+            .iter()
+            .any(|task| task.id == *id && task.status != crate::agent_task::TaskStatus::Archived)
+    })
+}
+
+/// Keep the overview a projection of the same task domain as the native task
+/// manager. Only the passive card is replaced; entry actions and scroll state
+/// survive task updates and never own a separate task selection.
+pub(crate) fn refresh_task_overview(ui: &UiState) {
+    if jterm_core::reference_conversation::fixture_enabled() {
+        return;
+    }
+    let Some(overview) = ui
+        .side_stack
+        .child_by_name("overview")
+        .and_then(|page| widget_with_class_any(&page, "reference-agent-overview"))
+        .and_then(|widget| widget.downcast::<gtk4::Box>().ok())
+    else {
+        return;
+    };
+    let domain = ui.agent_tasks.borrow();
+    let mut task = jterm_core::reference_conversation::observed_inspector_task(
+        domain.task_manager.tasks(),
+        domain.selected_task,
+    )
+    .map(|task| task.id);
+    let mut model = jterm_core::reference_conversation::observed_task_inspector(
+        domain.task_manager.tasks(),
+        domain.selected_task,
+        |id| crate::agent_task::DashboardActivity {
+            has_active_agent_stream: domain.task_manager.has_active_agent_event_stream(id),
+            native_preparing: domain.agent_runtime.has_preparing(id),
+            ..Default::default()
+        },
+    );
+    drop(domain);
+    let private = private_session(ui);
+    if private {
+        task = None;
+        model = jterm_core::reference_conversation::Inspector::empty();
+        model.title = "Private session".into();
+        model.subtitle = "Open Tasks to inspect recorded work explicitly".into();
+        model.badge = "Private".into();
+        model.output_title = "Task privacy".into();
+        model.output = "Task details are hidden for this private session.".into();
+    }
+    let snapshot = ObservedInspector { task, model };
+    let unchanged = unsafe {
+        overview
+            .data::<ObservedInspector>(OBSERVED_INSPECTOR_KEY)
+            .is_some_and(|previous| previous.as_ref() == &snapshot)
+    };
+    if unchanged {
+        return;
+    }
+    if let Some(card) = overview
+        .last_child()
+        .filter(|child| child.has_css_class("reference-rich-inspector"))
+    {
+        overview.remove(&card);
+    }
+    overview.append(&super::reference_conversation::inspector(
+        &snapshot.model,
+        false,
+    ));
+    if let Some(review) = widget_with_class_any(overview.upcast_ref(), "reference-review-task") {
+        review.set_sensitive(snapshot.task.is_some());
+        unsafe {
+            review.set_data(REVIEW_TASK_KEY, snapshot.task);
+        }
+    }
+    unsafe {
+        overview.set_data(OBSERVED_INSPECTOR_KEY, snapshot);
+    }
+}
+
 /// The always-present inspector has an honest empty state until a real task
 /// or chat owns its existing pages. The Files page is the real file browser.
 pub(crate) fn inspector(stack: &gtk4::Stack) -> gtk4::Box {
@@ -915,7 +1287,24 @@ pub(crate) fn inspector(stack: &gtk4::Stack) -> gtk4::Box {
     } else {
         jterm_core::reference_conversation::Inspector::empty()
     };
-    let overview = super::reference_conversation::inspector(&inspector, fixture);
+    let overview = if fixture {
+        super::reference_conversation::inspector(&inspector, true)
+    } else {
+        let overview = gtk4::Box::new(Orientation::Vertical, 8);
+        overview.add_css_class("reference-agent-overview");
+        overview.append(&agent_actions());
+        overview.append(&super::reference_conversation::inspector(&inspector, false));
+        unsafe {
+            overview.set_data(
+                OBSERVED_INSPECTOR_KEY,
+                ObservedInspector {
+                    task: None,
+                    model: inspector,
+                },
+            );
+        }
+        overview
+    };
     let scroll = gtk4::ScrolledWindow::new();
     scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
     scroll.set_child(Some(&overview));
@@ -923,6 +1312,7 @@ pub(crate) fn inspector(stack: &gtk4::Stack) -> gtk4::Box {
     stack.add_named(&scroll, Some("overview"));
     let context = gtk4::Box::new(Orientation::Vertical, 12);
     context.add_css_class("reference-agent-card");
+    context.add_css_class("reference-session-context");
     context.append(&label("Session context", "reference-card-title"));
     context.append(&label(
         "The current terminal owns its shell and working directory.",
@@ -933,15 +1323,43 @@ pub(crate) fn inspector(stack: &gtk4::Stack) -> gtk4::Box {
     path.set_wrap(true);
     path.set_selectable(true);
     context.append(&path);
+    for (title, key) in [
+        ("Session", "session"),
+        ("Connection", "connection"),
+        ("Git branch", "branch"),
+        ("Presentation", "mode"),
+        ("Foreground process", "process"),
+        ("Prompt", "prompt"),
+        ("Terminal size", "size"),
+        ("AI command context", "sharing"),
+    ] {
+        context.append(&label(title, "reference-section-label"));
+        let value = label("Waiting for a terminal", "reference-metadata");
+        value.add_css_class(&format!("reference-context-{key}"));
+        value.set_selectable(true);
+        value.set_wrap(true);
+        context.append(&value);
+    }
+    let context_actions = gtk4::Box::new(Orientation::Horizontal, 6);
+    context_actions.append(&context_action("Copy directory", "copy"));
+    context_actions.append(&context_action("Browse files", "browse"));
+    context.append(&context_actions);
+    let settings = gtk4::Button::with_label("Sharing settings");
+    settings.connect_clicked(|button| {
+        if let Some(ui) = ui_for_widget(button.upcast_ref()) {
+            ui.execute_action(crate::keybindings::Action::ToggleSettings);
+        }
+    });
+    context.append(&settings);
     context.append(&label(
-        "Input stays in the native terminal. Context is never sent automatically.",
+        "These are local session facts. AI requests follow your context-sharing and redaction settings.",
         "reference-muted",
     ));
     stack.add_named(&context, Some("context"));
     stack.set_visible_child_name("overview");
     let root = gtk4::Box::new(Orientation::Vertical, 0);
     root.add_css_class("reference-inspector");
-    root.set_width_request(token::INSPECTOR_WIDTH as i32);
+    root.set_width_request(token::MIN_INSPECTOR_WIDTH as i32);
     root.set_vexpand(true);
     let tabs = gtk4::Box::new(Orientation::Horizontal, 6);
     tabs.add_css_class("reference-inspector-tabs");
@@ -964,7 +1382,34 @@ pub(crate) fn inspector(stack: &gtk4::Stack) -> gtk4::Box {
     let fill = gtk4::Box::new(Orientation::Horizontal, 0);
     fill.set_hexpand(true);
     tabs.append(&fill);
-    tabs.append(&disabled("⋮", "Inspector menu is not implemented"));
+    let menu = gtk4::MenuButton::new();
+    menu.set_label("⋮");
+    menu.add_css_class("flat");
+    menu.set_tooltip_text(Some("Inspector actions"));
+    let popup = gtk4::Popover::new();
+    popup.add_css_class("forge-popup");
+    let menu_actions = gtk4::Box::new(Orientation::Vertical, 4);
+    for (title, page) in [
+        ("Agent overview", "overview"),
+        ("Session context", "context"),
+        ("Workspace files", "files"),
+    ] {
+        let button = gtk4::Button::with_label(title);
+        let stack = stack.downgrade();
+        let popup = popup.downgrade();
+        button.connect_clicked(move |_| {
+            if let Some(stack) = stack.upgrade() {
+                stack.set_visible_child_name(page);
+            }
+            if let Some(popup) = popup.upgrade() {
+                popup.popdown();
+            }
+        });
+        menu_actions.append(&button);
+    }
+    popup.set_child(Some(&menu_actions));
+    menu.set_popover(Some(&popup));
+    tabs.append(&menu);
     let agent_for_sync = agent.clone();
     stack.connect_visible_child_name_notify(move |stack| {
         let name = stack.visible_child_name();
@@ -976,7 +1421,14 @@ pub(crate) fn inspector(stack: &gtk4::Stack) -> gtk4::Box {
         files.set_active(name.as_deref() == Some("files"));
     });
     agent.set_active(true);
-    root.append(&tabs);
+    let tabs_scroll = gtk4::ScrolledWindow::new();
+    tabs_scroll.set_policy(gtk4::PolicyType::External, gtk4::PolicyType::Never);
+    tabs_scroll.set_min_content_width(0);
+    tabs_scroll.set_max_content_width(1);
+    tabs_scroll.set_propagate_natural_width(false);
+    tabs_scroll.set_focusable(false);
+    tabs_scroll.set_child(Some(&tabs));
+    root.append(&tabs_scroll);
     // Live AI/Tasks pages contain native editors and legacy controls whose
     // minimum size can exceed the inspector contract. Keep those widgets and
     // their focus/drafts intact inside a bounded, scrollable host; the Paned
@@ -1296,7 +1748,7 @@ pub(crate) fn install(
 
     ui.sidebar.add_css_class("reference-navigation");
     ui.sidebar
-        .set_width_request(token::NAVIGATION_WIDTH as i32 - 1);
+        .set_width_request(token::MIN_NAVIGATION_WIDTH as i32);
     if let Some(switcher) = ui
         .sidebar
         .first_child()
@@ -1306,7 +1758,8 @@ pub(crate) fn install(
     }
     let section = label("WORKSPACE", "reference-section-label");
     ui.sidebar.prepend(&section);
-    let workspace = gtk4::Button::new();
+    let workspace = gtk4::MenuButton::new();
+    workspace.set_always_show_arrow(false);
     let workspace_slots = gtk4::Box::new(Orientation::Horizontal, 6);
     workspace_slots.append(&vector_icon(jterm_core::reference_icons::Icon::Files, 16));
     let workspace_name = label("Local workspace", "reference-workspace-name");
@@ -1322,8 +1775,100 @@ pub(crate) fn install(
     ));
     workspace.set_child(Some(&workspace_slots));
     workspace.add_css_class("reference-workspace-selector");
-    workspace.set_sensitive(false);
-    workspace.set_tooltip_text(Some("Current workspace · profile switching unavailable"));
+    workspace.set_tooltip_text(Some("Switch terminal workspace"));
+    let workspace_popup = gtk4::Popover::new();
+    workspace_popup.add_css_class("forge-popup");
+    workspace_popup.set_has_arrow(false);
+    let workspace_list = gtk4::Box::new(Orientation::Vertical, 4);
+    workspace_list.set_width_request(240);
+    let workspace_scroll = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vscrollbar_policy(gtk4::PolicyType::Automatic)
+        .max_content_height(420)
+        .propagate_natural_height(true)
+        .child(&workspace_list)
+        .build();
+    workspace_popup.set_child(Some(&workspace_scroll));
+    workspace.set_popover(Some(&workspace_popup));
+    let workspace_snapshot = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let snapshot_for_privacy = workspace_snapshot.clone();
+    let workspace_popup_for_privacy = workspace_popup.downgrade();
+    let ui_for_privacy = Rc::downgrade(ui);
+    ui.window.connect_title_notify(move |_| {
+        // Ordinary terminal heartbeat notifications can repeat the same title.
+        // Dismiss only when displayed row identities/titles actually changed;
+        // privacy changes therefore remove the previous public rows promptly.
+        if let (Some(popup), Some(ui)) = (
+            workspace_popup_for_privacy.upgrade(),
+            ui_for_privacy.upgrade(),
+        ) {
+            if popup.is_visible() && *snapshot_for_privacy.borrow() != workspace_menu_snapshot(&ui)
+            {
+                popup.popdown();
+            }
+        }
+    });
+    let weak_ui = Rc::downgrade(ui);
+    workspace_popup.connect_show(move |popup| {
+        while let Some(child) = workspace_list.first_child() {
+            workspace_list.remove(&child);
+        }
+        let Some(ui) = weak_ui.upgrade() else {
+            return;
+        };
+        *workspace_snapshot.borrow_mut() = workspace_menu_snapshot(&ui);
+        workspace_list.append(&label("TERMINAL WORKSPACES", "reference-section-label"));
+        for index in 0..ui.notebook.n_pages() {
+            let Some(page) = ui.notebook.nth_page(Some(index)) else {
+                continue;
+            };
+            let title = super::tab_display_title(&ui.notebook, &page)
+                .unwrap_or_else(|| format!("Terminal {}", index + 1));
+            let safe = jterm_core::review_input::safe_inline_display(&title, 160);
+            let button = gtk4::Button::with_label(&format!(
+                "{}{}",
+                if ui.notebook.current_page() == Some(index) {
+                    "✓  "
+                } else {
+                    ""
+                },
+                safe
+            ));
+            button.set_tooltip_text(Some(&safe));
+            if let Some(title) = button.child().and_downcast::<gtk4::Label>() {
+                title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                title.set_max_width_chars(36);
+                title.set_xalign(0.0);
+            }
+            let ui = Rc::downgrade(&ui);
+            let page = page.downgrade();
+            let popup = popup.downgrade();
+            button.connect_clicked(move |_| {
+                if let (Some(ui), Some(page)) = (ui.upgrade(), page.upgrade()) {
+                    if let Some(index) = ui.notebook.page_num(&page) {
+                        ui.notebook.set_current_page(Some(index));
+                        ui.focus_current_terminal();
+                    }
+                }
+                if let Some(popup) = popup.upgrade() {
+                    popup.popdown();
+                }
+            });
+            workspace_list.append(&button);
+        }
+        let new_terminal = gtk4::Button::with_label("New terminal workspace");
+        let ui = Rc::downgrade(&ui);
+        let popup = popup.downgrade();
+        new_terminal.connect_clicked(move |_| {
+            if let Some(ui) = ui.upgrade() {
+                ui.execute_action(crate::keybindings::Action::NewTab);
+            }
+            if let Some(popup) = popup.upgrade() {
+                popup.popdown();
+            }
+        });
+        workspace_list.append(&new_terminal);
+    });
     ui.sidebar.insert_child_after(&workspace, Some(&section));
     let navigation = gtk4::Box::new(Orientation::Vertical, token::NAVIGATION_ROW_GAP as i32);
     navigation.add_css_class("reference-navigation-links");
@@ -1474,7 +2019,10 @@ pub(crate) fn install(
     }
     let navigation_scroll = gtk4::ScrolledWindow::new();
     navigation_scroll.add_css_class("reference-navigation-viewport");
-    navigation_scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::External);
+    navigation_scroll.set_policy(gtk4::PolicyType::External, gtk4::PolicyType::External);
+    navigation_scroll.set_min_content_width(0);
+    navigation_scroll.set_max_content_width(1);
+    navigation_scroll.set_propagate_natural_width(false);
     navigation_scroll.set_min_content_height(0);
     navigation_scroll.set_propagate_natural_height(false);
     navigation_scroll.set_vexpand(true);
@@ -1546,6 +2094,7 @@ pub(crate) fn install(
     capabilities.add_css_class("flat");
     capabilities.set_tooltip_text(Some("Terminal capabilities"));
     let popover = gtk4::Popover::new();
+    popover.add_css_class("forge-popup");
     let capability_list = gtk4::Box::new(Orientation::Vertical, 6);
     vim.set_child(Some(&icon_label("code", "Vim workspace")));
     ui.agent_toggle
@@ -1621,11 +2170,41 @@ pub(crate) fn install(
     let frame = gtk4::Overlay::new();
     frame.set_child(Some(&body));
     frame.set_vexpand(true);
+    let changed_ui = Rc::downgrade(ui);
+    let reflow_ui = Rc::downgrade(ui);
+    let sizing = super::sidebar_resize::SidebarResize::new(
+        content,
+        &ui.ai_paned,
+        ui.config.clone(),
+        move || {
+            if let Some(ui) = changed_ui.upgrade() {
+                ui.persist_config();
+            }
+        },
+        move || {
+            if let Some(ui) = reflow_ui.upgrade() {
+                sync_inspector(&ui, false);
+            }
+        },
+    );
+    let resize_for_deactivate = Rc::downgrade(&sizing);
+    ui.window.connect_is_active_notify(move |window| {
+        if !window.is_active() {
+            if let Some(sizing) = resize_for_deactivate.upgrade() {
+                sizing.cancel_deferred();
+            }
+        }
+    });
+    let drawer_grip = sizing.drawer_grip(&ui.reference_inspector);
+    frame.add_overlay(&drawer_grip);
+    frame.set_measure_overlay(&drawer_grip, false);
     let inspector_chrome = Rc::new(InspectorChrome {
         requested: std::cell::Cell::new(None),
         actual: std::cell::Cell::new(false),
         button: inspector_toggle.downgrade(),
         frame: frame.downgrade(),
+        sizing,
+        drawer_grip: drawer_grip.downgrade(),
     });
     unsafe {
         ui.window
@@ -1651,7 +2230,6 @@ pub(crate) fn install(
     frame.add_overlay(&observer);
     frame.set_measure_overlay(&observer, false);
     let ui_for_resize = Rc::downgrade(ui);
-    let content = content.clone();
     let palette_for_resize = palette.clone();
     let path_for_resize = path.clone();
     let top_for_geometry = top.clone();
@@ -1661,13 +2239,15 @@ pub(crate) fn install(
         let Some(ui) = ui_for_resize.upgrade() else {
             return;
         };
-        let layout = token::Layout::for_size(width as f32, height as f32 + token::TITLEBAR_HEIGHT);
+        let (navigation_width, inspector_width) = chrome_for_resize.sizing.preferences();
+        let layout = token::Layout::for_size_with_sidebars(width as f32, height as f32 + token::TITLEBAR_HEIGHT,
+            if ui.config.borrow().sidebar_visible { navigation_width as f32 } else { 0.0 },
+            if chrome_for_resize.requested.get() == Some(false) { 0.0 } else { inspector_width as f32 });
         path_for_resize.set_visible(layout.inspector.is_some());
         palette_for_resize.set_width_request(if layout.inspector.is_some() { token::SEARCH_WIDTH as i32 } else { 180 });
         ui.sidebar
             .set_visible(layout.navigation.is_some() && ui.config.borrow().sidebar_visible);
         chrome_for_resize.sync(&ui, width, height);
-        content.set_position(token::NAVIGATION_WIDTH as i32);
         if let Some(destination) = std::env::var_os("FORGE_REFERENCE_GEOMETRY") {
             let ui = Rc::downgrade(&ui);
             let top_for_geometry = top_for_geometry.clone();
@@ -1830,18 +2410,17 @@ pub(crate) fn install(
         if let Some(button) = &gated_agent_button {
             button.set_sensitive(ui.config.borrow().agent_tasks_enabled);
         }
+        refresh_task_overview(&ui);
         if let Some(terminal) = ui.current_terminal() {
-            let private = ui
-                .notebook
-                .current_page()
-                .and_then(|index| ui.notebook.nth_page(Some(index)))
-                .as_ref()
-                .and_then(super::tab_private_title_cell)
-                .is_some_and(|flag| flag.get());
+            let private = private_session(&ui);
+            let remote = ui.current_pane_leaf().is_some_and(|leaf| leaf.is_remote());
+            let directory = session_directory(&ui);
             let cwd = if private {
                 "Private session".to_string()
             } else {
-                crate::terminal::terminal_working_directory(&terminal).unwrap_or_default()
+                directory
+                    .clone()
+                    .unwrap_or_else(|| "Directory not reported".into())
             };
             let safe = jterm_core::review_input::safe_inline_display(&cwd, 1024);
             let name = if private {
@@ -1855,7 +2434,7 @@ pub(crate) fn install(
             };
             workspace_name.set_text(&name);
             workspace_name.set_tooltip_text(Some(&safe));
-            let branch = if private {
+            let branch = if private || remote || directory.is_none() {
                 None
             } else {
                 crate::block_view::reference_workspace_branch(&cwd)
@@ -1866,11 +2445,140 @@ pub(crate) fn install(
             path.set_tooltip_text(Some(&safe));
             if let Some(context_path) = &context_path {
                 context_path.set_text(&safe);
+                context_path.set_tooltip_text(Some(&safe));
+            }
+            let title = ui
+                .notebook
+                .current_page()
+                .and_then(|index| ui.notebook.nth_page(Some(index)))
+                .and_then(|page| super::tab_display_title(&ui.notebook, &page))
+                .unwrap_or_else(|| "Terminal".into());
+            set_context_value(&ui.side_stack, "session", &title);
+            let connection = if private {
+                "Hidden for private session".into()
+            } else if remote {
+                ui.current_pane_leaf()
+                    .and_then(|leaf| leaf.managed_remote_name())
+                    .unwrap_or_else(|| "Remote terminal".into())
+            } else {
+                "Local terminal".into()
+            };
+            set_context_value(&ui.side_stack, "connection", &connection);
+            set_context_value(
+                &ui.side_stack,
+                "branch",
+                if private {
+                    "Hidden for private session"
+                } else if remote {
+                    "Available in the remote terminal"
+                } else {
+                    branch.as_deref().unwrap_or("Not a Git workspace")
+                },
+            );
+            set_context_value(
+                &ui.side_stack,
+                "mode",
+                active_mode(&ui)
+                    .as_ref()
+                    .map(TerminalMode::presentation_label)
+                    .unwrap_or("Terminal"),
+            );
+            let process = if private {
+                "Hidden for private session".into()
+            } else {
+                ui.current_pane_leaf()
+                    .and_then(|leaf| leaf.foreground_process_name())
+                    .unwrap_or_else(|| "Not reported".into())
+            };
+            set_context_value(&ui.side_stack, "process", &process);
+            set_context_value(
+                &ui.side_stack,
+                "prompt",
+                if private {
+                    "Hidden for private session"
+                } else {
+                    ui.current_term_view()
+                        .as_ref()
+                        .map(|view| view.command_prompt_status().short_label())
+                        .unwrap_or("Native terminal input")
+                },
+            );
+            set_context_value(
+                &ui.side_stack,
+                "size",
+                &format!(
+                    "{} columns × {} rows",
+                    terminal.column_count(),
+                    terminal.row_count()
+                ),
+            );
+            let config = ui.config.borrow();
+            set_context_value(
+                &ui.side_stack,
+                "sharing",
+                if !config.ai_enabled {
+                    "AI disabled"
+                } else if config.ai_share_command_context {
+                    if config.ai_redact_secrets {
+                        "Enabled · secret redaction on"
+                    } else {
+                        "Enabled · secret redaction off"
+                    }
+                } else {
+                    "Command context sharing disabled"
+                },
+            );
+            drop(config);
+            if let Some(page) = ui.side_stack.child_by_name("context") {
+                for action in ["copy", "browse"] {
+                    if let Some(button) =
+                        widget_with_class_any(&page, &format!("reference-context-{action}"))
+                    {
+                        button.set_sensitive(!private && directory.is_some());
+                    }
+                }
+            }
+        } else {
+            workspace_name.set_text("No terminal selected");
+            workspace_name.set_tooltip_text(None);
+            workspace_branch.set_text("—");
+            workspace_branch.set_tooltip_text(None);
+            path.set_text("No terminal selected");
+            if let Some(context_path) = &context_path {
+                context_path.set_text("No terminal selected");
+                context_path.set_tooltip_text(None);
+            }
+            for key in [
+                "session",
+                "connection",
+                "branch",
+                "mode",
+                "process",
+                "prompt",
+                "size",
+            ] {
+                set_context_value(&ui.side_stack, key, "No terminal selected");
+            }
+            if let Some(page) = ui.side_stack.child_by_name("context") {
+                for action in ["copy", "browse"] {
+                    if let Some(button) =
+                        widget_with_class_any(&page, &format!("reference-context-{action}"))
+                    {
+                        button.set_sensitive(false);
+                    }
+                }
             }
         }
     });
+    let refresh_for_switch = refresh_context.clone();
+    ui.notebook.connect_switch_page(move |_, _, _| {
+        let refresh = refresh_for_switch.clone();
+        glib::idle_add_local_once(move || refresh());
+    });
     let refresh_for_title = refresh_context.clone();
     ui.window.connect_title_notify(move |_| refresh_for_title());
+    let refresh_for_initial = refresh_context.clone();
+    glib::idle_add_local_once(move || refresh_for_initial());
     let ui_for_poll = Rc::downgrade(ui);
     glib::timeout_add_seconds_local(1, move || {
         if ui_for_poll.upgrade().is_none() {
@@ -1984,14 +2692,22 @@ pub(crate) fn install(
     }
 }
 
-pub(crate) fn install_css() {
+/// Opt in only application-owned workspace dialogs; native file choosers keep
+/// their platform styling. Preserve the dialog's existing native text sizing.
+pub(crate) fn style_workspace_dialog(dialog: &impl IsA<gtk4::Widget>) {
+    dialog.add_css_class("forge-workspace-dialog");
+}
+
+fn shell_css() -> String {
     fn hex(color: [u8; 3]) -> String {
         format!("#{:02x}{:02x}{:02x}", color[0], color[1], color[2])
     }
     let css = format!(
-        "{}\n{}",
+        "{}\n{}\n{}\n{}",
         include_str!("reference_shell.css"),
-        include_str!("developer_block.css")
+        include_str!("developer_block.css"),
+        include_str!("reference_popovers.css"),
+        include_str!("reference_dialogs.css")
     )
     .replace("@TITLEBAR@", &hex(token::color::TITLEBAR))
     .replace("@RAIL@", &hex(token::color::RAIL))
@@ -2005,11 +2721,20 @@ pub(crate) fn install_css() {
         "@PROFILE_BACKGROUND@",
         &hex(token::color::PROFILE_BACKGROUND),
     )
-    .replace("@PROFILE_BORDER@", &hex(token::color::PROFILE_BORDER));
+    .replace("@PROFILE_BORDER@", &hex(token::color::PROFILE_BORDER))
+    .replace("@DARK_BORDER@", &hex(token::color::DARK_BORDER))
+    .replace("@POPUP_SURFACE@", &hex(token::color::NAVIGATION))
+    .replace("@POPUP_BORDER@", &{
+        let [r, g, b, _] = jterm_core::reference_popup::BORDER;
+        hex([r, g, b])
+    })
+    .replace("@POPUP_FOREGROUND@", &hex(token::color::CHROME_TEXT))
+    .replace("@POPUP_MUTED@", &hex(token::color::CHROME_MUTED))
+    .replace("@POPUP_SELECTED@", &hex(token::color::NAVIGATION_SELECTED));
     // GTK CSS minima exclude the surrounding padding/border. Keep those
     // insets explicit while binding the total measured geometry to the same
     // native contract used by both Block and Chat widget requests.
-    let css = [
+    [
         ("@TITLEBAR_HEIGHT@", token::TITLEBAR_HEIGHT),
         ("@SEARCH_INNER_HEIGHT@", token::SEARCH_HEIGHT - 2.0),
         ("@MODE_HEIGHT@", token::MODE_CONTROL_HEIGHT),
@@ -2020,10 +2745,10 @@ pub(crate) fn install_css() {
         ),
         (
             "@NAVIGATION_CONTENT_MIN@",
-            token::NAVIGATION_WIDTH - 2.0 - 2.0 * token::NAVIGATION_PADDING,
+            token::MIN_NAVIGATION_WIDTH - 1.0 - 2.0 * token::NAVIGATION_PADDING,
         ),
         ("@HEADER_INNER_HEIGHT@", token::CANVAS_HEADER_HEIGHT - 1.0),
-        ("@INSPECTOR_CONTENT_MIN@", token::INSPECTOR_WIDTH - 1.0),
+        ("@INSPECTOR_CONTENT_MIN@", token::MIN_INSPECTOR_WIDTH - 1.0),
         (
             "@INSPECTOR_TABS_INNER_HEIGHT@",
             token::INSPECTOR_TABS_HEIGHT - 1.0,
@@ -2046,14 +2771,133 @@ pub(crate) fn install_css() {
     .into_iter()
     .fold(css, |css, (name, value)| {
         css.replace(name, &value.to_string())
-    });
+    })
+}
+
+pub(crate) fn install_css() {
     let provider = gtk4::CssProvider::new();
-    provider.load_from_string(&css);
+    provider.load_from_string(&shell_css());
     if let Some(display) = gtk4::gdk::Display::default() {
         gtk4::style_context_add_provider_for_display(
             &display,
             &provider,
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 20,
+        );
+    }
+}
+
+#[cfg(test)]
+mod review_target_tests {
+    use super::{review_task_target, ObservedInspector};
+    use crate::agent_task::{AgentProvider, NewTask, TaskManager, TaskStatus};
+
+    fn tasks() -> Vec<crate::agent_task::AgentTask> {
+        let mut manager = TaskManager::new();
+        for name in ["displayed", "newer"] {
+            manager
+                .create(NewTask {
+                    title: name.into(),
+                    provider: AgentProvider::Codex,
+                    repo_root: "/repo".into(),
+                    worktree_path: format!("/tasks/{name}").into(),
+                    branch: format!("task/{name}"),
+                    base_commit: "a".repeat(40),
+                    source_context: None,
+                })
+                .unwrap();
+        }
+        manager.tasks().to_vec()
+    }
+
+    #[test]
+    fn review_keeps_displayed_identity_when_another_task_needs_attention() {
+        let mut tasks = tasks();
+        let displayed = tasks[0].id;
+        tasks[1].status = TaskStatus::WaitingForApproval;
+        assert_eq!(review_task_target(&tasks, Some(displayed)), Some(displayed));
+        tasks.remove(0);
+        assert_eq!(review_task_target(&tasks, Some(displayed)), None);
+        assert_eq!(review_task_target(&tasks, None), None);
+    }
+
+    #[test]
+    fn archived_displayed_task_cannot_redirect_review_to_another_task() {
+        let mut tasks = tasks();
+        let displayed = tasks[0].id;
+        tasks[0].status = TaskStatus::Archived;
+        assert_eq!(review_task_target(&tasks, Some(displayed)), None);
+    }
+
+    #[test]
+    fn equal_visible_models_with_different_task_ids_refresh_the_action_target() {
+        let tasks = tasks();
+        let model = jterm_core::reference_conversation::Inspector::empty();
+        let first = ObservedInspector {
+            task: Some(tasks[0].id),
+            model: model.clone(),
+        };
+        let second = ObservedInspector {
+            task: Some(tasks[1].id),
+            model,
+        };
+        assert!(first != second);
+    }
+}
+
+#[cfg(test)]
+mod context_directory_tests {
+    use super::context_directory;
+
+    #[test]
+    fn private_context_never_reads_local_or_remote_directory() {
+        for remote in [false, true] {
+            assert_eq!(
+                context_directory(true, remote, Some("file://remote/private"), || {
+                    panic!("private context must not query the process directory")
+                }),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn remote_context_requires_an_absolute_report_and_never_uses_local_process_cwd() {
+        let never_local = || panic!("SSH process cwd belongs to this machine");
+        assert_eq!(
+            context_directory(
+                false,
+                true,
+                Some("file://remote.example/srv/project%20one"),
+                never_local
+            ),
+            Some("/srv/project one".into())
+        );
+        assert_eq!(context_directory(false, true, None, never_local), None);
+        assert_eq!(
+            context_directory(
+                false,
+                true,
+                Some("https://remote.example/project"),
+                never_local
+            ),
+            None
+        );
+        assert_eq!(
+            context_directory(false, true, Some("file:relative"), never_local),
+            None
+        );
+    }
+
+    #[test]
+    fn local_context_uses_local_namespace_even_when_remote_metadata_is_present() {
+        assert_eq!(
+            context_directory(
+                false,
+                false,
+                Some("file://remote.example/srv/remote"),
+                || Some("/home/local".into())
+            ),
+            Some("/home/local".into())
         );
     }
 }
@@ -2121,5 +2965,364 @@ mod role_font_tests {
         assert!(!ui.contains(".chat-controls"));
         assert!(!ui.contains("margin:"));
         assert!(!ui.contains("padding:"));
+    }
+}
+
+#[cfg(test)]
+mod popup_theme_tests {
+    use gtk4 as gtk;
+    use libadwaita as adw;
+    use libadwaita::prelude::*;
+
+    fn settle() {
+        let context = gtk::glib::MainContext::default();
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(120);
+        while std::time::Instant::now() < until {
+            while context.iteration(false) {}
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    fn assert_color(actual: gtk::gdk::RGBA, expected: [u8; 3]) {
+        for (actual, expected) in [actual.red(), actual.green(), actual.blue()]
+            .into_iter()
+            .zip(expected)
+        {
+            assert!((actual * 255.0 - f32::from(expected)).abs() < 1.0);
+        }
+    }
+
+    fn matching_pixels(widget: &impl IsA<gtk::Widget>, rgb: [u8; 3]) -> usize {
+        let widget = widget.upcast_ref::<gtk::Widget>();
+        let snapshot = gtk::Snapshot::new();
+        gtk::WidgetPaintable::new(Some(widget)).snapshot(
+            &snapshot,
+            f64::from(widget.width()),
+            f64::from(widget.height()),
+        );
+        let node = snapshot.to_node().expect("mapped popup snapshot");
+        let surface = widget.native().unwrap().surface().unwrap();
+        let renderer = gtk::gsk::Renderer::for_surface(&surface).unwrap();
+        let texture = renderer.render_texture(&node, None);
+        let stride = texture.width() as usize * 4;
+        let mut pixels = vec![0; stride * texture.height() as usize];
+        texture.download(&mut pixels, stride);
+        renderer.unrealize();
+        pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|pixel| {
+                let argb = u32::from_ne_bytes([pixel[0], pixel[1], pixel[2], pixel[3]]);
+                [
+                    ((argb >> 16) & 255) as u8,
+                    ((argb >> 8) & 255) as u8,
+                    (argb & 255) as u8,
+                ] == rgb
+            })
+            .count()
+    }
+
+    fn modal_corner_alpha(widget: &impl IsA<gtk::Widget>) -> u8 {
+        let widget = widget.upcast_ref::<gtk::Widget>();
+        let snapshot = gtk::Snapshot::new();
+        gtk::WidgetPaintable::new(Some(widget)).snapshot(
+            &snapshot,
+            f64::from(widget.width()),
+            f64::from(widget.height()),
+        );
+        let node = snapshot.to_node().expect("mapped dialog snapshot");
+        let surface = widget.native().unwrap().surface().unwrap();
+        let renderer = gtk::gsk::Renderer::for_surface(&surface).unwrap();
+        let texture = renderer.render_texture(&node, None);
+        let stride = texture.width() as usize * 4;
+        let mut pixels = vec![0; stride * texture.height() as usize];
+        texture.download(&mut pixels, stride);
+        renderer.unrealize();
+        let argb = u32::from_ne_bytes([pixels[0], pixels[1], pixels[2], pixels[3]]);
+        (argb >> 24) as u8
+    }
+
+    fn find_popover(widget: &gtk::Widget) -> Option<gtk::Popover> {
+        if let Some(popover) = widget.downcast_ref::<gtk::Popover>() {
+            return Some(popover.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            if let Some(popover) = find_popover(&current) {
+                return Some(popover);
+            }
+            child = current.next_sibling();
+        }
+        None
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run on its own GTK main thread"]
+    fn reference_popups_follow_shell_chrome_across_terminal_themes() {
+        gtk::init().expect("GTK display");
+        struct AnimationPreference(gtk::Settings, bool);
+        impl Drop for AnimationPreference {
+            fn drop(&mut self) {
+                self.0.set_gtk_enable_animations(self.1);
+            }
+        }
+        let settings = gtk::Settings::default().unwrap();
+        let _animations =
+            AnimationPreference(settings.clone(), settings.is_gtk_enable_animations());
+        settings.set_gtk_enable_animations(false);
+        let display = gtk::gdk::Display::default().unwrap();
+        let shell = gtk::CssProvider::new();
+        let parsing_errors = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let errors = parsing_errors.clone();
+        shell.connect_parsing_error(move |_, _, error| {
+            errors.borrow_mut().push(error.to_string());
+        });
+        shell.load_from_string(&super::shell_css());
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &shell,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 20,
+        );
+        let theme = gtk::CssProvider::new();
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &theme,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+        );
+        let fonts = gtk::CssProvider::new();
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &fonts,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 21,
+        );
+        let window = gtk::Window::new();
+        window.add_css_class("forge-window");
+        window.add_css_class("reference-shell");
+        window.set_default_size(480, 360);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.add_css_class("reference-navigation");
+        let anchor = gtk::MenuButton::new();
+        anchor.set_label("Menu");
+        let popup = gtk::Popover::new();
+        popup.add_css_class("forge-popup");
+        popup.add_css_class("terminal-context-menu");
+        popup.set_has_arrow(false);
+        let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        menu.set_width_request(220);
+        let action = gtk::Button::with_label("Rename tab");
+        let unavailable = gtk::Button::with_label("Unavailable action");
+        unavailable.add_css_class("destructive-action");
+        unavailable.set_sensitive(false);
+        menu.append(&action);
+        menu.append(&unavailable);
+        popup.set_child(Some(&menu));
+        anchor.set_popover(Some(&popup));
+        content.append(&anchor);
+        // This menu is created by GTK, not by one of our Popover builders.
+        let dropdown = gtk::DropDown::from_strings(&["Current workspace", "Other workspace"]);
+        content.append(&dropdown);
+        window.set_child(Some(&content));
+        window.present();
+        anchor.popup();
+        settle();
+        let action_label = action.child().unwrap().downcast::<gtk::Label>().unwrap();
+        let disabled_label = unavailable
+            .child()
+            .unwrap()
+            .downcast::<gtk::Label>()
+            .unwrap();
+        for (background, foreground, font, ui_scale) in [
+            ("#16161e", "#c0caf5", "Monospace Bold Italic 18px", 1.0),
+            ("#f6f8fa", "#24292f", "Sans Italic 22px", 1.3),
+            ("#221122", "#ffddee", "Monospace Bold 16px", 1.0),
+        ] {
+            theme.load_from_string(&crate::font::menu_theme_css(
+                font,
+                &gtk::gdk::RGBA::parse(background).unwrap(),
+                &gtk::gdk::RGBA::parse(foreground).unwrap(),
+            ));
+            fonts.load_from_string(&super::role_font_css(ui_scale, 1.0));
+            settle();
+            assert_color(action_label.color(), super::token::color::CHROME_TEXT);
+            assert_color(disabled_label.color(), super::token::color::CHROME_MUTED);
+            let actual_font = action_label.pango_context().font_description().unwrap();
+            let families = actual_font.family().expect("popup font family stack");
+            let families = families.split(',').map(str::trim).collect::<Vec<_>>();
+            assert_eq!(families, ["DejaVu Sans", "sans-serif"]);
+            assert_eq!(actual_font.weight(), gtk::pango::Weight::Normal);
+            assert_eq!(actual_font.style(), gtk::pango::Style::Normal);
+            assert_eq!(
+                actual_font.size(),
+                (10.0 * ui_scale * f64::from(gtk::pango::SCALE)).round() as i32
+            );
+            assert!(matching_pixels(&popup, super::token::color::NAVIGATION) > 100);
+            action.set_state_flags(gtk::StateFlags::PRELIGHT, false);
+            settle();
+            assert!(matching_pixels(&popup, super::token::color::NAVIGATION_SELECTED) > 100);
+            action.unset_state_flags(gtk::StateFlags::PRELIGHT);
+        }
+        popup.popdown();
+        let native_popup = find_popover(dropdown.upcast_ref()).expect("native dropdown popup");
+        native_popup.popup();
+        settle();
+        assert!(matching_pixels(&native_popup, super::token::color::NAVIGATION) > 100);
+        assert!(
+            parsing_errors.borrow().is_empty(),
+            "{:?}",
+            parsing_errors.borrow()
+        );
+        native_popup.popdown();
+        window.close();
+        for provider in [&shell, &theme, &fonts] {
+            gtk::style_context_remove_provider_for_display(&display, provider);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run on its own GTK main thread"]
+    fn workspace_dialogs_share_readable_chrome_surfaces() {
+        adw::init().expect("GTK/Adwaita display");
+        struct DesktopPreferences(gtk::Settings, bool, adw::StyleManager, adw::ColorScheme);
+        impl Drop for DesktopPreferences {
+            fn drop(&mut self) {
+                self.0.set_gtk_enable_animations(self.1);
+                self.2.set_color_scheme(self.3);
+            }
+        }
+        let settings = gtk::Settings::default().unwrap();
+        let style = adw::StyleManager::default();
+        let _desktop = DesktopPreferences(
+            settings.clone(),
+            settings.is_gtk_enable_animations(),
+            style.clone(),
+            style.color_scheme(),
+        );
+        settings.set_gtk_enable_animations(false);
+        let display = gtk::gdk::Display::default().unwrap();
+        let provider = gtk::CssProvider::new();
+        let parsing_errors = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let errors = parsing_errors.clone();
+        provider.connect_parsing_error(move |_, _, error| {
+            errors.borrow_mut().push(error.to_string());
+        });
+        provider.load_from_string(&super::shell_css());
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 20,
+        );
+        // Deliberately omit the main-window classes: detached adaptive dialogs
+        // still need the same surface contract through their explicit opt-in.
+        let host = adw::Window::new();
+        host.set_default_size(760, 640);
+        host.set_content(Some(&gtk::Label::new(Some("Workspace"))));
+        host.present();
+        let dialog = adw::Dialog::builder()
+            .title("Command Palette")
+            .content_width(440)
+            .content_height(440)
+            .build();
+        super::style_workspace_dialog(&dialog);
+        let header = adw::HeaderBar::new();
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        body.set_margin_top(16);
+        body.set_margin_bottom(16);
+        body.set_margin_start(16);
+        body.set_margin_end(16);
+        let search = gtk::SearchEntry::new();
+        search.set_placeholder_text(Some("Search commands"));
+        body.append(&search);
+        let input = gtk::Entry::new();
+        input.set_text("Workspace name");
+        body.append(&input);
+        let list = gtk::ListBox::new();
+        list.add_css_class("boxed-list");
+        let row = adw::ActionRow::builder()
+            .title("Open workspace")
+            .subtitle("Choose a project")
+            .build();
+        list.append(&row);
+        body.append(&list);
+        let disabled = gtk::Button::with_label("Unavailable action");
+        disabled.add_css_class("suggested-action");
+        disabled.set_sensitive(false);
+        body.append(&disabled);
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&body));
+        dialog.set_child(Some(&toolbar));
+        dialog.present(Some(&host));
+        settle();
+        let disabled_label = disabled.child().unwrap().downcast::<gtk::Label>().unwrap();
+        let color = |[r, g, b]: [u8; 3]| {
+            gtk::gdk::RGBA::new(
+                f32::from(r) / 255.0,
+                f32::from(g) / 255.0,
+                f32::from(b) / 255.0,
+                1.0,
+            )
+        };
+        for scheme in [adw::ColorScheme::ForceLight, adw::ColorScheme::ForceDark] {
+            style.set_color_scheme(scheme);
+            settle();
+            assert_color(input.color(), super::token::color::CHROME_TEXT);
+            assert_color(disabled_label.color(), super::token::color::CHROME_MUTED);
+            assert!(
+                crate::config::contrast_ratio(
+                    &input.color(),
+                    &color(super::token::color::INSPECTOR),
+                ) >= 4.5,
+                "dialog inputs must remain readable in {scheme:?}"
+            );
+            assert!(matching_pixels(&dialog, super::token::color::NAVIGATION) > 100);
+            assert!(
+                modal_corner_alpha(&dialog) < 255,
+                "the workspace must remain visible through the dialog scrim"
+            );
+            assert!(matching_pixels(&header, super::token::color::TITLEBAR) > 100);
+            assert!(matching_pixels(&list, super::token::color::INSPECTOR_CARD) > 100);
+            assert!(matching_pixels(&input, super::token::color::INSPECTOR) > 100);
+            let family = input
+                .pango_context()
+                .font_description()
+                .unwrap()
+                .family()
+                .unwrap();
+            assert_eq!(family.split(',').next().map(str::trim), Some("DejaVu Sans"));
+            list.select_row(Some(&row));
+            settle();
+            assert!(matching_pixels(&list, super::token::color::NAVIGATION_SELECTED) > 100);
+            list.unselect_all();
+        }
+        dialog.force_close();
+        settle();
+        let preferences = adw::PreferencesDialog::new();
+        preferences.set_title("Settings");
+        super::style_workspace_dialog(&preferences);
+        let page = adw::PreferencesPage::new();
+        let group = adw::PreferencesGroup::new();
+        group.set_title("Appearance");
+        let entry = adw::EntryRow::new();
+        entry.set_title("Host");
+        entry.set_text("example.test");
+        group.add(&entry);
+        page.add(&group);
+        preferences.add(&page);
+        preferences.present(Some(&host));
+        for scheme in [adw::ColorScheme::ForceLight, adw::ColorScheme::ForceDark] {
+            style.set_color_scheme(scheme);
+            settle();
+            assert_color(entry.color(), super::token::color::CHROME_TEXT);
+            assert!(matching_pixels(&preferences, super::token::color::NAVIGATION) > 100);
+        }
+        assert!(
+            parsing_errors.borrow().is_empty(),
+            "{:?}",
+            parsing_errors.borrow()
+        );
+        preferences.force_close();
+        host.close();
+        gtk::style_context_remove_provider_for_display(&display, &provider);
     }
 }

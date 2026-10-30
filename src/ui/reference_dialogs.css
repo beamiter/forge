@@ -1,0 +1,160 @@
+/* Explicitly scoped workspace sheets, including Adwaita's separate-window
+ * fallback. File choosers and system dialogs never receive this class. */
+window.forge-workspace-dialog,
+.forge-workspace-dialog sheet.background,
+.forge-workspace-dialog toolbarview,
+.forge-workspace-dialog preferencespage {
+    background: @NAVIGATION@;
+    color: @POPUP_FOREGROUND@;
+}
+dialog.forge-workspace-dialog {
+    background: transparent;
+}
+.forge-workspace-dialog {
+    color: @POPUP_FOREGROUND@;
+    font-family: "DejaVu Sans", sans-serif;
+}
+.forge-workspace-dialog .top-bar,
+.forge-workspace-dialog .bottom-bar,
+.forge-workspace-dialog headerbar {
+    background: @TITLEBAR@;
+    color: @POPUP_FOREGROUND@;
+    border-bottom: 1px solid @DARK_BORDER@;
+    box-shadow: none;
+}
+.forge-workspace-dialog label {
+    color: @POPUP_FOREGROUND@;
+}
+.forge-workspace-dialog .dim-label,
+.forge-workspace-dialog .subtitle,
+.forge-workspace-dialog label.caption {
+    color: @POPUP_MUTED@;
+    opacity: 1;
+}
+.forge-workspace-dialog list,
+.forge-workspace-dialog listview,
+.forge-workspace-dialog .boxed-list,
+.forge-workspace-dialog .card {
+    background: @INSPECTOR_CARD@;
+    color: @POPUP_FOREGROUND@;
+    border: 1px solid @DARK_BORDER@;
+    border-radius: 10px;
+}
+.forge-workspace-dialog row {
+    background: transparent;
+    color: @POPUP_FOREGROUND@;
+    border-color: @DARK_BORDER@;
+}
+.forge-workspace-dialog row:hover,
+.forge-workspace-dialog row:selected {
+    background: @POPUP_SELECTED@;
+}
+.forge-workspace-dialog entry,
+.forge-workspace-dialog searchentry,
+.forge-workspace-dialog spinbutton,
+.forge-workspace-dialog dropdown > button {
+    background: @INSPECTOR@;
+    color: @POPUP_FOREGROUND@;
+    border: 1px solid @POPUP_BORDER@;
+    border-radius: 7px;
+    box-shadow: none;
+}
+.forge-workspace-dialog entry text,
+.forge-workspace-dialog searchentry text,
+.forge-workspace-dialog spinbutton text {
+    color: @POPUP_FOREGROUND@;
+    caret-color: @POPUP_FOREGROUND@;
+}
+.forge-workspace-dialog entry selection,
+.forge-workspace-dialog searchentry selection {
+    background: @POPUP_SELECTED@;
+    color: @POPUP_FOREGROUND@;
+}
+.forge-workspace-dialog entry:focus-within,
+.forge-workspace-dialog searchentry:focus-within,
+.forge-workspace-dialog spinbutton:focus-within {
+    border-color: @ACCENT@;
+    outline: 2px solid alpha(@ACCENT@, .35);
+    outline-offset: -1px;
+}
+.forge-workspace-dialog textview,
+.forge-workspace-dialog textview text {
+    background: @INSPECTOR@;
+    color: @POPUP_FOREGROUND@;
+    caret-color: @POPUP_FOREGROUND@;
+}
+.forge-workspace-dialog button {
+    background: @INSPECTOR_CARD@;
+    color: @POPUP_FOREGROUND@;
+    border: 1px solid @POPUP_BORDER@;
+    border-radius: 7px;
+    box-shadow: none;
+}
+.forge-workspace-dialog button.flat {
+    background: transparent;
+    border-color: transparent;
+}
+.forge-workspace-dialog button:hover,
+.forge-workspace-dialog button:checked {
+    background: @POPUP_SELECTED@;
+}
+.forge-workspace-dialog button:active {
+    background: mix(@POPUP_SELECTED@, @ACCENT@, .22);
+}
+.forge-workspace-dialog button:focus-visible,
+.forge-workspace-dialog row:focus-visible {
+    outline: 2px solid @ACCENT@;
+    outline-offset: -2px;
+}
+.forge-workspace-dialog button.suggested-action:not(:disabled) {
+    background: @ACCENT@;
+    border-color: @ACCENT@;
+    color: white;
+}
+.forge-workspace-dialog button.suggested-action:not(:disabled) label {
+    color: white;
+}
+.forge-workspace-dialog button.destructive-action:not(:disabled) {
+    background: alpha(@error_color, .18);
+    border-color: alpha(@error_color, .5);
+    color: mix(@error_color, @POPUP_FOREGROUND@, .45);
+}
+.forge-workspace-dialog button.destructive-action:not(:disabled) label {
+    color: mix(@error_color, @POPUP_FOREGROUND@, .45);
+}
+.forge-workspace-dialog :disabled,
+.forge-workspace-dialog button:disabled label {
+    color: @POPUP_MUTED@;
+    opacity: 1;
+    filter: none;
+}
+.forge-workspace-dialog button:disabled,
+.forge-workspace-dialog row:disabled {
+    background: @INSPECTOR_CARD@;
+    border-color: @DARK_BORDER@;
+}
+.forge-workspace-dialog checkbutton check,
+.forge-workspace-dialog switch {
+    background: @INSPECTOR@;
+    color: @POPUP_FOREGROUND@;
+    border-color: @POPUP_BORDER@;
+}
+.forge-workspace-dialog checkbutton check:checked,
+.forge-workspace-dialog switch:checked {
+    background: @ACCENT@;
+    color: white;
+    border-color: @ACCENT@;
+}
+.forge-workspace-dialog separator {
+    background: @DARK_BORDER@;
+}
+.forge-workspace-dialog scrollbar,
+.forge-workspace-dialog scrollbar trough {
+    background: transparent;
+}
+.forge-workspace-dialog scrollbar slider {
+    background: alpha(@POPUP_MUTED@, .45);
+}
+.forge-workspace-dialog scrollbar slider:hover {
+    background: @POPUP_MUTED@;
+}

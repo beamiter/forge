@@ -945,6 +945,7 @@ impl UiState {
 
     fn show_session_export_result(&self, heading: &str, message: &str) {
         let dialog = adw::AlertDialog::new(Some(heading), Some(message));
+        crate::ui::reference_shell::style_workspace_dialog(&dialog);
         dialog.add_response("ok", "OK");
         dialog.set_default_response(Some("ok"));
         dialog.present(Some(&self.window));
@@ -953,6 +954,7 @@ impl UiState {
     pub(crate) fn show_ai_error(&self, message: &str) {
         let message = jterm_core::review_input::safe_multiline_display(message, 16 * 1024);
         let dialog = adw::AlertDialog::new(Some("AI unavailable"), Some(&message));
+        crate::ui::reference_shell::style_workspace_dialog(&dialog);
         dialog.add_response("ok", "OK");
         dialog.set_default_response(Some("ok"));
         dialog.present(Some(&self.window));

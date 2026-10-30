@@ -2316,6 +2316,7 @@ impl NativeBuffer {
         menu.set_icon_name("preferences-desktop-font-symbolic");
         menu.set_tooltip_text(Some("Editor rendering, font and line spacing"));
         let popover = gtk::Popover::new();
+        popover.add_css_class("forge-popup");
         let settings = gtk::Box::new(gtk::Orientation::Vertical, 10);
         settings.set_margin_start(14);
         settings.set_margin_end(14);

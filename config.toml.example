@@ -43,7 +43,7 @@ tab_placement = "sidebar"     # "sidebar" 或 "top"
 sidebar_view = "tabs"         # "tabs" 或 "files"
 # 可选；省略时 sidebar 布局默认打开，top 布局默认关闭。运行时开关会自动保存。
 # sidebar_visible = true
-sidebar_width = 220            # 120 .. 800
+sidebar_width = 237            # 120 .. 800
 tab_width = 180                # 顶部 tab 宽度；拖动右缘调整，80 .. 480
 
 # 窗口底部状态栏：cwd、git 分支、上一条命令结果、终端网格、标签页序号。
@@ -140,7 +140,7 @@ ai_provider = "anthropic"
 ai_base_url = "https://api.anthropic.com"
 
 ai_panel_visible = false
-ai_panel_width = 360           # 240 .. 1200；拖动 AI 分隔条后自动更新
+ai_panel_width = 306           # 右侧栏 240 .. 1200；拖动分隔条后自动保存
 ai_model = "claude-sonnet-4-6"
 ai_max_tokens = 1024           # 64 .. 32768
 # 可选采样温度；0.0 .. 2.0。省略时使用 provider 默认值。

@@ -6,6 +6,18 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- Both workspace sidebars now have visible draggable dividers. Widths persist
+  independently, survive hide/show and narrow windows, and restore when space
+  returns; the right-hand drawer has its own resize edge. Native F8/arrow-key
+  divider controls remain available, and pointer resizing preserves shell focus.
+
+- Context menus, editor/tool popovers and native dropdown menus now share the
+  workspace's navy chrome surfaces, typography and keyboard-focus feedback.
+  Terminal palette changes no longer recolor these shell-owned menus; disabled
+  actions remain visibly muted, including destructive actions. Command Palette,
+  Settings, history, workflows and remote editors share those chrome surfaces
+  while preserving the dimmed workspace behind each dialog.
+
 - Soft-wrapped lines are painted natively in the Vim9 editor instead of
   switching the buffer to the compatibility view: continuation rows,
   `showbreak`, `breakindent` and `smoothscroll` partial lines keep Vim's exact

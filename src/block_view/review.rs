@@ -268,6 +268,7 @@ impl super::TermView {
             .default_width(parent.width().clamp(420, 860))
             .default_height(parent.height().clamp(420, 780))
             .build();
+        crate::ui::reference_shell::style_workspace_dialog(&window);
         let root = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
         root.set_margin_start(16);
         root.set_margin_end(16);
@@ -640,6 +641,7 @@ pub(super) fn open(
         .default_width(owner.width().clamp(320, 760))
         .default_height(owner.height().clamp(320, 680))
         .build();
+    crate::ui::reference_shell::style_workspace_dialog(&window);
     window.add_css_class("block-review-window");
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     root.set_margin_start(16);

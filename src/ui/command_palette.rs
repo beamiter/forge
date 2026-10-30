@@ -20,6 +20,18 @@ use crate::palette::{Accept, Entry, HistoryEntry, PaletteMode, Query};
 
 const MAX_PALETTE_QUERY_CHARS: i32 = 16 * 1024;
 
+/// The live header search, action, history and workflow entry points all use
+/// this constructor, so new palette modes retain the workspace surface scope.
+fn unified_palette_dialog(mode: PaletteMode) -> adw::Dialog {
+    let dialog = adw::Dialog::builder()
+        .title(palette_title(mode))
+        .content_width(620)
+        .content_height(520)
+        .build();
+    super::reference_shell::style_workspace_dialog(&dialog);
+    dialog
+}
+
 /// One live review-first natural-language command suggestion. It is kept
 /// separate from the multi-turn Shell Agent state machine, but intentionally
 /// uses the same Block-pinned review surface and interaction vocabulary.
@@ -457,6 +469,7 @@ impl UiState {
                         "This review-only action cannot insert the command because {error}."
                     )),
                 );
+                crate::ui::reference_shell::style_workspace_dialog(&dialog);
                 dialog.add_response("ok", "OK");
                 dialog.set_default_response(Some("ok"));
                 dialog.present(Some(&self.window));
@@ -545,6 +558,7 @@ impl UiState {
             Err(error) => {
                 log::warn!("refusing unsafe workflow render: {error}");
                 let alert = adw::AlertDialog::new(Some("Command was not inserted"), Some(&error));
+                crate::ui::reference_shell::style_workspace_dialog(&alert);
                 alert.add_response("ok", "OK");
                 alert.set_default_response(Some("ok"));
                 alert.present(Some(&self.window));
@@ -872,11 +886,7 @@ impl UiState {
         let (snapshot, history_load) = self.palette_snapshot();
         self.refresh_workflow_library();
         let snapshot = Rc::new(RefCell::new(snapshot));
-        let dialog = adw::Dialog::builder()
-            .title(palette_title(initial_mode))
-            .content_width(620)
-            .content_height(520)
-            .build();
+        let dialog = unified_palette_dialog(initial_mode);
         let header = adw::HeaderBar::new();
         let filter = SearchEntry::new();
         if let Some(text) = filter
@@ -1144,6 +1154,23 @@ pub(super) fn palette_controller(
 #[cfg(test)]
 mod tests {
     use super::{compact_one_line, merge_palette_history, palette_toggle_key};
+
+    #[test]
+    #[ignore = "requires DISPLAY; run on its own GTK main thread"]
+    fn native_unified_palette_retains_workspace_theme_scope() {
+        use libadwaita::prelude::*;
+        libadwaita::init().expect("GTK/Adwaita display");
+        for mode in [
+            PaletteMode::All,
+            PaletteMode::History,
+            PaletteMode::Workflows,
+        ] {
+            let dialog = super::unified_palette_dialog(mode);
+            assert!(dialog.has_css_class("forge-workspace-dialog"));
+            assert!(!dialog.has_css_class("forge-font-chrome"));
+        }
+    }
+
     use crate::palette::PaletteMode;
     use gtk4::gdk::{Key, ModifierType};
 

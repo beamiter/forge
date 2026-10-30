@@ -27,6 +27,7 @@ window.reference-shell decoration { border: 0; padding: 0; margin: 0; border-rad
 .reference-shell .reference-navigation { min-width: @NAVIGATION_CONTENT_MIN@px; padding: 16px 14px 0; background: @NAVIGATION@; color: #bac9e1; border-right: 1px solid #2c394f; }
 .reference-shell .reference-section-label { color: #7d91ae; font-size: 8px; font-weight: 700; letter-spacing: 1px; margin: 0 0 9px; }
 .reference-shell .reference-workspace-selector { min-height: 31px; min-width: 0; padding: 0 8px; margin-bottom: 0; color: #c6d4eb; background: #23324a; border: 1px solid #35445e; border-radius: 8px; font-size: 10px; }
+.reference-shell .reference-workspace-selector > button { min-height: 31px; min-width: 0; padding: 0; color: inherit; background: transparent; border: 0; box-shadow: none; }
 .reference-shell .reference-workspace-selector:disabled { opacity: .8; }
 .reference-shell .reference-navigation .sidebar-switcher { margin: 0 0 8px; }
 .reference-shell .reference-navigation .sidebar-switcher button { color: #9eb1ce; padding: 4px 6px; font-size: 10px; min-height: 24px; border-radius: 6px; }
@@ -167,6 +168,11 @@ window.forge-window.reference-shell .reference-rich-inspector label.reference-in
 .reference-shell .reference-rich-inspector .reference-step-running { background: #263d5a; border: 1px solid #38587a; border-radius: 7px; }
 window.forge-window.reference-shell .reference-rich-inspector .reference-step-complete label.reference-step-symbol { color: #5fbea3; }
 window.forge-window.reference-shell .reference-rich-inspector .reference-step-running label.reference-step-symbol { color: #80a9fa; }
+window.forge-window.reference-shell .reference-rich-inspector .reference-step-attention label.reference-step-symbol { color: #e8bb76; }
+.reference-shell .reference-agent-actions { margin: 10px @INSPECTOR_CARD_MARGIN@px 0; }
+.reference-shell .reference-agent-actions button { min-height: 28px; }
+window.forge-window.reference-shell .reference-agent-actions button label,
+window.forge-window.reference-shell .reference-session-context button label { font-family: "DejaVu Sans", sans-serif; font-size: 10px; font-weight: 400; }
 .reference-shell .reference-navigation-links { margin-top: 7px; }
 .reference-shell .reference-navigation-link { min-height: 26px; border: none; padding: 0 8px; margin: 0; border-radius: 6px; color: #9eb1cf; background: transparent; }
 .reference-shell .reference-navigation-active { color: #d4e5ff; background: #283d6f; box-shadow: inset -2px 0 #6b97f0; }
@@ -236,10 +242,7 @@ window.forge-window.reference-shell .reference-composer-controls .chat-submit { 
 window.forge-window.reference-shell .reference-composer-controls .chat-stop { margin:0; padding:0; min-height:26px; }
 window.forge-window.reference-shell .reference-composer-controls .reference-tools { min-height:0; padding:0; border:0; background:transparent; }
 window.forge-window.reference-shell .reference-composer-controls .reference-tools > button { min-height:26px; padding:0 6px; margin:0; }
-window.forge-window.reference-shell .reference-composer-controls button:disabled,
-.reference-tools-popover button:disabled { filter:none; opacity:1; color:#8493a9; }
-.reference-tools-popover > contents { background:#f9fbff; color:#657b9a; border:1px solid #cbd9ec; border-radius:10px; padding:6px; }
-.reference-tools-popover button { min-height:26px; padding:0 8px; background:transparent; font-size:10px; }
+window.forge-window.reference-shell .reference-composer-controls button:disabled { filter:none; opacity:1; color:#8493a9; }
 
 window.forge-window.reference-shell .reference-mode-switch { padding:0; min-height:@MODE_HEIGHT@px; }
 window.forge-window.reference-shell .reference-mode-switch button { min-height:@MODE_HEIGHT@px; min-width:@MODE_MIN_WIDTH@px; padding:0; border-width:0; margin:0; }
@@ -264,14 +267,6 @@ window.forge-window.reference-shell .term-chat-root .reference-composer-controls
 window.forge-window.reference-shell .reference-composer-controls button { min-width:23px; }
 window.forge-window.reference-shell .reference-composer-controls .chat-submit { min-width:26px; }
 
-window.forge-window.reference-shell .reference-tools-popover > contents { background:#162133; border:1px solid #394960; border-radius:12px; padding:8px; }
-window.forge-window.reference-shell .reference-tools-popover button { min-height:30px; padding:0 6px; margin:0; border:0; border-radius:6px; background:transparent; color:#dde5f4; font-weight:400; }
-window.forge-window.reference-shell .reference-tools-popover button:hover { background:#283d6f; }
-window.forge-window.reference-shell .reference-tools-popover label { font-family:"DejaVu Sans",sans-serif; font-size:10px; color:#dde5f4; }
-window.forge-window.reference-shell .reference-tools-popover label.reference-tool-detail { font-size:9px; color:#90a0b9; }
-window.forge-window.reference-shell .reference-tools-popover button:disabled,
-window.forge-window.reference-shell .reference-tools-popover button:disabled label { filter:none; opacity:1; color:#90a0b9; }
-window.forge-window.reference-shell .reference-tools-popover separator { min-height:1px; margin:0; background:#2b394f; }
 
 window.forge-window.reference-shell .reference-workspace-selector:disabled { opacity:1; filter:none; }
 window.forge-window.reference-shell .reference-workspace-selector label.reference-workspace-name { color:#c6d4eb; font-size:10px; font-weight:400; }
@@ -284,7 +279,12 @@ window.forge-window.reference-shell .reference-organism-speech { background:rgba
 
 /* The navigation and inspector already paint their one-pixel boundaries.
    Remove only the duplicate outer Paned handles, never terminal split rails. */
-window.forge-window.reference-shell paned.reference-layout-paned > separator { min-width:0; min-height:0; padding:0; margin:0; border:0; background:transparent; }
+window.forge-window.reference-shell paned.reference-layout-paned > separator { min-width:6px; min-height:0; padding:0; margin:0; border:0; background:#23324a; }
+window.forge-window.reference-shell paned.reference-layout-paned > separator:hover,
+window.forge-window.reference-shell paned.reference-layout-paned > separator:active { background:#5c7ef0; }
+window.forge-window.reference-shell paned.reference-layout-paned:focus-visible > separator { background:#5c7ef0; outline:1px solid #b9d2ff; outline-offset:-1px; }
+.reference-drawer-grip { min-width:6px; background:#23324a; }
+.reference-drawer-grip:hover, .reference-drawer-grip:active, .reference-drawer-grip:focus-visible { background:#5c7ef0; }
 
 /* Exact default capsule frames come from the shared logical-pixel contract.
    The original buttons keep their callbacks; overlays only paint disabled tools. */

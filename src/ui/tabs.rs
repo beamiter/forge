@@ -1121,6 +1121,7 @@ impl UiState {
         context.connect_pressed(move |gesture, _, x, y| {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
             let popover = gtk4::Popover::new();
+            popover.add_css_class("forge-popup");
             popover.add_css_class("terminal-context-menu");
             popover.set_parent(&button_for_context);
             popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
@@ -2510,6 +2511,7 @@ impl UiState {
                 .collect();
 
             let popover = gtk4::Popover::new();
+            popover.add_css_class("forge-popup");
             popover.add_css_class("terminal-context-menu");
             popover.set_parent(&strip_btn_for_ctx);
             popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));

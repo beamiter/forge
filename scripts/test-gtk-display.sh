@@ -54,6 +54,7 @@ fi
 tests=(
     block_view::chat_layout_tests::chat_bubbles_keep_alignment_through_resize_and_font_changes
     ui::sidebar_tabs::layout_tests::sidebar_resize_and_vertical_scroll_keep_the_leading_edge_visible
+    ui::sidebar_resize::tests::native_sidebar_drags_preserve_requests_and_input_focus
     block_view::tests::chat_completion_never_expands_between_shell_markers
     block_view::scroll::canvas_native_tests::capped_output_hands_remaining_pixels_to_retained_canvas
     block_view::scroll::canvas_native_tests::retained_canvas_scrolls_through_frames_and_yields_to_reading
@@ -146,6 +147,9 @@ tests=(
     block_view::tests::chat_docking_keeps_pty_rows_and_native_hit_geometry_stable
     block_view::chat::tests::chat_moves_only_the_native_clip_and_keeps_history_anchor
     font::tests::context_menu_tracks_live_theme_and_font_without_parent_emphasis
+    ui::reference_shell::popup_theme_tests::reference_popups_follow_shell_chrome_across_terminal_themes
+    ui::reference_shell::popup_theme_tests::workspace_dialogs_share_readable_chrome_surfaces
+    ui::command_palette::tests::native_unified_palette_retains_workspace_theme_scope
     block_view::font_sync_tests::font_groups_stay_independent_across_native_panes_and_late_rows
     ui::dialogs::organism_preview::tests::preview_lifecycle_keeps_motion_local_and_stops_hidden_sources
     ui::organism::tests::deferred_agent_loss_retires_closed_panes_but_keeps_hidden_outcomes

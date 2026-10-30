@@ -24,6 +24,7 @@ fn step_icon(state: StepState) -> (&'static str, &'static str) {
         StepState::Complete => ("✓", "reference-step-complete"),
         StepState::Running => ("◉", "reference-step-running"),
         StepState::Queued => ("○", "reference-step-queued"),
+        StepState::Attention => ("!", "reference-step-attention"),
     }
 }
 
@@ -394,7 +395,14 @@ pub(crate) fn inspector(model: &Inspector, is_fixture: bool) -> gtk4::Box {
         metadata.attach(&value, 1, row as i32, 1, 1);
     }
     root.append(&metadata);
-    let current_heading = text("CURRENT STEP", "reference-section-label");
+    let current_heading = text(
+        if is_fixture {
+            "CURRENT STEP"
+        } else {
+            "NEXT ACTION"
+        },
+        "reference-section-label",
+    );
     current_heading.add_css_class("reference-inspector-current-heading");
     current_heading.set_margin_top(6);
     current_heading.set_margin_bottom(7);
@@ -403,7 +411,11 @@ pub(crate) fn inspector(model: &Inspector, is_fixture: bool) -> gtk4::Box {
         step_row(step, true)
     } else {
         let card = inspector_empty_card(
-            "Select a task to see its current step",
+            if is_fixture {
+                "Select a task to see its current step"
+            } else {
+                "Select a task to see its next action"
+            },
             jterm_core::reference_icons::Icon::History,
         );
         card.add_css_class("reference-current-step");
@@ -412,7 +424,14 @@ pub(crate) fn inspector(model: &Inspector, is_fixture: bool) -> gtk4::Box {
     current.set_height_request(token::INSPECTOR_CURRENT_HEIGHT as i32);
     current.add_css_class("reference-inspector-current");
     root.append(&current);
-    let queue_heading = text("TASK QUEUE", "reference-section-label");
+    let queue_heading = text(
+        if is_fixture {
+            "TASK QUEUE"
+        } else {
+            "OTHER TASKS"
+        },
+        "reference-section-label",
+    );
     queue_heading.add_css_class("reference-inspector-queue-heading");
     queue_heading.set_margin_top(12);
     queue_heading.set_margin_bottom(6);
@@ -420,7 +439,14 @@ pub(crate) fn inspector(model: &Inspector, is_fixture: bool) -> gtk4::Box {
     let queue = gtk4::Box::new(Orientation::Vertical, token::INSPECTOR_QUEUE_GAP as i32);
     queue.add_css_class("reference-inspector-queue");
     if model.queue.is_empty() {
-        let empty = text("No queued tasks", "reference-muted");
+        let empty = text(
+            if is_fixture {
+                "No queued tasks"
+            } else {
+                "No other tasks"
+            },
+            "reference-muted",
+        );
         empty.set_height_request(token::INSPECTOR_QUEUE_ROW_HEIGHT as i32);
         queue.append(&empty);
     }
@@ -446,11 +472,17 @@ pub(crate) fn inspector(model: &Inspector, is_fixture: bool) -> gtk4::Box {
         jterm_core::reference_icons::Icon::Terminal,
         12,
     ));
-    let title = text("Terminal output", "reference-section-label");
+    let title = text(&model.output_title, "reference-section-label");
     title.set_hexpand(true);
     output_heading.append(&title);
     output_heading.append(&text(
-        if is_fixture { "Fixture" } else { "No task" },
+        if is_fixture {
+            "Fixture"
+        } else if has_task {
+            "Task status"
+        } else {
+            "No task"
+        },
         "reference-muted",
     ));
     terminal_section.append(&output_heading);

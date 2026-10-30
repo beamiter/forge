@@ -69,6 +69,7 @@ pub(super) fn go_to_line(
     message: &gtk::Label,
 ) {
     let dialog = adw::AlertDialog::new(Some("Go to line"), Some("Enter line or line:column"));
+    crate::ui::reference_shell::style_workspace_dialog(&dialog);
     dialog.set_widget_name(EDITOR_DIALOG_NAME);
     dialog.add_responses(&[("cancel", "Cancel"), ("go", "Go")]);
     dialog.set_default_response(Some("go"));
@@ -257,6 +258,7 @@ impl QuickOpen {
         message: &gtk::Label,
     ) {
         let dialog = adw::Dialog::new();
+        crate::ui::reference_shell::style_workspace_dialog(&dialog);
         dialog.set_widget_name(EDITOR_DIALOG_NAME);
         dialog.set_title("Quick open project file");
         dialog.set_content_width(620);

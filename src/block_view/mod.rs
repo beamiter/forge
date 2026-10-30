@@ -4389,6 +4389,7 @@ impl BlockBackend {
             }
 
             let popover = gtk4::Popover::new();
+            popover.add_css_class("forge-popup");
             if finished_widget.has_css_class("developer-command-card") {
                 popover.add_css_class("developer-block-menu");
                 popover.set_width_request(264);

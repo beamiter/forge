@@ -1,0 +1,184 @@
+/* Menus are a raised layer of the shared navy chrome, independent of the
+ * terminal's ANSI palette. Include native dropdown submenus in the same layer. */
+window.forge-window.reference-shell popover > contents,
+.forge-workspace-dialog popover > contents {
+    background: @POPUP_SURFACE@;
+    color: @POPUP_FOREGROUND@;
+    border: 1px solid @POPUP_BORDER@;
+    border-radius: 12px;
+    padding: 8px;
+    box-shadow: 0 8px 24px alpha(@RAIL@, .35);
+}
+window.forge-window.reference-shell popover > arrow,
+.forge-workspace-dialog popover > arrow {
+    background: @POPUP_SURFACE@;
+    border-color: @POPUP_BORDER@;
+}
+window.forge-window.reference-shell popover,
+.forge-workspace-dialog popover,
+window.forge-window.reference-shell popover.forge-popup label,
+.forge-workspace-dialog popover.forge-popup label,
+window.forge-window.reference-shell popover.forge-popup button,
+.forge-workspace-dialog popover.forge-popup button,
+window.forge-window.reference-shell popover.forge-popup checkbutton,
+.forge-workspace-dialog popover.forge-popup checkbutton,
+window.forge-window.reference-shell dropdown popover label,
+.forge-workspace-dialog dropdown popover label {
+    font-family: "DejaVu Sans", sans-serif;
+    font-size: 10px;
+    font-weight: 400;
+    font-style: normal;
+    color: @POPUP_FOREGROUND@;
+}
+window.forge-window.reference-shell popover.forge-popup label.reference-tool-detail,
+.forge-workspace-dialog popover.forge-popup label.reference-tool-detail,
+window.forge-window.reference-shell popover.forge-popup label.caption,
+.forge-workspace-dialog popover.forge-popup label.caption {
+    font-size: 9px;
+    color: @POPUP_MUTED@;
+}
+window.forge-window.reference-shell popover.forge-popup button,
+.forge-workspace-dialog popover.forge-popup button,
+window.forge-window.reference-shell popover.forge-popup checkbutton,
+.forge-workspace-dialog popover.forge-popup checkbutton,
+window.forge-window.reference-shell popover modelbutton,
+.forge-workspace-dialog popover modelbutton,
+window.forge-window.reference-shell popover row,
+.forge-workspace-dialog popover row {
+    min-height: 30px;
+    padding: 0 8px;
+    margin: 0;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: transparent;
+    box-shadow: none;
+    color: @POPUP_FOREGROUND@;
+}
+window.forge-window.reference-shell popover.forge-popup button:hover,
+.forge-workspace-dialog popover.forge-popup button:hover,
+window.forge-window.reference-shell popover.forge-popup checkbutton:hover,
+.forge-workspace-dialog popover.forge-popup checkbutton:hover,
+window.forge-window.reference-shell popover modelbutton:hover,
+.forge-workspace-dialog popover modelbutton:hover,
+window.forge-window.reference-shell popover row:hover,
+.forge-workspace-dialog popover row:hover,
+window.forge-window.reference-shell popover row:selected,
+.forge-workspace-dialog popover row:selected {
+    background: @POPUP_SELECTED@;
+}
+window.forge-window.reference-shell popover.forge-popup button:active,
+.forge-workspace-dialog popover.forge-popup button:active,
+window.forge-window.reference-shell popover.forge-popup button:checked,
+.forge-workspace-dialog popover.forge-popup button:checked {
+    background: mix(@POPUP_SELECTED@, @ACCENT@, .22);
+}
+window.forge-window.reference-shell popover.forge-popup button:focus-visible,
+.forge-workspace-dialog popover.forge-popup button:focus-visible,
+window.forge-window.reference-shell popover.forge-popup checkbutton:focus-visible,
+.forge-workspace-dialog popover.forge-popup checkbutton:focus-visible,
+window.forge-window.reference-shell popover modelbutton:focus-visible,
+.forge-workspace-dialog popover modelbutton:focus-visible,
+window.forge-window.reference-shell popover row:focus-visible,
+.forge-workspace-dialog popover row:focus-visible {
+    outline: 2px solid @ACCENT@;
+    outline-offset: -2px;
+}
+window.forge-window.reference-shell popover.forge-popup button:disabled,
+.forge-workspace-dialog popover.forge-popup button:disabled,
+window.forge-window.reference-shell popover.forge-popup button:disabled label,
+.forge-workspace-dialog popover.forge-popup button:disabled label,
+window.forge-window.reference-shell popover.forge-popup checkbutton:disabled,
+.forge-workspace-dialog popover.forge-popup checkbutton:disabled,
+window.forge-window.reference-shell popover.forge-popup checkbutton:disabled label,
+.forge-workspace-dialog popover.forge-popup checkbutton:disabled label,
+window.forge-window.reference-shell popover modelbutton:disabled,
+.forge-workspace-dialog popover modelbutton:disabled,
+window.forge-window.reference-shell popover row:disabled,
+.forge-workspace-dialog popover row:disabled {
+    color: @POPUP_MUTED@;
+    background: transparent;
+    opacity: 1;
+    filter: none;
+}
+window.forge-window.reference-shell popover.forge-popup button.destructive-action:not(:disabled),
+.forge-workspace-dialog popover.forge-popup button.destructive-action:not(:disabled),
+window.forge-window.reference-shell popover.forge-popup button.destructive-action:not(:disabled) label,
+.forge-workspace-dialog popover.forge-popup button.destructive-action:not(:disabled) label {
+    color: mix(@error_color, @POPUP_FOREGROUND@, .45);
+}
+window.forge-window.reference-shell popover separator,
+.forge-workspace-dialog popover separator {
+    min-height: 1px;
+    margin: 4px 0;
+    background: @DARK_BORDER@;
+}
+window.forge-window.reference-shell popover scrolledwindow,
+.forge-workspace-dialog popover scrolledwindow,
+window.forge-window.reference-shell popover viewport,
+.forge-workspace-dialog popover viewport,
+window.forge-window.reference-shell popover list,
+.forge-workspace-dialog popover list,
+window.forge-window.reference-shell popover listview,
+.forge-workspace-dialog popover listview,
+window.forge-window.reference-shell popover scrollbar,
+.forge-workspace-dialog popover scrollbar,
+window.forge-window.reference-shell popover scrollbar trough,
+.forge-workspace-dialog popover scrollbar trough {
+    background: transparent;
+}
+window.forge-window.reference-shell popover scrollbar slider,
+.forge-workspace-dialog popover scrollbar slider {
+    background: alpha(@POPUP_MUTED@, .45);
+}
+window.forge-window.reference-shell popover scrollbar slider:hover,
+.forge-workspace-dialog popover scrollbar slider:hover {
+    background: @POPUP_MUTED@;
+}
+window.forge-window.reference-shell popover.forge-popup entry,
+.forge-workspace-dialog popover.forge-popup entry,
+window.forge-window.reference-shell dropdown popover entry,
+.forge-workspace-dialog dropdown popover entry {
+    background: @INSPECTOR@;
+    border: 1px solid @POPUP_BORDER@;
+    color: @POPUP_FOREGROUND@;
+    caret-color: @POPUP_FOREGROUND@;
+}
+window.forge-window.reference-shell popover.forge-popup entry text,
+.forge-workspace-dialog popover.forge-popup entry text,
+window.forge-window.reference-shell dropdown popover entry text,
+.forge-workspace-dialog dropdown popover entry text {
+    color: @POPUP_FOREGROUND@;
+    caret-color: @POPUP_FOREGROUND@;
+}
+window.forge-window.reference-shell popover.forge-popup entry:focus-within,
+.forge-workspace-dialog popover.forge-popup entry:focus-within,
+window.forge-window.reference-shell dropdown popover entry:focus-within,
+.forge-workspace-dialog dropdown popover entry:focus-within {
+    border-color: @ACCENT@;
+    outline-color: @ACCENT@;
+}
+
+window.forge-window.reference-shell popover.forge-popup checkbutton check,
+.forge-workspace-dialog popover.forge-popup checkbutton check {
+    background: @INSPECTOR_CARD@;
+    border: 1px solid @POPUP_BORDER@;
+    border-radius: 4px;
+    color: @POPUP_FOREGROUND@;
+}
+window.forge-window.reference-shell popover.forge-popup checkbutton check:checked,
+.forge-workspace-dialog popover.forge-popup checkbutton check:checked {
+    background: @ACCENT@;
+    border-color: @ACCENT@;
+    color: white;
+}
+window.forge-window.reference-shell popover.forge-popup checkbutton:disabled check,
+.forge-workspace-dialog popover.forge-popup checkbutton:disabled check {
+    background: transparent;
+    border-color: @POPUP_BORDER@;
+    color: @POPUP_MUTED@;
+}
+window.forge-window.reference-shell popover entry selection,
+.forge-workspace-dialog popover entry selection {
+    background: @POPUP_SELECTED@;
+    color: @POPUP_FOREGROUND@;
+}

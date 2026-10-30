@@ -1028,6 +1028,7 @@ fn open_with_config_and_exit(
         rename.connect_clicked(move |_| {
             let Some(window) = weak.upgrade() else { return };
             let dialog = adw::AlertDialog::new(Some("Rename symbol"), None);
+            crate::ui::reference_shell::style_workspace_dialog(&dialog);
             dialog.add_responses(&[("cancel", "Cancel"), ("rename", "Rename")]);
             dialog.set_default_response(Some("rename"));
             dialog.set_close_response("cancel");

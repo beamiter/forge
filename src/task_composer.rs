@@ -230,6 +230,7 @@ pub(crate) fn show(
         .modal(true)
         .destroy_with_parent(true)
         .build();
+    crate::ui::reference_shell::style_workspace_dialog(&window);
     let root = gtk::Box::new(gtk::Orientation::Vertical, 10);
     for (edge, margin) in [(0, 20), (1, 20), (2, 20), (3, 20)] {
         match edge {

@@ -323,6 +323,7 @@ fn present_exact_preview(
         .content_width(760)
         .content_height(560)
         .build();
+    crate::ui::reference_shell::style_workspace_dialog(&dialog);
     let body = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
     body.set_margin_start(16);
     body.set_margin_end(16);

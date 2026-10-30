@@ -146,6 +146,7 @@ pub(crate) fn present(
         .content_width(480)
         .content_height(650)
         .build();
+    crate::ui::reference_shell::style_workspace_dialog(&dialog);
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&adw::HeaderBar::new());
     let scrolled = gtk::ScrolledWindow::builder()
@@ -301,6 +302,7 @@ pub(crate) fn present(
 
 pub(crate) fn present_capability(window: &adw::ApplicationWindow, message: &str) {
     let dialog = adw::AlertDialog::new(Some("ASCII companion"), Some(message));
+    crate::ui::reference_shell::style_workspace_dialog(&dialog);
     dialog.add_response("close", "Close");
     dialog.set_default_response(Some("close"));
     dialog.set_close_response("close");

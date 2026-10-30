@@ -4521,6 +4521,7 @@ impl UiState {
             .title("Open Filesystem Path")
             .content_width(440)
             .build();
+        crate::ui::reference_shell::style_workspace_dialog(&dialog);
         let entry = adw::EntryRow::new();
         entry.set_title("Absolute path");
         if let Some(root) = self.file_tree_root.borrow().to_str() {
@@ -4939,6 +4940,8 @@ impl UiState {
         );
 
         let popover = gtk4::Popover::new();
+        popover.add_css_class("forge-popup");
+        popover.add_css_class("terminal-context-menu");
         popover.set_parent(file_tree);
         popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
         popover.set_has_arrow(false);
@@ -5255,6 +5258,7 @@ impl UiState {
             .title(kind.title())
             .content_width(360)
             .build();
+        crate::ui::reference_shell::style_workspace_dialog(&dialog);
 
         let name_row = adw::EntryRow::new();
         name_row.set_title("Name");
@@ -5437,6 +5441,7 @@ impl UiState {
         let expected_location = self.file_tree_location.borrow().clone();
         let (title, detail) = delete_confirmation_text(&entries);
         let dialog = adw::AlertDialog::new(Some(&title), Some(&detail));
+        crate::ui::reference_shell::style_workspace_dialog(&dialog);
         dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");

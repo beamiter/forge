@@ -263,6 +263,7 @@ impl UiState {
             return;
         }
         let dialog = adw::AlertDialog::new(Some(title), Some(message));
+        crate::ui::reference_shell::style_workspace_dialog(&dialog);
         dialog.add_response("ok", "OK");
         dialog.set_default_response(Some("ok"));
         dialog.set_close_response("ok");
@@ -871,6 +872,7 @@ impl UiState {
                 "{path_display} was changed elsewhere while this window still had settings waiting to be written.\n\nKeep this window's settings and its pending save will be refused until you reload, so nothing is overwritten without you seeing it. Discard them to take the file's settings instead."
             )),
         );
+        crate::ui::reference_shell::style_workspace_dialog(&dialog);
         dialog.add_response("keep", "Keep My Settings");
         dialog.add_response("discard", "Discard and Reload");
         dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
@@ -912,6 +914,7 @@ impl UiState {
                 Some("Configuration reload disabled"),
                 Some("Safe mode keeps the built-in VTE profile isolated from user configuration."),
             );
+            crate::ui::reference_shell::style_workspace_dialog(&dialog);
             dialog.add_response("ok", "OK");
             dialog.set_default_response(Some("ok"));
             dialog.present(Some(&self.window));
@@ -1029,8 +1032,6 @@ impl UiState {
         let (mut new_config, _themes, new_keybindings) = load_config();
         new_config.terminal_mode = new_config.terminal_mode.public_presentation();
         new_config.tab_placement = crate::config::TabPlacement::Sidebar;
-        new_config.sidebar_width = jterm_core::developer_workspace::NAVIGATION_WIDTH as u32;
-        new_config.ai_panel_width = jterm_core::developer_workspace::INSPECTOR_WIDTH as u32;
         // `load_config` re-read the file. Prove it read the same bytes this
         // reload validated, and that it read them at all, before any of them
         // reaches a live setting.
