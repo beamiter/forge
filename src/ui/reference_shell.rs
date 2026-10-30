@@ -13,6 +13,11 @@ use vte4::TerminalExt;
 const INSPECTOR_CHROME_KEY: &str = "forge-reference-inspector-chrome";
 const OBSERVED_INSPECTOR_KEY: &str = "forge-observed-inspector-model";
 const REVIEW_TASK_KEY: &str = "forge-reference-review-task";
+const COMPOSER_CONTROL_HEIGHT: f64 = 22.0;
+
+fn composer_control_height(scale: f64) -> i32 {
+    COMPOSER_CONTROL_HEIGHT.max(14.0 * scale + 6.0).ceil() as i32
+}
 
 #[derive(PartialEq, Eq)]
 struct ObservedInspector {
@@ -476,7 +481,11 @@ fn composer_icon_label(key: &str, value: &str) -> gtk4::Box {
     glyph.add_css_class("reference-composer-glyph");
     row.append(&glyph);
     if !value.is_empty() {
-        row.append(&label(value, "reference-icon-label"));
+        let caption = label(value, "reference-icon-label");
+        caption.set_width_chars(0);
+        caption.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        caption.set_hexpand(true);
+        row.append(&caption);
     }
     row
 }
@@ -684,7 +693,7 @@ pub(crate) fn composer_controls(on_terminal: impl Fn() + 'static) -> (gtk4::Box,
     controls.add_css_class("reference-composer-controls");
     controls.add_css_class("reference-fixed-controls");
     controls.set_valign(gtk4::Align::End);
-    // Extra pixels in the minimum dock belong above this fixed28px footer,
+    // Extra pixels in the minimum dock belong above this compact footer,
     // including when the native editor is seated in a running command card.
     controls.set_vexpand(true);
     let group = gtk4::Box::new(Orientation::Horizontal, token::METADATA_GAP as i32);
@@ -715,7 +724,7 @@ pub(crate) fn composer_controls(on_terminal: impl Fn() + 'static) -> (gtk4::Box,
     scroll.set_policy(gtk4::PolicyType::External, gtk4::PolicyType::Never);
     scroll.set_propagate_natural_width(true);
     scroll.set_min_content_width(0);
-    scroll.set_max_content_width(400);
+    scroll.set_max_content_width(i32::MAX);
     scroll.set_hexpand(false);
     scroll.set_child(Some(&group));
     controls.append(&scroll);
@@ -893,7 +902,9 @@ fn refresh_composer_row(row: &gtk4::Box) {
         .find_map(|(class, width)| widget.has_css_class(class).then_some(width));
         if let Some(dimension) = dimension {
             widget.add_css_class("reference-sized-control");
-            widget.set_size_request(px(dimension), px(token::CONTROL_HEIGHT));
+            widget.set_size_request(px(dimension), composer_control_height(scale));
+            widget.set_valign(gtk4::Align::Center);
+            widget.set_overflow(gtk4::Overflow::Hidden);
         }
         if let Some(width) = width {
             if ["attach", "image", "code"]
@@ -915,7 +926,9 @@ fn refresh_composer_row(row: &gtk4::Box) {
         }
         if widget.has_css_class("reference-composer-glyph") {
             if let Some(glyph) = widget.downcast_ref::<gtk4::DrawingArea>() {
-                let size = px(jterm_core::reference_popup::FOOTER_ICON_SIZE);
+                let size = (f64::from(jterm_core::reference_popup::FOOTER_ICON_SIZE)
+                    * scale.min(1.25))
+                .round() as i32;
                 glyph.set_content_width(size);
                 glyph.set_content_height(size);
             }
@@ -940,7 +953,7 @@ fn refresh_composer_row(row: &gtk4::Box) {
             }
         }
     }
-    row.set_height_request(px(token::CONTROL_HEIGHT));
+    row.set_height_request(composer_control_height(scale));
 }
 
 /// A UI font change can retain the same allocation. Refresh once from the
