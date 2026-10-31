@@ -1783,20 +1783,61 @@ impl OwnedPty {
     /// return [`PtyForeground::Unknown`], which would silence every
     /// foreground-gated decision under test.
     pub(crate) fn for_tests(foreground: PtyForeground) -> io::Result<Self> {
+        Self::test_pty_pair(foreground, false)
+    }
+
+    /// Keep the inert session leader alive for asynchronous display fixtures.
+    /// The real reader must not observe child exit before prompt bytes arrive.
+    /// Existing kill/Drop ownership terminates and reaps this placeholder.
+    pub(crate) fn for_live_display_tests(foreground: PtyForeground) -> io::Result<Self> {
+        Self::test_pty_pair(foreground, true)
+    }
+
+    fn test_pty_pair(foreground: PtyForeground, keep_child_alive: bool) -> io::Result<Self> {
         let OpenptyResult { master, slave } = openpty_cloexec(None)?;
         prepare_test_slave(&slave);
         // SAFETY: the child performs only async-signal-safe syscalls before
         // `_exit`, which is the rule for forking from this multi-threaded
         // process (the same rule `spawn_inner`'s child body follows).
         let (exec_read, exec_write) = crate::gtk_process::exec_barrier()?;
+        let child_fds = [
+            master.as_raw_fd(),
+            slave.as_raw_fd(),
+            exec_read.as_raw_fd(),
+            exec_write.as_raw_fd(),
+        ];
+        #[cfg(target_os = "linux")]
+        let parent_pid = unsafe { libc::getpid() };
         let child = match unsafe { unistd::fork() }.map_err(io::Error::other)? {
             ForkResult::Child => unsafe {
                 libc::setsid();
+                if keep_child_alive {
+                    // A terminated test process must not leave this inert
+                    // child behind if normal owner teardown cannot run.
+                    #[cfg(target_os = "linux")]
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0
+                        || libc::getppid() != parent_pid
+                    {
+                        libc::_exit(1);
+                    }
+                    // Publish the session identity before the parent returns.
+                    // The placeholder never holds terminal endpoints open and
+                    // never runs Rust destructors or allocates after fork.
+                    for fd in child_fds {
+                        libc::close(fd);
+                    }
+                    loop {
+                        libc::pause();
+                    }
+                }
                 libc::_exit(0);
             },
             ForkResult::Parent { child } => child,
         };
-        crate::gtk_process::wait_exec_barrier(exec_read, exec_write)?;
+        if let Err(error) = crate::gtk_process::wait_exec_barrier(exec_read, exec_write) {
+            kill_and_reap_unreferenced(child);
+            return Err(error);
+        }
         let lifecycle = match ChildLifecycle::new(child.as_raw(), ReapOwner::Ours) {
             Ok(lifecycle) => lifecycle,
             Err(error) => {
@@ -2073,6 +2114,19 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::path::Path;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn live_display_fixture_reaps_its_idle_child_on_drop() {
+        let pty = OwnedPty::for_live_display_tests(PtyForeground::Shell).unwrap();
+        let child = pty.lifecycle();
+        assert!(child.exit_code().is_none());
+        assert!(!pty.guard.ready_to_reap(&child));
+        drop(pty);
+        assert!(
+            wait_until(Duration::from_secs(5), || child.exit_code().is_some()),
+            "the fixture child must be reaped"
+        );
+    }
 
     #[test]
     fn allocated_pty_pair_is_close_on_exec() {

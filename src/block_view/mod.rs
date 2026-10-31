@@ -33438,7 +33438,16 @@ mod tests {
             crate::config::TerminalMode::Chat,
             crate::config::TerminalMode::Block,
         ] {
-            let view = chat_display_view(mode.clone());
+            let view = super::TermView::new_with_spawner(
+                &crate::config::Config::safe_defaults(),
+                &mode,
+                &["sh".into()],
+                None,
+                None,
+                &[],
+                |_, _, _, _| crate::pty::OwnedPty::for_live_display_tests(PtyForeground::Shell),
+            )
+            .unwrap();
             let window = gtk4::Window::builder()
                 .default_width(1129)
                 .default_height(844)

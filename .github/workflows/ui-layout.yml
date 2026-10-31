@@ -82,6 +82,7 @@ jobs:
           export XDG_CACHE_HOME="$test_xdg_root/cache"
           export XDG_RUNTIME_DIR="$test_xdg_root/runtime"
           tests=(
+            pty::tests::live_display_fixture_reaps_its_idle_child_on_drop
             block_view::chat::tests::composer_keeps_three_input_rows_and_clearance_within_the_pane
             block_view::chat::tests::real_editor_minimum_uses_native_cell_height_and_bounded_canvas_budget
             block_view::chat::tests::bounded_editor_reveals_caret_without_changing_native_ring_or_history
