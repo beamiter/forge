@@ -33473,11 +33473,20 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join("\n");
                 let output = format!(
-                    "\x1b[2J\x1b[H\x1b]133;A\x07> \x1b]133;B\x07{}",
+                    "\x1b]133;A\x07> \x1b]133;B\x07{}",
                     expected_input.replace('\n', "\r\n")
                 );
+                // reset() already cleared the native screen. Sending an
+                // extra clear/home before A selects RawFallback and tests
+                // foreground recovery instead of docked editor geometry.
                 view.pty.write_test_slave(output.as_bytes());
                 settle();
+                assert_eq!(
+                    view.bstate.get(),
+                    BlockState::AwaitingCommand,
+                    "{mode:?} {count} lines: prompt markers must select the native editor"
+                );
+                assert!(view.ftcs_seen.get(), "shell prompt was observed");
                 // OSC PromptEnd intentionally clears the editor shadow. Seed
                 // this geometry fixture after those real parser transitions;
                 // keep the original coalesced native prompt/text bytes above.
@@ -33555,6 +33564,10 @@ mod tests {
                     let viewport = native
                         .ancestor(gtk4::ScrolledWindow::static_type())
                         .unwrap();
+                    assert!(
+                        viewport.has_css_class("chat-composer-viewport"),
+                        "{mode:?} {count} lines: measure the docked editor, not history"
+                    );
                     let editor = viewport.downcast_ref::<gtk4::ScrolledWindow>().unwrap();
                     if let Some(adapter) = editor.child().and_downcast::<gtk4::Viewport>() {
                         eprintln!(

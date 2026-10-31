@@ -582,14 +582,16 @@ mod tests {
                 "user messages must not impose their old fixed width"
             );
             for (index, row) in rows.iter().enumerate() {
-                let bounds = row.compute_bounds(&document).expect("native message bounds");
+                let bounds = row
+                    .compute_bounds(&document)
+                    .expect("native message bounds");
                 assert!((bounds.x() - 8.0).abs() <= 1.0, "shared reading edge");
                 assert!(
                     bounds.x() + bounds.width() <= document.width() as f32 + 1.0,
                     "the complete message, including avatar, stays inside the pane"
                 );
                 let body = row.first_child().unwrap();
-                let label = body.first_child().unwrap().downcast::<gtk4::Label>().unwrap();
+                let label = body.first_child().and_downcast::<gtk4::Label>().unwrap();
                 assert_eq!(label.text().as_str(), values[index].as_str());
                 assert!(
                     !label.layout().is_ellipsized(),
