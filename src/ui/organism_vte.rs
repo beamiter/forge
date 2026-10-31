@@ -197,7 +197,9 @@ impl VteOrganismSurface {
             mounting: Cell::new(false),
             expanded_widgets: RefCell::new(None),
             geometry_stamp: RefCell::new(Vec::new()),
-            enabled: Cell::new(config.ascii_organism_enabled && !crate::eva_companion::shared_mode_requested()),
+            enabled: Cell::new(
+                config.ascii_organism_enabled && !crate::eva_companion::shared_mode_requested(),
+            ),
             local: Cell::new(false),
             motion: Cell::new(motion),
             alive: Cell::new(true),
@@ -730,13 +732,20 @@ impl VteOrganismSurface {
     }
 
     pub(crate) fn set_local(self: &Rc<Self>, local: bool) {
-        if let Some(root)=self.root.upgrade(){if local{root.remove_css_class("eva-remote-surface");}else{root.add_css_class("eva-remote-surface");}}
+        if let Some(root) = self.root.upgrade() {
+            if local {
+                root.remove_css_class("eva-remote-surface");
+            } else {
+                root.add_css_class("eva-remote-surface");
+            }
+        }
         self.local.set(local);
         self.refresh();
     }
 
     pub(crate) fn apply_settings(self: &Rc<Self>, enabled: bool, motion: OrganismMotion) {
-        self.enabled.set(enabled && !crate::eva_companion::shared_mode_requested());
+        self.enabled
+            .set(enabled && !crate::eva_companion::shared_mode_requested());
         self.motion.set(motion);
         self.refresh();
     }

@@ -303,14 +303,45 @@ impl PaneLeaf {
             .map(|name| jterm_core::review_input::safe_inline_display(&name, 256))
     }
 
+    pub(crate) fn child_cleanup(&self) -> Option<crate::gtk_process::ChildDrain> {
+        match self {
+            Self::Block(view) => Some(view.child_lifecycle().into()),
+            Self::Vte(view) => view.child_cleanup(),
+        }
+    }
+
+    pub(crate) fn close_blocker(&self) -> Option<String> {
+        match self {
+            Self::Block(view) => self
+                .foreground_process_name()
+                .or_else(|| view.close_blocker()),
+            Self::Vte(view) => view.close_blocker(self.foreground_process_name()),
+        }
+    }
+
+    pub(crate) fn withdrawal_work_probe(&self) -> Box<dyn Fn() -> bool> {
+        match self {
+            Self::Block(view) => view.withdrawal_work_probe(),
+            Self::Vte(view) => crate::gtk_process::vte_withdrawal_work_probe(view.vte()),
+        }
+    }
+
     /// Terminate this leaf's shell and everything in its PTY session through
     /// the backend-neutral process teardown path.
     ///
     /// Each backend terminates its own child lifecycle, which knows who reaps
-    /// that child: forge for a Block pane's forked PTY, VTE's glib child
-    /// watch for a conventional pane. Repeated calls are no-ops, so a pane
+    /// that child: the application's owned reaper for normal Block and VTE
+    /// children; an exceptional pre-watch unwind remains separate. Repeated calls are no-ops, so a pane
     /// closed explicitly and then dropped tears down only once.
     pub(crate) fn kill(&self) {
+        if let (Some(window), Some(child)) = (
+            self.root_widget()
+                .root()
+                .and_then(|root| root.downcast::<gtk4::Window>().ok()),
+            self.child_cleanup(),
+        ) {
+            crate::gtk_process::retain_children(&window, vec![child]);
+        }
         match self {
             // Block mode also owns a dedicated PTY input worker. Route teardown
             // through TermView so the channel and cloned master fd close before

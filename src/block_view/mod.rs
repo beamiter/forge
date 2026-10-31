@@ -18231,6 +18231,23 @@ impl TermView {
             .prompt_anchor(self.prompt_end_pos.get(), self.prompt_anchor_rows.get())
     }
 
+    pub(crate) fn child_lifecycle(&self) -> std::sync::Arc<crate::process::ChildLifecycle> {
+        self.pty.lifecycle()
+    }
+
+    pub(crate) fn close_blocker(&self) -> Option<String> {
+        self.pty.close_blocker(matches!(
+            self.organism_activity_knowledge(),
+            jterm_core::organism_live::LiveActivityKnowledge::KnownIdle
+        ))
+    }
+
+    /// Detect changes to the currently confirmed root/session; this never
+    /// supplies the empty-prompt evidence needed for ordinary close admission.
+    pub(crate) fn withdrawal_work_probe(&self) -> Box<dyn Fn() -> bool> {
+        self.pty.withdrawal_work_probe()
+    }
+
     pub(crate) fn organism_activity_knowledge(
         &self,
     ) -> jterm_core::organism_live::LiveActivityKnowledge {

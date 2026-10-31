@@ -2125,6 +2125,10 @@ pub fn run() -> glib::ExitCode {
         let close_confirmation_open = Rc::new(Cell::new(false));
         window.connect_close_request(move |window| {
             if crate::vim9_ide::request_embedded_close(window) { return glib::Propagation::Stop; }
+            if crate::eva_companion::close_waiting(window.upcast_ref()) {
+                crate::eva_companion::observe_close_work(window.upcast_ref(),
+                    (crate::state::withdrawal_work_probe(&notebook_for_close_request))());
+            }
             if !close_allowed.get() {
                 // A zoomed split keeps the sibling tree outside the Notebook.
                 // Restore it before scanning/saving so no hidden pane escapes
@@ -2161,7 +2165,23 @@ pub fn run() -> glib::ExitCode {
                 }
             }
 
-            if crate::eva_companion::defer_close(window.upcast_ref()){return glib::Propagation::Stop;}
+            let work = crate::state::withdrawal_work_probe(&notebook_for_close_request);
+            let ready_window = window.downgrade();
+            let reset_allowed = close_allowed.clone();
+            if crate::eva_companion::defer_close(window.upcast_ref(), !close_allowed.get(),
+                work,
+                move |revision| {
+                    if let Some(window) = ready_window.upgrade() {
+                        if crate::eva_companion::close_callback_current(window.upcast_ref(), revision) { window.close(); }
+                    }
+                }, move || reset_allowed.set(false)) {
+                return glib::Propagation::Stop;
+            }
+            let window_after_drain = window.clone();
+            if crate::gtk_process::defer_children(window.upcast_ref(),
+                crate::state::terminal_children(&notebook_for_close_request),
+                move || window_after_drain.close()) { return glib::Propagation::Stop; }
+
             // Save requested widths only; responsive clamps are not user edits.
             ui::reference_shell::finish_sidebar_resize(&ui_for_close_request);
             ui_for_close_request.flush_pending_config();

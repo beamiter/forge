@@ -1,5 +1,9 @@
 #![allow(dead_code)]
 
+mod gtk_presentation;
+mod gtk_process;
+mod gtk_spawn;
+
 pub mod agent;
 pub(crate) mod agent_task;
 pub(crate) mod agent_task_ui;
@@ -9,10 +13,10 @@ pub mod cli;
 pub mod config;
 pub mod config_store;
 mod context_menu;
-mod eva_companion;
-mod eva_companion_paint;
-mod eva_companion_clip;
 pub(crate) mod enter_ownership;
+mod eva_companion;
+mod eva_companion_clip;
+mod eva_companion_paint;
 pub(crate) mod font;
 pub(crate) mod font_zoom;
 pub mod git_meta;

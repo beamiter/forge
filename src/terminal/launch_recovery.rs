@@ -9,7 +9,6 @@ pub(super) struct LaunchRecovery {
     pub(super) owner: Rc<launch_owner::LaunchOwner>,
     terminal: glib::WeakRef<Terminal>,
     root: glib::WeakRef<gtk4::Box>,
-    cancellable: Cancellable,
     organism: std::rc::Weak<crate::ui::VteOrganismSurface>,
     enabled: Cell<bool>,
     shell: Entry,
@@ -94,7 +93,6 @@ impl LaunchRecovery {
             state,
             terminal: terminal.downgrade(),
             root: root.downgrade(),
-            cancellable: Cancellable::new(),
             organism: Rc::downgrade(organism),
             enabled: Cell::new(false),
             shell,
@@ -185,7 +183,6 @@ impl LaunchRecovery {
             self.env_extra.clone(),
             self.auto_gui,
             self.on_settled.borrow_mut().take(),
-            &self.cancellable,
             Box::new(move |result| {
                 let Some(recovery) = weak.upgrade() else {
                     return;
@@ -197,7 +194,9 @@ impl LaunchRecovery {
 
     pub(super) fn close(&self) {
         self.state.borrow_mut().close();
-        self.cancellable.cancel();
+        if let Some(terminal) = self.terminal.upgrade() {
+            crate::gtk_process::close_vte(&terminal);
+        }
         self.panel.set_visible(false);
     }
 

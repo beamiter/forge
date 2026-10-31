@@ -374,7 +374,7 @@ impl UiState {
                 .into_iter()
                 .enumerate()
                 .filter_map(|(index, leaf)| {
-                    leaf.foreground_process_name()
+                    leaf.close_blocker()
                         .map(|process| format!("Pane {}: {process}", index + 1))
                 })
                 .collect();
@@ -388,8 +388,11 @@ impl UiState {
             .into_iter()
             .enumerate()
             .filter_map(|(index, terminal)| {
-                crate::state::get_foreground_process_name(&terminal)
-                    .map(|process| format!("Pane {}: {process}", index + 1))
+                crate::gtk_process::vte_blocker(
+                    &terminal,
+                    crate::state::get_foreground_process_name(&terminal),
+                )
+                .map(|process| format!("Pane {}: {process}", index + 1))
             })
             .collect()
     }
@@ -622,7 +625,7 @@ impl UiState {
                     }
                     return;
                 }
-                if let Some(process) = leaf.foreground_process_name() {
+                if let Some(process) = leaf.close_blocker() {
                     let ui_state = self.clone();
                     glib::MainContext::default().spawn_local(async move {
                         if Self::confirm_close_with_processes(

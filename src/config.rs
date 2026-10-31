@@ -1743,7 +1743,7 @@ fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
         "focus_reporting_enabled",
         "preserve_live_scrollback",
         "eva_companion_enabled",
-    "ascii_organism_enabled",
+        "ascii_organism_enabled",
         "ascii_organism_care_enabled",
         "sidebar_visible",
         "ai_enabled",
@@ -2677,7 +2677,7 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
         preserve_live_scrollback: table
             .get("preserve_live_scrollback")
             .and_then(|v| v.as_bool()),
-        eva_companion_enabled: table.get("eva_companion_enabled").and_then(|v|v.as_bool()),
+        eva_companion_enabled: table.get("eva_companion_enabled").and_then(|v| v.as_bool()),
         ascii_organism_enabled: table
             .get("ascii_organism_enabled")
             .and_then(|v| v.as_bool()),

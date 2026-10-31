@@ -2,9 +2,7 @@ use adw::prelude::*;
 use gtk4::gdk::ffi::GDK_BUTTON_PRIMARY;
 use gtk4::gdk::ModifierType;
 use gtk4::gdk::RGBA;
-use gtk4::gio::{self, Cancellable};
-use gtk4::glib::translate::IntoGlib;
-use gtk4::glib::SpawnFlags;
+use gtk4::gio;
 use gtk4::pango::FontDescription;
 use gtk4::GestureClick;
 use gtk4::{glib, Entry, Label, Orientation, Paned};
@@ -13,7 +11,7 @@ use std::cell::{Cell, RefCell};
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::sync::Arc;
-use vte4::{CursorBlinkMode, CursorShape, PtyFlags, Terminal};
+use vte4::{CursorBlinkMode, CursorShape, Terminal};
 use vte4::{TerminalExt, TerminalExtManual};
 
 mod launch_owner;
@@ -23,7 +21,7 @@ mod launch_success;
 pub(crate) use launch_recovery::close_terminal_launch;
 
 use crate::config::Config;
-use crate::process::{ChildLifecycle, EscalationPolicy, ReapOwner};
+use crate::process::{ChildLifecycle, EscalationPolicy};
 
 /// Shutdown ladder for a terminal pane's shell.
 ///
@@ -330,10 +328,10 @@ impl VteTerminalView {
                 // A stop or continue report: the child is still alive.
                 return;
             };
-            let admitted_child = launch_owner.note_exit(code);
-            if let Some(lifecycle) = terminal_child_lifecycle(term) {
-                lifecycle.note_foreign_exit(code);
-            }
+            let admitted_child =
+                launch_owner.note_exit(code) && !crate::gtk_process::vte_closed(term);
+            // The owned session reaper has already cached this exit.
+            let _ = term;
             if !admitted_child {
                 return;
             }
@@ -523,6 +521,19 @@ impl VteTerminalView {
         }
     }
 
+    pub(crate) fn child_lifecycle(&self) -> Option<Arc<ChildLifecycle>> {
+        terminal_child_lifecycle(&self.terminal)
+    }
+
+    pub(crate) fn child_cleanup(&self) -> Option<crate::gtk_process::ChildDrain> {
+        crate::gtk_process::vte_cleanup(&self.terminal)
+            .or_else(|| self.child_lifecycle().map(Into::into))
+    }
+
+    pub(crate) fn close_blocker(&self, foreground: Option<String>) -> Option<String> {
+        crate::gtk_process::vte_blocker(&self.terminal, foreground)
+    }
+
     pub fn pid_i32(&self) -> i32 {
         terminal_child_pid(&self.terminal).unwrap_or(0)
     }
@@ -668,7 +679,6 @@ fn spawn_shell(
     env_extra: Vec<(String, String)>,
     auto_gui: bool,
     on_settled: Option<Box<dyn FnOnce()>>,
-    cancellable: &Cancellable,
     on_resolved: Box<dyn FnOnce(Result<(), String>)>,
 ) {
     let Some(generation) = launch_owner.state.borrow_mut().begin() else {
@@ -716,11 +726,9 @@ fn spawn_shell(
     // The child gets the complete environment frozen at launch (see
     // `capture_inherited_environment` in `app::run`), so variables written
     // after startup — CLI's `FORGE_*`, the input-method `GTK_*` rewrites —
-    // never reach the shell. `VTE_SPAWN_NO_PARENT_ENVV` stops VTE from merging
-    // the live, toolkit-mutated process environment back in; without it the
-    // frozen block would be pointless. The flag and the frozen block must stay
-    // paired: with the pre-freeze identity-only fallback envv the flag would
-    // strip the whole parent environment.
+    // never reach the shell. The owned launcher passes the frozen block
+    // directly to execve; only the pre-freeze compatibility fallback inherits
+    // the live parent environment.
     let child_identity = jterm_core::child_env::ChildEnv::from_identity();
     let (envv_owned, frozen) =
         match jterm_core::child_env::vte_envv_from_captured(&child_identity, &env_extra_pairs) {
@@ -733,9 +741,8 @@ fn spawn_shell(
                         // UTF-8, which the `&str`-based VTE envv cannot carry.
                         // Rebuild the same block from the frozen capture with
                         // those entries dropped (a non-UTF-8 name drops the
-                        // whole entry) and keep the pairing invariant — the
-                        // flag must still suppress the live, mutated parent
-                        // environment instead of merging it back in.
+                        // whole entry). The complete block still excludes the
+                        // live, mutated parent environment.
                         let envv: Vec<String> = block
                             .into_iter()
                             .filter_map(|entry| String::from_utf8(entry.into_bytes()).ok())
@@ -750,7 +757,7 @@ fn spawn_shell(
                         // starts); keep the pre-freeze identity-only behavior
                         // rather than failing the spawn.
                         log::warn!(
-                            "no frozen launch environment; VTE inherits the live one: {err}"
+                            "no frozen launch environment; shell inherits the live one: {err}"
                         );
                         (
                             jterm_core::child_env::vte_envv(&child_identity, &env_extra_pairs),
@@ -762,11 +769,6 @@ fn spawn_shell(
         };
     let envv: Vec<&str> = envv_owned.iter().map(String::as_str).collect();
     let envv: &[&str] = &envv;
-    let mut spawn_flags = SpawnFlags::SEARCH_PATH;
-    if frozen {
-        spawn_flags |=
-            SpawnFlags::from_bits_retain(jterm_core::child_env::VTE_SPAWN_NO_PARENT_ENVV_BITS);
-    }
     let spawn_working_directory = if crate::host::is_flatpak() {
         None
     } else {
@@ -776,191 +778,89 @@ fn spawn_shell(
 
     // If initial commands are provided, send them after the shell starts.
 
-    // Unlike terminal.spawn_async, this lets us acquire the child's identity
-    // BEFORE installing VTE's foreign watcher. Pty spawn leaves the successful
-    // DO_NOT_REAP_CHILD PID unreaped for its caller to watch.
-    let pty = match terminal.pty_new_sync(PtyFlags::DEFAULT, Some(cancellable)) {
-        Ok(pty) => pty,
-        Err(error) => {
-            // Preserve the constructor's asynchronous observer-registration contract.
-            glib::idle_add_local_once(move || {
-                resolve_spawn(
-                    &terminal_for_pid,
-                    launch_owner,
-                    generation,
-                    None,
-                    Err(error),
-                    on_settled,
-                    on_resolved,
-                );
-            });
-            return;
-        }
-    };
-    let spawned_pty = pty.clone();
-    pty.spawn_async(
-        spawn_working_directory,
+    crate::gtk_spawn::spawn(
+        terminal,
         &argv,
         envv,
-        spawn_flags,
-        || {},
-        -1,
-        Some(cancellable),
-        move |res| {
-            let unwatched = res
-                .as_ref()
-                .ok()
-                .copied()
-                .map(launch_owner::UnwatchedChild::from_spawn_success);
-            if let Some(child) = &unwatched {
-                if let Err(error) = child.acquire(&launch_owner, generation) {
-                    let report = !launch_owner.state.borrow().closed();
-                    let message = unwind_unowned_spawn(
-                        &launch_owner,
-                        unwatched.unwrap(),
-                        &terminal_for_pid,
-                        &spawned_pty,
-                        error,
-                    );
-                    if let Some(on_settled) = on_settled {
-                        on_settled();
-                    }
-                    if report {
-                        on_resolved(Err(message));
-                    }
-                    return;
-                }
-            }
+        !frozen,
+        spawn_working_directory,
+        move |result| {
             resolve_spawn(
                 &terminal_for_pid,
                 launch_owner,
                 generation,
-                unwatched.map(|child| (child, &spawned_pty)),
-                res,
+                result,
                 on_settled,
                 on_resolved,
-            );
+            )
         },
     );
 }
 
-/// Exceptional pre-watch unwind shared with deterministic native coverage.
-fn unwind_unowned_spawn(
-    owner: &launch_owner::LaunchOwner,
-    child: launch_owner::UnwatchedChild,
-    terminal: &Terminal,
-    pty: &vte4::Pty,
-    error: std::io::Error,
-) -> String {
-    owner.state.borrow_mut().close();
-    owner.retain_for_reap(terminal);
-    let stopped = child.abort_before_watch();
-    child.watch(terminal, pty);
-    let detail = jterm_core::review_input::safe_inline_display(&error.to_string(), 256);
-    let message = if stopped.is_ok() {
-        format!(
-            "Terminal launch aborted: process ownership unavailable ({detail}). Close this pane and try again. Detached descendant cleanup could not be verified."
-        )
-    } else {
-        format!(
-            "Terminal launch could not be safely managed or stopped ({detail}). Close this pane and check the child process."
-        )
-    };
-    log::error!("{message}");
-    message
-}
-
-/// The production completion boundary also used by deterministic native races.
-#[allow(clippy::too_many_arguments)]
+/// Real owned launch outcome. No callback can reopen or signal a retired PID.
 fn resolve_spawn(
-    terminal_for_pid: &Terminal,
-    launch_owner: Rc<launch_owner::LaunchOwner>,
+    terminal: &Terminal,
+    owner: Rc<launch_owner::LaunchOwner>,
     generation: launch_state::Generation,
-    unwatched_pty: Option<(launch_owner::UnwatchedChild, &vte4::Pty)>,
-    res: Result<glib::Pid, glib::Error>,
+    result: std::io::Result<Arc<ChildLifecycle>>,
     on_settled: Option<Box<dyn FnOnce()>>,
     on_resolved: Box<dyn FnOnce(Result<(), String>)>,
 ) {
-    let launch_state = launch_owner.state.clone();
-    let terminal_for_init = terminal_for_pid.clone();
-    log::debug!("spawn_async: {res:?}");
-    // The spawn resolved one way or the other: the child (on success)
-    // has already entered its working directory through the path it
-    // was handed, so launch-time pins may be released now. Runs on
-    // failure too — the pin must not leak on a failed spawn.
-    let accepted = launch_state.borrow_mut().resolve(generation, res.is_ok());
-    if res.is_ok() {
+    log::debug!(
+        "owned terminal launch: {:?}",
+        result.as_ref().map(|child| child.pid())
+    );
+    let state = owner.state.clone();
+    if crate::gtk_process::vte_closed(terminal) {
+        state.borrow_mut().close();
+    }
+    if let Ok(child) = &result {
+        owner.adopt_owned(generation, Arc::clone(child));
+    }
+    let accepted = state.borrow_mut().resolve(generation, result.is_ok());
+    if let Ok(child) = &result {
         if accepted {
-            launch_owner.admit();
-            if let Some(child) = launch_owner.child(generation) {
-                set_terminal_child_lifecycle(terminal_for_pid, child);
+            owner.admit();
+            if let Some(owned) = owner.child(generation) {
+                set_terminal_child_lifecycle(terminal, owned);
             }
-        }
-        // No watcher exists yet: the successful child/zombie pins its PID
-        // and its own process-group identity. Abort only through this token,
-        // with no delayed numeric signaling or /proc scans.
-        if let Some((child, pty)) = unwatched_pty {
-            if !accepted {
-                launch_owner.retain_for_reap(terminal_for_pid);
-                if let Err(error) = child.abort_before_watch() {
-                    log::error!("Cancelled terminal child could not be stopped: {error}");
-                }
-            }
-            child.watch(terminal_for_pid, pty);
+        } else {
+            child.terminate(TERMINAL_ESCALATION);
         }
     }
-    if let Some(on_settled) = on_settled {
-        on_settled();
+    if let Some(settled) = on_settled {
+        settled();
+    }
+    if crate::gtk_process::vte_closed(terminal) {
+        state.borrow_mut().close();
     }
     if !accepted {
         return;
     }
-    match res {
-        Ok(_) => {}
-        Err(error) => {
-            let detail = jterm_core::review_input::safe_inline_display(&error.to_string(), 2048);
-            let message = format!("Could not launch terminal: {detail}");
-            log::error!("{message}");
-            // Observers must retire the launch before the diagnostic
-            // can emit contents-changed (remote first-output badges).
-            let diagnostic = format!("\r\nforge: {message}\r\n");
-            if !launch_state.borrow().failed_generation(generation) {
-                return;
-            }
-            on_resolved(Err(message));
-            if launch_state.borrow().failed_generation(generation) {
-                terminal_for_pid.feed(diagnostic.as_bytes());
-            }
+    if let Err(error) = result {
+        if !state.borrow().failed_generation(generation) {
             return;
         }
-    };
-    if !launch_state.borrow().running_generation(generation) {
+        let detail = jterm_core::review_input::safe_inline_display(&error.to_string(), 2048);
+        let message = format!("Could not launch terminal: {detail}");
+        log::error!("{message}");
+        let diagnostic = format!("\r\nforge: {message}\r\n");
+        on_resolved(Err(message));
+        if state.borrow().failed_generation(generation) {
+            terminal.feed(diagnostic.as_bytes());
+        }
+        return;
+    }
+    if !state.borrow().running_generation(generation) {
         return;
     }
     on_resolved(Ok(()));
-    // Feed initial commands after the shell has fully initialized.
-    // We delay to ensure the shell has entered raw mode; sending \r
-    // too early would hit the kernel's cooked-mode icrnl translation
-    // (turning \r into \n), which raw-mode shells don't treat as Enter.
-    // Each pre-parsed command is fed as exactly one line; splitting
-    // here would let a restored command's own bytes change boundaries.
-    if launch_state.borrow().pending_count() != 0 {
-        glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
-            if terminal_for_init.root().is_none()
-                || terminal_child_lifecycle(&terminal_for_init)
-                    .is_none_or(|child| child.exit_code().is_some())
-            {
-                return;
-            }
-            let cmds = launch_state.borrow_mut().take_commands(generation);
-            for line in &cmds {
-                if !launch_state.borrow().running_generation(generation) {
-                    break;
-                }
-                let text = format!("{line}\r");
-                terminal_for_init.feed_child(text.as_bytes());
-            }
-        });
+    if state.borrow().pending_count() != 0 {
+        if let Some(child) = owner.child(generation) {
+            crate::gtk_process::schedule_initial_commands(terminal, child, move || {
+                state.borrow_mut().take_commands(generation)
+            });
+        }
     }
 }
 

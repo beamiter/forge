@@ -1827,14 +1827,48 @@ pub(crate) fn kill_widget_child_processes(widget: &gtk4::Widget) -> bool {
 /// so this path never has to guess from the widget type. Calling it a second
 /// time (an explicit close followed by the drop of the same pane) is a no-op.
 pub(crate) fn kill_terminal_child(terminal: &Terminal) {
+    let cleanup = crate::gtk_process::vte_cleanup(terminal)
+        .or_else(|| terminal_child_lifecycle(terminal).map(Into::into));
+    if let (Some(window), Some(cleanup)) = (
+        terminal
+            .root()
+            .and_then(|root| root.downcast::<gtk4::Window>().ok()),
+        cleanup,
+    ) {
+        crate::gtk_process::retain_children(&window, vec![cleanup]);
+    }
     crate::terminal::close_terminal_launch(terminal);
-    let Some(lifecycle) = terminal_child_lifecycle(terminal) else {
-        return;
-    };
-    lifecycle.terminate(TERMINAL_ESCALATION);
+    if let Some(lifecycle) = terminal_child_lifecycle(terminal) {
+        lifecycle.terminate(TERMINAL_ESCALATION);
+    }
 }
 
 /// Send SIGHUP to all child process groups across every terminal in the notebook.
+pub(crate) fn terminal_children(notebook: &Notebook) -> Vec<crate::gtk_process::ChildDrain> {
+    (0..notebook.n_pages())
+        .filter_map(|index| notebook.nth_page(Some(index)))
+        .flat_map(|widget| {
+            PaneNode::from_widget(&widget)
+                .map(|node| node.leaves())
+                .unwrap_or_default()
+        })
+        .filter_map(|leaf| leaf.child_cleanup())
+        .collect()
+}
+
+pub(crate) fn withdrawal_work_probe(notebook: &Notebook) -> Box<dyn Fn() -> bool> {
+    let probes: Vec<_> = (0..notebook.n_pages())
+        .filter_map(|index| notebook.nth_page(Some(index)))
+        .flat_map(|widget| {
+            PaneNode::from_widget(&widget)
+                .map(|node| node.leaves())
+                .unwrap_or_default()
+        })
+        .map(|leaf| leaf.withdrawal_work_probe())
+        .collect();
+    Box::new(move || probes.iter().any(|probe| probe()))
+}
+
 pub(crate) fn kill_all_terminal_children(notebook: &Notebook) {
     for i in 0..notebook.n_pages() {
         if let Some(page_widget) = notebook.nth_page(Some(i)) {

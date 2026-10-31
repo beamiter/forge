@@ -103,6 +103,7 @@ case "${CMD}" in
         run_in_nix bash -c '
             set -Eeuo pipefail
             bash scripts/privacy-check.sh
+            python3 tools/check-process-bundle.py
             cargo fmt --all -- --check
             cargo check --all-targets --all-features --locked
             cargo test --all-targets --all-features --locked --no-fail-fast
