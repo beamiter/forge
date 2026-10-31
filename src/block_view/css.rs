@@ -465,7 +465,7 @@ pub(crate) fn block_css(config: &Config) -> String {
             font-family: {font_stack};
             font-size: {font_size};
             background-color: rgba({agent_r},{agent_g},{agent_b},0.24);
-            border-radius: 18px 18px 5px 18px;
+            border-radius: 12px;
             padding: 0 10px 0 2px;
         }}
         .term-chat-root .chat-result {{

@@ -52,6 +52,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    ui::reference_conversation::tests::user_capsules_follow_reading_edge_and_wrap_in_narrow_windows
     block_view::chat_layout_tests::chat_bubbles_keep_alignment_through_resize_and_font_changes
     ui::sidebar_tabs::layout_tests::sidebar_resize_and_vertical_scroll_keep_the_leading_edge_visible
     ui::sidebar_resize::tests::native_sidebar_drags_preserve_requests_and_input_focus

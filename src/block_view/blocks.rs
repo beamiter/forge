@@ -4213,9 +4213,9 @@ impl FinishedBlock {
             result.append(&child);
         }
         command.add_css_class("chat-command");
-        command.set_halign(gtk4::Align::End);
+        command.set_halign(gtk4::Align::Start);
         command.set_hexpand(false);
-        command.set_margin_start(36);
+        command.set_margin_start(0);
         command.set_margin_bottom(if self.is_background {
             0
         } else {
@@ -5729,7 +5729,7 @@ mod tests {
         assert_eq!(block.output_vte, output);
         assert_eq!(
             block.content.first_child().unwrap().halign(),
-            gtk4::Align::End
+            gtk4::Align::Start
         );
         assert!(block
             .content

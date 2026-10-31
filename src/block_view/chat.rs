@@ -18,11 +18,18 @@ pub(super) const fn card_extra_height(is_background: bool) -> i32 {
     SHELL_ROLE_HEIGHT_PX + if is_background { 0 } else { COMMAND_GAP_PX }
 }
 
-/// A one-line empty editor grows for everything the real shell draws,
-/// including wrapped commands and completion menus. The companion is an
-/// independently guarded overlay, never a reserved native input row.
+/// Three input rows and one breathing row share the real native editor.
+/// Grow for wrapped commands and completion menus, keeping one spare row
+/// below their extent whenever the pane has room. The companion stays an
+/// independent overlay and does not participate in this row budget.
+pub(super) const EDITOR_MIN_ROWS: i64 = 4;
+
 pub(super) fn composer_rows(input: i64, drawn: i64, viewport: i64) -> i64 {
-    input.max(drawn).clamp(1, viewport.max(1))
+    let viewport = viewport.max(1);
+    input
+        .max(drawn)
+        .saturating_add(1)
+        .clamp(EDITOR_MIN_ROWS.min(viewport), viewport)
 }
 
 pub(super) const EDITOR_MIN_HEIGHT_PX: i32 = 72;
@@ -46,17 +53,22 @@ pub(super) fn editor_height_budget(
     let cell = cell_height.max(1);
     let insets = terminal_insets.max(0);
     let available_rows = available_rows.clamp(1, i32::MAX as i64);
-    let cap = (available_height.max(0).saturating_mul(2) / 5)
-        .min(EDITOR_MAX_HEIGHT_PX)
-        .max(cell.saturating_add(insets));
-    let cap_rows = i64::from((cap.saturating_sub(insets) / cell).max(1)).min(available_rows);
     let preferred_rows = i64::from(
         EDITOR_MIN_HEIGHT_PX
             .saturating_sub(insets)
             .saturating_add(cell - 1)
             / cell,
     )
-    .max(1);
+    .max(EDITOR_MIN_ROWS);
+    // Zoom must not turn four native rows into a one-line editor. The
+    // independent canvas fraction still wins in a genuinely short pane.
+    let preferred_height = (preferred_rows as i32)
+        .saturating_mul(cell)
+        .saturating_add(insets);
+    let cap = (available_height.max(0).saturating_mul(2) / 5)
+        .min(EDITOR_MAX_HEIGHT_PX.max(preferred_height))
+        .max(cell.saturating_add(insets));
+    let cap_rows = i64::from((cap.saturating_sub(insets) / cell).max(1)).min(available_rows);
     EditorHeightBudget {
         minimum_rows: preferred_rows.min(cap_rows),
         maximum_height: (cap_rows as i32)
@@ -137,10 +149,13 @@ fn caret_scroll_value(
     lower: f64,
     upper: f64,
 ) -> f64 {
+    // Preserve a full row below the caret, but never scroll the caret itself
+    // out of a viewport too short to show both rows.
+    let clearance = caret_height.min((viewport_height - caret_height).max(0.0));
     let displacement = if caret_top < 0.0 {
         caret_top
     } else {
-        (caret_top + caret_height - viewport_height).max(0.0)
+        (caret_top + caret_height + clearance - viewport_height).max(0.0)
     };
     (current + displacement).clamp(lower, (upper - viewport_height).max(lower))
 }
@@ -588,7 +603,9 @@ impl ChatPresentation {
         let running_command = gtk4::Label::new(None);
         running_command.add_css_class("chat-command");
         running_command.set_selectable(true);
-        running_command.set_halign(gtk4::Align::End);
+        running_command.set_halign(gtk4::Align::Start);
+        running_command.set_xalign(0.0);
+        running_command.set_width_chars(1);
         running_command.set_wrap(true);
         running_command.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
         running_command.set_max_width_chars(72);
@@ -905,15 +922,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn composer_keeps_three_input_rows_and_clearance_within_the_pane() {
+        assert_eq!(composer_rows(1, 1, 40), 4);
+        assert_eq!(composer_rows(3, 1, 40), 4);
+        assert_eq!(composer_rows(7, 4, 40), 8);
+        assert_eq!(composer_rows(1, 12, 40), 13);
+        assert_eq!(composer_rows(1, i64::MAX, 40), 40);
+        assert_eq!(composer_rows(1, 1, 2), 2);
+        assert_eq!(composer_rows(1, 1, 0), 1);
+    }
+
+    #[test]
     fn real_editor_minimum_uses_native_cell_height_and_bounded_canvas_budget() {
         for cell in [13, 19, 21, 28, 42, 84] {
             for insets in [0, 2, 10] {
-                let budget = editor_height_budget(cell, insets, 40, 800);
+                let budget = editor_height_budget(cell, insets, 40, 1200);
                 let minimum = budget.minimum_rows as i32 * cell + insets;
-                assert!(minimum >= EDITOR_MIN_HEIGHT_PX);
-                assert!(minimum - cell < EDITOR_MIN_HEIGHT_PX);
+                let preferred = EDITOR_MIN_HEIGHT_PX.max(4 * cell + insets);
+                assert!(minimum >= preferred);
+                assert!(minimum - cell < preferred);
                 assert!(budget.maximum_height >= minimum);
-                assert!(budget.maximum_height <= EDITOR_MAX_HEIGHT_PX);
+                assert!(budget.maximum_height <= EDITOR_MAX_HEIGHT_PX.max(preferred));
             }
         }
         assert_eq!(
@@ -927,6 +956,8 @@ mod tests {
         assert_eq!(short.minimum_rows, 1);
         assert_eq!(short.maximum_height, 23);
         assert_eq!(editor_height_budget(21, 2, 1, 0), short);
+        // At extreme zoom a short pane takes precedence over the usual floor.
+        assert_eq!(editor_height_budget(84, 2, 20, 800).minimum_rows, 3);
         // No previous editor/dock allocation participates in either bound.
         assert_eq!(editor_height_budget(21, 0, 30, 300).maximum_height, 105);
     }
@@ -934,7 +965,7 @@ mod tests {
     #[test]
     fn bounded_editor_reveals_caret_without_changing_native_ring_or_history() {
         assert_eq!(caret_scroll_value(0.0, 10.0, 21.0, 84.0, 0.0, 300.0), 0.0);
-        assert_eq!(caret_scroll_value(0.0, 100.0, 21.0, 84.0, 0.0, 300.0), 37.0);
+        assert_eq!(caret_scroll_value(0.0, 100.0, 21.0, 84.0, 0.0, 300.0), 58.0);
         assert_eq!(
             caret_scroll_value(90.0, -21.0, 21.0, 84.0, 0.0, 300.0),
             69.0
@@ -944,6 +975,10 @@ mod tests {
             216.0
         );
         assert_eq!(caret_scroll_value(0.0, 100.0, 21.0, 84.0, 0.0, 20.0), 0.0);
+        // With room for just one row, keep that row visible rather than
+        // manufacturing clearance by scrolling its caret out of view.
+        assert_eq!(caret_scroll_value(0.0, 0.0, 21.0, 21.0, 0.0, 300.0), 0.0);
+        assert_eq!(caret_scroll_value(0.0, 21.0, 21.0, 21.0, 0.0, 300.0), 21.0);
     }
 
     #[test]
@@ -1255,6 +1290,8 @@ mod tests {
         settle();
         chat.set_running_command("printf '<long & literal command>'\nnext line");
         let command = chat.running_command.upgrade().unwrap();
+        assert_eq!(command.halign(), gtk4::Align::Start);
+        assert_eq!(command.xalign(), 0.0);
         assert_eq!(
             command.tooltip_text().as_deref(),
             Some(command.text().as_str())

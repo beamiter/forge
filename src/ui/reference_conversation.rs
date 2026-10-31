@@ -222,10 +222,8 @@ fn message_widget(message: &Message) -> gtk4::Box {
     content.set_hexpand(true);
     if message.role == Role::User {
         root.add_css_class("reference-user-message");
-        root.set_halign(gtk4::Align::End);
+        root.set_halign(gtk4::Align::Start);
         content.set_hexpand(false);
-        content.set_width_request(token::USER_BUBBLE_WIDTH as i32);
-        content.set_height_request(token::USER_BUBBLE_HEIGHT as i32);
         content.add_css_class("reference-user-bubble");
     } else {
         root.add_css_class("reference-assistant-message");
@@ -243,6 +241,7 @@ fn message_widget(message: &Message) -> gtk4::Box {
             Part::Paragraph(value) => {
                 let paragraph = text(value, "reference-message-paragraph");
                 if message.role == Role::User {
+                    paragraph.set_width_chars(1);
                     paragraph.set_max_width_chars(42);
                 }
                 content.append(&paragraph);
@@ -534,4 +533,83 @@ fn inspector_empty_card(message: &str, icon: jterm_core::reference_icons::Icon) 
     label.set_hexpand(true);
     card.append(&label);
     card
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires isolated DISPLAY; native user messages and production CSS"]
+    fn user_capsules_follow_reading_edge_and_wrap_in_narrow_windows() {
+        gtk4::init().expect("GTK display");
+        crate::ui::reference_shell::install_css();
+        let document = gtk4::Box::new(Orientation::Vertical, 21);
+        document.add_css_class("reference-rich-conversation");
+        document.set_hexpand(true);
+        let values = ["pwd".to_owned(), "LongToken界面".repeat(80)];
+        let mut rows = Vec::new();
+        for value in &values {
+            let mut message = jterm_core::reference_conversation::acceptance_fixture()
+                .messages
+                .into_iter()
+                .find(|message| message.role == Role::User)
+                .expect("fixture user message");
+            message.parts = vec![Part::Paragraph(value.clone())];
+            let row = message_widget(&message);
+            document.append(&row);
+            rows.push(row);
+        }
+        let scroll = gtk4::ScrolledWindow::new();
+        scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+        scroll.set_child(Some(&document));
+        let window = gtk4::Window::builder()
+            .default_width(900)
+            .default_height(480)
+            .child(&scroll)
+            .build();
+        window.add_css_class("reference-shell");
+        window.add_css_class("forge-window");
+        window.present();
+        for width in [900, 320, 640] {
+            window.set_default_size(width, 480);
+            for _ in 0..40 {
+                while gtk4::glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(
+                window.width() <= width + 1,
+                "user messages must not impose their old fixed width"
+            );
+            for (index, row) in rows.iter().enumerate() {
+                let bounds = row.compute_bounds(&document).expect("native message bounds");
+                assert!((bounds.x() - 8.0).abs() <= 1.0, "shared reading edge");
+                assert!(
+                    bounds.x() + bounds.width() <= document.width() as f32 + 1.0,
+                    "the complete message, including avatar, stays inside the pane"
+                );
+                let body = row.first_child().unwrap();
+                let label = body.first_child().unwrap().downcast::<gtk4::Label>().unwrap();
+                assert_eq!(label.text().as_str(), values[index].as_str());
+                assert!(
+                    !label.layout().is_ellipsized(),
+                    "messages wrap without truncation"
+                );
+                let (_, logical) = label.layout().pixel_extents();
+                assert!(
+                    logical.height() <= label.height(),
+                    "wrapped lines remain visible"
+                );
+                if index == 0 {
+                    assert!(
+                        body.width() < document.width() / 2,
+                        "short capsules stay compact"
+                    );
+                } else {
+                    assert!(label.layout().line_count() > 1, "long tokens and CJK wrap");
+                }
+            }
+        }
+        window.close();
+    }
 }

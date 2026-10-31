@@ -1,0 +1,109 @@
+name: Native conversation layout
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ui-layout-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  native-layout:
+    name: Composer and native conversation geometry
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Materialize bundled shared core
+        run: bash scripts/materialize-shared-core.sh
+
+      - name: Install GTK, VTE, and isolated display
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            pkg-config libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev \
+            libpcre2-dev dbus-x11 xauth xvfb fonts-dejavu-core fonts-noto-cjk
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Cache Cargo data
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-ui-layout-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-ui-layout-
+            ${{ runner.os }}-cargo-
+
+      - name: Compile application tests
+        run: cargo test --locked --lib --all-features --no-run
+
+      - name: Check composer budget and native message geometry
+        env:
+          GDK_BACKEND: x11
+          GSK_RENDERER: cairo
+          GTK_A11Y: none
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          set -euo pipefail
+          test_xdg_root="$(mktemp -d)"
+          trap 'rm -rf -- "$test_xdg_root"' EXIT
+          mkdir -p "$test_xdg_root"/{config,data,state,cache,runtime}
+          chmod 700 "$test_xdg_root/runtime"
+          export XDG_CONFIG_HOME="$test_xdg_root/config"
+          export XDG_DATA_HOME="$test_xdg_root/data"
+          export XDG_STATE_HOME="$test_xdg_root/state"
+          export XDG_CACHE_HOME="$test_xdg_root/cache"
+          export XDG_RUNTIME_DIR="$test_xdg_root/runtime"
+          tests=(
+            block_view::chat::tests::composer_keeps_three_input_rows_and_clearance_within_the_pane
+            block_view::chat::tests::real_editor_minimum_uses_native_cell_height_and_bounded_canvas_budget
+            block_view::chat::tests::bounded_editor_reveals_caret_without_changing_native_ring_or_history
+            block_view::developer_block::tests::block_input_rows_keep_three_lines_plus_clearance_and_follow_native_content
+            block_view::chat_layout_tests::chat_bubbles_keep_alignment_through_resize_and_font_changes
+            ui::reference_conversation::tests::user_capsules_follow_reading_edge_and_wrap_in_narrow_windows
+            block_view::chat::tests::chat_moves_only_the_native_clip_and_keeps_history_anchor
+            block_view::tests::multiline_native_caret_fits_editor_and_footer
+            block_view::tests::chat_docking_keeps_pty_rows_and_native_hit_geometry_stable
+          )
+          listed_tests="$(cargo test --locked --lib --all-features -- --list --include-ignored)"
+          failed=0
+          for test_name in "${tests[@]}"; do
+            if ! grep -Fxq "${test_name}: test" <<< "$listed_tests"; then
+              printf 'Required layout test not found: %s\n' "$test_name" >&2
+              failed=1
+              continue
+            fi
+            if ! dbus-run-session -- xvfb-run --auto-servernum \
+              cargo test --locked --lib --all-features "$test_name" \
+              -- --exact --include-ignored --test-threads=1; then
+              failed=1
+            fi
+          done
+          exit "$failed"

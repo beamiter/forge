@@ -124,7 +124,7 @@ window.forge-window.reference-shell .unified-navigation button { color: #70839f;
 window.forge-window.reference-shell .reference-rich-conversation label { font-family: "DejaVu Sans", sans-serif; font-size: 12px; color: #2c3b52; }
 window.forge-window.reference-shell .reference-rich-conversation label.reference-fixture-label { color: #7b83a0; font-size: 9px; }
 .reference-shell .reference-message-avatar { min-width: 24px; min-height: 24px; border-radius: 12px; background: #6d87eb; color: white; padding: 0; }
-.reference-shell .reference-user-message { margin: 0 11px 0 70px; }
+.reference-shell .reference-user-message { margin: 0 11px 0 8px; }
 .reference-shell .reference-user-bubble { padding: 8px 14px; border-radius: 12px; background: #d9e4fa; border: 1px solid #ccdcf6; }
 .reference-shell .reference-assistant-message { padding: 0 26px 0 8px; }
 window.forge-window.reference-shell .reference-rich-conversation label.reference-message-avatar { color: white; font-size: 12px; font-weight: 700; }
