@@ -33656,6 +33656,7 @@ mod tests {
                 }
             }
             window.close();
+            view.pty.kill();
         }
     }
 
