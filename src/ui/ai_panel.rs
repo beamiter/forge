@@ -1,7 +1,7 @@
 //! Provider-neutral multi-chat sidebar.
 //!
 //! GTK keeps one transcript and composer alive while `ChatStore` owns a
-//! bounded collection of chats. Enter and Ctrl+Enter send, Shift+Enter inserts
+//! bounded collection of chats. Ctrl+Enter sends, Enter inserts
 //! a newline, and IME candidate confirmation gets first refusal. Requests are
 //! completed against `(chat_id, epoch)`, so switching chats never redirects a
 //! background reply into the visible conversation.
@@ -121,8 +121,10 @@ fn classify_composer_key(
             | gtk4::gdk::ModifierType::META_MASK,
     ) {
         ComposerKeyAction::Proceed
-    } else {
+    } else if state.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
         ComposerKeyAction::Send
+    } else {
+        ComposerKeyAction::Newline
     }
 }
 
@@ -130,6 +132,12 @@ fn classify_composer_key(
 pub(crate) struct AiPanel {
     pub(crate) root: GBox,
     store: Rc<RefCell<ChatStore>>,
+    shared: Rc<RefCell<super::workspace_chats::SharedChats>>,
+    pending_shared: Rc<RefCell<HashMap<u64, (RequestPayload, bool)>>>,
+    pending_new_context: Rc<RefCell<HashMap<u64, RequestPayload>>>,
+    earlier_history: Rc<RefCell<HashMap<u64, String>>>,
+    scroll_owner: Rc<Cell<u64>>,
+    scroll_positions: Rc<RefCell<HashMap<u64, f64>>>,
     content_stack: Stack,
     library_btn: Button,
     new_chat_btn: Button,
@@ -201,18 +209,22 @@ impl AiPanel {
         header_text.append(&header_meta);
         header_text.set_hexpand(true);
 
-        let new_chat_btn = Button::with_label("New chat");
+        let new_chat_btn = Button::from_icon_name("list-add-symbolic");
         new_chat_btn.set_tooltip_text(Some("Create a new chat and keep existing chats"));
         new_chat_btn.set_focus_on_click(false);
         new_chat_btn.add_css_class("flat");
         new_chat_btn.add_css_class("ai-chat-header-button");
 
+        let earlier_btn = menu_button("Load earlier messages");
+        let reload_btn = menu_button("Reload shared history · keep draft");
         let rename_chat_btn = menu_button("Rename");
         let archive_chat_btn = menu_button("Archive");
         let delete_chat_btn = menu_button("Delete");
         delete_chat_btn.add_css_class("destructive-action");
         let actions_box = GBox::new(Orientation::Vertical, 0);
         actions_box.add_css_class("menu");
+        actions_box.append(&earlier_btn);
+        actions_box.append(&reload_btn);
         actions_box.append(&rename_chat_btn);
         actions_box.append(&archive_chat_btn);
         actions_box.append(&delete_chat_btn);
@@ -236,6 +248,8 @@ impl AiPanel {
         close_btn.add_css_class("flat");
         close_btn.add_css_class("ai-chat-header-button");
 
+        // Unified workspace sidebar owns conversation navigation.
+        library_btn.set_visible(false);
         header.append(&library_btn);
         header.append(&header_text);
         header.append(&new_chat_btn);
@@ -389,8 +403,8 @@ impl AiPanel {
         send_btn.set_valign(gtk4::Align::Center);
         send_btn.add_css_class("suggested-action");
         send_btn.add_css_class("ai-send-button");
-        send_btn.set_tooltip_text(Some("Send (Enter / Ctrl+Enter) · New line (Shift+Enter)"));
-        let input_hint = Label::new(Some("Enter to send · Shift+Enter for new line"));
+        send_btn.set_tooltip_text(Some("Send (Ctrl+Enter) · New line (Enter)"));
+        let input_hint = Label::new(Some("Enter for new line · Ctrl+Enter to send"));
         input_hint.set_halign(gtk4::Align::Start);
         input_hint.set_hexpand(true);
         input_hint.add_css_class("ai-input-hint");
@@ -452,7 +466,7 @@ impl AiPanel {
 
         let root = GBox::new(Orientation::Vertical, 0);
         root.add_css_class("ai-panel");
-        root.set_hexpand(false);
+        root.set_hexpand(true);
         root.set_vexpand(true);
         root.append(&header);
         root.append(&content_stack);
@@ -460,6 +474,19 @@ impl AiPanel {
         let panel = Self {
             root,
             store: Rc::new(RefCell::new(new_store())),
+            shared: Rc::new(RefCell::new(super::workspace_chats::SharedChats::new(
+                format!(
+                    "forge:{}",
+                    crate::state::tabs_state_file_path()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|_| format!("window-{}", std::process::id()))
+                ),
+            ))),
+            pending_shared: Rc::new(RefCell::new(HashMap::new())),
+            pending_new_context: Rc::new(RefCell::new(HashMap::new())),
+            earlier_history: Rc::new(RefCell::new(HashMap::new())),
+            scroll_owner: Rc::new(Cell::new(0)),
+            scroll_positions: Rc::new(RefCell::new(HashMap::new())),
             content_stack,
             library_btn: library_btn.clone(),
             new_chat_btn: new_chat_btn.clone(),
@@ -656,8 +683,83 @@ impl AiPanel {
             library_page.add_controller(key);
         }
 
+        {
+            let panel = panel.clone();
+            earlier_btn.connect_clicked(move |_| {
+                let local = panel.store.borrow().active_id();
+                let result = panel.shared.borrow_mut().history(local);
+                if let Err(error) = result {
+                    panel.show_info_status(&error);
+                }
+                panel.actions_popover.popdown();
+            });
+        }
+        {
+            let panel = panel.clone();
+            reload_btn.connect_clicked(move |_| {
+                let local = panel.store.borrow().active_id();
+                let result = panel.shared.borrow_mut().reload(local);
+                if let Err(error) = result {
+                    panel.show_info_status(&error);
+                }
+                panel.actions_popover.popdown();
+            });
+        }
         panel.render_active_chat();
         panel
+    }
+
+    pub(crate) fn workspace_rows(&self, visible: bool) -> Vec<super::workspace_navigation::Row> {
+        use super::workspace_navigation::{Action, Row};
+        let summaries = self.store.borrow().summaries();
+        let shared = self.shared.borrow();
+        let mut rows = shared
+            .rows
+            .iter()
+            .map(|row| {
+                let state = shared
+                    .local_id(&row.id)
+                    .and_then(|id| summaries.iter().find(|chat| chat.id == id));
+                Row {
+                    action: Action::SharedApi(row.id.clone()),
+                    title: format!("{}{}", if row.pinned { "★ " } else { "" }, row.title),
+                    detail: "API conversation".into(),
+                    searchable: row.preview.clone(),
+                    active: visible && state.is_some_and(|s| s.active),
+                    busy: row.runtime.is_live() || state.is_some_and(|s| s.busy),
+                    attention: state.is_some_and(|s| s.unread || s.error),
+                    archived: row.archived,
+                    pinned: row.pinned,
+                    project: row.cwd.clone(),
+                    provider: row.provider.clone(),
+                    updated: row.updated_at_ms,
+                }
+            })
+            .collect::<Vec<_>>();
+        rows.extend(
+            summaries
+                .into_iter()
+                .filter(|chat| !shared.is_shared(chat.id))
+                .map(|chat| Row {
+                    action: Action::Api(chat.id),
+                    title: chat.title,
+                    detail: if chat.preview == "Empty conversation" {
+                        "API draft".into()
+                    } else {
+                        "API conversation · syncing".into()
+                    },
+                    searchable: chat.preview,
+                    active: visible && chat.active,
+                    busy: chat.busy,
+                    attention: chat.unread || chat.error,
+                    archived: chat.archived,
+                    pinned: false,
+                    project: String::new(),
+                    provider: "API".into(),
+                    updated: 0,
+                }),
+        );
+        rows
     }
 
     pub(crate) fn refresh_config_display(&self) {
@@ -696,6 +798,9 @@ impl AiPanel {
             return;
         };
         *self.store.borrow_mut() = restore_store(snapshot);
+        self.shared
+            .borrow_mut()
+            .restore_legacy_sources(&self.store.borrow());
         let count = self.store.borrow().len();
         self.store.borrow_mut().set_active_info(format!(
             "Restored {count} chat{} for this window.",
@@ -711,6 +816,7 @@ impl AiPanel {
         let mut store = self.store.borrow_mut();
         for (token, request) in requests {
             request.cancellation.cancel();
+            let _ = self.shared.borrow_mut().finish(token, Err(()));
             cancellations.push(request.cancellation);
             let _ = store.cancel_request(
                 token,
@@ -761,6 +867,7 @@ impl AiPanel {
             return;
         };
         request.cancellation.cancel();
+        let _ = self.shared.borrow_mut().finish(token, Err(()));
         let owner_active = self
             .store
             .borrow_mut()
@@ -848,26 +955,142 @@ impl AiPanel {
         }
     }
 
-    fn create_new_chat(&self) {
-        let result = self.store.borrow_mut().new_chat();
-        match result {
-            Ok(_) => {
-                self.store.borrow_mut().clear_active_status();
-                self.render_active_chat();
-                self.publish_persisted_conversation();
-                self.show_chat_page();
-            }
-            Err(ChatStoreError::LimitReached) => {
-                self.show_chat_page();
-                self.show_error_status(
-                    "Chat limit reached. Delete a chat before creating another one.",
-                );
-            }
-            Err(_) => {}
+    pub(crate) fn create_new_chat(&self) {
+        if let Err(error) = self.shared.borrow_mut().create() {
+            self.show_error_status(&error);
         }
     }
 
-    fn select_chat(&self, id: u64) {
+    pub(crate) fn shared_mutation(&self, command: jterm_core::agent_workspace::WorkspaceCommand) {
+        let result = self.shared.borrow_mut().mutation(command);
+        if let Err(error) = result {
+            self.show_error_status(&error);
+        }
+    }
+
+    pub(crate) fn open_shared(&self, id: jterm_core::agent_workspace::ConversationId) {
+        let result = self.shared.borrow_mut().open(id);
+        match result {
+            Ok(Some(id)) => self.select_chat(id),
+            Ok(None) => self.show_info_status("Opening conversation…"),
+            Err(error) => self.show_error_status(&error),
+        }
+    }
+
+    pub(crate) fn poll_workspace(&self) {
+        let redact = self.config.borrow().ai_redact_secrets;
+        let events = self
+            .shared
+            .borrow_mut()
+            .poll(&mut self.store.borrow_mut(), redact);
+        for event in events {
+            match event {
+                super::workspace_chats::Event::Created {
+                    request,
+                    chat_id: _,
+                } => {
+                    let payload = self.pending_new_context.borrow_mut().remove(&request);
+                    if let Some(payload) = payload {
+                        self.send_with_context(payload.user_text, payload.context, false, false);
+                    }
+                    self.render_active_chat();
+                    self.publish_persisted_conversation();
+                }
+                super::workspace_chats::Event::Opened(_) => {
+                    self.render_active_chat();
+                    self.publish_persisted_conversation();
+                }
+                super::workspace_chats::Event::Authorized {
+                    request,
+                    chat_id,
+                    receipt,
+                } => {
+                    let pending = self.pending_shared.borrow_mut().remove(&request);
+                    let Some((payload, clear)) = pending else {
+                        self.shared.borrow_mut().reject_receipt(chat_id, receipt);
+                        continue;
+                    };
+                    let active = self.store.borrow().active_id();
+                    if active != chat_id && !self.store.borrow_mut().select_chat(chat_id) {
+                        self.shared.borrow_mut().reject_receipt(chat_id, receipt);
+                        continue;
+                    }
+                    let draft = self.store.borrow().active_draft().to_string();
+                    let draft = if redact {
+                        crate::redact::redact_secrets(&draft)
+                    } else {
+                        draft
+                    };
+                    let clear = clear && draft.trim() == payload.user_text.trim();
+                    // No focus transfer occurs while the owner is selected for
+                    // reducer mutation. Restore the visible chat before GTK draws.
+                    self.render_active_chat();
+                    if !self.send_with_context_authorized(
+                        payload.user_text,
+                        payload.context,
+                        payload.restore_pending_as_draft,
+                        clear,
+                        receipt.clone(),
+                    ) {
+                        self.shared.borrow_mut().reject_receipt(chat_id, receipt);
+                    }
+                    self.store.borrow_mut().select_chat(active);
+                    self.render_active_chat();
+                }
+                super::workspace_chats::Event::Rejected { request, message } => {
+                    self.pending_shared.borrow_mut().remove(&request);
+                    self.show_error_status(&message);
+                }
+                super::workspace_chats::Event::Deleted(id) => {
+                    let active = self.store.borrow().active_id();
+                    if active == id || self.store.borrow_mut().select_chat(id) {
+                        let _ = self.store.borrow_mut().delete_active();
+                    }
+                    if active != id {
+                        self.store.borrow_mut().select_chat(active);
+                    }
+                    self.earlier_history.borrow_mut().remove(&id);
+                    self.retry_payloads.borrow_mut().remove(&id);
+                    self.render_active_chat();
+                    self.publish_persisted_conversation();
+                }
+                super::workspace_chats::Event::Earlier { chat_id, text } => {
+                    {
+                        let mut history = self.earlier_history.borrow_mut();
+                        if history.len() >= 8 && !history.contains_key(&chat_id) {
+                            if let Some(id) = history.keys().next().copied() {
+                                history.remove(&id);
+                            }
+                        }
+                        let earlier = history.entry(chat_id).or_default();
+                        *earlier = format!("{text}{earlier}");
+                        if earlier.len() > 1024 * 1024 {
+                            let mut end = 1024 * 1024;
+                            while !earlier.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            earlier.truncate(end);
+                        }
+                    }
+                    if self.store.borrow().active_id() == chat_id {
+                        self.render_active_chat();
+                        let view = self.convo_view.clone();
+                        glib::idle_add_local_once(move || {
+                            let mut start = view.buffer().start_iter();
+                            view.scroll_to_iter(&mut start, 0.0, false, 0.0, 0.0);
+                        });
+                    }
+                }
+                super::workspace_chats::Event::Error(error) => {
+                    if !self.store.borrow().is_active_busy() {
+                        self.show_info_status(&format!("Shared workspace: {error}"));
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn select_chat(&self, id: u64) {
         let selected = self.store.borrow_mut().select_chat(id);
         if selected {
             self.render_active_chat();
@@ -918,6 +1141,7 @@ impl AiPanel {
     }
 
     fn show_delete_chat_dialog(&self) {
+        let confirmed_chat_id = self.store.borrow().active_id();
         let title = self.store.borrow().active_title().to_string();
         let title = jterm_core::review_input::safe_inline_display(&title, 1024);
         let dialog = adw::AlertDialog::new(
@@ -936,6 +1160,10 @@ impl AiPanel {
             if response != "delete" {
                 return;
             }
+            if p.store.borrow().active_id() != confirmed_chat_id {
+                p.show_info_status("The selected conversation changed. Confirm deletion again for this conversation.");
+                return;
+            }
             let (deleted_id, token) = {
                 let store = p.store.borrow();
                 (store.active_id(), store.active_request_token())
@@ -943,11 +1171,17 @@ impl AiPanel {
             if let Some(token) = token {
                 if let Some(request) = p.requests.borrow_mut().remove(&token) {
                     request.cancellation.cancel();
+                    let _ = p.shared.borrow_mut().finish(token, Err(()));
                 }
                 let _ = p
                     .store
                     .borrow_mut()
                     .cancel_request(token, "Chat deleted.".to_string());
+            }
+            match p.shared.borrow_mut().delete(deleted_id) {
+                Ok(true) => { p.show_info_status("Deleting the shared conversation…"); return; }
+                Ok(false) => {},
+                Err(error) => { p.show_error_status(&error); return; }
             }
             p.retry_payloads.borrow_mut().remove(&deleted_id);
             // Deletion cannot be refused under forge's busy policy (the
@@ -1105,6 +1339,41 @@ impl AiPanel {
     }
 
     fn render_active_chat(&self) {
+        let active = self.store.borrow().active_id();
+        let previous = self.scroll_owner.replace(active);
+        let adjustment = self.convo_scroll.vadjustment();
+        let bottom = (adjustment.upper() - adjustment.page_size()).max(0.0);
+        let follows = adjustment.value() >= bottom - 24.0;
+        let value = adjustment.value();
+        if previous != 0 {
+            if follows {
+                self.scroll_positions.borrow_mut().remove(&previous);
+            } else {
+                self.scroll_positions.borrow_mut().insert(previous, value);
+            }
+            if previous != active {
+                self.shared
+                    .borrow_mut()
+                    .save_position(previous, if bottom > 0.0 { value / bottom } else { 1.0 });
+            }
+        }
+        let restore = if previous == active {
+            (!follows).then_some((false, value))
+        } else {
+            self.scroll_positions
+                .borrow()
+                .get(&active)
+                .copied()
+                .map(|value| (false, value))
+                .or_else(|| {
+                    self.shared
+                        .borrow()
+                        .read_position(active)
+                        .filter(|ratio| *ratio < 0.99)
+                        .map(|ratio| (true, ratio))
+                })
+        };
+
         // A full re-render rebuilds the transcript from the store, including
         // the in-flight reply's streamed text: a chat switched away and back
         // shows what has already arrived instead of an empty gap until the
@@ -1122,7 +1391,14 @@ impl AiPanel {
                 streaming,
             )
         };
-        self.convo_buffer.set_text("");
+        let active = self.store.borrow().active_id();
+        self.convo_buffer.set_text(
+            self.earlier_history
+                .borrow()
+                .get(&active)
+                .map(String::as_str)
+                .unwrap_or(""),
+        );
         for turn in history {
             match turn.role {
                 Role::User => self.insert_visible("You", "role-user", &turn.text),
@@ -1140,7 +1416,24 @@ impl AiPanel {
         self.sync_active_status();
         self.refresh_chat_chrome();
         self.refresh_chat_library();
-        self.scroll_transcript_to_end();
+        if let Some((ratio, position)) = restore {
+            let scroll = self.convo_scroll.clone();
+            let owner = self.scroll_owner.clone();
+            glib::idle_add_local_once(move || {
+                if owner.get() != active {
+                    return;
+                }
+                let adjustment = scroll.vadjustment();
+                let bottom = (adjustment.upper() - adjustment.page_size()).max(0.0);
+                adjustment.set_value(if ratio {
+                    position * bottom
+                } else {
+                    position.min(bottom)
+                });
+            });
+        } else {
+            self.scroll_transcript_to_end();
+        }
     }
 
     fn sync_empty_state(&self) {
@@ -1574,14 +1867,21 @@ impl AiPanel {
 
     pub(crate) fn ask_about_block(&self, ctx: BlockContext, intent: ai::BlockAiIntent) {
         if self.store.borrow().active_archived() {
-            if self.store.borrow_mut().new_chat().is_err() {
-                self.show_error_status(
-                    "Unarchive this chat or delete another chat before asking about a Block.",
-                );
-                return;
+            let payload = RequestPayload {
+                user_text: ai::seeded_block_question(intent, ctx.exit_code).into(),
+                context: Some(ctx),
+                restore_pending_as_draft: false,
+            };
+            let result = self.shared.borrow_mut().create();
+            match result {
+                Ok(request) => {
+                    self.pending_new_context
+                        .borrow_mut()
+                        .insert(request, payload);
+                }
+                Err(error) => self.show_error_status(&error),
             }
-            self.render_active_chat();
-            self.publish_persisted_conversation();
+            return;
         }
         if self.store.borrow().is_active_busy() {
             self.sync_active_status();
@@ -1600,6 +1900,54 @@ impl AiPanel {
         context: Option<BlockContext>,
         restore_pending_as_draft: bool,
         clear_composer_on_start: bool,
+    ) -> bool {
+        if !self.config.borrow().ai_enabled {
+            self.show_error_status("Enable AI in Settings before sending a message.");
+            return false;
+        }
+        if user_text.trim().is_empty() || self.store.borrow().is_active_busy() {
+            return false;
+        }
+        let user_text = if self.config.borrow().ai_redact_secrets {
+            crate::redact::redact_secrets(&user_text)
+        } else {
+            user_text
+        };
+        let local = self.store.borrow().active_id();
+        let result =
+            self.shared
+                .borrow_mut()
+                .prepare(local, user_text.clone(), clear_composer_on_start);
+        match result {
+            Ok(request) => {
+                self.pending_shared.borrow_mut().insert(
+                    request,
+                    (
+                        RequestPayload {
+                            user_text,
+                            context,
+                            restore_pending_as_draft,
+                        },
+                        clear_composer_on_start,
+                    ),
+                );
+                self.show_info_status("Saving the draft and preparing this conversation…");
+                true
+            }
+            Err(error) => {
+                self.show_error_status(&error);
+                false
+            }
+        }
+    }
+
+    fn send_with_context_authorized(
+        &self,
+        user_text: String,
+        context: Option<BlockContext>,
+        restore_pending_as_draft: bool,
+        clear_composer_on_start: bool,
+        receipt: jterm_core::agent_workspace::SubmissionReceipt,
     ) -> bool {
         let (user_text, context) = {
             let config = self.config.borrow();
@@ -1677,6 +2025,7 @@ impl AiPanel {
             );
         }
         let token = start.token;
+        self.shared.borrow_mut().attach(token, receipt);
         let cancellation = ai::AiCancellationToken::new();
         self.requests.borrow_mut().insert(
             token,
@@ -1762,6 +2111,15 @@ impl AiPanel {
                         return glib::ControlFlow::Break;
                     }
                     let owner_active = p.store.borrow_mut().complete_success(token, text);
+                    if owner_active.is_some() {
+                        let _ = p.shared.borrow_mut().complete(
+                            token,
+                            &p.store.borrow(),
+                            p.config.borrow().ai_redact_secrets,
+                        );
+                    } else {
+                        let _ = p.shared.borrow_mut().finish(token, Err(()));
+                    }
                     let Some(owner_active) = owner_active else {
                         return glib::ControlFlow::Break;
                     };
@@ -1820,6 +2178,7 @@ impl AiPanel {
     }
 
     fn finish_request_error(&self, token: RequestToken, message: String, keep_shown_partial: bool) {
+        let _ = self.shared.borrow_mut().finish(token, Err(()));
         let Some(request) = self.requests.borrow_mut().remove(&token) else {
             return;
         };
@@ -1938,7 +2297,11 @@ mod tests {
         use gtk4::gdk::{Key, ModifierType};
 
         let cases = [
-            (Key::Return, ModifierType::empty(), ComposerKeyAction::Send),
+            (
+                Key::Return,
+                ModifierType::empty(),
+                ComposerKeyAction::Newline,
+            ),
             (
                 Key::Return,
                 ModifierType::CONTROL_MASK,

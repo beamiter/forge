@@ -120,6 +120,8 @@ pub(crate) struct DiffSync {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActionKind {
     StartNative,
+    RecentHistory,
+    EarlierHistory,
     StartTerminal,
     FocusTerminal,
     FocusValidation,
@@ -202,8 +204,10 @@ fn primary_task_action(detail: &TaskDetailSync) -> Option<(ActionKind, String)> 
     Some((kind, label.to_string()))
 }
 
-const ACTION_KINDS: [(ActionKind, &str); 12] = [
+const ACTION_KINDS: [(ActionKind, &str); 14] = [
     (ActionKind::StartNative, "Start provider"),
+    (ActionKind::RecentHistory, "Recent history"),
+    (ActionKind::EarlierHistory, "Load earlier"),
     (ActionKind::StartTerminal, "Start terminal"),
     (ActionKind::FocusTerminal, "Agent terminal"),
     (ActionKind::FocusValidation, "Validation output"),
@@ -368,7 +372,7 @@ pub(crate) struct TasksPanel {
     diff_view: TextView,
     follow_up_hint: Label,
     follow_up_row: GBox,
-    follow_up_entry: Entry,
+    follow_up_entry: TextView,
     follow_up_send: Button,
 }
 
@@ -742,13 +746,25 @@ impl TasksPanel {
 
         let follow_up_row = GBox::new(gtk4::Orientation::Horizontal, 4);
         follow_up_row.set_visible(false);
-        let follow_up_entry = Entry::new();
+        let follow_up_entry = TextView::new();
         follow_up_entry.set_hexpand(true);
-        follow_up_entry.set_placeholder_text(Some("Follow-up turn for the Agent…"));
-        follow_up_row.append(&follow_up_entry);
+        follow_up_entry.set_wrap_mode(gtk4::WrapMode::WordChar);
+        follow_up_entry.set_top_margin(8);
+        follow_up_entry.set_bottom_margin(8);
+        follow_up_entry.set_left_margin(8);
+        follow_up_entry.set_right_margin(8);
+        follow_up_entry.add_css_class("ai-panel-input");
+        follow_up_entry.set_tooltip_text(Some("Enter for a new line · Ctrl+Enter to send"));
+        let follow_up_scroll = ScrolledWindow::new();
+        follow_up_scroll.set_hexpand(true);
+        follow_up_scroll.set_min_content_height(76);
+        follow_up_scroll.set_max_content_height(150);
+        follow_up_scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+        follow_up_scroll.set_child(Some(&follow_up_entry));
+        follow_up_row.append(&follow_up_scroll);
         let follow_up_send = Button::from_icon_name("go-next-symbolic");
         follow_up_send.add_css_class("flat");
-        follow_up_send.set_tooltip_text(Some("Send follow-up turn"));
+        follow_up_send.set_tooltip_text(Some("Send follow-up turn (Ctrl+Enter)"));
         follow_up_row.append(&follow_up_send);
         detail_box.append(&follow_up_row);
 
@@ -823,6 +839,12 @@ impl TasksPanel {
         panel.build_action_buttons();
         panel.connect_signals();
         panel
+    }
+
+    pub(crate) fn reveal_workspace_task(&self, archived: bool) {
+        self.dashboard_clear.emit_clicked();
+        self.filters.borrow_mut().hidden = archived;
+        self.apply_dashboard_filters();
     }
 
     fn build_action_buttons(&self) {
@@ -1086,22 +1108,49 @@ impl TasksPanel {
         });
 
         let panel = self.clone();
-        self.follow_up_entry.connect_changed(move |entry| {
+        self.follow_up_entry.buffer().connect_changed(move |entry| {
             if panel.follow_up_guard.get() {
                 return;
             }
             let selected = panel.state.borrow().selected;
             if let Some(id) = selected {
-                panel
-                    .follow_up_drafts
-                    .borrow_mut()
-                    .insert(id, entry.text().to_string());
+                panel.follow_up_drafts.borrow_mut().insert(
+                    id,
+                    entry
+                        .text(&entry.start_iter(), &entry.end_iter(), true)
+                        .to_string(),
+                );
                 panel.refresh_follow_up_send();
             }
         });
         let panel = self.clone();
-        self.follow_up_entry
-            .connect_activate(move |_| panel.send_follow_up());
+        let editor = self.follow_up_entry.clone();
+        let keys = gtk4::EventControllerKey::new();
+        keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        keys.connect_key_pressed(move |controller, key, _, modifiers| {
+            if matches!(key, gtk4::gdk::Key::Return | gtk4::gdk::Key::KP_Enter)
+                && modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
+                && !modifiers.intersects(
+                    gtk4::gdk::ModifierType::SHIFT_MASK
+                        | gtk4::gdk::ModifierType::ALT_MASK
+                        | gtk4::gdk::ModifierType::SUPER_MASK
+                        | gtk4::gdk::ModifierType::META_MASK,
+                )
+            {
+                if controller
+                    .current_event()
+                    .as_ref()
+                    .is_some_and(|event| editor.im_context_filter_keypress(event))
+                {
+                    return gtk4::glib::Propagation::Stop;
+                }
+                panel.send_follow_up();
+                gtk4::glib::Propagation::Stop
+            } else {
+                gtk4::glib::Propagation::Proceed
+            }
+        });
+        self.follow_up_entry.add_controller(keys);
         let panel = self.clone();
         self.follow_up_send
             .connect_clicked(move |_| panel.send_follow_up());
@@ -1148,6 +1197,8 @@ impl TasksPanel {
         };
         let action = match kind {
             ActionKind::StartNative => TaskPanelAction::StartNative(id),
+            ActionKind::RecentHistory => TaskPanelAction::LoadNativeHistory(id, true),
+            ActionKind::EarlierHistory => TaskPanelAction::LoadNativeHistory(id, false),
             ActionKind::StartTerminal => TaskPanelAction::StartTerminal(id),
             ActionKind::FocusTerminal => TaskPanelAction::FocusTerminal(id),
             ActionKind::FocusValidation => TaskPanelAction::FocusValidation(id),
@@ -1471,6 +1522,21 @@ impl TasksPanel {
         for (kind, button) in self.action_buttons.borrow().iter() {
             let sensitive = detail.is_some_and(|detail| match kind {
                 ActionKind::StartNative => detail.can_start_native,
+                ActionKind::RecentHistory => {
+                    detail.provider == crate::agent_task::AgentProvider::Codex
+                        && detail.can_finish
+                        && detail
+                            .stream
+                            .as_ref()
+                            .is_some_and(|view| !view.history_loading)
+                }
+                ActionKind::EarlierHistory => {
+                    detail.provider == crate::agent_task::AgentProvider::Codex
+                        && detail.can_finish
+                        && detail.stream.as_ref().is_some_and(|view| {
+                            !view.history_loading && view.history_cursor.is_some()
+                        })
+                }
                 ActionKind::StartTerminal => detail.can_start_terminal,
                 ActionKind::FocusTerminal => detail.can_focus_terminal,
                 ActionKind::FocusValidation => detail.can_focus_validation,
@@ -1493,6 +1559,11 @@ impl TasksPanel {
                 ));
             }
             let visible = detail.is_some_and(|detail| match kind {
+                ActionKind::RecentHistory | ActionKind::EarlierHistory => {
+                    detail.provider == crate::agent_task::AgentProvider::Codex
+                        && detail.stream.is_some()
+                        && !detail.archived
+                }
                 ActionKind::Complete => !detail.manual_review && !detail.archived,
                 ActionKind::AcceptReviewed => detail.manual_review && !detail.archived,
                 ActionKind::Archive => !detail.archived,
@@ -1564,11 +1635,10 @@ impl TasksPanel {
             }
 
             self.follow_up_row.set_visible(detail.can_follow_up);
-            let placeholder = format!("Follow-up turn for {}…", detail.provider.display_name());
-            if self.follow_up_entry.placeholder_text().as_deref() != Some(placeholder.as_str()) {
-                self.follow_up_entry
-                    .set_placeholder_text(Some(&placeholder));
-            }
+            self.follow_up_entry.set_tooltip_text(Some(&format!(
+                "Follow-up turn for {} · Enter for a new line · Ctrl+Enter to send",
+                detail.provider.display_name()
+            )));
             let receipts = self.follow_up_receipts.borrow();
             let error = receipts.error(detail.id);
             let hint = error.unwrap_or(&detail.follow_up_hint);
@@ -1587,9 +1657,19 @@ impl TasksPanel {
                 .get(&detail.id)
                 .cloned()
                 .unwrap_or_default();
-            if self.follow_up_entry.text().as_str() != draft {
+            if self
+                .follow_up_entry
+                .buffer()
+                .text(
+                    &self.follow_up_entry.buffer().start_iter(),
+                    &self.follow_up_entry.buffer().end_iter(),
+                    true,
+                )
+                .as_str()
+                != draft
+            {
                 let guard = self.follow_up_guard.replace(true);
-                self.follow_up_entry.set_text(&draft);
+                self.follow_up_entry.buffer().set_text(&draft);
                 self.follow_up_guard.set(guard);
             }
         }

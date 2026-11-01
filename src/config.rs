@@ -3068,13 +3068,11 @@ fn resolve_file_config(
     let agent_enabled = env_bool("FORGE_AGENT_ENABLED")
         .or(fc.agent_enabled)
         .unwrap_or(true);
-    // Fail-closed by design: the contained-agent surface and the sharing
-    // of terminal evidence with a provider both stay off until the user
-    // opts in (ember's `experimental_task_sidebar` /
-    // `ai_share_command_context` defaults).
+    // The task workspace is discoverable by default. Starting an agent
+    // remains an explicit action, and sharing terminal context stays opt-in.
     let agent_tasks_enabled = env_bool("FORGE_AGENT_TASKS_ENABLED")
         .or(fc.agent_tasks_enabled)
-        .unwrap_or(false);
+        .unwrap_or(true);
     let ai_share_command_context = env_bool("FORGE_AI_SHARE_COMMAND_CONTEXT")
         .or(fc.ai_share_command_context)
         .unwrap_or(false);

@@ -150,6 +150,7 @@ fn task_control_center_preserves_search_action_identity_and_rejected_drafts() {
     drain();
     panel
         .follow_up_entry
+        .buffer()
         .set_text("Keep this instruction if the session closes");
     drain();
     panel.follow_up_send.emit_clicked();
@@ -161,13 +162,13 @@ fn task_control_center_preserves_search_action_identity_and_rejected_drafts() {
     assert_eq!(request.task_id, task);
     assert_eq!(panel.follow_up_drafts.borrow()[&task], request.text);
     assert!(!panel.follow_up_send.is_sensitive());
-    panel.follow_up_entry.set_text("");
+    panel.follow_up_entry.buffer().set_text("");
     drain();
     assert!(
         !panel.primary_action.is_visible(),
         "a pending follow-up must not recommend finishing the session"
     );
-    panel.follow_up_entry.set_text(&request.text);
+    panel.follow_up_entry.buffer().set_text(&request.text);
     drain();
     panel.follow_up_send.emit_clicked();
     drain();
@@ -180,7 +181,18 @@ fn task_control_center_preserves_search_action_identity_and_rejected_drafts() {
         Err("Session closed; draft retained".into()),
     );
     drain();
-    assert_eq!(panel.follow_up_entry.text().as_str(), request.text);
+    assert_eq!(
+        panel
+            .follow_up_entry
+            .buffer()
+            .text(
+                &panel.follow_up_entry.buffer().start_iter(),
+                &panel.follow_up_entry.buffer().end_iter(),
+                true
+            )
+            .as_str(),
+        request.text
+    );
     assert!(panel.follow_up_send.is_sensitive());
     assert!(panel.follow_up_hint.label().contains("Session closed"));
 
@@ -192,6 +204,7 @@ fn task_control_center_preserves_search_action_identity_and_rejected_drafts() {
     };
     panel
         .follow_up_entry
+        .buffer()
         .set_text("New correction typed while submitting");
     drain();
     panel.resolve_follow_up(request, Ok(()));
@@ -203,7 +216,15 @@ fn task_control_center_preserves_search_action_identity_and_rejected_drafts() {
     panel.resolve_follow_up(retry, Ok(()));
     drain();
     assert_eq!(
-        panel.follow_up_entry.text().as_str(),
+        panel
+            .follow_up_entry
+            .buffer()
+            .text(
+                &panel.follow_up_entry.buffer().start_iter(),
+                &panel.follow_up_entry.buffer().end_iter(),
+                true
+            )
+            .as_str(),
         "New correction typed while submitting"
     );
     assert!(panel.follow_up_send.is_sensitive());
@@ -221,7 +242,7 @@ fn task_control_center_preserves_search_action_identity_and_rejected_drafts() {
         !panel.primary_action.is_visible(),
         "an unsent draft must not recommend finishing the session"
     );
-    panel.follow_up_entry.set_text("");
+    panel.follow_up_entry.buffer().set_text("");
     drain();
     assert!(panel.primary_action.is_visible());
     assert!(!panel.actions_expander.is_expanded());
@@ -251,6 +272,7 @@ fn task_control_center_preserves_search_action_identity_and_rejected_drafts() {
     }
     panel
         .follow_up_entry
+        .buffer()
         .set_text("New correction typed while submitting");
     drain();
     assert!(!panel.primary_action.is_visible());
@@ -260,11 +282,27 @@ fn task_control_center_preserves_search_action_identity_and_rejected_drafts() {
     sync.detail.as_mut().unwrap().id = other;
     panel.sync(sync);
     drain();
-    assert!(panel.follow_up_entry.text().is_empty());
+    assert!(panel
+        .follow_up_entry
+        .buffer()
+        .text(
+            &panel.follow_up_entry.buffer().start_iter(),
+            &panel.follow_up_entry.buffer().end_iter(),
+            true
+        )
+        .is_empty());
     panel.sync(original);
     drain();
     assert_eq!(
-        panel.follow_up_entry.text().as_str(),
+        panel
+            .follow_up_entry
+            .buffer()
+            .text(
+                &panel.follow_up_entry.buffer().start_iter(),
+                &panel.follow_up_entry.buffer().end_iter(),
+                true
+            )
+            .as_str(),
         "New correction typed while submitting"
     );
     assert!(actions.borrow().is_empty());

@@ -123,6 +123,7 @@ pub(crate) enum TaskPanelAction {
     ComposeProject,
     CreateProject(TaskProjectRequest),
     StartNative(TaskId),
+    LoadNativeHistory(TaskId, bool),
     StartTerminal(TaskId),
     FocusTerminal(TaskId),
     FocusValidation(TaskId),
@@ -598,6 +599,24 @@ pub(crate) fn render_stream_text(
             "\n({} oldest turns elided by the retained-history budget)",
             snapshot.dropped_turns
         ));
+    }
+    if !snapshot.persisted_history.is_empty() {
+        out.push_str("\n\nProvider history · read only\n");
+        for turn in snapshot.persisted_history.iter() {
+            push_bounded(
+                &mut out,
+                &format!(
+                    "\n— {} · {} —\nYou: {}\nAssistant: {}\n",
+                    turn.provider_turn_id, turn.status, turn.user_text, turn.agent_text
+                ),
+            );
+            if out.truncated {
+                break;
+            }
+        }
+    }
+    if snapshot.history_loading {
+        out.push_str("\nLoading provider history…\n");
     }
     for turn in snapshot.turn_history.iter() {
         out.push_str(&format!("\n\n— turn {} —", turn.ordinal));

@@ -609,25 +609,9 @@ impl UiState {
                 self.ask_ai_about_selected_block();
             }
             Action::OpenAgentSessions => {
-                let owner = self.unified_navigation_owner.borrow().clone();
-                super::agent_sessions::show(
-                    &self.window,
-                    current_terminal
-                        .as_ref()
-                        .and_then(terminal_working_directory)
-                        .map(PathBuf::from),
-                    self.agent_session_library.clone(),
-                    self.agent_session_tabs.borrow().keys().cloned().collect(),
-                    move |request| {
-                        if let Some(ui) = owner.upgrade() {
-                            ui.add_agent_session_tab(request);
-                        } else {
-                            let _ = request
-                                .completion
-                                .send(Err("The terminal window closed.".into()));
-                        }
-                    },
-                );
+                self.sidebar.set_visible(true);
+                self.apply_sidebar_view(crate::config::SidebarView::Tabs, false);
+                self.session_sidebar.focus_search();
             }
             Action::OpenAgent => self.toggle_agent_panel(),
             Action::ToggleTasksPanel => {
@@ -695,38 +679,20 @@ impl UiState {
     pub(crate) fn sync_side_panel(&self) {
         let tasks = self.agent_tasks.borrow().panel_visible;
         let chats = self.ai_panel_visible.get();
-        if tasks || chats {
-            self.side_stack
-                .set_visible_child_name(if tasks { "tasks" } else { "chats" });
-            if self.reference_inspector.parent().is_none() {
-                self.ai_paned.set_end_child(Some(&self.reference_inspector));
-                // Attaching after both panels were closed loses the Paned
-                // position; reapply the configured share like the AI path
-                // does (the tasks panel has no width config of its own).
-                if !super::reference_shell::sync_inspector(self, false) {
-                    self.ai_panel_width_restoring.set(true);
-                    let requested_width = self.config.borrow().ai_panel_width;
-                    apply_ai_panel_width(&self.ai_paned, requested_width);
-                    let paned = self.ai_paned.clone();
-                    let restoring = self.ai_panel_width_restoring.clone();
-                    glib::idle_add_local_once(move || {
-                        apply_ai_panel_width(&paned, requested_width);
-                        glib::idle_add_local_once(move || restoring.set(false));
-                    });
-                }
-            }
+        self.workspace_stack.set_visible_child_name(if tasks {
+            "tasks"
+        } else if chats {
+            "chats"
         } else {
-            // Closing an optional feature returns to the neutral inspector;
-            // it does not remove the shared workspace's right-hand chrome.
-            if matches!(
-                self.side_stack.visible_child_name().as_deref(),
-                Some("tasks" | "chats")
-            ) {
-                self.side_stack.set_visible_child_name("overview");
-            }
-            if self.reference_inspector.parent().is_none() {
-                self.ai_paned.set_end_child(Some(&self.reference_inspector));
-            }
+            "terminal"
+        });
+        // The right side remains a context/diff drawer. The actual provider
+        // composer and task approvals belong to the main workspace only.
+        if matches!(
+            self.side_stack.visible_child_name().as_deref(),
+            Some("tasks" | "chats")
+        ) {
+            self.side_stack.set_visible_child_name("overview");
         }
         super::reference_shell::sync_inspector(self, false);
     }
@@ -741,7 +707,8 @@ impl UiState {
         }
         self.set_ai_panel_visible(next, true);
         if self.ai_panel_visible.get() {
-            super::reference_shell::sync_inspector(self, true);
+            self.agent_tasks.borrow_mut().panel_visible = false;
+            self.sync_side_panel();
             self.ai_panel.focus_input();
         } else {
             self.focus_current_terminal();
@@ -757,7 +724,8 @@ impl UiState {
             return;
         }
         self.set_ai_panel_visible(true, true);
-        super::reference_shell::sync_inspector(self, true);
+        self.agent_tasks.borrow_mut().panel_visible = false;
+        self.sync_side_panel();
         self.ai_panel.focus_input();
     }
 

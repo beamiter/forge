@@ -1,5 +1,9 @@
 # forge 用户指南
 
+## Agent Workspace
+
+会话侧栏现在是默认导航，API / Agent 在中央打开；托管 CLI 可以 Ctrl+] 断开后从另一端继续。输入约定、共享存储、各 provider 能力与运行生命周期见 [Agent Workspace](AGENT_WORKSPACE.md)。
+
 ## 1. 启动、诊断与恢复
 
 forge 默认启动 Block 后端并恢复最近一个可领取的窗口快照：
@@ -670,7 +674,7 @@ chmod 600 ~/.config/forge/ai.key
 ai_api_key_file = "~/.config/forge/ai.key"
 ```
 
-文件必须是当前用户所有的普通文件，Unix 权限不得向 group/other 开放，最大 16 KiB，且只能包含一行非空密钥。环境 Key 优先于文件；`FORGE_AI_API_KEY_FILE` 可覆盖文件路径。相关配置为 `ai_enabled`、`ai_provider`、`ai_base_url`、`ai_api_key_file`、`ai_model`、`ai_max_tokens`、`ai_stream` 和 `ai_redact_secrets`。请求通过系统 `curl`/Flatpak host bridge 发送；运行 `--doctor` 可离线检查凭据文件和 curl。右侧聊天面板使用 `Ctrl+Alt+Shift+A`，Block 选择后 `Ctrl+Shift+Q` 可发送命令、退出码、cwd 和截断输出。
+文件必须是当前用户所有的普通文件，Unix 权限不得向 group/other 开放，最大 16 KiB，且只能包含一行非空密钥。环境 Key 优先于文件；`FORGE_AI_API_KEY_FILE` 可覆盖文件路径。相关配置为 `ai_enabled`、`ai_provider`、`ai_base_url`、`ai_api_key_file`、`ai_model`、`ai_max_tokens`、`ai_stream` 和 `ai_redact_secrets`。请求通过系统 `curl`/Flatpak host bridge 发送；运行 `--doctor` 可离线检查凭据文件和 curl。中央聊天工作区使用 `Ctrl+Alt+Shift+A`，Block 选择后 `Ctrl+Shift+Q` 可发送命令、退出码、cwd 和截断输出。
 
 面板可拖动分隔条，实际宽度会在 400 ms 防抖后写回 `ai_panel_width`，并在启动、配置热重载和重新打开面板时恢复。输入框中 `Enter` 与 `Ctrl+Enter` 均发送，`Shift+Enter` 换行；输入法正在选词时，Enter 只确认候选，不会误发。焦点位于输入框时，`Ctrl+Shift+C/V` 也会作用于输入框，而不是后台终端。空会话提供三个快捷提示，它们只填入 composer，绝不会自动发送。
 

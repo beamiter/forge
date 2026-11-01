@@ -1291,7 +1291,8 @@ impl UiState {
     /// no shell-integration sequences, so Block mode would have nothing to
     /// build blocks from, and the tab deserves a better name than argv[0].
     pub(crate) fn add_agent_session_tab(&self, request: super::agent_sessions::ResumeRequest) {
-        let key = (request.provider, request.id.clone());
+        self.show_terminal_workspace();
+        let key = request.runtime_key.clone();
         let existing = self
             .agent_session_tabs
             .borrow()
@@ -1316,10 +1317,6 @@ impl UiState {
             }) {
                 self.notebook.set_current_page(Some(page));
                 terminal.grab_focus();
-                let _ = self
-                    .agent_session_library
-                    .borrow_mut()
-                    .record_resumed(request.provider, &request.id);
                 let _ = request.completion.send(Ok(()));
                 return;
             }
@@ -1334,10 +1331,7 @@ impl UiState {
         let launch = plan.clone();
         let mut argv = vec![launch.program];
         argv.extend(launch.args);
-        let library = self.agent_session_library.clone();
         let completion = request.completion.clone();
-        let provider = request.provider;
-        let id = request.id.clone();
         let settled = Rc::new(Cell::new(false));
         let successful = settled.clone();
         let terminal = self.add_tab_with_argv(TabLaunch {
@@ -1353,6 +1347,7 @@ impl UiState {
         self.agent_session_tabs
             .borrow_mut()
             .insert(key.clone(), terminal.downgrade());
+        self.apply_tab_filter(self.tab_search_entry.text().as_str());
         // Resolve against the newly created leaf, never whichever tab is
         // current when an asynchronous spawn failure eventually arrives.
         if let Some(leaf) = self
@@ -1369,7 +1364,6 @@ impl UiState {
             if let PaneLeaf::Vte(view) = &leaf {
                 view.connect_launched(move || {
                     if !successful.replace(true) {
-                        let _ = library.borrow_mut().record_resumed(provider, &id);
                         let _ = completion.send(Ok(()));
                     }
                 });

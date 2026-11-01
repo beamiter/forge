@@ -9,7 +9,8 @@ impl UiState {
     /// Move the tab strip into the holder matching the current placement and
     /// adjust orientation and per-button sizing.
     pub(crate) fn apply_tab_placement(&self) {
-        let placement = self.tab_placement.get();
+        let placement = TabPlacement::Sidebar;
+        self.tab_placement.set(placement);
 
         // Detach the strip from whichever scroll holder currently owns it. The
         // tab filter is not part of this move: it stays in the sidebar's Tabs
@@ -63,7 +64,7 @@ impl UiState {
     pub(crate) fn apply_sidebar_view(&self, view: SidebarView, persist: bool) {
         self.invalidate_file_tree_remote_follow();
         match view {
-            SidebarView::Tabs => self.sidebar_stack.set_visible_child_name("tabs"),
+            SidebarView::Tabs => self.sidebar_stack.set_visible_child_name("sessions"),
             SidebarView::Files => {
                 self.side_stack.set_visible_child_name("files");
                 // Hosts may have been added/removed while the tree was hidden.
