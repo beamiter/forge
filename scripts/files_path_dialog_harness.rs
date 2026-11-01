@@ -50,6 +50,13 @@ mod jterm_core {
         }
     }
 }
+// Workspace chrome is outside this callback/navigation harness. Keep the
+// production style call while modeling only its unrelated visual boundary.
+mod ui {
+    pub mod reference_shell {
+        pub fn style_workspace_dialog(_: &crate::adw::Dialog) {}
+    }
+}
 mod gtk4 {
     use super::*;
     type Click = Rc<dyn Fn(&Button)>;
