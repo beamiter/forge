@@ -2925,6 +2925,13 @@ fn resolve_font_roles(main: Option<String>, chrome: Option<String>) -> (String, 
 
 pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let (fc, persistence_revision) = load_file_config();
+    resolve_file_config(fc, persistence_revision)
+}
+
+fn resolve_file_config(
+    fc: FileConfig,
+    persistence_revision: Option<crate::config_store::ConfigRevision>,
+) -> (Config, Vec<Theme>, KeybindingMap) {
     let themes = builtin_themes();
 
     // Resolve active theme
@@ -3087,7 +3094,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let command_correction_enabled = env_bool("FORGE_COMMAND_CORRECTION_ENABLED")
         .or(fc.command_correction_enabled)
         .unwrap_or(true);
-    let eva_companion_enabled = fc.eva_companion_enabled.unwrap_or(false);
+    let eva_companion_enabled = fc.eva_companion_enabled.unwrap_or(true);
     let ascii_organism_enabled = env_bool("FORGE_ASCII_ORGANISM_ENABLED")
         .or(fc.ascii_organism_enabled)
         .unwrap_or(true);
@@ -3422,6 +3429,20 @@ mod tests {
             assert_eq!(resolved_ui, ui, "explicit UI value and unit stay intact");
         }
         assert_eq!(resolve_font_roles(None, Some("Monospace".into())).1, "14");
+    }
+
+    #[test]
+    fn shared_eva_defaults_on_and_respects_explicit_disable() {
+        assert!(
+            resolve_file_config(FileConfig::default(), None)
+                .0
+                .eva_companion_enabled
+        );
+        let disabled = FileConfig {
+            eva_companion_enabled: Some(false),
+            ..FileConfig::default()
+        };
+        assert!(!resolve_file_config(disabled, None).0.eva_companion_enabled);
     }
 
     #[test]

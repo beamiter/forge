@@ -1,5 +1,7 @@
 # forge
 
+新版 Shared Eva 默认启用，由 JWM 随图形会话启动共享协调器。四端只连接同一协调器；设置 `eva_companion_enabled = false` 并重启窗口可关闭。旧本地 Organism 仅在显式关闭 Shared Eva 后使用。
+
 forge 是一个面向开发工作流的原生 GTK4 终端。它默认使用 Block 后端，把命令、输出、退出状态和工作目录组织成可搜索的结构化块；需要传统终端语义时也可切换到 VTE 后端。
 
 ## 能力概览
@@ -444,7 +446,7 @@ Tasks 面板显示当前可见数与搜索匹配数，各状态按钮也显示�
 包括其他标签页中的分屏。
 失败和等待处理的任务会在列表中显示原因预览，悬停可查看有界完整说明。
 
-本地 ASCII 生命体默认开启，会响应命令与 Agent 状态；设为 `ascii_organism_enabled = false` 可关闭。
+显式关闭 Shared Eva 后，本地 ASCII 生命体默认开启，会响应命令与 Agent 状态；设为 `ascii_organism_enabled = false` 可关闭。
 关闭期间的 Agent 活动不会改变它的生命状态，也不会在重新开启时补发反应。
 
 每个 GUI 只有一个生命体。切换 block、分屏或标签页时，原来的身体先隐藏，再由当前本地窗格接管；
