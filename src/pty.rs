@@ -651,6 +651,7 @@ fn invalid_nul(context: &str) -> io::Error {
 /// and `bat`/`delta`/`lazygit` fell back to 256 colours.
 fn child_environment(env_extra: &[(&str, &str)]) -> io::Result<Vec<CString>> {
     jterm_core::child_env::envp_from_captured(&block_mode_child_env(), env_extra)
+        .map(crate::agent_cli::environment)
 }
 
 fn block_mode_child_env() -> jterm_core::child_env::ChildEnv<'static> {
@@ -727,6 +728,7 @@ impl OwnedPty {
         enable_shell_token: bool,
     ) -> io::Result<Self> {
         let argv_owned: Vec<String> = argv.iter().map(|value| (*value).to_string()).collect();
+        let argv_owned = crate::agent_cli::inline_argv(&argv_owned);
         let host_bridge = crate::host::is_flatpak();
         // Decide the directory once, before it is baked into the host-bridge
         // wrapper argv and used to resolve a relative executable: the bridge

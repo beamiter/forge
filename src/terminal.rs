@@ -705,6 +705,7 @@ fn spawn_shell(
     // for ordinary shells; task terminals use it to pin validation children to
     // no-rc startup files. The pairs must reach both a native child (through
     // the frozen envv) and a flatpak-spawn host wrapper (through wrap_argv).
+    let argv_vec = crate::agent_cli::inline_argv(&argv_vec);
     let vim_environment = if env_extra.is_empty() {
         crate::vim9_ide::shell_environment(argv_owned, auto_gui)
     } else {
@@ -767,6 +768,7 @@ fn spawn_shell(
                 }
             }
         };
+    let envv_owned = crate::agent_cli::vte_environment(envv_owned);
     let envv: Vec<&str> = envv_owned.iter().map(String::as_str).collect();
     let envv: &[&str] = &envv;
     let spawn_working_directory = if crate::host::is_flatpak() {
