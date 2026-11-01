@@ -514,6 +514,9 @@ impl jterm_core::organism_memory::MemoryScheduler for OrganismLane {
 }
 
 pub fn run() -> glib::ExitCode {
+    if let Some(code) = jterm_core::agent_workspace::run_embedded_if_requested() {
+        std::process::exit(code);
+    }
     // Freeze the launch-time environment before CLI parsing writes FORGE_*,
     // before input-method setup rewrites GTK_PATH/GTK_IM_MODULE/XMODIFIERS,
     // and before GTK or any worker thread starts: terminal and PTY children
@@ -1176,16 +1179,41 @@ pub fn run() -> glib::ExitCode {
         sidebar_switcher.append(&sidebar_files_btn);
 
         // Stack shows exactly one sidebar view at a time.
+        let unified_navigation_owner = Rc::new(RefCell::new(std::rc::Weak::<UiState>::new()));
+        let agent_session_library = Rc::new(RefCell::new(jterm_core::agent_sessions::SessionLibraryStore::new()));
+        let owner = unified_navigation_owner.clone();
+        let session_sidebar = ui::agent_sessions::sidebar(
+            &window, None, agent_session_library.clone(), Default::default(), move |request| {
+                if let Some(ui) = owner.borrow().upgrade() { ui.add_agent_session_tab(request); }
+                else { let _ = request.completion.send(Err("The terminal window closed.".into())); }
+            },
+        );
+        let owner = unified_navigation_owner.clone();
+        let workspace_navigation = ui::workspace_navigation::Navigation::new(move |action| {
+            if let Some(ui) = owner.borrow().upgrade() { ui.workspace_action(action); }
+        });
+        session_sidebar.bind_navigation(&workspace_navigation);
+        session_sidebar.supplemental.append(&workspace_navigation.root);
+        let sessions_page = gtk4::Box::new(Orientation::Vertical, 0);
+        session_sidebar.root.set_vexpand(true);
+        sessions_page.append(&session_sidebar.root);
+        let terminals = gtk4::Expander::new(Some("Terminals"));
+        terminals.set_child(Some(&sidebar_tabs_page));
+        terminals.set_expanded(true);
+        sidebar_tabs_page.set_size_request(-1, 120);
+        sidebar_tabs_page.set_vexpand(false);
+        sessions_page.append(&terminals);
         let sidebar_stack = gtk4::Stack::new();
         sidebar_stack.set_vexpand(true);
-        sidebar_stack.add_named(&sidebar_tabs_page, Some("tabs"));
+        sidebar_stack.add_named(&sessions_page, Some("sessions"));
 
         sidebar.append(&sidebar_switcher);
         sidebar.append(&sidebar_stack);
         // Older configs have no explicit visibility key. `load_config` derives
         // their initial state from tab placement, matching anvil: top-bar tabs
         // start with the optional file sidebar closed.
-        sidebar.set_visible(config.borrow().sidebar_visible);
+        sidebar.set_visible(true);
+        config.borrow_mut().sidebar_visible = true;
 
         // Content area: resizable sidebar | notebook (draggable divider).
         let right_col = gtk4::Box::new(Orientation::Vertical, 0);
@@ -1194,7 +1222,13 @@ pub fn run() -> glib::ExitCode {
         right_col.set_vexpand(true);
         let canvas_header = ui::reference_shell::center_header(&top_tab_scroll);
         right_col.append(&canvas_header);
-        right_col.append(&notebook);
+        let workspace_stack = gtk4::Stack::new();
+        workspace_stack.set_transition_type(gtk4::StackTransitionType::None);
+        workspace_stack.set_hhomogeneous(false);
+        workspace_stack.set_vhomogeneous(false);
+        workspace_stack.set_vexpand(true);
+        workspace_stack.add_named(&notebook, Some("terminal"));
+        right_col.append(&workspace_stack);
         right_col.append(&search_bar);
 
         // AI sidebar: wraps `right_col` in another horizontal Paned so the
@@ -1208,8 +1242,16 @@ pub fn run() -> glib::ExitCode {
         let tasks_panel_widget = ui::TasksPanel::build();
         let side_stack = gtk4::Stack::new();
         side_stack.add_css_class("forge-font-chrome");
-        side_stack.add_named(&ai_panel_widget.root, Some("chats"));
-        side_stack.add_named(&tasks_panel_widget.root, Some("tasks"));
+        workspace_stack.add_named(&ai_panel_widget.root, Some("chats"));
+        ui::workspace_navigation::compact_task_surface(&tasks_panel_widget.root);
+        workspace_stack.add_named(&tasks_panel_widget.root, Some("tasks"));
+        workspace_stack.set_visible_child_name("terminal");
+        {
+            let header = canvas_header.clone();
+            workspace_stack.connect_visible_child_name_notify(move |workspace| {
+                header.set_visible(workspace.visible_child_name().as_deref() == Some("terminal"));
+            });
+        }
         side_stack.add_named(&file_tree_box, Some("files"));
         let reference_inspector = ui::reference_shell::inspector(&side_stack);
         let ai_paned = gtk4::Paned::new(Orientation::Horizontal);
@@ -1293,13 +1335,16 @@ pub fn run() -> glib::ExitCode {
         toast_overlay.set_child(Some(&main_box));
 
         let ui = Rc::new(UiState {
-            unified_navigation_owner: Rc::new(RefCell::new(std::rc::Weak::new())),
+            unified_navigation_owner,
             window: window.clone(),
             toast_overlay: toast_overlay.clone(),
             opacity_toast: Rc::new(RefCell::new(None)),
             notebook: notebook.clone(),
+            workspace_stack: workspace_stack.clone(),
+            session_sidebar,
+            workspace_navigation,
             agent_session_tabs: RefCell::new(HashMap::new()),
-            agent_session_library: Rc::new(RefCell::new(jterm_core::agent_sessions::SessionLibraryStore::new())),
+            agent_session_library,
             tab_counter: tab_counter.clone(),
             font_scale: font_scale.clone(),
             config_persist_generation: Rc::new(Cell::new(0)),
@@ -1407,6 +1452,14 @@ pub fn run() -> glib::ExitCode {
         );
 
         *ui.unified_navigation_owner.borrow_mut() = Rc::downgrade(&ui);
+        {
+            let owner = Rc::downgrade(&ui);
+            glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+                let Some(ui) = owner.upgrade() else { return glib::ControlFlow::Break; };
+                ui.sync_workspace_navigation();
+                glib::ControlFlow::Continue
+            });
+        }
         ui.observe_ascii_organism_motion();
 
         // A configuration that could not be read leaves every setting at its
@@ -2028,6 +2081,7 @@ pub fn run() -> glib::ExitCode {
             // Headers are only maintained for the visible tab, so the newly
             // selected one has to catch up before it is drawn.
             ui_for_switch.refresh_pane_headers_for(widget);
+            ui_for_switch.show_terminal_workspace();
             ui::reference_shell::sync_canvas_header(&ui_for_switch, Some(widget));
             focus_switched_page(
                 &ui_for_switch.search_bar,

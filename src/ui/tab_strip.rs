@@ -485,12 +485,29 @@ impl UiState {
                 self.top_tab_scroll.set_visible(false);
             }
             TabPlacement::TopBar => {
-                self.top_tab_scroll.set_visible(true);
+                self.top_tab_scroll.set_visible(false);
                 self.tab_strip_scroll.set_visible(false);
                 self.sidebar_tab_mirror_scroll.set_visible(true);
             }
         }
         self.refresh_sidebar_tab_mirror();
+    }
+
+    fn tab_is_agent_session(&self, button: &ToggleButton) -> bool {
+        let Some(page) = notebook_page_named(&self.notebook, button.widget_name().as_str()) else {
+            return false;
+        };
+        let Some(node) = PaneNode::from_widget(&page) else {
+            return false;
+        };
+        let leaves = node.leaves();
+        !leaves.is_empty()
+            && leaves.iter().all(|leaf| {
+                self.agent_session_tabs
+                    .borrow()
+                    .values()
+                    .any(|bound| bound.upgrade().as_ref() == Some(leaf.terminal()))
+            })
     }
 
     pub(crate) fn apply_tab_filter(&self, query: &str) {
@@ -503,7 +520,9 @@ impl UiState {
                         .map(|label| label.as_ref().text().to_string())
                 }
                 .unwrap_or_default();
-                button.set_visible(tab_title_matches(query, &title));
+                button.set_visible(
+                    !self.tab_is_agent_session(&button) && tab_title_matches(query, &title),
+                );
             }
             child = widget.next_sibling();
         }
@@ -519,10 +538,10 @@ impl UiState {
         let ui = self.clone();
         title.connect_notify_local(Some("label"), move |label, _| {
             label.set_tooltip_text(Some(label.text().as_str()));
-            button.set_visible(tab_title_matches(
-                filter.text().as_str(),
-                label.text().as_str(),
-            ));
+            button.set_visible(
+                !ui.tab_is_agent_session(&button)
+                    && tab_title_matches(filter.text().as_str(), label.text().as_str()),
+            );
             // The mirror binds to this label for its text, but a filtered
             // tab appearing or disappearing is a visibility change it has to
             // be told about.

@@ -4,6 +4,10 @@
 
 forge 是一个面向开发工作流的原生 GTK4 终端。它默认使用 Block 后端，把命令、输出、退出状态和工作目录组织成可搜索的结构化块；需要传统终端语义时也可切换到 VTE 后端。
 
+## Agent Workspace
+
+默认左侧会话导航统一列出本地 Codex / Claude CLI、共享 API 对话和 Agent 任务；单击在中央打开真实会话。支持项目/搜索筛选、置顶、共享草稿、托管 CLI 的 Ctrl+] 断开与跨端重连，API / 原生 Agent 使用 Enter 换行、Ctrl+Enter 发送。原生任务仍由其所属窗口管理。详见 [Agent Workspace 使用与架构](docs/AGENT_WORKSPACE.md)。
+
 ## 能力概览
 
 - 原生 [Vim9 GUI buffer](docs/VIM9_IDE.md)：默认只保留编辑区，IDE 控件/面板可在 `[vim9]` 中逐项开启；真实 Vim 9 编辑语义 + GTK/Pango 原生 buffer 渲染（读取 GUI RGB 高亮、编辑器字体/行距、连字、原生输入法预编辑；复杂视图明确回退兼容显示），GTK 项目/缓冲区导航、全项目模糊快速打开、行列跳转、Vim 双向分屏、受保护的缓冲区关闭、保存全部后构建、项目搜索、诊断定位、异步构建与输出，以及按 Vim 实际能力启用的语言服务按钮。在本地交互命令行运行 `vim` 自动打开原生 GUI（保留参数、目录和退出码）；也可用 `forge --ide ~/project` 或 `Ctrl+Alt+I`。滚动保留触摸板小数位移，按分屏投递并跟随显示器帧时钟。

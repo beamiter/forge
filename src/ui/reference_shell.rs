@@ -1205,7 +1205,7 @@ fn agent_actions() -> gtk4::Box {
                 if !ui.agent_tasks.borrow().panel_visible {
                     ui.toggle_tasks_panel();
                 }
-                ui.side_stack.set_visible_child_name("tasks");
+                ui.workspace_stack.set_visible_child_name("tasks");
             } else if action == crate::keybindings::Action::OpenAiPanel {
                 if !ui.config.borrow().ai_enabled {
                     ui.execute_action(crate::keybindings::Action::ToggleSettings);
@@ -1214,7 +1214,7 @@ fn agent_actions() -> gtk4::Box {
                 // The explicit assistant action takes precedence over a task
                 // page without closing or discarding its live domain state.
                 ui.open_ai_panel();
-                ui.side_stack.set_visible_child_name("chats");
+                ui.workspace_stack.set_visible_child_name("chats");
             } else {
                 ui.execute_action(action);
             }
@@ -1250,7 +1250,7 @@ fn agent_actions() -> gtk4::Box {
         if !ui.agent_tasks.borrow().panel_visible {
             ui.toggle_tasks_panel();
         }
-        ui.side_stack.set_visible_child_name("tasks");
+        ui.workspace_stack.set_visible_child_name("tasks");
         ui.execute_task_panel_action(crate::agent_task_ui::TaskPanelAction::ReviewDiff(id));
     });
     actions.append(&review);
@@ -1973,10 +1973,14 @@ pub(crate) fn install(
         });
         navigation.append(&button);
     }
-    ui.sidebar.insert_child_after(&navigation, Some(&workspace));
+    if jterm_core::reference_conversation::fixture_enabled() {
+        ui.sidebar.insert_child_after(&navigation, Some(&workspace));
+    }
     let recent = label("RECENT", "reference-section-label");
     recent.add_css_class("reference-recent-section");
-    ui.sidebar.insert_child_after(&recent, Some(&navigation));
+    if jterm_core::reference_conversation::fixture_enabled() {
+        ui.sidebar.insert_child_after(&recent, Some(&navigation));
+    }
     if jterm_core::reference_conversation::fixture_enabled() {
         ui.sidebar_stack.set_visible(false);
         let entries = gtk4::Box::new(Orientation::Vertical, 0);
@@ -2042,7 +2046,9 @@ pub(crate) fn install(
         row.set_height_request(token::SPACES_ROW_HEIGHT as i32);
         spaces.append(&row);
     }
-    ui.sidebar.append(&spaces);
+    if jterm_core::reference_conversation::fixture_enabled() {
+        ui.sidebar.append(&spaces);
+    }
     let fill = gtk4::Box::new(Orientation::Vertical, 0);
     fill.set_vexpand(true);
     ui.sidebar.append(&fill);
@@ -2262,7 +2268,9 @@ pub(crate) fn install(
     frame.add_overlay(&drawer_grip);
     frame.set_measure_overlay(&drawer_grip, false);
     let inspector_chrome = Rc::new(InspectorChrome {
-        requested: std::cell::Cell::new(None),
+        requested: std::cell::Cell::new(
+            (!jterm_core::reference_conversation::fixture_enabled()).then_some(false),
+        ),
         actual: std::cell::Cell::new(false),
         button: inspector_toggle.downgrade(),
         frame: frame.downgrade(),

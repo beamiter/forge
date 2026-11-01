@@ -21,7 +21,7 @@ companion-host = { version = "0.1.0", path = "vendor/companion-host" }
 companion-process = { version = "0.1.0", path = "vendor/companion-process" }
 eva-character-atlas = { git = "https://github.com/beamiter/jcompanion.git", rev = "9aa569540091524d637a7115b64c587b9177a55b" }
 # Shared family source; Nix stages the deterministic packaging source snapshot.
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "974ccad203375032fe87706caecab39ad516c238" }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "589a26658f548ec96ff60a53ea65804901ed5c7b" }
 jagent = { version = "0.7.0", git = "https://github.com/beamiter/jagent.git", rev = "f269c3c6afafcf9b6d60b3cccd741649fdb74576" }
 log = { version = "0.4", features = ["std"] }
 crossbeam-channel = "0.5"
@@ -47,7 +47,7 @@ gtk4 = { version = "0.11.4", features = ["v4_14"] }
 libadwaita = { version = "0.9.2", features = ["v1_5"] }
 
 [dev-dependencies]
-jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "974ccad203375032fe87706caecab39ad516c238" }
+jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "589a26658f548ec96ff60a53ea65804901ed5c7b" }
 env_logger = "0.11"
 
 [profile.dev]

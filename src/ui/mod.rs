@@ -15,7 +15,8 @@ use crate::keybindings::KeybindingMap;
 
 mod actions;
 mod agent_panel;
-mod agent_sessions;
+pub(crate) mod agent_sessions;
+mod agent_workspace_ui;
 mod ai_chat_store;
 mod ai_panel;
 mod bottom_bar;
@@ -47,6 +48,9 @@ mod search_preview;
 mod session;
 mod sidebar_resize;
 mod sidebar_tabs;
+mod workspace_chats;
+mod workspace_cli;
+pub(crate) mod workspace_navigation;
 pub(crate) use sidebar_tabs::configure_layout as configure_sidebar_layout;
 #[cfg(test)]
 mod tab_geometry_tests;
@@ -304,8 +308,11 @@ pub(crate) struct UiState {
     /// separate toast per step.
     pub(crate) opacity_toast: Rc<RefCell<Option<adw::Toast>>>,
     pub(crate) notebook: Notebook,
+    pub(crate) workspace_stack: Stack,
+    pub(crate) session_sidebar: agent_sessions::Sidebar,
+    pub(crate) workspace_navigation: workspace_navigation::Navigation,
     pub(crate) agent_session_tabs:
-        RefCell<HashMap<agent_sessions::SessionIdentity, gtk4::glib::WeakRef<Terminal>>>,
+        RefCell<HashMap<agent_sessions::RuntimeIdentity, gtk4::glib::WeakRef<Terminal>>>,
     pub(crate) agent_session_library: Rc<RefCell<jterm_core::agent_sessions::SessionLibraryStore>>,
     pub(crate) tab_counter: Rc<Cell<u32>>,
     pub(crate) font_scale: Rc<Cell<f64>>,
