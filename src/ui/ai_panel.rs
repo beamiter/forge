@@ -29,9 +29,8 @@ use crate::config::Config;
 
 const CHAT_PAGE: &str = "chat";
 const CHAT_LIBRARY_PAGE: &str = "library";
-const STOPPED_STATUS: &str = "Response stopped. You can retry when ready.";
 const MAX_PENDING_STREAM_DELTAS: usize = 64;
-const MAX_STREAM_DELTA_BYTES: usize = 16 * 1024;
+const MAX_STREAM_DELTA_BYTES: usize = 64 * 1024;
 const MAX_STATUS_DISPLAY_BYTES: usize = 16 * 1024;
 const MAX_CHAT_SEARCH_CHARS: i32 = 1024;
 
@@ -44,9 +43,9 @@ struct RequestPayload {
     restore_pending_as_draft: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct InflightRequest {
-    cancellation: ai::AiCancellationToken,
+    cancellation: jterm_core::agent_workspace::ApiObservation,
     payload: RequestPayload,
 }
 
@@ -66,6 +65,7 @@ fn try_queue_stream_delta(sender: &std::sync::mpsc::SyncSender<String>, delta: &
 /// fragment.
 #[derive(Debug, PartialEq, Eq)]
 enum StreamRender {
+    Rebuild,
     /// Nothing visible changes (nothing new arrived past the store's reply
     /// budget, or nothing has been received yet).
     None,
@@ -809,44 +809,13 @@ impl AiPanel {
         self.render_active_chat();
     }
 
-    pub(crate) fn cancel_all_requests(&self) {
+    pub(crate) fn detach_all_requests(&self) {
         let requests = std::mem::take(&mut *self.requests.borrow_mut());
-        let retry_payloads = std::mem::take(&mut *self.retry_payloads.borrow_mut());
-        let mut cancellations = Vec::with_capacity(requests.len());
         let mut store = self.store.borrow_mut();
         for (token, request) in requests {
-            request.cancellation.cancel();
-            let _ = self.shared.borrow_mut().finish(token, Err(()));
-            cancellations.push(request.cancellation);
-            let _ = store.cancel_request(
-                token,
-                "Response stopped because the window is closing.".to_string(),
-            );
-            if !request.payload.restore_pending_as_draft {
-                store.recover_retry_payload(
-                    token.chat_id,
-                    &request.payload.user_text,
-                    request.payload.context,
-                );
-            }
-        }
-        for (chat_id, payload) in retry_payloads {
-            if !payload.restore_pending_as_draft {
-                store.recover_retry_payload(chat_id, &payload.user_text, payload.context);
-            }
-        }
-        drop(store);
-
-        // Give worker threads a short shared deadline to kill and reap curl
-        // before application teardown. Tokens whose workers have not started
-        // are already cancelled and cannot spawn a child later.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-        for cancellation in cancellations {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() || !cancellation.wait_for_inactive(remaining) {
-                log::warn!("Timed out waiting for an AI request to shut down");
-                break;
-            }
+            // ApiObservation::drop releases view control without cancelling.
+            drop(request);
+            let _ = store.cancel_request(token, "Response continues in the session host.".into());
         }
     }
 
@@ -860,31 +829,12 @@ impl AiPanel {
     }
 
     fn stop_active_request(&self) {
-        let Some(token) = self.store.borrow().active_request_token() else {
-            return;
-        };
-        let Some(request) = self.requests.borrow_mut().remove(&token) else {
-            return;
-        };
-        request.cancellation.cancel();
-        let _ = self.shared.borrow_mut().finish(token, Err(()));
-        let owner_active = self
-            .store
-            .borrow_mut()
-            .cancel_request(token, STOPPED_STATUS.to_string());
-        let Some(owner_active) = owner_active else {
-            return;
-        };
-        self.retry_payloads
-            .borrow_mut()
-            .insert(token.chat_id, request.payload);
-        if owner_active {
-            self.render_active_chat();
-            self.input_view.grab_focus();
-        } else {
-            self.refresh_chat_library();
+        if let Some(token) = self.store.borrow().active_request_token() {
+            if let Some(request) = self.requests.borrow().get(&token) {
+                request.cancellation.cancel();
+                self.show_info_status("Stopping the background response…");
+            }
         }
-        self.publish_persisted_conversation();
     }
 
     fn retry_active_request(&self) {
@@ -996,7 +946,27 @@ impl AiPanel {
                     self.render_active_chat();
                     self.publish_persisted_conversation();
                 }
-                super::workspace_chats::Event::Opened(_) => {
+                super::workspace_chats::Event::Opened(id) => {
+                    let job = self.shared.borrow().hosted_job(id);
+                    if let Some(job) = job {
+                        let payload = RequestPayload {
+                            user_text: job.user_text.clone(),
+                            context: None,
+                            restore_pending_as_draft: false,
+                        };
+                        let token = self.store.borrow_mut().observe_turn(id, job.user_text);
+                        if let Ok(token) = token {
+                            self.observe_hosted(
+                                token,
+                                payload,
+                                jterm_core::agent_workspace::ApiRequest::Observe {
+                                    id: job.id,
+                                    epoch: job.epoch,
+                                    view: uuid::Uuid::new_v4().to_string(),
+                                },
+                            );
+                        }
+                    }
                     self.render_active_chat();
                     self.publish_persisted_conversation();
                 }
@@ -1169,14 +1139,9 @@ impl AiPanel {
                 (store.active_id(), store.active_request_token())
             };
             if let Some(token) = token {
-                if let Some(request) = p.requests.borrow_mut().remove(&token) {
-                    request.cancellation.cancel();
-                    let _ = p.shared.borrow_mut().finish(token, Err(()));
-                }
-                let _ = p
-                    .store
-                    .borrow_mut()
-                    .cancel_request(token, "Chat deleted.".to_string());
+                if let Some(request) = p.requests.borrow().get(&token) { request.cancellation.cancel(); }
+                p.show_info_status("Stopping the background response. Delete this chat after cleanup finishes.");
+                return;
             }
             match p.shared.borrow_mut().delete(deleted_id) {
                 Ok(true) => { p.show_info_status("Deleting the shared conversation…"); return; }
@@ -2025,12 +1990,45 @@ impl AiPanel {
             );
         }
         let token = start.token;
+        let launch = client
+            .map_err(|error| error.to_string())
+            .and_then(|client| {
+                jterm_core::agent_workspace::ApiLaunch::new(
+                    receipt.clone(),
+                    &client,
+                    system,
+                    &history,
+                    self.config.borrow().ai_stream,
+                )
+            });
+        let launch = match launch {
+            Ok(launch) => launch,
+            Err(error) => {
+                self.store.borrow_mut().complete_error(token, error);
+                return false;
+            }
+        };
         self.shared.borrow_mut().attach(token, receipt);
-        let cancellation = ai::AiCancellationToken::new();
+        self.observe_hosted(
+            token,
+            payload,
+            jterm_core::agent_workspace::ApiRequest::Start(launch),
+        );
+        true
+    }
+
+    fn observe_hosted(
+        &self,
+        token: RequestToken,
+        payload: RequestPayload,
+        request: jterm_core::agent_workspace::ApiRequest,
+    ) {
+        let cancellation = jterm_core::agent_workspace::ApiObservation::default();
+        let observer = cancellation.token();
         self.requests.borrow_mut().insert(
             token,
             InflightRequest {
-                cancellation: cancellation.clone(),
+                cancellation,
                 payload,
             },
         );
@@ -2039,31 +2037,17 @@ impl AiPanel {
         self.sync_active_status();
         self.refresh_chat_chrome();
         self.refresh_chat_library();
-
-        let stream_replies = self.config.borrow().ai_stream;
         let (delta_tx, delta_rx) =
             std::sync::mpsc::sync_channel::<String>(MAX_PENDING_STREAM_DELTAS);
-        let (result_tx, result_rx) =
-            std::sync::mpsc::sync_channel::<Result<String, ai::AiError>>(1);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<Result<String, String>>(1);
         std::thread::spawn(move || {
-            let result = client.and_then(|client| {
-                if stream_replies {
-                    client.send_turns_streaming_cancellable(
-                        system.as_deref(),
-                        &history,
-                        &cancellation,
-                        &mut |delta| {
-                            let _ = try_queue_stream_delta(&delta_tx, delta);
-                        },
-                    )
-                } else {
-                    client.send_turns_blocking_cancellable(
-                        system.as_deref(),
-                        &history,
-                        &cancellation,
-                    )
-                }
-            });
+            let result = jterm_core::agent_workspace::HostedApiClient::new().execute(
+                request,
+                &observer,
+                &mut |preview| {
+                    let _ = try_queue_stream_delta(&delta_tx, preview);
+                },
+            );
             let _ = result_tx.send(result);
         });
 
@@ -2083,7 +2067,9 @@ impl AiPanel {
                         let render = {
                             let mut store = p.store.borrow_mut();
                             let shown = store.active_partial().len();
-                            match store.push_delta(token, &fragment) {
+                            let append_only = fragment.starts_with(store.active_partial());
+                            match store.replace_partial(token, &fragment) {
+                                Some(true) if !append_only => StreamRender::Rebuild,
                                 Some(true) => {
                                     stream_render(store.active_partial(), shown, attached)
                                 }
@@ -2091,6 +2077,7 @@ impl AiPanel {
                             }
                         };
                         match render {
+                            StreamRender::Rebuild => p.render_active_chat(),
                             StreamRender::None => {}
                             StreamRender::Materialize(text) => {
                                 p.append_visible("Assistant", "role-asst", &text);
@@ -2111,15 +2098,7 @@ impl AiPanel {
                         return glib::ControlFlow::Break;
                     }
                     let owner_active = p.store.borrow_mut().complete_success(token, text);
-                    if owner_active.is_some() {
-                        let _ = p.shared.borrow_mut().complete(
-                            token,
-                            &p.store.borrow(),
-                            p.config.borrow().ai_redact_secrets,
-                        );
-                    } else {
-                        let _ = p.shared.borrow_mut().finish(token, Err(()));
-                    }
+                    let _ = p.shared.borrow_mut().hosted_finished(token);
                     let Some(owner_active) = owner_active else {
                         return glib::ControlFlow::Break;
                     };
@@ -2174,11 +2153,10 @@ impl AiPanel {
                 }
             }
         });
-        true
     }
 
     fn finish_request_error(&self, token: RequestToken, message: String, keep_shown_partial: bool) {
-        let _ = self.shared.borrow_mut().finish(token, Err(()));
+        let _ = self.shared.borrow_mut().hosted_finished(token);
         let Some(request) = self.requests.borrow_mut().remove(&token) else {
             return;
         };

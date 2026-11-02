@@ -2253,7 +2253,7 @@ pub fn run() -> glib::ExitCode {
                 }
                 agent.shutdown();
             }
-            ai_panel_for_close.cancel_all_requests();
+            ai_panel_for_close.detach_all_requests();
             if session_persistence {
                 // Do not let the composer's draft debounce outlive the final
                 // window snapshot. This also persists an in-flight question as
