@@ -260,6 +260,9 @@ impl VteTerminalView {
     ) -> Self {
         // Create Terminal widget
         let terminal = create_terminal(&config.borrow());
+        if crate::agent_cli::is_inline_launch(shell_argv) {
+            crate::block_view::install_inline_cli_reading(&terminal);
+        }
 
         // Wrap with scrollbar, then stack the pane header above it. The outer
         // box is the pane's leaf widget, so the split tree still sees exactly

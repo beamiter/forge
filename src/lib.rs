@@ -4,6 +4,7 @@ mod agent_cli;
 mod gtk_presentation;
 mod gtk_process;
 mod gtk_spawn;
+mod immersive_command;
 
 pub mod agent;
 pub(crate) mod agent_task;

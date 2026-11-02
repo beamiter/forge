@@ -78,6 +78,12 @@ window.reference-shell decoration { border: 0; padding: 0; margin: 0; border-rad
 .reference-shell .term-view-root:not(.term-chat-root) .block-scroll { margin: 18px 24px 12px; border: 1px solid #d0dceb; border-radius: 10px; }
 .reference-shell .term-chat-root { background: transparent; color: #26364c; }
 .reference-shell .term-chat-root .chat-canvas { background: transparent; }
+/* The Chat paper is light regardless of the terminal ANSI palette. Keep its
+   native history rail visible even when the selected terminal theme is dark. */
+.reference-shell .term-chat-root .block-output-scrollbar trough { background-color: alpha(#26364c, .10); }
+.reference-shell .term-chat-root .block-output-scrollbar slider { background-color: alpha(#26364c, .44); }
+.reference-shell .term-chat-root .block-output-scrollbar slider:hover { background-color: @ACCENT@; }
+
 .reference-shell .term-chat-root .block-list, .reference-shell .term-chat-root .block-scroll, .reference-shell .term-chat-root .block-active, .reference-shell .term-chat-root .chat-live-anchor { background: transparent; }
 .reference-shell .term-chat-root .chat-transcript { padding: 0 28px 16px; }
 .reference-shell .term-chat-root .chat-pair { margin: 0 0 18px; padding: 0; }

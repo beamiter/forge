@@ -59,6 +59,7 @@ mod history;
 mod ime_gate;
 mod input_feedback;
 mod kitty_graphics;
+mod native_transcript_scroll;
 mod onboarding;
 #[allow(dead_code)]
 mod palette;
@@ -66,6 +67,8 @@ mod paste_feedback;
 mod prepared_search;
 mod review;
 mod scroll;
+pub(crate) use native_transcript_scroll::install_inline_cli_reading;
+use native_transcript_scroll::NativeTranscriptScroll;
 mod scroll_transfer;
 pub(crate) mod search_preview;
 mod selection_folding;
@@ -13649,6 +13652,9 @@ struct KeyCtx {
     /// kitty-encode the bytes VTE emits for it and join a split Alt chord.
     live_commit_for_key: LiveCommitSink,
     active_vte_for_key: glib::WeakRef<Terminal>,
+    running_cmd_for_key: Rc<RefCell<String>>,
+    native_transcript_for_key: NativeTranscriptScroll,
+    scroll_debouncer_for_key: ScrollDebouncer,
     pty_synced_for_key: Rc<Cell<bool>>,
     bracketed_paste_for_key: Rc<Cell<bool>>,
     typed_cmd_for_key: Rc<RefCell<String>>,
@@ -13679,6 +13685,9 @@ impl KeyCtx {
         let KeyCtx {
             live_commit_for_key,
             active_vte_for_key,
+            running_cmd_for_key,
+            native_transcript_for_key,
+            scroll_debouncer_for_key,
             pty_synced_for_key,
             bracketed_paste_for_key,
             typed_cmd_for_key,
@@ -13801,6 +13810,27 @@ impl KeyCtx {
             // readline buffer has been edited, Home/End belong to the shell so
             // users can move to the beginning/end of the visible command.
             let state = bstate_for_key.get();
+            if !ctrl
+                && !shift
+                && !alt
+                && !modifiers.intersects(
+                    gtk4::gdk::ModifierType::SUPER_MASK | gtk4::gdk::ModifierType::META_MASK,
+                )
+                && native_transcript_for_key.owns_session(&running_cmd_for_key.borrow())
+                && matches!(
+                    keyval,
+                    Key::Page_Up | Key::Page_Down | Key::KP_Page_Up | Key::KP_Page_Down
+                )
+            {
+                live_commit_for_key.kitty_last_key.set(None);
+                native_transcript_for_key.page(
+                    &active_vte_for_key,
+                    &block_scroll_for_key,
+                    &scroll_debouncer_for_key,
+                    matches!(keyval, Key::Page_Down | Key::KP_Page_Down),
+                );
+                return glib::Propagation::Stop;
+            }
             let history_navigation = !matches!(
                 state,
                 BlockState::CollectingOutput | BlockState::AltScreen | BlockState::RawFallback
@@ -13822,10 +13852,11 @@ impl KeyCtx {
                 && matches!(keyval, Key::Page_Up | Key::Page_Down)
             {
                 let adj = block_scroll_for_key.vadjustment();
-                let step = (adj.page_size() * 0.9).max(1.0);
+                let row = (active_vte_for_key.char_height() as f64).max(1.0);
+                let step = (adj.page_size() - 2.0 * row).max(row);
                 let delta = if keyval == Key::Page_Up { -step } else { step };
-                let max_val = (adj.upper() - adj.page_size()).max(adj.lower());
-                adj.set_value((adj.value() + delta).clamp(adj.lower(), max_val));
+                live_commit_for_key.kitty_last_key.set(None);
+                scroll_debouncer_for_key.scroll_pixels(&block_scroll_for_key, delta);
                 return glib::Propagation::Stop;
             }
 
@@ -14516,6 +14547,7 @@ impl TermView {
         let mut pane_config = config.clone();
         pane_config.terminal_mode = mode.clone();
         let config = &pane_config;
+        let direct_cli = crate::agent_cli::is_inline_launch(shell_argv);
         // Detect jsh shell for session_id passing.
         let is_jsh = shell_argv_uses_jsh(shell_argv);
 
@@ -14847,7 +14879,7 @@ impl TermView {
         scroll_overlay.add_overlay(&jump_fab);
         let block_onboarding = BlockOnboarding::attach(
             &scroll_overlay,
-            matches!(mode, crate::config::TerminalMode::Block),
+            matches!(mode, crate::config::TerminalMode::Block) && !direct_cli,
         );
         let chat_presentation = if chat_mode {
             Some(Rc::new(chat::ChatPresentation::new(
@@ -14893,6 +14925,12 @@ impl TermView {
 
         // ── Shared state ──────────────────────────────────────────────────
         let bstate = Rc::new(Cell::new(BlockState::Idle));
+        // Task and resume tabs may launch the CLI directly, without a shell
+        // capable of announcing OSC command boundaries. Exact launch argv is
+        // the fallback authority; ordinary unintegrated shells stay untouched.
+
+        let native_transcript_scroll = NativeTranscriptScroll::new(bstate.clone(), direct_cli);
+        native_transcript_scroll.install(&active_vte);
         let ftcs_seen = Rc::new(Cell::new(false));
 
         // Keystroke-shadow command line. The authoritative command text is read
@@ -15522,8 +15560,26 @@ impl TermView {
                 .push(Box::new(move |_| onboarding.human_input_observed()));
         }
         let alt_screen_callbacks: AltScreenCallbacks = Rc::new(RefCell::new(vec![]));
+        {
+            let native = native_transcript_scroll.clone();
+            alt_screen_callbacks
+                .borrow_mut()
+                .push(Box::new(move |_| native.cancel()));
+        }
         let command_started_callbacks: CommandStartedCallbacks = Rc::new(RefCell::new(vec![]));
+        {
+            let native = native_transcript_scroll.clone();
+            command_started_callbacks
+                .borrow_mut()
+                .push(Box::new(move |_| native.cancel()));
+        }
         let command_finished_callbacks: CommandFinishedCallbacks = Rc::new(RefCell::new(vec![]));
+        {
+            let native = native_transcript_scroll.clone();
+            command_finished_callbacks
+                .borrow_mut()
+                .push(Box::new(move |_| native.cancel()));
+        }
         if matches!(mode, crate::config::TerminalMode::Block) {
             let weak = Rc::downgrade(&active);
             command_started_callbacks
@@ -16865,6 +16921,9 @@ impl TermView {
             let key_ctx = KeyCtx {
                 live_commit_for_key: live_commit.clone(),
                 active_vte_for_key: active_vte.downgrade(),
+                running_cmd_for_key: running_cmd.clone(),
+                native_transcript_for_key: native_transcript_scroll.clone(),
+                scroll_debouncer_for_key: scroll_debouncer.clone(),
                 pty_synced_for_key: pty_synced.clone(),
                 bracketed_paste_for_key: bracketed_paste.clone(),
                 typed_cmd_for_key,
@@ -17005,6 +17064,8 @@ impl TermView {
                 active_vte.add_controller(motion);
             }
 
+            let running_for_scroll = running_cmd.clone();
+            let native_for_scroll = native_transcript_scroll.clone();
             let fullscreen_for_scroll = fullscreen.clone();
             let mouse_mode_for_scroll = mouse_reporting_mode.clone();
             let scroll_enabled = config.scroll_reporting_enabled;
@@ -17092,6 +17153,20 @@ impl TermView {
                         });
                     }
                     return glib::Propagation::Stop;
+                }
+                if native_for_scroll.owns_session(&running_for_scroll.borrow()) {
+                    if let (Some(vte), Some(outer)) =
+                        (vte_for_scroll.upgrade(), outer_for_scroll.upgrade())
+                    {
+                        native_for_scroll.wheel(
+                            &vte,
+                            &outer,
+                            &debouncer_for_scroll,
+                            dy,
+                            surface_unit,
+                        );
+                        return glib::Propagation::Stop;
+                    }
                 }
                 // Alt-screen without mouse reporting: VTE fakes arrow keys for
                 // the wheel (less, man, codex's Ctrl+T transcript). A wheel
@@ -17181,6 +17256,8 @@ impl TermView {
                 gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
             scrollbar_scroll.set_propagation_phase(gtk4::PropagationPhase::Capture);
             let vte_for_scrollbar = active_vte.downgrade();
+            let native_for_scrollbar = native_transcript_scroll.clone();
+            let running_for_scrollbar = running_cmd.clone();
             let outer_for_scrollbar = block_scroll.downgrade();
             let debouncer_for_scrollbar = scroll_debouncer.clone();
             if !unified {
@@ -17188,6 +17265,20 @@ impl TermView {
             }
             scrollbar_scroll.connect_scroll(move |controller, _dx, dy| {
                 let mut remaining = dy;
+                if native_for_scrollbar.owns_session(&running_for_scrollbar.borrow()) {
+                    if let (Some(vte), Some(outer)) =
+                        (vte_for_scrollbar.upgrade(), outer_for_scrollbar.upgrade())
+                    {
+                        native_for_scrollbar.wheel(
+                            &vte,
+                            &outer,
+                            &debouncer_for_scrollbar,
+                            dy,
+                            controller.unit() == gtk4::gdk::ScrollUnit::Surface,
+                        );
+                        return glib::Propagation::Stop;
+                    }
+                }
                 if let Some(vte) = vte_for_scrollbar.upgrade() {
                     if let Some(adj) = vte.vadjustment() {
                         remaining = scroll_adjustment_by_input(

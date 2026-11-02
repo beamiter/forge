@@ -1344,6 +1344,7 @@ impl UiState {
             terminal_mode: crate::config::TerminalMode::Vte,
             task: None,
         });
+        crate::block_view::install_inline_cli_reading(&terminal);
         self.agent_session_tabs
             .borrow_mut()
             .insert(key.clone(), terminal.downgrade());
@@ -1439,6 +1440,9 @@ impl UiState {
         let leaf_root = pane_leaf_root_of(terminal.upcast_ref())?;
         let leaf = PaneLeaf::from_widget(&leaf_root)?;
         leaf.set_task_role(role);
+        if role == crate::agent_task::TaskTerminalRole::Agent {
+            crate::block_view::install_inline_cli_reading(&terminal);
+        }
         Some(leaf)
     }
 
