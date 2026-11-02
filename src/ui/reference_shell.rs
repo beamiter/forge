@@ -9,6 +9,8 @@ use gtk4::{glib, Orientation};
 use jterm_core::developer_workspace as token;
 use std::rc::Rc;
 use vte4::TerminalExt;
+#[path = "navigation_drawer.rs"]
+mod navigation_drawer;
 
 const INSPECTOR_CHROME_KEY: &str = "forge-reference-inspector-chrome";
 const OBSERVED_INSPECTOR_KEY: &str = "forge-observed-inspector-model";
@@ -35,6 +37,12 @@ struct InspectorChrome {
     frame: glib::WeakRef<gtk4::Overlay>,
     sizing: Rc<super::sidebar_resize::SidebarResize>,
     drawer_grip: glib::WeakRef<gtk4::DrawingArea>,
+    navigation_requested: std::cell::Cell<bool>,
+    navigation_actual: std::cell::Cell<bool>,
+    navigation_home: glib::WeakRef<gtk4::Paned>,
+    navigation_drawer: gtk4::Box,
+    navigation_scrim: gtk4::Button,
+    navigation_button: glib::WeakRef<gtk4::Button>,
 }
 
 impl InspectorChrome {
@@ -43,6 +51,21 @@ impl InspectorChrome {
             return;
         };
         let (navigation_width, inspector_width) = self.sizing.preferences();
+        let can_dock_navigation = token::Layout::for_size_with_sidebars(
+            width as f32,
+            height as f32 + token::TITLEBAR_HEIGHT,
+            navigation_width as f32,
+            0.0,
+        )
+        .navigation
+        .is_some();
+        if can_dock_navigation {
+            self.navigation_requested.set(false);
+        }
+        let navigation_drawer = !can_dock_navigation
+            && self.navigation_requested.get()
+            && width > token::RAIL_WIDTH as i32 + 80
+            && height >= 120;
         let layout = token::Layout::for_size_with_sidebars(
             width as f32,
             height as f32 + token::TITLEBAR_HEIGHT,
@@ -57,7 +80,48 @@ impl InspectorChrome {
                 inspector_width as f32
             },
         );
-        ui.sidebar.set_visible(layout.navigation.is_some());
+        let navigation_focus = gtk4::prelude::RootExt::focus(&ui.window).filter(|focus| {
+            focus == ui.sidebar.upcast_ref::<gtk4::Widget>() || focus.is_ancestor(&ui.sidebar)
+        });
+        let was_in_drawer = ui.sidebar.parent().as_ref()
+            == Some(self.navigation_drawer.upcast_ref::<gtk4::Widget>());
+        if let Some(home) = self.navigation_home.upgrade() {
+            navigation_drawer::rehost(
+                &ui.sidebar,
+                &home,
+                &self.navigation_drawer,
+                navigation_drawer,
+            );
+        }
+        let drawer_width =
+            (navigation_width as i32).min((width - token::RAIL_WIDTH as i32 - 24).max(0));
+        ui.sidebar.set_width_request(if navigation_drawer {
+            drawer_width
+        } else {
+            token::MIN_NAVIGATION_WIDTH as i32
+        });
+        ui.sidebar
+            .set_visible(layout.navigation.is_some() || navigation_drawer);
+        self.navigation_drawer.set_visible(navigation_drawer);
+        self.navigation_scrim.set_visible(navigation_drawer);
+        self.navigation_scrim
+            .set_margin_start(token::RAIL_WIDTH as i32 + drawer_width);
+        self.navigation_actual.set(navigation_drawer);
+        if let Some(button) = self.navigation_button.upgrade() {
+            let title = if navigation_drawer || layout.navigation.is_some() {
+                "Hide left sidebar"
+            } else {
+                "Show left sidebar"
+            };
+            button.set_tooltip_text(Some(title));
+            button.update_property(&[gtk4::accessible::Property::Label(title)]);
+        }
+        if navigation_drawer != was_in_drawer {
+            if let Some(focus) = navigation_focus.filter(|focus| focus.is_mapped()) {
+                focus.grab_focus();
+            }
+            frame.queue_allocate();
+        }
         let inline = layout.inspector.is_some();
         let usable = width >= 360 && height >= 120;
         let inspector = &ui.reference_inspector;
@@ -69,7 +133,7 @@ impl InspectorChrome {
             // A responsive resize must not hide the user's focused editor.
             self.requested.set(Some(true));
         }
-        let visible = usable && self.requested.get().unwrap_or(inline);
+        let visible = usable && !navigation_drawer && self.requested.get().unwrap_or(inline);
         let drawer = visible && !inline;
         let in_drawer = inspector.parent().as_ref() == Some(frame.upcast_ref());
         if drawer != in_drawer {
@@ -213,10 +277,45 @@ pub(crate) fn sync_inspector(ui: &UiState, reveal: bool) -> bool {
             ui_for_widget(ui.window.upcast_ref()),
         ) {
             if reveal {
+                controller.navigation_requested.set(false);
                 controller.requested.set(Some(true));
             }
             controller.sync(&ui, frame.width(), frame.height());
         }
+    }
+    true
+}
+
+/// A compact rail activation changes only window presentation, not preferences.
+pub(crate) fn toggle_navigation_drawer_if_compact(ui: &UiState) -> bool {
+    let controller = unsafe {
+        ui.window
+            .data::<std::rc::Weak<InspectorChrome>>(INSPECTOR_CHROME_KEY)
+            .and_then(|ptr| ptr.as_ref().upgrade())
+    };
+    let Some(controller) = controller else {
+        return false;
+    };
+    let Some(frame) = controller.frame.upgrade() else {
+        return false;
+    };
+    let navigation_width = controller.sizing.preferences().0;
+    if token::Layout::for_size_with_sidebars(
+        frame.width() as f32,
+        frame.height() as f32 + token::TITLEBAR_HEIGHT,
+        navigation_width as f32,
+        0.0,
+    )
+    .navigation
+    .is_some()
+    {
+        return false;
+    }
+    controller
+        .navigation_requested
+        .set(!controller.navigation_actual.get());
+    if let Some(ui) = ui_for_widget(ui.window.upcast_ref()) {
+        controller.sync(&ui, frame.width(), frame.height());
     }
     true
 }
@@ -2267,6 +2366,24 @@ pub(crate) fn install(
     let drawer_grip = sizing.drawer_grip(&ui.reference_inspector);
     frame.add_overlay(&drawer_grip);
     frame.set_measure_overlay(&drawer_grip, false);
+    let navigation_scrim = gtk4::Button::new();
+    navigation_scrim.add_css_class("flat");
+    navigation_scrim.set_tooltip_text(Some("Close left sidebar"));
+    navigation_scrim.set_focusable(false);
+    navigation_scrim.set_focus_on_click(false);
+    navigation_scrim.set_halign(gtk4::Align::Fill);
+    navigation_scrim.set_valign(gtk4::Align::Fill);
+    navigation_scrim.set_visible(false);
+    frame.add_overlay(&navigation_scrim);
+    frame.set_measure_overlay(&navigation_scrim, false);
+    let navigation_drawer = gtk4::Box::new(Orientation::Vertical, 0);
+    navigation_drawer.add_css_class("reference-navigation-drawer");
+    navigation_drawer.set_halign(gtk4::Align::Start);
+    navigation_drawer.set_valign(gtk4::Align::Fill);
+    navigation_drawer.set_margin_start(token::RAIL_WIDTH as i32);
+    navigation_drawer.set_visible(false);
+    frame.add_overlay(&navigation_drawer);
+    frame.set_measure_overlay(&navigation_drawer, false);
     let inspector_chrome = Rc::new(InspectorChrome {
         requested: std::cell::Cell::new(
             (!jterm_core::reference_conversation::fixture_enabled()).then_some(false),
@@ -2276,17 +2393,57 @@ pub(crate) fn install(
         frame: frame.downgrade(),
         sizing,
         drawer_grip: drawer_grip.downgrade(),
+        navigation_requested: std::cell::Cell::new(false),
+        navigation_actual: std::cell::Cell::new(false),
+        navigation_home: content.downgrade(),
+        navigation_drawer,
+        navigation_scrim: navigation_scrim.clone(),
+        navigation_button: sidebar_toggle.downgrade(),
     });
     unsafe {
         ui.window
             .set_data(INSPECTOR_CHROME_KEY, Rc::downgrade(&inspector_chrome));
     }
+    let chrome_for_dismiss = inspector_chrome.clone();
+    let ui_for_dismiss = Rc::downgrade(ui);
+    navigation_scrim.connect_clicked(move |_| {
+        if let (Some(ui), Some(frame)) =
+            (ui_for_dismiss.upgrade(), chrome_for_dismiss.frame.upgrade())
+        {
+            chrome_for_dismiss.navigation_requested.set(false);
+            chrome_for_dismiss.sync(&ui, frame.width(), frame.height());
+            ui.focus_current_terminal();
+        }
+    });
+    // Bubble after Entry/TextView IM handling, scoped to the navigation subtree.
+    let navigation_keys = gtk4::EventControllerKey::new();
+    navigation_keys.set_propagation_phase(gtk4::PropagationPhase::Bubble);
+    let chrome_for_escape = inspector_chrome.clone();
+    let ui_for_escape = Rc::downgrade(ui);
+    navigation_keys.connect_key_pressed(move |_, key, _, modifiers| {
+        if key == gtk4::gdk::Key::Escape
+            && modifiers.is_empty()
+            && chrome_for_escape.navigation_actual.get()
+        {
+            if let (Some(ui), Some(frame)) =
+                (ui_for_escape.upgrade(), chrome_for_escape.frame.upgrade())
+            {
+                chrome_for_escape.navigation_requested.set(false);
+                chrome_for_escape.sync(&ui, frame.width(), frame.height());
+                ui.focus_current_terminal();
+            }
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    ui.sidebar.add_controller(navigation_keys);
     let chrome_for_click = inspector_chrome.clone();
     let ui_for_inspector = Rc::downgrade(ui);
     inspector_toggle.connect_clicked(move |_| {
         if let (Some(ui), Some(frame)) =
             (ui_for_inspector.upgrade(), chrome_for_click.frame.upgrade())
         {
+            chrome_for_click.navigation_requested.set(false);
             chrome_for_click
                 .requested
                 .set(Some(!chrome_for_click.actual.get()));
@@ -2316,8 +2473,6 @@ pub(crate) fn install(
             if chrome_for_resize.requested.get() == Some(false) { 0.0 } else { inspector_width as f32 });
         path_for_resize.set_visible(layout.inspector.is_some());
         palette_for_resize.set_width_request(if layout.inspector.is_some() { token::SEARCH_WIDTH as i32 } else { 180 });
-        ui.sidebar
-            .set_visible(layout.navigation.is_some() && ui.config.borrow().sidebar_visible);
         chrome_for_resize.sync(&ui, width, height);
         if let Some(destination) = std::env::var_os("FORGE_REFERENCE_GEOMETRY") {
             let ui = Rc::downgrade(&ui);

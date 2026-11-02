@@ -2796,6 +2796,9 @@ impl UiState {
     }
 
     pub(crate) fn toggle_sidebar(&self) {
+        if super::reference_shell::toggle_navigation_drawer_if_compact(self) {
+            return;
+        }
         let visible = if self.window.has_css_class("reference-shell") {
             !self.config.borrow().sidebar_visible
         } else {
