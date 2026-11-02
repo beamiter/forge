@@ -425,3 +425,16 @@ menubutton.eva-companion-dock label { color:inherit; font-size:11px; }
 .reference-shell .reference-central .ai-panel .ai-panel-composer { padding: 12px 16px; border-top: 1px solid #2a3a52; }
 
 .reference-shell .reference-central .ai-panel .card { background: #18283e; border: 1px solid #354a6b; box-shadow: none; }
+
+/* Shared history evidence, context and result readers use the workspace palette. */
+.workspace-surface { background:#101927; color:#d4e2f8; }
+.workspace-surface.workspace-evidence { padding:16px; }
+.workspace-surface label { color:#d4e2f8; }
+.workspace-surface label.dim-label { color:#91a5c1; }
+.workspace-surface textview,.workspace-surface textview text { background:#101c2e; color:#d4e2f8; caret-color:#d4e2f8; font-size:13px; }
+.workspace-surface textview.workspace-material-editor { border:1px solid #354a6b; border-radius:8px; }
+.workspace-surface textview text selection { background:#385a96; color:#ffffff; }
+.workspace-surface entry,.workspace-surface searchentry,.workspace-surface dropdown > button { background:#16243a; color:#d4e2f8; caret-color:#d4e2f8; border-color:#354a6b; }
+.workspace-surface button:not(.suggested-action):not(.destructive-action) { background:#19283c; color:#d4e2f8; border-color:#354a6b; }
+.workspace-surface button:not(.suggested-action):not(.destructive-action):hover { background:#283d6f; }
+.workspace-surface scrolledwindow,.workspace-surface viewport { background:transparent; }

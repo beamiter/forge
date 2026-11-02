@@ -27,6 +27,40 @@ use super::ai_chat_store::{
 use crate::ai::{self, BlockContext, Role};
 use crate::config::Config;
 
+#[derive(Clone)]
+struct PendingHandoffDraft {
+    body: String,
+    source_chat: u64,
+    source_draft: String,
+    source_input_epoch: u64,
+}
+impl PendingHandoffDraft {
+    fn may_activate(
+        &self,
+        chat: u64,
+        draft: &str,
+        input_epoch: u64,
+        navigation_current: bool,
+        view_owns_focus: bool,
+    ) -> bool {
+        navigation_current
+            && view_owns_focus
+            && self.source_chat == chat
+            && self.source_draft == draft
+            && self.source_input_epoch == input_epoch
+    }
+}
+fn handoff_view_owns_focus(root: &impl IsA<gtk4::Widget>) -> bool {
+    let root = root.as_ref();
+    let Some(window) = root.root().and_downcast::<gtk4::Window>() else {
+        return false;
+    };
+    root.is_mapped()
+        && window.is_active()
+        && gtk4::prelude::RootExt::focus(&window)
+            .is_none_or(|focus| focus == *root || focus.is_ancestor(root))
+}
+
 const CHAT_PAGE: &str = "chat";
 const CHAT_LIBRARY_PAGE: &str = "library";
 const MAX_PENDING_STREAM_DELTAS: usize = 64;
@@ -135,6 +169,9 @@ pub(crate) struct AiPanel {
     shared: Rc<RefCell<super::workspace_chats::SharedChats>>,
     pending_shared: Rc<RefCell<HashMap<u64, (RequestPayload, bool)>>>,
     pending_new_context: Rc<RefCell<HashMap<u64, RequestPayload>>>,
+    pending_new_drafts: Rc<RefCell<HashMap<u64, (u64, PendingHandoffDraft)>>>,
+    handoff_navigation_epoch: Rc<Cell<u64>>,
+    handoff_input_epoch: Rc<Cell<u64>>,
     earlier_history: Rc<RefCell<HashMap<u64, String>>>,
     scroll_owner: Rc<Cell<u64>>,
     scroll_positions: Rc<RefCell<HashMap<u64, f64>>>,
@@ -388,14 +425,19 @@ impl AiPanel {
             .child(&input_view)
             .build();
         input_scroll.add_css_class("ai-panel-input");
+        crate::composer_geometry::install(&input_view, &input_scroll, 104, 220);
         let input_placeholder = Label::new(Some("Ask about commands, errors, or output…"));
         input_placeholder.set_halign(gtk4::Align::Start);
         input_placeholder.set_valign(gtk4::Align::Start);
         input_placeholder.set_can_target(false);
+        input_placeholder.set_wrap(true);
+        input_placeholder.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        input_placeholder.set_xalign(0.0);
         input_placeholder.add_css_class("ai-input-placeholder");
         let input_overlay = Overlay::new();
         input_overlay.set_child(Some(&input_scroll));
         input_overlay.add_overlay(&input_placeholder);
+        input_overlay.set_measure_overlay(&input_placeholder, false);
 
         let send_btn = Button::with_label("Send");
         send_btn.set_focus_on_click(false);
@@ -407,6 +449,9 @@ impl AiPanel {
         let input_hint = Label::new(Some("Enter for new line · Ctrl+Enter to send"));
         input_hint.set_halign(gtk4::Align::Start);
         input_hint.set_hexpand(true);
+        input_hint.set_wrap(true);
+        input_hint.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        input_hint.set_xalign(0.0);
         input_hint.add_css_class("ai-input-hint");
         let composer_actions = GBox::new(Orientation::Horizontal, 8);
         composer_actions.append(&input_hint);
@@ -484,6 +529,9 @@ impl AiPanel {
             ))),
             pending_shared: Rc::new(RefCell::new(HashMap::new())),
             pending_new_context: Rc::new(RefCell::new(HashMap::new())),
+            pending_new_drafts: Rc::new(RefCell::new(HashMap::new())),
+            handoff_navigation_epoch: Rc::new(Cell::new(0)),
+            handoff_input_epoch: Rc::new(Cell::new(0)),
             earlier_history: Rc::new(RefCell::new(HashMap::new())),
             scroll_owner: Rc::new(Cell::new(0)),
             scroll_positions: Rc::new(RefCell::new(HashMap::new())),
@@ -627,6 +675,10 @@ impl AiPanel {
                 let truncated = input.len() > MAX_LIVE_MESSAGE_BYTES;
                 let draft = bounded_live_message(input);
                 let changed = p.store.borrow_mut().set_active_draft(draft.clone());
+                if changed {
+                    p.handoff_input_epoch
+                        .set(p.handoff_input_epoch.get().wrapping_add(1));
+                }
                 if truncated {
                     // `set_text` emits `changed` synchronously. Store the
                     // bounded draft first so the nested callback is a no-op.
@@ -649,6 +701,8 @@ impl AiPanel {
             let p = panel.clone();
             let input_for_key = input_view.clone();
             key.connect_key_pressed(move |controller, keyval, _code, state| {
+                p.handoff_input_epoch
+                    .set(p.handoff_input_epoch.get().wrapping_add(1));
                 let action = classify_composer_key(keyval, state);
                 if action != ComposerKeyAction::Proceed {
                     if let Some(event) = controller.current_event() {
@@ -668,6 +722,13 @@ impl AiPanel {
                 }
             });
             input_view.add_controller(key);
+        }
+        {
+            let pointer = gtk4::GestureClick::new();
+            pointer.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            let epoch = panel.handoff_input_epoch.clone();
+            pointer.connect_pressed(move |_, _, _, _| epoch.set(epoch.get().wrapping_add(1)));
+            input_view.add_controller(pointer);
         }
         {
             let key = EventControllerKey::new();
@@ -722,17 +783,18 @@ impl AiPanel {
                     .and_then(|id| summaries.iter().find(|chat| chat.id == id));
                 Row {
                     action: Action::SharedApi(row.id.clone()),
-                    title: format!("{}{}", if row.pinned { "★ " } else { "" }, row.title),
-                    detail: "API conversation".into(),
+                    title: row.title.clone(),
+                    detail: format!("{} · {}", row.provider, row.presentation().status_label),
                     searchable: row.preview.clone(),
                     active: visible && state.is_some_and(|s| s.active),
                     busy: row.runtime.is_live() || state.is_some_and(|s| s.busy),
-                    attention: state.is_some_and(|s| s.unread || s.error),
+                    attention: row.attention().is_some() || state.is_some_and(|s| s.error),
                     archived: row.archived,
                     pinned: row.pinned,
                     project: row.cwd.clone(),
                     provider: row.provider.clone(),
                     updated: row.updated_at_ms,
+                    source: Some(row.clone()),
                 }
             })
             .collect::<Vec<_>>();
@@ -751,12 +813,13 @@ impl AiPanel {
                     searchable: chat.preview,
                     active: visible && chat.active,
                     busy: chat.busy,
-                    attention: chat.unread || chat.error,
+                    attention: chat.error,
                     archived: chat.archived,
                     pinned: false,
                     project: String::new(),
                     provider: "API".into(),
                     updated: 0,
+                    source: None,
                 }),
         );
         rows
@@ -889,6 +952,8 @@ impl AiPanel {
     }
 
     fn show_chat_library(&self) {
+        self.handoff_navigation_epoch
+            .set(self.handoff_navigation_epoch.get().wrapping_add(1));
         self.refresh_chat_library();
         self.content_stack.set_visible_child_name(CHAT_LIBRARY_PAGE);
         self.library_btn.set_label("Back");
@@ -905,7 +970,32 @@ impl AiPanel {
         }
     }
 
+    pub(crate) fn create_draft_chat(&self, draft: String) {
+        if draft.len() > MAX_LIVE_MESSAGE_BYTES {
+            self.show_error_status("This handoff exceeds the API draft limit. Edit the source context before creating a draft.");
+            return;
+        }
+        let epoch = self.handoff_navigation_epoch.get().wrapping_add(1);
+        self.handoff_navigation_epoch.set(epoch);
+        let handoff = PendingHandoffDraft {
+            body: draft,
+            source_chat: self.store.borrow().active_id(),
+            source_draft: self.store.borrow().active_draft().into(),
+            source_input_epoch: self.handoff_input_epoch.get(),
+        };
+        match self.shared.borrow_mut().create_inactive() {
+            Ok(request) => {
+                self.pending_new_drafts
+                    .borrow_mut()
+                    .insert(request, (epoch, handoff));
+            }
+            Err(error) => self.show_error_status(&error),
+        }
+    }
+
     pub(crate) fn create_new_chat(&self) {
+        self.handoff_navigation_epoch
+            .set(self.handoff_navigation_epoch.get().wrapping_add(1));
         if let Err(error) = self.shared.borrow_mut().create() {
             self.show_error_status(&error);
         }
@@ -919,6 +1009,8 @@ impl AiPanel {
     }
 
     pub(crate) fn open_shared(&self, id: jterm_core::agent_workspace::ConversationId) {
+        self.handoff_navigation_epoch
+            .set(self.handoff_navigation_epoch.get().wrapping_add(1));
         let result = self.shared.borrow_mut().open(id);
         match result {
             Ok(Some(id)) => self.select_chat(id),
@@ -935,16 +1027,50 @@ impl AiPanel {
             .poll(&mut self.store.borrow_mut(), redact);
         for event in events {
             match event {
-                super::workspace_chats::Event::Created {
-                    request,
-                    chat_id: _,
-                } => {
+                super::workspace_chats::Event::Created { request, chat_id } => {
+                    let handoff = self.pending_new_drafts.borrow_mut().remove(&request);
+                    let activate_handoff = handoff.as_ref().is_some_and(|(epoch, draft)| {
+                        let store = self.store.borrow();
+                        draft.may_activate(
+                            store.active_id(),
+                            store.active_draft(),
+                            self.handoff_input_epoch.get(),
+                            *epoch == self.handoff_navigation_epoch.get(),
+                            handoff_view_owns_focus(&self.root),
+                        )
+                    });
+                    let background_handoff = handoff.is_some() && !activate_handoff;
+                    let mut draft_conflict = false;
+                    if let Some((_, draft)) = handoff {
+                        let mut store = self.store.borrow_mut();
+                        if store.chat_draft(chat_id).is_some_and(str::is_empty) {
+                            store.set_chat_draft(chat_id, draft.body);
+                        } else {
+                            draft_conflict = true;
+                        }
+                        if activate_handoff {
+                            store.select_chat(chat_id);
+                        }
+                    }
                     let payload = self.pending_new_context.borrow_mut().remove(&request);
                     if let Some(payload) = payload {
                         self.send_with_context(payload.user_text, payload.context, false, false);
                     }
-                    self.render_active_chat();
+                    if !background_handoff {
+                        self.render_active_chat();
+                        if activate_handoff {
+                            self.show_chat_page();
+                        }
+                    } else {
+                        self.refresh_chat_library();
+                    }
                     self.publish_persisted_conversation();
+                    if background_handoff && !draft_conflict {
+                        self.show_info_status("Handoff draft created in the conversation list. Your current input and selection are retained.");
+                    }
+                    if draft_conflict {
+                        self.show_error_status("The new conversation already has a draft. The handoff remains in its source context; no text was overwritten.");
+                    }
                 }
                 super::workspace_chats::Event::Opened(id) => {
                     let job = self.shared.borrow().hosted_job(id);
@@ -1009,6 +1135,7 @@ impl AiPanel {
                 }
                 super::workspace_chats::Event::Rejected { request, message } => {
                     self.pending_shared.borrow_mut().remove(&request);
+                    self.pending_new_drafts.borrow_mut().remove(&request);
                     self.show_error_status(&message);
                 }
                 super::workspace_chats::Event::Deleted(id) => {
@@ -1061,6 +1188,8 @@ impl AiPanel {
     }
 
     pub(crate) fn select_chat(&self, id: u64) {
+        self.handoff_navigation_epoch
+            .set(self.handoff_navigation_epoch.get().wrapping_add(1));
         let selected = self.store.borrow_mut().select_chat(id);
         if selected {
             self.render_active_chat();
@@ -2434,5 +2563,67 @@ mod tests {
         let mut truncated = context;
         truncated.truncated = true;
         assert!(context_chip_text(&truncated, false).contains("output truncated"));
+    }
+    #[test]
+    #[ignore = "requires an isolated workspace state and native GTK display"]
+    fn workspace_v2_api_composer_keeps_portrait_width_after_render() {
+        gtk4::init().expect("GTK display");
+        crate::ui::reference_shell::install_css();
+        let panel = AiPanel::build(Rc::new(RefCell::new(Config::safe_defaults())));
+        panel
+            .input_buffer
+            .set_text("第一行\nsecond line\nthird line");
+        let window = gtk4::Window::new();
+        window.add_css_class("reference-shell");
+        window.set_decorated(false);
+        window.set_default_size(360, 640);
+        let root = GBox::new(Orientation::Horizontal, 0);
+        root.add_css_class("reference-central");
+        let rail = GBox::new(Orientation::Vertical, 0);
+        rail.set_width_request(55);
+        root.append(&rail);
+        root.append(&panel.root);
+        window.set_child(Some(&root));
+        window.present();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        while std::time::Instant::now() < deadline {
+            while glib::MainContext::default().iteration(false) {}
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let minimum = panel.root.measure(Orientation::Horizontal, -1).0;
+        assert!(
+            minimum <= 305,
+            "the rendered API panel needs {minimum}px beside a 55px rail"
+        );
+        assert_eq!(
+            window.width(),
+            360,
+            "API controls clamped a portrait window"
+        );
+        assert!(
+            panel.root.width() <= 305,
+            "API controls overflowed the portrait canvas"
+        );
+        assert_eq!(panel.input_text(), "第一行\nsecond line\nthird line");
+        window.close();
+    }
+    #[test]
+    fn workspace_handoff_receipt_preserves_later_navigation_and_typing() {
+        let draft = PendingHandoffDraft {
+            body: "reviewed handoff".into(),
+            source_chat: 7,
+            source_draft: "local draft".into(),
+            source_input_epoch: 3,
+        };
+        assert!(draft.may_activate(7, "local draft", 3, true, true));
+        assert!(!draft.may_activate(8, "local draft", 3, true, true));
+        assert!(!draft.may_activate(7, "new typing", 3, true, true));
+        assert!(!draft.may_activate(7, "local draft", 3, false, true));
+        assert!(!draft.may_activate(7, "local draft", 3, true, false));
+        assert!(
+            !draft.may_activate(7, "local draft", 4, true, true),
+            "IME/caret activity must retire pending input ownership"
+        );
+        assert_eq!(draft.body, "reviewed handoff");
     }
 }

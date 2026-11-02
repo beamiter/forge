@@ -1,6 +1,7 @@
 //! Native workspace routing. Browsing never sends input into a hidden PTY.
 use super::workspace_navigation::{Action as WorkspaceAction, Row};
 use super::*;
+use gtk4::prelude::WidgetExt;
 
 impl UiState {
     pub(crate) fn show_terminal_workspace(&self) {
@@ -11,7 +12,14 @@ impl UiState {
 
     pub(crate) fn workspace_action(&self, action: WorkspaceAction) {
         match action {
-            WorkspaceAction::Cli(id) => self.session_sidebar.activate(&id),
+            WorkspaceAction::Cli(id) => {
+                if self.session_sidebar.contains(&id) {
+                    self.session_sidebar.activate(&id);
+                } else {
+                    self.workspace_action(WorkspaceAction::Inspect(id));
+                    self.task_toast("The saved CLI source is not available in the current local catalog. Its indexed evidence remains read only; refresh Sessions to rediscover the source.");
+                }
+            }
             WorkspaceAction::PinCli(id, pinned) => {
                 self.session_sidebar.organize(&id, Some(pinned), None)
             }
@@ -45,7 +53,39 @@ impl UiState {
                     self.show_ai_error("Enable AI in Settings to create an API conversation.");
                 }
             }
-            WorkspaceAction::Task(id, _) => {
+            WorkspaceAction::PrefillApi { body } => {
+                if self.config.borrow().ai_enabled {
+                    self.open_ai_panel();
+                    self.ai_panel.create_draft_chat(body);
+                    super::reference_shell::navigation_entered_canvas(self);
+                    self.ai_panel.focus_input();
+                } else {
+                    self.show_ai_error("Enable AI in Settings to create an API handoff draft.");
+                }
+            }
+            WorkspaceAction::PrefillTask {
+                title,
+                cwd,
+                provider,
+                body,
+            } => {
+                self.compose_handoff_task(title, cwd, provider, body);
+            }
+            WorkspaceAction::OpenTask(conversation) => {
+                if let Some(row) = self.workspace_navigation.lookup(&conversation) {
+                    if let Some(id) = row
+                        .facts
+                        .task_id
+                        .filter(|id| self.agent_tasks.borrow().task_manager.get(*id).is_some())
+                    {
+                        self.workspace_action(WorkspaceAction::Task(id, conversation));
+                    } else {
+                        self.workspace_action(WorkspaceAction::Inspect(conversation));
+                        self.task_toast("Task controls will appear after the host's task state has synchronized.");
+                    }
+                }
+            }
+            WorkspaceAction::Task(id, conversation) => {
                 let terminal = self
                     .agent_tasks
                     .borrow()
@@ -72,6 +112,8 @@ impl UiState {
                         id,
                     ));
                     super::reference_shell::navigation_entered_canvas(self);
+                } else {
+                    self.workspace_action(WorkspaceAction::Inspect(conversation));
                 }
             }
             WorkspaceAction::PinShared(id, pinned) => self
@@ -80,15 +122,59 @@ impl UiState {
             WorkspaceAction::ArchiveShared(id, archived) => self.ai_panel.shared_mutation(
                 jterm_core::agent_workspace::WorkspaceCommand::Archive { id, archived },
             ),
-            WorkspaceAction::ExternalTask(id) => {
-                if let Some(row) = self.session_sidebar.shared_row(&id) {
+            WorkspaceAction::ExternalTask(id) | WorkspaceAction::Inspect(id) => {
+                if let Some(row) = self
+                    .workspace_navigation
+                    .lookup(&id)
+                    .or_else(|| self.session_sidebar.shared_row(&id))
+                {
                     if let Some(old) = self.workspace_stack.child_by_name("task-context") {
                         self.workspace_stack.remove(&old);
                     }
-                    let page = super::workspace_navigation::task_context(&row);
+                    let page = self.workspace_navigation.inspect(&row);
                     self.workspace_stack.add_named(&page, Some("task-context"));
                     self.workspace_stack.set_visible_child_name("task-context");
                     super::reference_shell::navigation_entered_canvas(self);
+                }
+            }
+            WorkspaceAction::InspectContext(id) => {
+                if let Some(row) = self
+                    .workspace_navigation
+                    .lookup(&id)
+                    .or_else(|| self.session_sidebar.shared_row(&id))
+                {
+                    if let Some(old) = self.workspace_stack.child_by_name("task-context") {
+                        self.workspace_stack.remove(&old);
+                    }
+                    let page = self.workspace_navigation.inspect_context(&row);
+                    self.workspace_stack.add_named(&page, Some("task-context"));
+                    self.workspace_stack.set_visible_child_name("task-context");
+                    super::reference_shell::navigation_entered_canvas(self);
+                    page.grab_focus();
+                }
+            }
+            WorkspaceAction::ShowEvidence(id) => {
+                if let Some(page) = self.workspace_navigation.evidence(id) {
+                    if let Some(old) = self.workspace_stack.child_by_name("workspace-evidence") {
+                        self.workspace_stack.remove(&old);
+                    }
+                    self.workspace_stack
+                        .add_named(&page, Some("workspace-evidence"));
+                    self.workspace_stack
+                        .set_visible_child_name("workspace-evidence");
+                    super::reference_shell::navigation_entered_canvas(self);
+                    page.grab_focus();
+                }
+            }
+            WorkspaceAction::AddEvidenceContext(id) => {
+                if let Some(page) = self.workspace_navigation.evidence_context(id) {
+                    if let Some(old) = self.workspace_stack.child_by_name("task-context") {
+                        self.workspace_stack.remove(&old);
+                    }
+                    self.workspace_stack.add_named(&page, Some("task-context"));
+                    self.workspace_stack.set_visible_child_name("task-context");
+                    super::reference_shell::navigation_entered_canvas(self);
+                    page.grab_focus();
                 }
             }
             WorkspaceAction::NewTask => {
@@ -100,6 +186,7 @@ impl UiState {
                 self.show_terminal_workspace();
                 self.execute_action(crate::keybindings::Action::NewTab);
             }
+            WorkspaceAction::RemoteWorkspace => super::workspace_remote_ui::show(&self.window),
         }
         self.sync_workspace_navigation();
     }
@@ -147,7 +234,6 @@ impl UiState {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|_| "default".into())
         );
-        let mut task_index = Vec::new();
         let mut owned = std::collections::HashSet::new();
         for task in domain.task_manager.tasks() {
             let Some(metadata) = domain
@@ -162,37 +248,82 @@ impl UiState {
                 continue;
             };
             owned.insert(metadata.clone());
+            self.workspace_navigation.set_task_usage(
+                metadata.clone(),
+                domain
+                    .agent_runtime
+                    .shared_snapshot(task.id)
+                    .as_deref()
+                    .and_then(|snapshot| snapshot.usage.as_ref())
+                    .map(|usage| usage.summary()),
+            );
             let shared = self.session_sidebar.shared_row(&metadata);
-            task_index.push(jterm_core::agent_workspace::WorkspaceRow {
-                id: metadata.clone(),
-                kind: jterm_core::agent_workspace::ConversationKind::Task,
-                title: task.title.clone(),
-                provider: task.provider.display_name().into(),
-                cwd: task.repo_root.to_string_lossy().into_owned(),
-                preview: format!("{} · {}", task.status.label(), task.branch),
-                updated_at_ms: task.updated_at_ms,
-                archived: task.status == crate::agent_task::TaskStatus::Archived,
-                pinned: false,
-                tags: Vec::new(),
-                runtime: jterm_core::agent_workspace::RuntimeState::Idle,
-            });
+            let activity = jterm_core::agent_task::DashboardActivity {
+                has_agent_terminal: domain.agent_runtime.hosted_terminal(task.id).is_some(),
+                has_validation_terminal: domain
+                    .agent_runtime
+                    .hosted_validation_terminal(task.id)
+                    .is_some(),
+                has_active_agent_stream: domain.task_manager.has_active_agent_event_stream(task.id),
+                native_preparing: domain.agent_runtime.has_preparing(task.id),
+            };
+            let mut projection = domain
+                .agent_runtime
+                .workspace_row(task.id)
+                .unwrap_or_else(|| jterm_core::agent_workspace::WorkspaceRow {
+                    id: metadata.clone(),
+                    kind: jterm_core::agent_workspace::ConversationKind::Task,
+                    title: task.title.clone(),
+                    provider: task.provider.display_name().into(),
+                    cwd: task.repo_root.to_string_lossy().into_owned(),
+                    preview: format!("{} · {}", task.status.label(), task.branch),
+                    updated_at_ms: task.updated_at_ms,
+                    archived: task.status == crate::agent_task::TaskStatus::Archived,
+                    pinned: false,
+                    tags: Vec::new(),
+                    runtime: if activity.native_preparing {
+                        jterm_core::agent_workspace::RuntimeState::Starting
+                    } else if activity.has_agent_terminal
+                        || activity.has_validation_terminal
+                        || activity.has_active_agent_stream
+                    {
+                        jterm_core::agent_workspace::RuntimeState::Running
+                    } else {
+                        jterm_core::agent_workspace::RuntimeState::Idle
+                    },
+                    facts: jterm_core::agent_workspace::WorkspaceFacts::from_task(task, activity),
+                });
+            if let Some(shared) = &shared {
+                projection.pinned = shared.pinned;
+                projection.tags.clone_from(&shared.tags);
+            }
+            let presentation = projection.presentation();
             rows.push(Row {
                 action: WorkspaceAction::Task(task.id, metadata),
-                title: task.title.clone(),
-                detail: format!("{} · {}", task.provider.display_name(), task.status.label()),
-                searchable: format!("{} {}", task.repo_root.display(), task.branch),
+                title: projection.title.clone(),
+                detail: format!(
+                    "{} · {}",
+                    task.provider.display_name(),
+                    presentation.status_label
+                ),
+                searchable: format!(
+                    "{} {} {}",
+                    task.repo_root.display(),
+                    task.branch,
+                    presentation.detail.as_deref().unwrap_or_default()
+                ),
                 active: domain.selected_task == Some(task.id)
                     && surface.as_deref() == Some("tasks"),
-                busy: task.status.is_running() || domain.agent_runtime.has_preparing(task.id),
-                attention: task.needs_attention(),
-                archived: task.status == crate::agent_task::TaskStatus::Archived,
-                pinned: shared.is_some_and(|row| row.pinned),
-                project: task.repo_root.to_string_lossy().into_owned(),
-                provider: task.provider.display_name().into(),
-                updated: task.updated_at_ms,
+                busy: projection.runtime.is_live(),
+                attention: presentation.attention.is_some(),
+                archived: projection.archived,
+                pinned: projection.pinned,
+                project: projection.cwd.clone(),
+                provider: projection.provider.clone(),
+                updated: projection.updated_at_ms,
+                source: Some(projection),
             });
         }
-        self.session_sidebar.index_tasks(task_index);
         rows.extend(self.session_sidebar.external_tasks(&owned));
         self.session_sidebar.set_projects(
             rows.iter()

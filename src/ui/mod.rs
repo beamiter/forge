@@ -50,7 +50,15 @@ mod sidebar_resize;
 mod sidebar_tabs;
 mod workspace_chats;
 mod workspace_cli;
+mod workspace_context;
+mod workspace_context_ui;
 pub(crate) mod workspace_navigation;
+mod workspace_remote;
+mod workspace_remote_ui;
+mod workspace_review;
+mod workspace_review_ui;
+mod workspace_search_ui;
+mod workspace_tools;
 pub(crate) mod workspace_visibility;
 pub(crate) use sidebar_tabs::configure_layout as configure_sidebar_layout;
 #[cfg(test)]

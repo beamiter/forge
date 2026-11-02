@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 mod agent_cli;
+mod composer_geometry;
 mod gtk_presentation;
 mod gtk_process;
 mod gtk_spawn;

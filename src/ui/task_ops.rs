@@ -937,6 +937,41 @@ impl UiState {
         );
     }
 
+    /// A reviewed handoff becomes an editable new task. The ordinary composer
+    /// still owns validation, explicit creation, and the worktree receipt.
+    pub(crate) fn compose_handoff_task(
+        &self,
+        title: String,
+        cwd: String,
+        provider: String,
+        body: String,
+    ) {
+        if !self.config.borrow().agent_tasks_enabled {
+            self.task_toast("Enable agent tasks in Settings before creating a handoff task.");
+            return;
+        }
+        if self.agent_tasks.borrow().pending_task_creation.is_some() {
+            self.task_toast("Another task worktree is still being created");
+            return;
+        }
+        let Some(provider) = AgentProvider::from_config_value(&provider) else {
+            self.task_toast("Choose a supported agent provider for this new task.");
+            return;
+        };
+        let state = self.clone();
+        agent_task_ui::task_composer::show_prefilled(
+            &self.window,
+            (!cwd.is_empty()).then(|| std::path::PathBuf::from(cwd)),
+            self.shell_argv.borrow().first().cloned(),
+            Some(agent_task_ui::task_composer::TaskSeed {
+                title,
+                goal: body,
+                provider,
+            }),
+            move |draft| state.execute_task_panel_action(TaskPanelAction::CreateProject(draft)),
+        );
+    }
+
     fn create_project_task(&self, request: agent_task_ui::TaskProjectRequest) {
         if self.agent_tasks.borrow().pending_task_creation.is_some() {
             self.task_toast("Another task worktree is still being created");
@@ -2034,6 +2069,7 @@ mod hosted_validation_history_tests {
         let secret = format!("sk-{}", "x".repeat(32));
         let history = HostedValidationSnapshot {
             run_id: "synthetic-validation".into(),
+            evidence: None,
             preparing: false,
             terminal: None,
             output: format!("first line\n{secret}\n\u{1b}[31m\u{202e}failure"),

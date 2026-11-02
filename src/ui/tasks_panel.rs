@@ -761,6 +761,7 @@ impl TasksPanel {
         follow_up_scroll.set_max_content_height(150);
         follow_up_scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
         follow_up_scroll.set_child(Some(&follow_up_entry));
+        crate::composer_geometry::install(&follow_up_entry, &follow_up_scroll, 104, 220);
         follow_up_row.append(&follow_up_scroll);
         let follow_up_send = Button::from_icon_name("go-next-symbolic");
         follow_up_send.add_css_class("flat");

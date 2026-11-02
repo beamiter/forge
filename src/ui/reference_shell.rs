@@ -2005,7 +2005,13 @@ pub(crate) fn install(
             });
         }
     }
-    top_background.append(&toolbar);
+    // Permit a portrait allocation before compact labels are hidden.
+    let toolbar_scroll = gtk4::ScrolledWindow::new();
+    toolbar_scroll.set_policy(gtk4::PolicyType::External, gtk4::PolicyType::Never);
+    toolbar_scroll.set_min_content_width(1);
+    toolbar_scroll.set_propagate_natural_width(false);
+    toolbar_scroll.set_child(Some(&toolbar));
+    top_background.append(&toolbar_scroll);
 
     ui.sidebar.add_css_class("reference-navigation");
     ui.sidebar
@@ -2609,6 +2615,8 @@ pub(crate) fn install(
     let ui_for_resize = Rc::downgrade(ui);
     let palette_for_resize = palette.clone();
     let path_for_resize = path.clone();
+    let identity_for_resize = identity.downgrade();
+    let modes_for_resize = modes.downgrade();
     let top_for_geometry = top.clone();
     let rail_for_geometry = rail.clone();
     let chrome_for_resize = inspector_chrome.clone();
@@ -2621,6 +2629,13 @@ pub(crate) fn install(
             if ui.config.borrow().sidebar_visible { navigation_width as f32 } else { 0.0 },
             if chrome_for_resize.requested.get() == Some(false) { 0.0 } else { inspector_width as f32 });
         path_for_resize.set_visible(layout.inspector.is_some());
+        palette_for_resize.set_visible(width >= 1024);
+        if let Some(identity) = identity_for_resize.upgrade() {
+            identity.set_visible(width >= 520);
+        }
+        if let Some(modes) = modes_for_resize.upgrade() {
+            modes.set_visible(width >= 520);
+        }
         palette_for_resize.set_width_request(if layout.inspector.is_some() { token::SEARCH_WIDTH as i32 } else { 180 });
         chrome_for_resize.sync(&ui, width, height);
         if let Some(destination) = std::env::var_os("FORGE_REFERENCE_GEOMETRY") {
