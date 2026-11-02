@@ -3171,7 +3171,7 @@ fn resolve_file_config(
         sidebar_width: fc
             .sidebar_width
             .unwrap_or(jterm_core::developer_workspace::NAVIGATION_WIDTH as u32)
-            .clamp(120, 800),
+            .clamp(240, 360),
         tab_width: fc
             .tab_width
             .unwrap_or(DEFAULT_TAB_WIDTH)

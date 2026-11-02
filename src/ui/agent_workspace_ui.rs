@@ -36,6 +36,17 @@ impl UiState {
                 }
             }
             WorkspaceAction::Task(id, _) => {
+                let terminal = self
+                    .agent_tasks
+                    .borrow()
+                    .agent_runtime
+                    .hosted_terminal(id)
+                    .cloned();
+                if let Some(session) = terminal {
+                    self.open_hosted_native_terminal(session);
+                    return;
+                }
+
                 let status = self
                     .agent_tasks
                     .borrow()
@@ -81,6 +92,28 @@ impl UiState {
         self.sync_workspace_navigation();
     }
 
+    pub(crate) fn open_hosted_native_terminal(
+        &self,
+        session: jterm_core::agent_sessions::AgentSession,
+    ) {
+        match jterm_core::agent_workspace::managed_launch(&session)
+            .and_then(|launch| Ok((jterm_core::agent_workspace::session_id(&session)?, launch)))
+        {
+            Ok((runtime_key, launch)) => {
+                let (completion, _) = std::sync::mpsc::channel();
+                self.add_agent_session_tab(super::agent_sessions::ResumeRequest {
+                    runtime_key,
+                    provider: session.provider,
+                    id: session.id,
+                    title: session.title,
+                    launch: Some(launch),
+                    completion,
+                });
+            }
+            Err(error) => self.task_toast(error),
+        }
+    }
+
     pub(crate) fn sync_workspace_navigation(&self) {
         self.ai_panel.poll_workspace();
         self.session_sidebar
@@ -105,9 +138,14 @@ impl UiState {
         let mut task_index = Vec::new();
         let mut owned = std::collections::HashSet::new();
         for task in domain.task_manager.tasks() {
-            let Some(metadata) = self
-                .session_sidebar
-                .task_id(&namespace, &task.id.to_string())
+            let Some(metadata) = domain
+                .agent_runtime
+                .conversation_id(task.id)
+                .cloned()
+                .or_else(|| {
+                    self.session_sidebar
+                        .task_id(&namespace, &task.id.to_string())
+                })
             else {
                 continue;
             };

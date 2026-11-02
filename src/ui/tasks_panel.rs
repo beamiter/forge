@@ -1114,6 +1114,7 @@ impl TasksPanel {
             }
             let selected = panel.state.borrow().selected;
             if let Some(id) = selected {
+                panel.follow_up_receipts.borrow_mut().edited(id);
                 panel.follow_up_drafts.borrow_mut().insert(
                     id,
                     entry

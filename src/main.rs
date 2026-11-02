@@ -1457,6 +1457,7 @@ pub fn run() -> glib::ExitCode {
             glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
                 let Some(ui) = owner.upgrade() else { return glib::ControlFlow::Break; };
                 ui.sync_workspace_navigation();
+                ui.ensure_agent_tasks_timer();
                 glib::ControlFlow::Continue
             });
         }
