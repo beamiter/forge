@@ -51,6 +51,7 @@ mod sidebar_tabs;
 mod workspace_chats;
 mod workspace_cli;
 pub(crate) mod workspace_navigation;
+pub(crate) mod workspace_visibility;
 pub(crate) use sidebar_tabs::configure_layout as configure_sidebar_layout;
 #[cfg(test)]
 mod tab_geometry_tests;
@@ -311,6 +312,7 @@ pub(crate) struct UiState {
     pub(crate) workspace_stack: Stack,
     pub(crate) session_sidebar: agent_sessions::Sidebar,
     pub(crate) workspace_navigation: workspace_navigation::Navigation,
+    pub(crate) agent_workspace_expander: gtk4::Expander,
     pub(crate) agent_session_tabs:
         RefCell<HashMap<agent_sessions::RuntimeIdentity, gtk4::glib::WeakRef<Terminal>>>,
     pub(crate) agent_session_library: Rc<RefCell<jterm_core::agent_sessions::SessionLibraryStore>>,

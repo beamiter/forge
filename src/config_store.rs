@@ -997,6 +997,10 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         toml::Value::Boolean(config.sidebar_visible),
     );
     table.insert(
+        "agent_workspace_enabled".into(),
+        toml::Value::Boolean(config.agent_workspace_enabled),
+    );
+    table.insert(
         "sidebar_width".into(),
         toml::Value::Integer(config.sidebar_width as i64),
     );
@@ -2347,3 +2351,26 @@ mod tests {
 #[cfg(test)]
 #[path = "config_store_fault_tests.rs"]
 mod fault_tests;
+
+#[cfg(test)]
+mod agent_workspace_visibility_tests {
+    use super::*;
+    #[test]
+    fn hidden_workspace_preference_is_written_without_overwriting_sidebar_width() {
+        let mut config = Config::safe_defaults();
+        config.agent_workspace_enabled = false;
+        config.sidebar_width = 312;
+        let mut table = toml::Table::new();
+        apply_config_to_table(&config, &mut table);
+        assert_eq!(
+            table
+                .get("agent_workspace_enabled")
+                .and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            table.get("sidebar_width").and_then(toml::Value::as_integer),
+            Some(312)
+        );
+    }
+}

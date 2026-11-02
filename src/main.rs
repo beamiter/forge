@@ -1195,13 +1195,25 @@ pub fn run() -> glib::ExitCode {
         session_sidebar.bind_navigation(&workspace_navigation);
         session_sidebar.supplemental.append(&workspace_navigation.root);
         let sessions_page = gtk4::Box::new(Orientation::Vertical, 0);
-        session_sidebar.root.set_vexpand(true);
-        sessions_page.append(&session_sidebar.root);
         let terminals = gtk4::Expander::new(Some("Terminals"));
         terminals.set_child(Some(&sidebar_tabs_page));
         terminals.set_expanded(true);
         sidebar_tabs_page.set_size_request(-1, 120);
         sidebar_tabs_page.set_vexpand(false);
+        let owner = unified_navigation_owner.clone();
+        let agent_workspace_expander = ui::workspace_visibility::group(
+            session_sidebar.root.upcast_ref(), terminals.upcast_ref(), sidebar_tabs_page.upcast_ref(),
+            config.borrow().agent_workspace_enabled,
+            move |visible| {
+                if let Some(ui) = owner.borrow().upgrade() {
+                    if ui.config.borrow().agent_workspace_enabled != visible {
+                        ui.config.borrow_mut().agent_workspace_enabled = visible;
+                        ui.persist_config();
+                    }
+                }
+            },
+        );
+        sessions_page.append(&agent_workspace_expander);
         sessions_page.append(&terminals);
         let sidebar_stack = gtk4::Stack::new();
         sidebar_stack.set_vexpand(true);
@@ -1343,6 +1355,7 @@ pub fn run() -> glib::ExitCode {
             workspace_stack: workspace_stack.clone(),
             session_sidebar,
             workspace_navigation,
+            agent_workspace_expander,
             agent_session_tabs: RefCell::new(HashMap::new()),
             agent_session_library,
             tab_counter: tab_counter.clone(),

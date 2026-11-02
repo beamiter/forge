@@ -1100,6 +1100,9 @@ impl UiState {
         self.sidebar_view.set(sidebar_view);
         self.apply_tab_placement();
         self.set_sidebar_visible(sidebar_visible, false);
+        let agent_workspace_enabled = self.config.borrow().agent_workspace_enabled;
+        self.agent_workspace_expander
+            .set_expanded(agent_workspace_enabled);
         self.sync_bottom_bar_visibility();
 
         self.ai_panel_visible.set(ai_visible);

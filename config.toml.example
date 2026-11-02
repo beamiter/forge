@@ -46,6 +46,8 @@ tab_placement = "sidebar"     # "sidebar" 或 "top"
 sidebar_view = "tabs"         # "tabs" 或 "files"
 # 可选；省略时 sidebar 布局默认打开，top 布局默认关闭。运行时开关会自动保存。
 # sidebar_visible = true
+# Show Agent Workspace conversations; false keeps terminal tabs and other sidebar views.
+agent_workspace_enabled = true
 sidebar_width = 237            # 120 .. 800
 tab_width = 180                # 顶部 tab 宽度；拖动右缘调整，80 .. 480
 

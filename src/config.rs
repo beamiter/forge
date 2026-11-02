@@ -869,6 +869,8 @@ pub struct Config {
     /// startup derives the default from tab placement: open for sidebar tabs,
     /// closed for top-bar tabs.
     pub(crate) sidebar_visible: bool,
+    /// Collapse only Agent Workspace conversations; terminal and Files navigation stay available.
+    pub(crate) agent_workspace_enabled: bool,
     /// Sidebar width in pixels (resizable divider position).
     pub(crate) sidebar_width: u32,
     /// Width of each tab in the horizontal top tab strip, in pixels.
@@ -1039,6 +1041,7 @@ impl Config {
             // Recovery mode must never initiate update/network work.
             jsh_update_check: JshUpdateCheck::Never,
             sidebar_visible: true,
+            agent_workspace_enabled: true,
             sidebar_width: jterm_core::developer_workspace::NAVIGATION_WIDTH as u32,
             tab_width: DEFAULT_TAB_WIDTH,
             max_visible_blocks: 200,
@@ -1576,6 +1579,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "sidebar_view",
     "jsh_update_check",
     "sidebar_visible",
+    "agent_workspace_enabled",
     "sidebar_width",
     "tab_width",
     "max_visible_blocks",
@@ -1746,6 +1750,7 @@ fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
         "ascii_organism_enabled",
         "ascii_organism_care_enabled",
         "sidebar_visible",
+        "agent_workspace_enabled",
         "ai_enabled",
         "agent_enabled",
         "agent_tasks_enabled",
@@ -2400,6 +2405,7 @@ struct FileConfig {
     sidebar_view: Option<String>,
     jsh_update_check: Option<String>,
     sidebar_visible: Option<bool>,
+    agent_workspace_enabled: Option<bool>,
     sidebar_width: Option<u32>,
     tab_width: Option<u32>,
     // Block view optimizations
@@ -2639,6 +2645,9 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         sidebar_visible: table.get("sidebar_visible").and_then(|v| v.as_bool()),
+        agent_workspace_enabled: table
+            .get("agent_workspace_enabled")
+            .and_then(|v| v.as_bool()),
         sidebar_width: table_u32(&table, "sidebar_width"),
         tab_width: table_u32(&table, "tab_width"),
         max_visible_blocks: table_u32(&table, "max_visible_blocks"),
@@ -3168,6 +3177,7 @@ fn resolve_file_config(
                 .unwrap_or_else(|| "daily".to_string()),
         ),
         sidebar_visible,
+        agent_workspace_enabled: fc.agent_workspace_enabled.unwrap_or(true),
         sidebar_width: fc
             .sidebar_width
             .unwrap_or(jterm_core::developer_workspace::NAVIGATION_WIDTH as u32)
@@ -3394,6 +3404,23 @@ pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_workspace_enabled_defaults_on_and_restores_explicit_false() {
+        assert!(Config::safe_defaults().agent_workspace_enabled);
+        let (config, _, _) = resolve_file_config(
+            FileConfig {
+                agent_workspace_enabled: Some(false),
+                sidebar_width: Some(312),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(!config.agent_workspace_enabled);
+        assert_eq!(config.sidebar_width, 312);
+        let issues = validate_config_contents("agent_workspace_enabled = false\n").unwrap();
+        assert!(issues.is_empty(), "{issues:?}");
+    }
 
     #[test]
     fn main_default_is_absolute_pixels_and_ui_default_stays_points() {
