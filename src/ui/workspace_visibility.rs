@@ -40,10 +40,9 @@ fn apply_layout(
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "requires an isolated GTK display and one test per process"]
     fn collapse_retains_conversation_widgets_and_gives_terminals_the_space() {
-        if gtk::init().is_err() {
-            return;
-        }
+        gtk::init().expect("isolated GTK display is required");
         let entry = gtk::Entry::new();
         entry.set_text("same conversation draft");
         entry.set_width_request(312);

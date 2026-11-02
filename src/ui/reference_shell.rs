@@ -43,6 +43,9 @@ struct InspectorChrome {
     navigation_drawer: gtk4::Box,
     navigation_scrim: gtk4::Button,
     navigation_button: glib::WeakRef<gtk4::Button>,
+    navigation_last_focus: std::cell::RefCell<Option<glib::WeakRef<gtk4::Widget>>>,
+    navigation_return_focus: std::cell::RefCell<Option<glib::WeakRef<gtk4::Widget>>>,
+    navigation_rehosting: std::cell::Cell<bool>,
 }
 
 impl InspectorChrome {
@@ -85,6 +88,14 @@ impl InspectorChrome {
         });
         let was_in_drawer = ui.sidebar.parent().as_ref()
             == Some(self.navigation_drawer.upcast_ref::<gtk4::Widget>());
+        self.navigation_rehosting.set(true);
+        if let Some(focus) = &navigation_focus {
+            *self.navigation_last_focus.borrow_mut() = Some(focus.downgrade());
+        }
+        if navigation_drawer && !was_in_drawer && navigation_focus.is_none() {
+            *self.navigation_return_focus.borrow_mut() =
+                gtk4::prelude::RootExt::focus(&ui.window).map(|focus| focus.downgrade());
+        }
         if let Some(home) = self.navigation_home.upgrade() {
             navigation_drawer::rehost(
                 &ui.sidebar,
@@ -117,11 +128,14 @@ impl InspectorChrome {
             button.update_property(&[gtk4::accessible::Property::Label(title)]);
         }
         if navigation_drawer != was_in_drawer {
-            if let Some(focus) = navigation_focus.filter(|focus| focus.is_mapped()) {
-                focus.grab_focus();
+            if navigation_drawer {
+                self.focus_navigation(ui);
+            } else if let Some(focus) = navigation_focus.filter(|focus| focus.is_mapped()) {
+                navigation_drawer::focus_preserving_selection(&focus);
             }
             frame.queue_allocate();
         }
+        self.navigation_rehosting.set(false);
         let inline = layout.inspector.is_some();
         let usable = width >= 360 && height >= 120;
         let inspector = &ui.reference_inspector;
@@ -219,6 +233,41 @@ impl InspectorChrome {
             ui.focus_current_terminal();
         }
     }
+
+    fn restore_navigation_focus(&self, ui: &UiState) {
+        let previous = self
+            .navigation_return_focus
+            .borrow_mut()
+            .take()
+            .and_then(|focus| focus.upgrade())
+            .filter(|focus| {
+                focus.is_mapped()
+                    && focus.is_sensitive()
+                    && focus.root().as_ref() == Some(ui.window.upcast_ref())
+            });
+        if let Some(previous) = previous {
+            navigation_drawer::focus_preserving_selection(&previous);
+        } else {
+            ui.focus_current_terminal();
+        }
+    }
+
+    fn focus_navigation(&self, ui: &UiState) {
+        // A remembered row owns navigation keys but not text. Prefer the live
+        // search field so typing immediately after a rail/shortcut open is safe.
+        let target = navigation_drawer::search_target(ui.sidebar.upcast_ref()).or_else(|| {
+            self.navigation_last_focus
+                .borrow()
+                .as_ref()
+                .and_then(|focus| focus.upgrade())
+                .filter(|focus| focus.is_mapped())
+        });
+        if let Some(target) = target {
+            navigation_drawer::focus_preserving_selection(&target);
+        } else {
+            ui.sidebar.child_focus(gtk4::DirectionType::TabForward);
+        }
+    }
 }
 
 /// Non-measuring overlays do not propagate their children's resize requests.
@@ -286,6 +335,25 @@ pub(crate) fn sync_inspector(ui: &UiState, reveal: bool) -> bool {
     true
 }
 
+/// Successful canvas activation retires only the temporary navigation overlay.
+pub(crate) fn navigation_entered_canvas(ui: &UiState) {
+    let controller = unsafe {
+        ui.window
+            .data::<std::rc::Weak<InspectorChrome>>(INSPECTOR_CHROME_KEY)
+            .and_then(|ptr| ptr.as_ref().upgrade())
+    };
+    if let Some(controller) = controller.filter(|controller| controller.navigation_actual.get()) {
+        controller.navigation_requested.set(false);
+        controller.navigation_return_focus.borrow_mut().take();
+        if let (Some(frame), Some(ui)) = (
+            controller.frame.upgrade(),
+            ui_for_widget(ui.window.upcast_ref()),
+        ) {
+            controller.sync(&ui, frame.width(), frame.height());
+        }
+    }
+}
+
 /// A compact rail activation changes only window presentation, not preferences.
 pub(crate) fn toggle_navigation_drawer_if_compact(ui: &UiState) -> bool {
     let controller = unsafe {
@@ -314,8 +382,39 @@ pub(crate) fn toggle_navigation_drawer_if_compact(ui: &UiState) -> bool {
     controller
         .navigation_requested
         .set(!controller.navigation_actual.get());
+    let opening = controller.navigation_requested.get();
     if let Some(ui) = ui_for_widget(ui.window.upcast_ref()) {
         controller.sync(&ui, frame.width(), frame.height());
+        if !opening {
+            controller.restore_navigation_focus(&ui);
+        } else {
+            // Reparenting is synchronous, but the new overlay is allocated on
+            // the next main-context turn. Confirm focus once after it maps.
+            let chrome = controller.clone();
+            let weak_ui = Rc::downgrade(&ui);
+            glib::idle_add_local_once(move || {
+                let Some(ui) = weak_ui.upgrade() else {
+                    return;
+                };
+                if !chrome.navigation_actual.get() {
+                    return;
+                }
+                let focus = gtk4::prelude::RootExt::focus(&ui.window);
+                let prior = chrome
+                    .navigation_return_focus
+                    .borrow()
+                    .as_ref()
+                    .and_then(|focus| focus.upgrade());
+                let still_opening = focus.as_ref().is_none_or(|focus| {
+                    focus.is_ancestor(&ui.sidebar) || Some(focus) == prior.as_ref()
+                });
+                if still_opening {
+                    chrome.navigation_rehosting.set(true);
+                    chrome.focus_navigation(&ui);
+                    chrome.navigation_rehosting.set(false);
+                }
+            });
+        }
     }
     true
 }
@@ -2399,6 +2498,9 @@ pub(crate) fn install(
         navigation_drawer,
         navigation_scrim: navigation_scrim.clone(),
         navigation_button: sidebar_toggle.downgrade(),
+        navigation_last_focus: Default::default(),
+        navigation_return_focus: Default::default(),
+        navigation_rehosting: std::cell::Cell::new(false),
     });
     unsafe {
         ui.window
@@ -2412,7 +2514,7 @@ pub(crate) fn install(
         {
             chrome_for_dismiss.navigation_requested.set(false);
             chrome_for_dismiss.sync(&ui, frame.width(), frame.height());
-            ui.focus_current_terminal();
+            chrome_for_dismiss.restore_navigation_focus(&ui);
         }
     });
     // Bubble after Entry/TextView IM handling, scoped to the navigation subtree.
@@ -2430,13 +2532,60 @@ pub(crate) fn install(
             {
                 chrome_for_escape.navigation_requested.set(false);
                 chrome_for_escape.sync(&ui, frame.width(), frame.height());
-                ui.focus_current_terminal();
+                chrome_for_escape.restore_navigation_focus(&ui);
             }
             return glib::Propagation::Stop;
         }
         glib::Propagation::Proceed
     });
     ui.sidebar.add_controller(navigation_keys);
+    let chrome_for_focus = inspector_chrome.clone();
+    let ui_for_focus = Rc::downgrade(ui);
+    ui.window.connect_focus_widget_notify(move |window| {
+        if chrome_for_focus.navigation_rehosting.get() || !chrome_for_focus.navigation_actual.get()
+        {
+            return;
+        }
+        let (Some(ui), Some(focus)) = (
+            ui_for_focus.upgrade(),
+            gtk4::prelude::RootExt::focus(window),
+        ) else {
+            return;
+        };
+        if &focus == ui.sidebar.upcast_ref::<gtk4::Widget>() || focus.is_ancestor(&ui.sidebar) {
+            *chrome_for_focus.navigation_last_focus.borrow_mut() = Some(focus.downgrade());
+            return;
+        }
+        let in_canvas = focus.is_ancestor(&ui.workspace_stack)
+            || &focus == ui.workspace_stack.upcast_ref::<gtk4::Widget>()
+            || ui
+                .ai_paned
+                .start_child()
+                .is_some_and(|center| focus == center || focus.is_ancestor(&center));
+        if in_canvas {
+            // Wait until the activating action releases its borrows; honor only
+            // this exact focus transfer, never a later user selection.
+            let intended = focus.downgrade();
+            let chrome = chrome_for_focus.clone();
+            let weak_ui = Rc::downgrade(&ui);
+            glib::idle_add_local_once(move || {
+                let (Some(ui), Some(intended), Some(frame)) = (
+                    weak_ui.upgrade(),
+                    intended.upgrade(),
+                    chrome.frame.upgrade(),
+                ) else {
+                    return;
+                };
+                if chrome.navigation_actual.get()
+                    && gtk4::prelude::RootExt::focus(&ui.window).as_ref() == Some(&intended)
+                {
+                    chrome.navigation_requested.set(false);
+                    chrome.navigation_return_focus.borrow_mut().take();
+                    chrome.sync(&ui, frame.width(), frame.height());
+                }
+            });
+        }
+    });
     let chrome_for_click = inspector_chrome.clone();
     let ui_for_inspector = Rc::downgrade(ui);
     inspector_toggle.connect_clicked(move |_| {

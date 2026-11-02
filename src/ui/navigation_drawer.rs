@@ -1,6 +1,38 @@
 //! Rehost one authoritative navigation subtree without rebuilding its controls.
 use gtk4::prelude::*;
 
+pub(super) fn focus_preserving_selection(widget: &gtk4::Widget) -> bool {
+    let editable = widget.clone().dynamic_cast::<gtk4::Editable>().ok();
+    let selection = editable.as_ref().and_then(|entry| entry.selection_bounds());
+    let position = editable.as_ref().map(|entry| entry.position());
+    let focused = widget.grab_focus();
+    if let Some(entry) = editable {
+        if let Some((start, end)) = selection {
+            entry.select_region(start, end);
+        } else if let Some(position) = position {
+            entry.set_position(position);
+        }
+    }
+    focused
+}
+
+pub(super) fn search_target(root: &gtk4::Widget) -> Option<gtk4::Widget> {
+    if (root.is::<gtk4::SearchEntry>() || root.is::<gtk4::Entry>())
+        && root.is_mapped()
+        && root.is_sensitive()
+    {
+        return Some(root.clone());
+    }
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        if let Some(target) = search_target(&widget) {
+            return Some(target);
+        }
+        child = widget.next_sibling();
+    }
+    None
+}
+
 pub(super) fn rehost(
     sidebar: &gtk4::Box,
     home: &gtk4::Paned,
@@ -28,10 +60,9 @@ pub(super) fn rehost(
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "requires an isolated GTK display and one test per process"]
     fn rehost_keeps_the_exact_navigation_widgets_draft_selection_and_scroll() {
-        if gtk4::init().is_err() {
-            return;
-        }
+        gtk4::init().expect("isolated GTK display is required");
         let sidebar = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         let search = gtk4::Entry::new();
         search.set_text("same query 中文");

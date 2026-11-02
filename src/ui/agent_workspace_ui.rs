@@ -21,16 +21,26 @@ impl UiState {
             WorkspaceAction::Api(id) => {
                 self.open_ai_panel();
                 self.ai_panel.select_chat(id);
+                if self.ai_panel_visible.get() {
+                    super::reference_shell::navigation_entered_canvas(self);
+                    self.ai_panel.focus_input();
+                }
             }
             WorkspaceAction::SharedApi(id) => {
                 self.open_ai_panel();
                 self.workspace_stack.set_visible_child_name("chats");
                 self.ai_panel.open_shared(id);
+                if self.ai_panel_visible.get() {
+                    super::reference_shell::navigation_entered_canvas(self);
+                    self.ai_panel.focus_input();
+                }
             }
             WorkspaceAction::NewApi => {
                 if self.config.borrow().ai_enabled {
                     self.open_ai_panel();
                     self.ai_panel.create_new_chat();
+                    super::reference_shell::navigation_entered_canvas(self);
+                    self.ai_panel.focus_input();
                 } else {
                     self.show_ai_error("Enable AI in Settings to create an API conversation.");
                 }
@@ -61,6 +71,7 @@ impl UiState {
                     self.execute_task_panel_action(crate::agent_task_ui::TaskPanelAction::Select(
                         id,
                     ));
+                    super::reference_shell::navigation_entered_canvas(self);
                 }
             }
             WorkspaceAction::PinShared(id, pinned) => self
@@ -77,6 +88,7 @@ impl UiState {
                     let page = super::workspace_navigation::task_context(&row);
                     self.workspace_stack.add_named(&page, Some("task-context"));
                     self.workspace_stack.set_visible_child_name("task-context");
+                    super::reference_shell::navigation_entered_canvas(self);
                 }
             }
             WorkspaceAction::NewTask => {
