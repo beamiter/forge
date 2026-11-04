@@ -252,6 +252,14 @@ impl UiState {
     /// Keep the top-bar Tasks button in step with the domain. It is shown
     /// only where tasks can be used and counts attention by the shared rule.
     pub(crate) fn sync_task_badge(&self) {
+        {
+            use gtk4::prelude::*;
+            let domain = self.agent_tasks.borrow();
+            crate::eva_companion::report_agent_tasks(
+                self.window.upcast_ref(),
+                domain.task_manager.tasks(),
+            );
+        }
         let (has_tasks, counts) = {
             let domain = self.agent_tasks.borrow();
             (
@@ -937,6 +945,60 @@ impl UiState {
         );
     }
 
+    /// An approved Eva handoff opens the ordinary task composer prefilled. The
+    /// user still chooses repository, provider and validation and creates the
+    /// task; starting the agent stays a separate action in the task panel.
+    pub(crate) fn compose_eva_handoff(&self, handoff: crate::eva_companion::EvaHandoff) {
+        use crate::eva_companion::{report_handoff, HandoffReport};
+        use gtk4::prelude::*;
+        let window: &gtk4::Window = self.window.upcast_ref();
+        if !self.config.borrow().agent_tasks_enabled {
+            report_handoff(
+                window,
+                &handoff.operation_id,
+                HandoffReport::Unavailable("agent_tasks_disabled"),
+            );
+            self.task_toast("Eva suggested an agent task, but agent tasks are off in Settings.");
+            return;
+        }
+        if self.agent_tasks.borrow().pending_task_creation.is_some() {
+            report_handoff(
+                window,
+                &handoff.operation_id,
+                HandoffReport::Unavailable("task_creation_busy"),
+            );
+            self.task_toast("Another task worktree is still being created");
+            return;
+        }
+        let directory = self
+            .active_pane_leaf()
+            .and_then(|leaf| crate::terminal::terminal_working_directory(leaf.terminal()))
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::current_dir().ok());
+        let weak = self.window.downgrade();
+        let operation = handoff.operation_id.clone();
+        let on_abandoned: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(move || {
+            if let Some(window) = weak.upgrade() {
+                report_handoff(window.upcast_ref(), &operation, HandoffReport::Closed);
+            }
+        });
+        let state = self.clone();
+        agent_task_ui::task_composer::show_prefilled(
+            &self.window,
+            directory,
+            self.shell_argv.borrow().first().cloned(),
+            Some(agent_task_ui::task_composer::TaskSeed {
+                title: handoff.title,
+                goal: handoff.goal,
+                provider: AgentProvider::ALL[0],
+                eva_operation: Some(handoff.operation_id.clone()),
+                on_abandoned: Some(on_abandoned),
+            }),
+            move |draft| state.execute_task_panel_action(TaskPanelAction::CreateProject(draft)),
+        );
+        report_handoff(window, &handoff.operation_id, HandoffReport::Opened);
+    }
+
     /// A reviewed handoff becomes an editable new task. The ordinary composer
     /// still owns validation, explicit creation, and the worktree receipt.
     pub(crate) fn compose_handoff_task(
@@ -967,6 +1029,8 @@ impl UiState {
                 title,
                 goal: body,
                 provider,
+                eva_operation: None,
+                on_abandoned: None,
             }),
             move |draft| state.execute_task_panel_action(TaskPanelAction::CreateProject(draft)),
         );
@@ -1078,6 +1142,17 @@ impl UiState {
         match result {
             Ok(task_id) => {
                 self.agent_tasks.borrow_mut().selected_task = Some(task_id);
+                if let Some(operation) = project_request
+                    .as_ref()
+                    .and_then(|request| request.draft.eva_operation.as_deref())
+                {
+                    use gtk4::prelude::*;
+                    crate::eva_companion::report_handoff(
+                        self.window.upcast_ref(),
+                        operation,
+                        crate::eva_companion::HandoffReport::Created(task_id.to_string()),
+                    );
+                }
                 self.task_toast("Task created in an isolated worktree; choose Start when ready");
             }
             Err(error) => {

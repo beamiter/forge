@@ -2343,7 +2343,18 @@ pub fn run() -> glib::ExitCode {
 
         let eva_overlay = gtk4::Overlay::new();
         eva_overlay.set_child(Some(&toast_overlay));
-        crate::eva_companion::install(window.upcast_ref(), &eva_overlay, "forge");
+        let handoff_ui = Rc::downgrade(&ui);
+        let handoff_sink: crate::eva_companion::HandoffSink = Rc::new(move |handoff| {
+            if let Some(ui) = handoff_ui.upgrade() {
+                ui.compose_eva_handoff(handoff);
+            }
+        });
+        crate::eva_companion::install_with_handoffs(
+            window.upcast_ref(),
+            &eva_overlay,
+            "forge",
+            Some(handoff_sink),
+        );
         window.set_content(Some(&eva_overlay));
         window.present();
 
