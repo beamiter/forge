@@ -24,3 +24,8 @@ flatpak-smoke-logs/
 /qa/eva-native/*-96dpi.png
 /qa/eva-native/*-144dpi.png
 /qa/eva-native/*-192dpi.png
+
+# Review the candidate shared-core source override with the frontend.
+!.cargo/
+.cargo/*
+!.cargo/config.toml

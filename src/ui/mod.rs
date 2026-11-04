@@ -26,6 +26,7 @@ mod command_palette;
 mod command_review;
 mod config_apply;
 mod dialogs;
+pub(crate) mod desktop_sessions;
 mod file_tree;
 pub(crate) mod history_notice;
 mod jsh;

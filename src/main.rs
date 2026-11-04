@@ -1465,6 +1465,7 @@ pub fn run() -> glib::ExitCode {
         );
 
         *ui.unified_navigation_owner.borrow_mut() = Rc::downgrade(&ui);
+        ui::desktop_sessions::install(&ui);
         {
             let owner = Rc::downgrade(&ui);
             glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
