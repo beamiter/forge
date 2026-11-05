@@ -267,6 +267,7 @@ jobs:
           python3 scripts/test-chat-render-matrix.py
 
       - name: Check F13 real Bash keyboard and clipboard smoke
+        if: ${{ !cancelled() }}
         run: |
           python3 scripts/test-chat-shell-oracles.py
           python3 scripts/test-chat-shell-smoke.py
@@ -385,6 +386,7 @@ jobs:
             --ignored --exact --nocapture 2>&1 | tee gtk-paint-diagnostics/exact-search-preview-dialog.log
 
       - name: Run display-backed GTK/VTE regressions
+        if: ${{ !cancelled() }}
         run: FORGE_NATIVE_CRASH_DIAGNOSTICS=1 GTK_PAINT_DIAGNOSTICS_DIR="$PWD/gtk-paint-diagnostics" FORGE_XTEST_DRIVER="$PWD/scripts/qa-cross-selection-pointer.py" bash scripts/test-gtk-display.sh
 
       - name: Upload synthetic GTK paint diagnostics

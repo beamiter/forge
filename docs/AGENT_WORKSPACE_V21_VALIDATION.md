@@ -82,3 +82,32 @@ Hosted GTK font/search/Vim regressions, Flatpak build and smoke, and Nix build
 remain pending until their exact-commit workflow results are recorded. Real IME
 composition/candidate UI, physical hardware, Wayland, provider execution, remote
 SSH, and a live model request surviving GUI closure were not verified here.
+
+## Hosted checkpoint: c10869c
+
+[CI run 41950429946](https://github.com/beamiter/forge/actions/runs/41950429946)
+completed the production source/PTY input, native font groups, exact search
+preview (including the previously timing-out production dialog), native Vim9,
+top-tab geometry and same-execution metadata checks successfully. The unit test,
+strict Clippy, Rustfmt, Rustdoc, release, dependency policy, shell, privacy,
+prototype and Nix package jobs passed. The separate
+[Native Vim](https://github.com/beamiter/forge/actions/runs/41950429875),
+[native conversation](https://github.com/beamiter/forge/actions/runs/41950429820)
+and [Flatpak](https://github.com/beamiter/forge/actions/runs/41950429848)
+workflows also passed, including Flatpak installation and X11/Wayland smoke.
+These exact-commit results do not certify later frontend revisions.
+
+The main GTK job failed in the F13 synthetic-render fixture before capture zero:
+`chat_render_tests.rs:132` asserted nonzero native clip/control bounds. Its
+artifact shows the render fixture still used the immediately-exiting PTY child;
+the asynchronous reader had retired the active prompt before rendering. That
+fixture now uses the same owned live-display child as the font/search fixtures.
+Its geometry, cursor, glyph, scrollbar and capture assertions remain unchanged.
+The artifact digest was
+`cfdccc2b17b212af554eedb196ad7ead20daad1931cf73686fbd6704288bb5fc`.
+
+The plain real-Bash smoke and broad GTK/VTE runner were skipped by GitHub's default
+success condition after that failure. They are **not** counted as passes. These
+independent stages now use `!cancelled()` so an earlier failure still leaves the
+job failed while allowing all native diagnostics to execute. Native verification
+of the F13 fixture change and the broad regression set is pending its next run.

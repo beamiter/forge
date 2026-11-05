@@ -45,7 +45,9 @@ fn chat_native_unicode_render_geometry() {
         None,
         None,
         &[],
-        |_, _, _, _| crate::pty::OwnedPty::for_tests(crate::pty::PtyForeground::Shell),
+        // This fixture pumps the real reader between synthetic output stages.
+        // A child that already exited retires the active prompt and controls.
+        |_, _, _, _| crate::pty::OwnedPty::for_live_display_tests(crate::pty::PtyForeground::Shell),
     )
     .unwrap();
     let window = gtk4::Window::builder()
