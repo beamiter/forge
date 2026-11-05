@@ -71,6 +71,10 @@ Run 页的共享依赖队列可加入、移除和选择任务依赖；写入用�
 
 Workspace toggle 只折叠导航内容，保留原任务、草稿、布局与后台工作。中央视图保持连续左对齐，右检查器可收起；原生文本输入保留至少三行和光标下一行留白；留白是原生布局 margin，不进入发送文本。New task 表单可滚动，Cancel / Create task 固定留在可视底部。
 
+## 多仓 Mission
+
+**＋ New → Mission workbench · linked delivery** 提供五仓交付清单、revision 检查保存、只读检查、候选冻结和已有 task/run 关联。未检查或过期证据进入 Needs you；保存计划不表示交付完成，也不会自动启动任务、验证或 Git 写入。详情、草稿冲突处理及验证边界见 [Mission workbench](AGENT_WORKSPACE_MISSIONS.md)。
+
 ## 远程只读工作区
 
 **＋ New → Remote workspace · read only** 打开独立连接窗口。填写已有 SSH alias、远端已安装本版本终端的绝对路径与预期 host ID；在远端用 `<terminal executable> --jterm-workspace-host-id` 取得身份。连接使用严格 known_hosts、BatchMode 与协议/host ID 检查，只读取已经运行的远端 workspace host，不自动启动 host 或 provider。

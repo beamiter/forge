@@ -111,3 +111,26 @@ success condition after that failure. They are **not** counted as passes. These
 independent stages now use `!cancelled()` so an earlier failure still leaves the
 job failed while allowing all native diagnostics to execute. Native verification
 of the F13 fixture change and the broad regression set is pending its next run.
+
+## Hosted checkpoint: 0ea0fbf
+
+[CI run 41951959168](https://github.com/beamiter/forge/actions/runs/41951959168)
+now passes the complete F13 synthetic fractional-scale rendering matrix,
+confirming the live-display fixture correction. Flatpak, Nix, release, unit,
+Clippy, Rustfmt, Rustdoc and the independent native workflows also passed.
+The newly unblocked real-Bash keyboard/clipboard smoke fails: Bash accepted both
+commands' bytes correctly, but the history-disabled pasted command's completed
+capsule became `(command capture unavailable)` after resize, yielding a one-row
+capsule instead of the keyboard command's four rows. The strict geometry check
+is retained; production command-capture diagnosis remains open.
+
+The broad GTK runner reached registration preflight and found one obsolete test
+name. `successful_spawn_losing_close_and_exit_before_completion_retire_exact_ownership`
+was renamed to `late_owned_outcomes_obey_controller_close_exit_and_reentry` in
+`terminal::launch_owner::tests`; the script now names that actual owned-child
+regression. No test was removed. The broad native set has still not executed
+successfully and is not counted as accepted. Its new run also includes the
+Mission editing regression.
+
+The diagnostic artifact SHA256 is
+`01f9aba5fdb2d688c463f7a4b459127d1db7f54cf0a111e815ac64a70db7f65a`.

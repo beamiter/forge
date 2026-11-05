@@ -86,6 +86,8 @@ impl UiState {
                 }
             }
             WorkspaceAction::Task(id, conversation) => {
+                self.workspace_navigation
+                    .mission_link_target(conversation.clone());
                 let terminal = self
                     .agent_tasks
                     .borrow()
@@ -128,6 +130,9 @@ impl UiState {
                     .lookup(&id)
                     .or_else(|| self.session_sidebar.shared_row(&id))
                 {
+                    if row.kind == jterm_core::agent_workspace::ConversationKind::Task {
+                        self.workspace_navigation.mission_link_target(id.clone());
+                    }
                     if let Some(old) = self.workspace_stack.child_by_name("task-context") {
                         self.workspace_stack.remove(&old);
                     }
@@ -185,6 +190,28 @@ impl UiState {
             WorkspaceAction::NewTerminal => {
                 self.show_terminal_workspace();
                 self.execute_action(crate::keybindings::Action::NewTab);
+            }
+            WorkspaceAction::Missions | WorkspaceAction::Mission(_) => {
+                let id = if let WorkspaceAction::Mission(id) = &action {
+                    Some(id.as_str())
+                } else {
+                    None
+                };
+                if let Some(old) = self.workspace_stack.child_by_name("workspace-missions") {
+                    self.workspace_stack.remove(&old);
+                }
+                let page = self.workspace_navigation.mission_page(id);
+                if let Some(parent) = page.parent().and_downcast::<gtk4::ScrolledWindow>() {
+                    parent.set_child(None::<&gtk4::Widget>);
+                }
+                let scroll = gtk4::ScrolledWindow::new();
+                scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+                scroll.set_child(Some(&page));
+                self.workspace_stack
+                    .add_named(&scroll, Some("workspace-missions"));
+                self.workspace_stack
+                    .set_visible_child_name("workspace-missions");
+                super::reference_shell::navigation_entered_canvas(self);
             }
             WorkspaceAction::RemoteWorkspace => super::workspace_remote_ui::show(&self.window),
         }

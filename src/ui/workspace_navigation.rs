@@ -22,6 +22,8 @@ pub(crate) enum Action {
     NewTask,
     NewTerminal,
     RemoteWorkspace,
+    Missions,
+    Mission(String),
     Inspect(jterm_core::agent_workspace::ConversationId),
     InspectContext(jterm_core::agent_workspace::ConversationId),
     OpenTask(jterm_core::agent_workspace::ConversationId),
@@ -129,6 +131,20 @@ impl Filter {
     }
 }
 
+/// The shared query contract describes conversations. Until it gains explicit
+/// non-conversation fields, Mission discovery supports positive free text only.
+/// Parsing quoted plain terms and comparing the parsed contract avoids a second
+/// lexer and also rejects typed/negated terms without guessing their meaning.
+fn mission_query_uses_plain_text(query: &jterm_core::agent_workspace::WorkspaceQuery) -> bool {
+    let plain = query
+        .plain_terms()
+        .into_iter()
+        .map(|term| format!("\"{}\"", term.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    jterm_core::agent_workspace::WorkspaceQuery::parse(&plain).is_ok_and(|plain| &plain == query)
+}
+
 impl Row {
     fn identity(&self) -> RowIdentity {
         self.source
@@ -141,6 +157,11 @@ impl Row {
             )
     }
     fn matches_query(&self, query: &jterm_core::agent_workspace::WorkspaceQuery) -> bool {
+        if matches!(self.action, Action::Mission(_)) && !mission_query_uses_plain_text(query) {
+            // Mission is a delivery plan, not an API/CLI/task conversation.
+            // Never invent conversation kind, runtime or failure predicates.
+            return false;
+        }
         self.source.as_ref().map_or_else(
             || query.matches(&self.search_row()),
             |row| query.matches(row),
@@ -255,6 +276,7 @@ pub(crate) struct Navigation {
     next_surface: Rc<Cell<u64>>,
     context: super::workspace_context_ui::ContextSurface,
     review: super::workspace_review_ui::ReviewSurface,
+    missions: super::workspace_missions::MissionSurface,
     callback: Rc<dyn Fn(Action)>,
 }
 
@@ -276,6 +298,7 @@ impl Navigation {
             (SharedAction::NewApiChat.label(), Action::NewApi),
             (SharedAction::NewTask.label(), Action::NewTask),
             (SharedAction::NewTerminal.label(), Action::NewTerminal),
+            ("Mission workbench · linked delivery", Action::Missions),
             ("Remote workspace · read only", Action::RemoteWorkspace),
         ] {
             let button = gtk::Button::with_label(label);
@@ -482,6 +505,7 @@ impl Navigation {
             next_surface: Rc::new(Cell::new(1)),
             context,
             review,
+            missions: super::workspace_missions::MissionSurface::new(callback.clone()),
             callback,
         }
     }
@@ -579,6 +603,8 @@ impl Navigation {
                 source: Some(source),
             });
         }
+        self.missions.poll();
+        rows.extend(self.missions.rows(filter.project.as_deref()));
         self.search
             .set_query(&filter.history_query(), None, filter.archive != 0);
         self.search.poll();
@@ -634,14 +660,14 @@ impl Navigation {
         visible.truncate(self.visible_limit.get());
         self.summary.set_text(&if total == 0 {
             if filter.query.trim().is_empty() {
-                "No conversations yet".into()
+                "No workspace items yet".into()
             } else {
-                "No matching conversations".into()
+                "No matching workspace items".into()
             }
         } else if total > visible.len() {
-            format!("{} of {total} conversations", visible.len())
+            format!("{} of {total} workspace items", visible.len())
         } else {
-            format!("{total} conversations")
+            format!("{total} workspace items")
         });
         self.next_attention
             .set_label(&format!("Needs you · {all_attention}"));
@@ -705,6 +731,15 @@ impl Navigation {
         if headers_changed {
             self.list.invalidate_headers();
         }
+    }
+
+    pub fn mission_page(&self, id: Option<&str>) -> gtk::Box {
+        self.missions.open(id);
+        self.missions.root.clone()
+    }
+
+    pub fn mission_link_target(&self, id: jterm_core::agent_workspace::ConversationId) {
+        self.missions.link_target(id);
     }
 
     pub fn evidence(&self, id: u64) -> Option<gtk::Box> {
@@ -1040,6 +1075,7 @@ impl RowWidgets {
             Some((jterm_core::agent_workspace::ConversationKind::Cli, false)) => "CLI history: open the exact conversation to inspect its current runtime or resume availability.",
             Some((jterm_core::agent_workspace::ConversationKind::Api, _)) => "API: the session host owns an accepted request; closing a view does not send it again.",
             Some((jterm_core::agent_workspace::ConversationKind::Task, _)) => "Agent task: execution and validation belong to the session host; this is a view.",
+            None if matches!(row.action, Action::Mission(_)) => "Delivery plan: inspection is read only; task execution and integration require explicit existing controls.",
             None => "Local conversation; waiting for shared-session registration.",
         };
         self.widget.set_tooltip_text(Some(&format!(
@@ -1244,6 +1280,31 @@ pub(crate) fn compact_task_surface(root: &gtk::Box) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn missions_do_not_invent_conversation_query_facts() {
+        use jterm_core::agent_workspace::WorkspaceQuery;
+        for text in [
+            "kind:api",
+            "-kind:api",
+            "type:chat",
+            "provider:Mission",
+            "attention:failed",
+            "runtime:idle",
+            "-delivery",
+        ] {
+            assert!(
+                !super::mission_query_uses_plain_text(&WorkspaceQuery::parse(text).unwrap()),
+                "{text}"
+            );
+        }
+        for text in ["", "delivery core", "\"kind:api\"", "\"目标 pin\""] {
+            assert!(
+                super::mission_query_uses_plain_text(&WorkspaceQuery::parse(text).unwrap()),
+                "{text}"
+            );
+        }
+    }
+
     use super::*;
 
     fn row() -> Row {

@@ -12,7 +12,7 @@
     "vendor/companion-process/src/pty_session.rs": "34ef861a92c1afe27059f491664802f932b996306f09d5a04e91db94b8661a2f",
     "vendor/companion-process/src/shell_identity.rs": "cff15f40ec159f8c099a74335d51bc236d524e4166088f9d1bf785ebff28435f"
   },
-  "public_core_base": "f8566bb9cb6e9cca3258c8050c6dc4e9b96da8ff",
+  "public_core_base": "c1aebbe7b6ad4a8edb98582ea282d6e4d2ba6816",
   "schema": 1,
   "scope": "Versioned process observer and GTK launch ownership, validated against public_core_base. Bundled source origins and hashes are unchanged. No protocol or presentation proof.",
   "version": "0.1.0"

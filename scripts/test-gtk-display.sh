@@ -52,6 +52,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    ui::workspace_missions::tests::mission_editor_preserves_newer_drafts_stable_rows_and_releases_callbacks
     ui::workspace_visibility::tests::collapse_retains_conversation_widgets_and_gives_terminals_the_space
     ui::reference_shell::navigation_drawer::tests::rehost_keeps_the_exact_navigation_widgets_draft_selection_and_scroll
     ui::reference_conversation::tests::user_capsules_follow_reading_edge_and_wrap_in_narrow_windows
@@ -69,7 +70,7 @@ tests=(
     ui::tasks_panel::tests::task_filters_route_real_x11_keyboard_by_identity
     ui::tasks_panel::tests::task_filters_keep_identity_hidden_updates_and_keyboard_routing
     ui::tasks_panel::tests::thousand_task_filter_and_update_native_benchmark
-    terminal::launch_owner::tests::successful_spawn_losing_close_and_exit_before_completion_retire_exact_ownership
+    terminal::launch_owner::tests::late_owned_outcomes_obey_controller_close_exit_and_reentry
     terminal::launch_recovery::tests::manual_recovery_is_single_flight_scoped_and_delivers_startup_once
     terminal::launch_recovery::tests::unavailable_cwd_falls_back_home_and_pending_commands_run_once
     terminal::launch_recovery::tests::close_and_exit_retire_pending_commands_and_background_retry_keeps_focus
