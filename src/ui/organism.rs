@@ -5679,6 +5679,69 @@ mod tests {
             .all(|key| follow[key].as_bool() == Some(false))
     }
 
+    /// Only the paint oracle's surrounding native chrome is made stationary.
+    /// Keep the real canvas motion, layout and complete old/new damage region.
+    #[cfg(target_os = "linux")]
+    struct InlinePaintEnvironment {
+        scroller: gtk4::ScrolledWindow,
+        settings: gtk4::Settings,
+        overlay_scrolling: bool,
+        cursor_blink: bool,
+        animations: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl InlinePaintEnvironment {
+        fn new(window: &gtk4::Window, card: &gtk4::Widget) -> Self {
+            // GtkText checks blink policy when focus/allocation installs its
+            // tick. Set it before this fixture's first map and focus, rather
+            // than trying to freeze an already-running cursor halfway through.
+            assert!(!window.is_mapped());
+            let scroller = card
+                .ancestor(gtk4::ScrolledWindow::static_type())
+                .and_downcast::<gtk4::ScrolledWindow>()
+                .expect("inline card's native scroller");
+            assert!(scroller.has_css_class("block-scroll"));
+            let settings = window.settings();
+            let saved = Self {
+                overlay_scrolling: scroller.is_overlay_scrolling(),
+                cursor_blink: settings.is_gtk_cursor_blink(),
+                animations: settings.is_gtk_enable_animations(),
+                scroller,
+                settings,
+            };
+            // GTK removes the indicator fade tick/timeouts and draws an
+            // ordinary stationary scrollbar. Do not disable app animations.
+            saved.scroller.set_overlay_scrolling(false);
+            saved.settings.set_gtk_cursor_blink(false);
+            saved
+        }
+
+        fn restore(self) {
+            let scroller = self.scroller.clone();
+            let settings = self.settings.clone();
+            let expected = (self.overlay_scrolling, self.cursor_blink, self.animations);
+            drop(self);
+            assert_eq!(
+                (
+                    scroller.is_overlay_scrolling(),
+                    settings.is_gtk_cursor_blink(),
+                    settings.is_gtk_enable_animations(),
+                ),
+                expected,
+                "later lifecycle checks must use the original native settings"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for InlinePaintEnvironment {
+        fn drop(&mut self) {
+            self.scroller.set_overlay_scrolling(self.overlay_scrolling);
+            self.settings.set_gtk_cursor_blink(self.cursor_blink);
+        }
+    }
+
     #[test]
     fn inline_paint_barrier_waits_for_scroll_controller_retirement() {
         let idle = serde_json::json!({"follow": {
@@ -5712,6 +5775,7 @@ mod tests {
         window: &gtk4::Window,
         view: &TermView,
         runtime: &OrganismRuntime,
+        environment: InlinePaintEnvironment,
     ) {
         use super::surface_probe::{PaintSerial, PixelRect, SurfaceProbe};
         assert!(
@@ -5976,6 +6040,11 @@ mod tests {
         assert_eq!(runtime.state.text(), state);
         assert_eq!(runtime.card.margin_start(), margin);
         assert_eq!(window.default_size(), size);
+        // Restoring overlay scrolling changes native allocation. Finish that
+        // layout before the following tooltip test captures hit coordinates.
+        drop(_style);
+        environment.restore();
+        settle_geometry();
     }
 
     #[test]
@@ -6162,6 +6231,8 @@ mod tests {
             .content(&tooltip_overlay)
             .build()
             .upcast::<gtk4::Window>();
+        #[cfg(target_os = "linux")]
+        let paint_environment = InlinePaintEnvironment::new(&window, &runtime.card);
         window.present();
         entry.grab_focus();
         let main = gtk4::glib::MainContext::default();
@@ -6173,7 +6244,7 @@ mod tests {
         assert!(view.widget().is_mapped());
         crate::block_view::organism_settings_test_clean_prompt(&view);
         #[cfg(target_os = "linux")]
-        assert_inline_card_repaint(&window, &view, &runtime);
+        assert_inline_card_repaint(&window, &view, &runtime, paint_environment);
         let wait_for_tooltip_layout = |ready: &dyn Fn() -> bool| {
             let started = Instant::now();
             while !ready() && started.elapsed() < Duration::from_secs(2) {

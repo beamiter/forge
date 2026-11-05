@@ -243,3 +243,37 @@ These corrections still need the next exact-commit native run. In particular,
 the former dialog failure did not identify which widget retained ownership;
 the staged release diagnostics distinguish native host ownership from a signal
 cycle instead of asserting a production leak without evidence.
+
+## Hosted checkpoint: 6722978
+
+[CI run 41964166559](https://github.com/beamiter/forge/actions/runs/41964166559)
+completed 173/173 native cases with 172 passes. The Block round trip now passes
+both exact native/child grid checks and the unchanged resize epoch, excluding
+an intermediate resize that later returns to the same size. Unified navigation,
+workflow dialog release, approval pagination and failed-launch task retirement
+also pass. All earlier GTK matrix stages, other CI jobs, independent native
+workflows and [Flatpak](https://github.com/beamiter/forge/actions/runs/41964166579)
+passed. The Mission native regression passes again.
+
+The sole remaining gate is the incremental organism paint oracle. Geometry and
+the real scroll controller now stay identical, but its complete old/new damage
+envelope also includes an unrelated native overlay scrollbar. All 115 differing
+pixels are in that fading scrollbar, outside the current card. A second full
+expose changes another 65 pixels including the focused entry's blinking caret,
+so even the two full-reference captures are not temporally identical. The
+original zero-difference assertion correctly remains failed. The downloaded
+artifact was verified against SHA256
+`0856d424ad426bd405f33a81e714e25edab8078e24b4b6345a7025cffa40d850`.
+
+The paint fixture now makes only this surrounding chrome stationary before its
+first map/focus: the card's ancestor uses a non-overlay scrollbar, and the entry
+cursor does not blink. A scoped guard restores both properties immediately after
+the paint oracle, before the remaining lifecycle checks. GTK animations and the
+real canvas scroll controller stay enabled; neither the damage region nor the
+zero-pixel tolerance changes. GTK 4.14.5's `remove_indicator` cancels the overlay
+fade sources, while `GtkText` checks the blink policy when installing its focus
+tick. This isolates unrelated temporal changes, not a production repaint fix.
+The ordinary scrollbar has a different width allocation; this oracle verifies
+the card's incremental paint under that real layout, not overlay scrollbar
+animation. Restoration also waits for settled layout before later hit testing.
+The next exact-commit native run must still prove the original pixel assertion.
