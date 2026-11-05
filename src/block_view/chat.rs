@@ -11,6 +11,45 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use vte4::{Terminal, TerminalExt};
 
+// The allocation probe is not painted content. Even NON_TARGETABLE picking
+// (used by pass-through tooltips) must see the real canvas underneath it.
+// Keep DrawingArea's size_allocate/resize behavior, but no hit-test region.
+mod resize_observer {
+    use gtk4::{glib, prelude::*, subclass::prelude::*};
+
+    mod imp {
+        use super::*;
+
+        #[derive(Default)]
+        pub struct CanvasResizeObserver;
+
+        #[glib::object_subclass]
+        impl ObjectSubclass for CanvasResizeObserver {
+            const NAME: &'static str = "ForgeCanvasResizeObserver";
+            type Type = super::CanvasResizeObserver;
+            type ParentType = gtk4::DrawingArea;
+        }
+
+        impl ObjectImpl for CanvasResizeObserver {}
+        impl WidgetImpl for CanvasResizeObserver {
+            fn contains(&self, _x: f64, _y: f64) -> bool {
+                false
+            }
+        }
+        impl DrawingAreaImpl for CanvasResizeObserver {}
+    }
+
+    glib::wrapper! {
+        pub struct CanvasResizeObserver(ObjectSubclass<imp::CanvasResizeObserver>)
+            @extends gtk4::Widget, gtk4::DrawingArea,
+            @implements gtk4::Accessible, gtk4::Buildable, gtk4::ConstraintTarget;
+    }
+
+    pub(super) fn new() -> gtk4::DrawingArea {
+        glib::Object::new::<CanvasResizeObserver>().upcast()
+    }
+}
+
 pub(super) const COMMAND_GAP_PX: i32 = 8;
 /// Native role icon sets the minimum height of every observed Shell header.
 pub(super) const SHELL_ROLE_HEIGHT_PX: i32 = 16;
@@ -603,7 +642,7 @@ impl ChatPresentation {
         frame.set_child(Some(&canvas));
         frame.set_hexpand(true);
         frame.set_vexpand(true);
-        let observer = gtk4::DrawingArea::new();
+        let observer = resize_observer::new();
         observer.set_halign(gtk4::Align::Fill);
         observer.set_valign(gtk4::Align::Fill);
         observer.set_can_target(false);
@@ -1332,6 +1371,9 @@ mod tests {
         let overlay = gtk4::Overlay::new();
         overlay.set_child(Some(&scroll));
         let chat = ChatPresentation::new(&root, &overlay, &live, false);
+        let resizes = Rc::new(Cell::new(0));
+        let observed = resizes.clone();
+        chat.connect_resize(Rc::new(move || observed.set(observed.get() + 1)));
         let anchor: gtk4::Widget = live.widget().clone().upcast();
         let original_parent = anchor.parent();
         let block = ActiveBlock::new(&config, Rc::new(RefCell::new(BoundedByteRing::new(1024))));
@@ -1350,6 +1392,32 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         };
+        settle();
+        let observer = chat.resize_observer.upgrade().expect("mapped resize probe");
+        assert!(observer.is_mapped() && observer.width() > 0 && observer.height() > 0);
+        assert!(
+            resizes.get() > 0,
+            "allocation still emits the native resize signal"
+        );
+        assert!(
+            observer
+                .pick(
+                    f64::from(observer.width()) / 2.0,
+                    f64::from(observer.height()) / 2.0,
+                    gtk4::PickFlags::NON_TARGETABLE,
+                )
+                .is_none(),
+            "a nonpainting observer must not cover pass-through tooltip targets"
+        );
+        let previous_resizes = resizes.get();
+        let original_size = window.default_size();
+        window.set_default_size(window.width(), window.height() + 120);
+        settle();
+        assert!(
+            resizes.get() > previous_resizes,
+            "window changes still re-arm geometry"
+        );
+        window.set_default_size(original_size.0, original_size.1);
         settle();
         chat.set_running_command("printf '<long & literal command>'\nnext line");
         let command = chat.running_command.upgrade().unwrap();

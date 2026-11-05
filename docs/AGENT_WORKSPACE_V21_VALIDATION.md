@@ -277,3 +277,23 @@ The ordinary scrollbar has a different width allocation; this oracle verifies
 the card's incremental paint under that real layout, not overlay scrollbar
 animation. Restoration also waits for settled layout before later hit testing.
 The next exact-commit native run must still prove the original pixel assertion.
+
+## Hosted checkpoint: 9d09ff0
+
+[CI run 41967605701](https://github.com/beamiter/forge/actions/runs/41967605701)
+passed all six strict incremental/full-expose paint stages, the unchanged
+snapshot-reuse assertion and restored-layout barrier. The same long organism
+case then reached its previously unexecuted tooltip checks and failed its first
+native target query. Overall the 173-case gate remains 172 passed / one failed;
+all other CI jobs, native workflows and Flatpak passed again.
+
+The new Block/Chat canvas places a transparent `DrawingArea` above the whole
+canvas solely to observe allocation. `can_target(false)` excludes normal input
+picking but not the tooltip's deliberate `NON_TARGETABLE` pick. GTK's default
+`contains` therefore let this nonpainting probe hide the real label beneath it.
+The probe now subclasses `DrawingArea` with an empty hit region, retaining its
+native allocation and resize signal. The existing native Chat case also checks
+that it maps, reports allocation/resizes and never becomes a non-targetable pick
+result. Tooltip ownership, pointer-state checks and the external decorative
+overlay rejection are unchanged. The next exact-commit native run is required
+before treating the remaining long case as passed.

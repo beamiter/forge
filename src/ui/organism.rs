@@ -6298,7 +6298,11 @@ mod tests {
         };
         assert!(
             query(false),
-            "native query reaches the pass-through state label"
+            "native query reaches the pass-through state label: bounds={bounds:?}, picked={:?}, pointer={:?}",
+            pane_root.compute_point(&window, &gtk4::graphene::Point::new(tip_x as f32, tip_y as f32))
+                .and_then(|point| window.pick(f64::from(point.x()), f64::from(point.y()), gtk4::PickFlags::NON_TARGETABLE))
+                .map(|picked| (picked.type_().name().to_string(), picked.css_classes())),
+            surface.device_position(&pointer),
         );
         assert!(!query(true), "keyboard tooltip coordinates are not defined");
         assert_eq!(
