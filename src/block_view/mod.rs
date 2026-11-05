@@ -22734,19 +22734,37 @@ mod tests {
 
         let winsize = view.pty.test_slave_winsize();
         let columns = view.active_vte.column_count();
+        let resize_epoch = view.pty_resize_generation.get();
 
         view.pty.write_test_slave(b"\x1b[?1049h");
         settle();
         // The alt-screen chrome keeps the running card's content box, so the
         // app is not resized (a SIGWINCH makes codex replay its transcript).
         assert_eq!(view.pty.test_slave_winsize(), winsize, "no resize at 1049h");
+        assert_eq!(
+            view.pty_resize_generation.get(),
+            resize_epoch,
+            "no transient resize at 1049h"
+        );
         assert_eq!(view.active_vte.column_count(), columns);
+        assert_eq!(view.active_vte.row_count(), i64::from(winsize.1));
+        let controls = chat_display_widget(view.root.upcast_ref(), "reference-composer-controls");
+        assert!(
+            !controls.is_mapped(),
+            "fullscreen never exposes dock controls"
+        );
         view.pty.write_test_slave(b"\x1b[999;1Htranscript");
         settle();
         view.pty.write_test_slave(b"\x1b[?1049l");
         settle();
         assert_eq!(view.pty.test_slave_winsize(), winsize, "no resize at 1049l");
+        assert_eq!(
+            view.pty_resize_generation.get(),
+            resize_epoch,
+            "no transient resize at 1049l"
+        );
         assert_eq!(view.active_vte.column_count(), columns);
+        assert_eq!(view.active_vte.row_count(), i64::from(winsize.1));
         assert_eq!(
             extent.get(),
             running,

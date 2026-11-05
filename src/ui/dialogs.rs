@@ -6994,7 +6994,15 @@ mod tests {
             while glib::MainContext::default().iteration(false) {}
             std::thread::sleep(std::time::Duration::from_millis(2));
         };
-        let window = adw::Window::new();
+        // The production form has a mapped, allocated host and a focus owner
+        // to restore. An empty default-sized host does not establish that
+        // lifecycle for Adwaita's in-window sheet.
+        let parent_focus = gtk4::Button::with_label("Original input target");
+        let window = adw::Window::builder()
+            .default_width(640)
+            .default_height(480)
+            .content(&parent_focus)
+            .build();
         let dialog = adw::Dialog::new();
         let closed = super::workflow_dialog_closed(&dialog);
         let body = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -7031,14 +7039,28 @@ mod tests {
             });
         }
         window.present();
+        assert!(parent_focus.grab_focus());
+        let mapped_frames = Rc::new(Cell::new(0));
+        let observed = mapped_frames.clone();
+        dialog.add_tick_callback(move |_, _| {
+            observed.set(observed.get() + 1);
+            if observed.get() >= 3 {
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        });
         dialog.present(Some(&window));
-        // Adwaita opens its sheet on the second frame and then assigns focus.
-        // Draining currently pending sources does not wait for those frames.
+        // Focus can be assigned before Adwaita's opening callbacks finish.
+        // Three mapped frames cover both internal map ticks regardless of
+        // callback order, and pump returns outside their dispatch before close.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while dialog.focus().is_none() {
+        while mapped_frames.get() < 3 || dialog.focus().is_none() {
             assert!(std::time::Instant::now() < deadline, "form did not open");
             pump();
         }
+        assert!(row.is_mapped());
+        assert!(row.width() > 0 && row.height() > 0);
         insert.emit_clicked();
         assert_eq!(calls.get(), 1);
         row.set_text("retained");
@@ -7047,16 +7069,44 @@ mod tests {
             closed.get(),
             "close must retire callbacks before the animation"
         );
+        assert_eq!(
+            gtk4::prelude::GtkWindowExt::focus(&window).as_ref(),
+            Some(parent_focus.upcast_ref::<gtk4::Widget>()),
+            "close must return focus to the original host target"
+        );
         insert.emit_clicked();
         assert_eq!(calls.get(), 1, "late submit after close must be inert");
         reset.emit_clicked();
         assert_eq!(row.text().as_str(), "retained", "late reset must be inert");
-        drop((insert, reset, row, body, dialog));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Closing retires controls immediately; unparenting is the separate
+        // end of the native animation. Do not mistake that host ownership for
+        // an application signal cycle, or destroy the host to hide a cycle.
+        while dialog.parent().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "closed form remained parented after its native close animation: mapped={}, focus_in_dialog={}",
+                dialog.is_mapped(),
+                gtk4::prelude::GtkWindowExt::focus(&window)
+                    .is_some_and(|focus| focus.is_ancestor(&dialog))
+            );
+            pump();
+        }
+        drop((insert, reset, row, body, dialog));
         while weak_dialog.upgrade().is_some() || weak_row.upgrade().is_some() {
             assert!(
                 std::time::Instant::now() < deadline,
-                "closed form leaked its widgets"
+                "closed form leaked its widgets: dialog={:?}, row={:?}",
+                weak_dialog.upgrade().map(|widget| (
+                    widget.parent().is_some(),
+                    widget.is_mapped(),
+                    widget.ref_count()
+                )),
+                weak_row.upgrade().map(|widget| (
+                    widget.parent().is_some(),
+                    widget.is_mapped(),
+                    widget.ref_count()
+                )),
             );
             pump();
         }

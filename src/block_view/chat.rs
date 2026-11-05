@@ -197,6 +197,18 @@ fn completion_surface(previous: ChatSurface, state: BlockState, integrated: bool
     presentation_surface(previous, state, integrated)
 }
 
+fn preserve_block_dock_budget(
+    block: bool,
+    previous: ChatSurface,
+    current: ChatSurface,
+    already_reserved: bool,
+) -> bool {
+    block
+        && current == ChatSurface::Fullscreen
+        && (matches!(previous, ChatSurface::Prompt | ChatSurface::Running)
+            || (previous == ChatSurface::Fullscreen && already_reserved))
+}
+
 /// The command and real foreground represented at an action's origin.
 #[derive(Clone, Copy)]
 pub(super) struct StopTarget {
@@ -789,8 +801,23 @@ impl ChatPresentation {
             hint.set_visible(surface == ChatSurface::Running);
         }
         let decorated = matches!(surface, ChatSurface::Prompt | ChatSurface::Running);
+        let preserve_budget = preserve_block_dock_budget(
+            active.developer_header.is_some(),
+            self.current.get(),
+            surface,
+            anchor.has_css_class("block-alt-keeps-dock"),
+        );
+        if preserve_budget {
+            anchor.add_css_class("block-alt-keeps-dock");
+        } else {
+            anchor.remove_css_class("block-alt-keeps-dock");
+        }
         dock.set_visible(decorated);
-        controls.set_visible(decorated);
+        // Block keeps the running grid across 1049h/l. Its hidden dock still
+        // supplies the natural footer budget, so keep this child measurable
+        // while the parent hides the entire subtree. Chat deliberately gives
+        // its fullscreen surface the extra rows instead.
+        controls.set_visible(decorated || preserve_budget);
         if let Some(submit) = self.submit.upgrade() {
             submit.set_visible(docked);
         }
@@ -872,11 +899,18 @@ pub(super) fn command_columns(command: &str, recorded: i64) -> i64 {
 /// may be docked or in the transcript; both converge on this same canvas.
 pub(super) fn viewport_height_for(vte: &Terminal) -> Option<i32> {
     let mut parent = vte.parent();
+    let mut block_alt_screen = false;
     while let Some(widget) = parent {
+        block_alt_screen |= vte.has_css_class("developer-live-terminal")
+            && widget.has_css_class("block-alt-keeps-dock");
         if widget.has_css_class("chat-canvas") {
             let mut height = widget.height();
             let dock = widget.last_child()?;
-            if dock.is_visible() {
+            // Hiding Block's footer is a paint/input change, not permission
+            // to resize its running process and make it replay its transcript.
+            // The controls remain visible within the hidden parent so their
+            // natural measurement stays current after font/window changes.
+            if dock.is_visible() || block_alt_screen {
                 // Reference Chat paints padding and a border around the whole
                 // editor/tools frame. Reserve that actual fixed chrome too:
                 // leaving it in the grid budget hides the final multiline
@@ -920,6 +954,35 @@ pub(super) fn viewport_height_for(vte: &Terminal) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_decorated_block_keeps_its_dock_budget_through_fullscreen() {
+        use ChatSurface::{Fullscreen, Passthrough, Prompt, Running};
+        for previous in [Prompt, Running] {
+            assert!(preserve_block_dock_budget(
+                true, previous, Fullscreen, false
+            ));
+            assert!(!preserve_block_dock_budget(
+                false, previous, Fullscreen, false
+            ));
+        }
+        assert!(preserve_block_dock_budget(
+            true, Fullscreen, Fullscreen, true
+        ));
+        assert!(!preserve_block_dock_budget(
+            true, Fullscreen, Fullscreen, false
+        ));
+        // A direct CLI with no dock never loses rows just by entering a TUI.
+        assert!(!preserve_block_dock_budget(
+            true,
+            Passthrough,
+            Fullscreen,
+            false
+        ));
+        for current in [Prompt, Running, Passthrough] {
+            assert!(!preserve_block_dock_budget(true, Fullscreen, current, true));
+        }
+    }
 
     #[test]
     fn composer_keeps_three_input_rows_and_clearance_within_the_pane() {

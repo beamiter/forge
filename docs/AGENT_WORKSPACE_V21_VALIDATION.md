@@ -207,3 +207,39 @@ real allocated Tab targets, ten-second elapsed labels and a static but still
 visible organism. Pixel comparisons wait for stable geometry without forcing a
 full redraw; their unchanged pixel assertions still decide success. Native
 verification of these additional fixes remains pending the next exact-commit run.
+
+## Hosted checkpoint: 737c88e
+
+[CI run 41959890897](https://github.com/beamiter/forge/actions/runs/41959890897)
+completed all 173 named GTK cases: 167 passed and six failed. None was skipped
+or cut off by the job deadline. All preceding PTY/Pango/Vim, F13 synthetic and
+real-Bash, metadata/provenance, font, top-tab and exact-search stages passed.
+The other CI jobs and independent Vim/conversation workflows passed. The
+[Flatpak run](https://github.com/beamiter/forge/actions/runs/41959890960) passed
+source verification, build, install and both X11/Wayland launch checks.
+The GTK artifact SHA256 is
+`e6c36ac9b49c6dc711fe0ef7839d41c75e449a9c012606fda28d2bc5727a1533`.
+
+The six remaining cases cover workflow dialog release, approval pagination,
+incremental organism paint, Block's alternate-screen round trip, failed VTE
+launch diagnostics and Unified navigation. Their follow-up corrections retain
+all six tests and their acceptance assertions:
+
+- Block's hidden dock continues to contribute its measured footer budget when
+  an integrated prompt/running card enters fullscreen. The controls remain
+  hidden by their parent. A direct CLI with no prior dock, Chat and Unified keep
+  their distinct geometry policies. The child must not receive a seat-only
+  resize on Block's 1049h/l round trip.
+- Launch diagnostics name only the original executable plus the sanitized
+  failure cause, never its arguments or environment.
+- Paint comparison waits for the actual scroll controller to retire before
+  requiring stable geometry and exact incremental/full-expose pixels. Unified
+  records its normal grid only after the closing Find entry is unmapped.
+- Dialog and approval fixtures use allocated hosts. Dialog release separately
+  checks immediate callback retirement, focus return, animation-time unparenting
+  and final weak-reference release. Their original time budgets remain intact.
+
+These corrections still need the next exact-commit native run. In particular,
+the former dialog failure did not identify which widget retained ownership;
+the staged release diagnostics distinguish native host ownership from a signal
+cycle instead of asserting a production leak without evidence.

@@ -781,6 +781,9 @@ fn spawn_shell(
         requested_working_directory
     };
     let terminal_for_pid = terminal.clone();
+    // Keep only the original executable, never arguments or environment. The
+    // host/inline wrappers can otherwise hide which requested program failed.
+    let program = argv_owned.first().cloned().unwrap_or_default();
 
     // If initial commands are provided, send them after the shell starts.
 
@@ -796,6 +799,7 @@ fn spawn_shell(
         !frozen,
         spawn_working_directory,
         move |result: std::io::Result<Arc<ChildLifecycle>>| {
+            let result = result.map_err(|error| launch_error_with_program(&program, error));
             resolve_spawn(
                 &terminal_for_pid,
                 launch_owner,
@@ -806,6 +810,17 @@ fn spawn_shell(
             )
         },
     );
+}
+
+fn launch_error_with_program(program: &str, error: std::io::Error) -> std::io::Error {
+    let program = jterm_core::review_input::safe_inline_display(program, 512);
+    let detail = jterm_core::review_input::safe_inline_display(&error.to_string(), 1024);
+    let program = if program.is_empty() {
+        "<empty executable>"
+    } else {
+        &program
+    };
+    std::io::Error::new(error.kind(), format!("{program}: {detail}"))
 }
 
 /// Real owned launch outcome. No callback can reopen or signal a retired PID.
@@ -1222,6 +1237,37 @@ pub(crate) fn reattach_terminal_to_tree(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn launch_failure_names_the_requested_executable_and_preserves_its_cause() {
+        let error = super::launch_error_with_program(
+            "/forge-test/nonexistent-executable",
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "PTY executable does not exist or is not executable",
+            ),
+        );
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(error.to_string(), "/forge-test/nonexistent-executable: PTY executable does not exist or is not executable");
+    }
+
+    #[test]
+    fn launch_failure_executable_is_bounded_single_line_and_spoof_safe() {
+        let error = super::launch_error_with_program(
+            &format!("/tmp/bad\n\u{1b}\u{202e}{}", "界".repeat(1000)),
+            std::io::Error::other(format!("cause\r\u{1b}{}", "x".repeat(2000))),
+        );
+        let message = error.to_string();
+        assert!(message.starts_with("/tmp/bad"));
+        assert!(message.contains(": cause"));
+        assert!(message.len() <= 512 + 2 + 1024);
+        assert!(!message.chars().any(char::is_control));
+        assert!(!jterm_core::review_input::contains_visual_spoofing(
+            &message
+        ));
+        let empty = super::launch_error_with_program("", std::io::Error::other("missing"));
+        assert_eq!(empty.to_string(), "<empty executable>: missing");
+    }
+
     #[test]
     #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
     fn explicit_focus_return_respects_reopened_search() {

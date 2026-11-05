@@ -2596,7 +2596,13 @@ mod tests {
     fn approval_details_are_paged_read_only_and_stale_controls_cannot_decide() {
         gtk4::init().expect("GTK display");
         let panel = TasksPanel::build();
-        let window = gtk4::Window::new();
+        // A minimum-sized window gives the vertical Paned's entire allocation
+        // to its list and collapses the zero-minimum detail ScrolledWindow.
+        // Use the same allocated sidebar host as the other inspector tests.
+        let window = gtk4::Window::builder()
+            .default_width(520)
+            .default_height(920)
+            .build();
         window.set_child(Some(&panel.root));
         window.present();
         while gtk4::glib::MainContext::default().pending() {
@@ -2676,7 +2682,14 @@ mod tests {
         while !view.is_mapped() || view.height() == 0 || next.width() == 0 || close.width() == 0 {
             assert!(
                 std::time::Instant::now() < deadline,
-                "expanded approval details did not receive a layout frame"
+                "expanded approval details did not receive a layout frame: mapped={}, view={}x{}, next={}x{}, close={}x{}",
+                view.is_mapped(),
+                view.width(),
+                view.height(),
+                next.width(),
+                next.height(),
+                close.width(),
+                close.height(),
             );
             gtk4::glib::MainContext::default().iteration(false);
             std::thread::sleep(std::time::Duration::from_millis(2));

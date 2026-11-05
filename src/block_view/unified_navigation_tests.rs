@@ -387,8 +387,8 @@ fn unified_navigation_preserves_reading_identity_selection_and_tui() {
     search_bar.set_search_mode(false);
     view.return_to_live();
     wait_until(
-        || grid_matches_pty(&view),
-        "Find close geometry must settle",
+        || !query.is_mapped() && grid_matches_pty(&view),
+        "Find close animation must unmap its entry and settle the final grid",
     );
     let normal_grid = view.pty.test_slave_winsize();
     assert_no_input(&view);

@@ -5666,10 +5666,53 @@ mod tests {
         .outcome
     }
 
+    fn inline_paint_scroll_settled(viewport: &serde_json::Value) -> bool {
+        let follow = &viewport["follow"];
+        follow["drive"].as_str() == Some("Idle")
+            && [
+                "pin_active",
+                "animating",
+                "programmatic",
+                "immediate_follow",
+            ]
+            .iter()
+            .all(|key| follow[key].as_bool() == Some(false))
+    }
+
+    #[test]
+    fn inline_paint_barrier_waits_for_scroll_controller_retirement() {
+        let idle = serde_json::json!({"follow": {
+            "drive": "Idle", "pin_active": false, "animating": false,
+            "programmatic": false, "immediate_follow": false,
+            "position": 0.0, "target": 0.0
+        }});
+        assert!(inline_paint_scroll_settled(&idle));
+        for key in [
+            "pin_active",
+            "animating",
+            "programmatic",
+            "immediate_follow",
+        ] {
+            let mut pending = idle.clone();
+            pending["follow"][key] = true.into();
+            assert!(!inline_paint_scroll_settled(&pending), "{key}");
+        }
+        for drive in ["Follow", "Wheel", "Coast"] {
+            let mut pending = idle.clone();
+            pending["follow"]["drive"] = drive.into();
+            assert!(!inline_paint_scroll_settled(&pending), "{drive}");
+        }
+        assert!(!inline_paint_scroll_settled(&serde_json::json!({})));
+    }
+
     /// Reuse this fixture's mapped window and inert terminal. No new process,
     /// display, PTY, timer or production redraw hook is created here.
     #[cfg(target_os = "linux")]
-    fn assert_inline_card_repaint(window: &gtk4::Window, runtime: &OrganismRuntime) {
+    fn assert_inline_card_repaint(
+        window: &gtk4::Window,
+        view: &TermView,
+        runtime: &OrganismRuntime,
+    ) {
         use super::surface_probe::{PaintSerial, PixelRect, SurfaceProbe};
         assert!(
             !std::env::var("GSK_DEBUG")
@@ -5700,12 +5743,15 @@ mod tests {
         };
         let settle_geometry = || {
             let geometry = || {
+                let viewport = view.reference_viewport_state();
                 (
                     window.width(),
                     window.height(),
                     runtime.card.compute_bounds(window),
                     runtime.status.compute_bounds(window),
                     runtime.sprite.compute_bounds(window),
+                    viewport["adjustment"].clone(),
+                    inline_paint_scroll_settled(&viewport),
                 )
             };
             let clock = window.frame_clock().expect("mapped paint fixture");
@@ -5715,17 +5761,18 @@ mod tests {
             while stable_frames < 2 {
                 assert!(
                     started.elapsed() < Duration::from_secs(2),
-                    "inline paint geometry did not settle"
+                    "inline paint geometry did not settle: {}",
+                    view.reference_viewport_state()
                 );
                 let before = paint.current();
-                // A changed font can allocate the label in one frame and its
-                // scrolled parent in the next. Observe two stable frame ends
-                // before comparing pixels. Requesting this phase does not
-                // invalidate nodes or expose/redraw the native surface.
+                // Stable pixels can precede the follow controller's next
+                // scroll step. Wait for that real controller to retire, then
+                // observe two stable geometry/adjustment frame ends. This
+                // phase request never invalidates or exposes the surface.
                 clock.request_phase(gtk4::gdk::FrameClockPhase::AFTER_PAINT);
                 wait(&|| paint.current() > before);
                 let current = geometry();
-                stable_frames = if current == previous {
+                stable_frames = if current.6 && current == previous {
                     stable_frames + 1
                 } else {
                     0
@@ -5734,6 +5781,11 @@ mod tests {
             }
         };
         let log_state = |stage: &str| {
+            let viewport = view.reference_viewport_state();
+            eprintln!(
+                "paint-scroll {stage}: follow={} adjustment={}",
+                viewport["follow"], viewport["adjustment"]
+            );
             let origin = runtime
                 .card
                 .compute_point(window, &gtk4::graphene::Point::new(0.0, 0.0));
@@ -6121,7 +6173,7 @@ mod tests {
         assert!(view.widget().is_mapped());
         crate::block_view::organism_settings_test_clean_prompt(&view);
         #[cfg(target_os = "linux")]
-        assert_inline_card_repaint(&window, &runtime);
+        assert_inline_card_repaint(&window, &view, &runtime);
         let wait_for_tooltip_layout = |ready: &dyn Fn() -> bool| {
             let started = Instant::now();
             while !ready() && started.elapsed() < Duration::from_secs(2) {
