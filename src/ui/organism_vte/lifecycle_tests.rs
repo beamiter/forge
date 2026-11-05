@@ -529,8 +529,15 @@ pub(super) fn exercise(window: &gtk4::Window, main: &glib::MainContext) {
             drain(&slave, started, iteration, stage.get()).is_empty(),
             "iteration={iteration}: unexpected PTY write before detach"
         );
-        set_stage("PTY detach");
-        terminal.set_pty(None);
+        // Exercise normal widget disposal, which detaches the PTY internally.
+        // VTE 0.76's public set_pty(NULL) dereferences NULL in
+        // _vte_pty_get_impl, despite the API accepting an optional PTY. Its
+        // Terminal destructor instead calls unset_pty(false), disconnecting
+        // both watches and clearing pending I/O before releasing the PTY.
+        // Prove that disposal really happened rather than keeping the terminal
+        // alive behind the adapter's separately checked weak references.
+        let weak_terminal = terminal.downgrade();
+        let weak_root = root.downgrade();
         set_stage("terminal drop");
         drop(terminal);
         set_stage("root drop");
@@ -547,7 +554,9 @@ pub(super) fn exercise(window: &gtk4::Window, main: &glib::MainContext) {
         let mut release_budget = budget::Budget::new(started.elapsed());
         loop {
             pump(main, started, iteration, stage.get(), &mut release_budget);
-            let released = weak_nodes.iter().all(|node| node.upgrade().is_none());
+            let released = weak_nodes.iter().all(|node| node.upgrade().is_none())
+                && weak_terminal.upgrade().is_none()
+                && weak_root.upgrade().is_none();
             checked(
                 release_budget.check(started.elapsed()),
                 iteration,

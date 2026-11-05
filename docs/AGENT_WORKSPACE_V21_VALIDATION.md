@@ -297,3 +297,24 @@ that it maps, reports allocation/resizes and never becomes a non-targetable pick
 result. Tooltip ownership, pointer-state checks and the external decorative
 overlay rejection are unchanged. The next exact-commit native run is required
 before treating the remaining long case as passed.
+
+## Hosted checkpoint: 0fe2a7c
+
+[CI run 41970947524](https://github.com/beamiter/forge/actions/runs/41970947524)
+passed the resize observer's native allocation/pick regression and the long
+organism case's tooltip ownership, actual overlay obstruction, drag suppression,
+settings/timer and horizontal clipping checks. The 173-case gate still has
+172 passes: the long case then entered its 1,000-cycle lifecycle soak and crashed
+on its first explicit PTY detach. GDB identifies `vte_terminal_set_pty` called
+from `lifecycle_tests.rs`. All other CI jobs, native workflows and Flatpak passed.
+
+The runner uses VTE 0.76.0. In that version, `Widget::set_pty(NULL)` calls
+`_vte_pty_get_impl(NULL)`, which dereferences the null argument. The fixture now
+uses normal terminal/root disposal, whose VTE destructor calls
+`unset_pty(false)` to disconnect both I/O watches and clear pending I/O. It also
+requires the terminal and root weak references to expire, in addition to the
+eight adapter widgets, so avoiding the null setter cannot hide a retained live
+terminal. The 1,000 cycles, stage/time budgets, callback/timer retirement and
+before/after slave no-write assertions remain unchanged. No production null
+PTY setter exists in Forge. The next exact-commit run must finish this soak
+before the native gate can be considered passed.
