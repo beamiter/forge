@@ -134,3 +134,28 @@ Mission editing regression.
 
 The diagnostic artifact SHA256 is
 `01f9aba5fdb2d688c463f7a4b459127d1db7f54cf0a111e815ac64a70db7f65a`.
+
+## Command capture after reflow
+
+The history-disabled Bash artifact has an exact append-only application draft at
+stage 6, but VTE reflow moved the command's end above its old prompt anchor.
+Refusing that native extraction range is correct. Treating the refusal as literal
+`(command capture unavailable)` text prevented the existing empty-capture resolver
+from using that exact draft. The reader now allows that existing fallback only
+for a nonempty exact shadow with no explicit shell truncation. Edited or
+post-submit typeahead shadows still fail closed. The result remains screen-derived,
+not shell-reported or eligible for exact replay. Reviewed/Agent submissions still
+require their independent byte-exact command identity and cannot gain approval
+from this fallback.
+
+Regression coverage includes rejected-range reader dispatch for both exact states
+and the inexact state, unavailable reviewed Agent identity (lost event and cleared
+generation), explicit truncation, empty shadows, and the existing edited-input
+identity cases. The 22 non-GTK source-contract tests passed locally against the
+final shared pin; the full ReaderHarness and real Bash/GTK acceptance remain for
+hosted CI. The original native geometry assertion has not been relaxed.
+
+The first Mission native build found a missing GTK optional-cast trait import,
+fixed in `d0fd5e8`. Its next hosted Clippy run found one needless borrow in the
+native Mission test; that test expression has been corrected without allowing
+warnings. These findings are not native acceptance of the Mission UI.

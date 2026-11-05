@@ -606,7 +606,7 @@ mod tests {
         gtk::init().expect("isolated GTK display is required");
         let surface = MissionSurface::new(Rc::new(|_| panic!("rendering must not navigate")));
         assert!(!surface.editor_view.is_editable());
-        let mut plan = WorkspaceMission::new(&"M".repeat(256), "Exact delivery");
+        let mut plan = WorkspaceMission::new("M".repeat(256), "Exact delivery");
         plan.revision = 1;
         {
             let mut state = surface.state.borrow_mut();

@@ -750,6 +750,25 @@ fn resolve_submitted_command(
     }
 }
 
+/// An invalid native range after reflow is missing evidence, not rendered
+/// command text. Let the existing resolver use an exact, nonempty append-only
+/// shadow just as for a not-yet-rendered range. Edited/typeahead shadows and
+/// explicit shell truncation still fail closed; reviewed submissions never use
+/// the interactive fallback because their rendered identity must match exactly.
+fn refused_native_command_capture(
+    typed_shadow: &str,
+    typed_shadow_exact: bool,
+    command_truncated: bool,
+) -> String {
+    if command_truncated {
+        TRUNCATED_COMMAND_PLACEHOLDER.to_string()
+    } else if typed_shadow_exact && !typed_shadow.trim().is_empty() {
+        String::new()
+    } else {
+        UNAVAILABLE_COMMAND_PLACEHOLDER.to_string()
+    }
+}
+
 /// Bind an Agent generation only when the command that reached CommandStart is
 /// byte-for-byte the text the user approved. Display/history normalization is
 /// intentionally downstream of this check: trimming here would turn a real
@@ -8946,12 +8965,15 @@ impl ReaderCtx {
                 .capture_text_range(start_row, start_col, cmd_end_row, cmd_end_col)
                 .map(|text| bounded_command_text(&text))
                 .unwrap_or_default()
-        } else if meta.command_truncated {
-            TRUNCATED_COMMAND_PLACEHOLDER.to_string()
         } else {
-            // A rejected native range may be inverted after reflow or exceed
-            // the extraction budget. Neither proves the command was too long.
-            UNAVAILABLE_COMMAND_PLACEHOLDER.to_string()
+            // Reflow may move the native cursor before the old anchor. Keep
+            // range extraction bounded while retaining the already admitted,
+            // exact interactive shadow as the ordinary missing-capture fallback.
+            refused_native_command_capture(
+                &self.typed_cmd_rc.borrow(),
+                self.typed_cmd_fidelity_rc.get().can_repair_capture(),
+                meta.command_truncated,
+            )
         };
         let deferred = self.post_prompt_bytes_rc.borrow_mut().take_vec();
         if !deferred.is_empty() {
@@ -31802,6 +31824,131 @@ mod tests {
                 // This shell reported no cwd, so the pane's own answer fills in.
                 cwd: Some(HARNESS_CWD.to_string()),
             }]
+        );
+    }
+
+    #[test]
+    fn refused_native_range_uses_only_exact_interactive_shadow() {
+        let command = "printf '中文 e\u{301} ＡＢＣ'";
+        for fidelity in [
+            TypedShadowFidelity::ExactOpen,
+            TypedShadowFidelity::ExactSubmitted,
+            TypedShadowFidelity::Inexact,
+        ] {
+            let harness = ReaderHarness::new();
+            harness.backend.render_row(9, "$ ");
+            harness.feed_all([
+                ParserEvent::PromptStart,
+                bytes("$ "),
+                ParserEvent::PromptEnd,
+            ]);
+            *harness.ctx.typed_cmd_rc.borrow_mut() = command.into();
+            harness.ctx.typed_cmd_fidelity_rc.set(fidelity);
+            harness.backend.render_row(3, "native tail after resize");
+            harness.backend.take_calls();
+            harness.feed(ParserEvent::CommandStart(CommandMeta::default()));
+            assert!(!harness
+                .backend
+                .take_calls()
+                .iter()
+                .any(|call| matches!(call, Call::Query(Query::CaptureTextRange { .. }))));
+            assert_eq!(
+                harness.commands_started.borrow()[0].event.command,
+                if fidelity.can_repair_capture() {
+                    command
+                } else {
+                    UNAVAILABLE_COMMAND_PLACEHOLDER
+                }
+            );
+            assert_eq!(
+                harness.ctx.engine.borrow().pending_command_source,
+                super::CommandTextSource::Screen
+            );
+        }
+    }
+
+    #[test]
+    fn refused_native_range_cannot_bind_reviewed_agent_from_exact_shadow() {
+        let command = "printf approved";
+        let harness = ReaderHarness::new();
+        harness.backend.render_row(9, "$ ");
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            bytes("$ "),
+            ParserEvent::PromptEnd,
+        ]);
+        *harness.ctx.typed_cmd_rc.borrow_mut() = command.into();
+        harness
+            .ctx
+            .typed_cmd_fidelity_rc
+            .set(TypedShadowFidelity::ExactSubmitted);
+        *harness.ctx.external_submission_rc.borrow_mut() = Some(command.into());
+        harness.ctx.external_submission_generation_rc.set(Some(42));
+        harness.ctx.submission_pending_rc.set(true);
+        harness.backend.render_row(3, "native tail after resize");
+        harness.backend.take_calls();
+
+        harness.feed(ParserEvent::CommandStart(CommandMeta::default()));
+
+        assert!(!harness
+            .backend
+            .take_calls()
+            .iter()
+            .any(|call| matches!(call, Call::Query(Query::CaptureTextRange { .. }))));
+        assert_eq!(harness.ctx.active_agent_generation_rc.get(), None);
+        assert_eq!(harness.ctx.external_submission_generation_rc.get(), None);
+        assert_eq!(
+            harness.agent_lost.borrow().as_slice(),
+            &[(
+                42,
+                "the command reported by the shell did not exactly match the approved command"
+            )]
+        );
+        assert_eq!(
+            harness.commands_started.borrow()[0].event.command,
+            UNAVAILABLE_COMMAND_PLACEHOLDER
+        );
+        assert_eq!(
+            harness.ctx.engine.borrow().pending_command_source,
+            super::CommandTextSource::Screen
+        );
+    }
+
+    #[test]
+    fn refused_capture_fallback_preserves_truncation_edits_and_review_identity() {
+        let command = "printf '中文 e\u{301} ＡＢＣ'";
+        for exact in [false, true] {
+            for truncated in [false, true] {
+                let captured = super::refused_native_command_capture(command, exact, truncated);
+                let result =
+                    resolve_submitted_command(&captured, "$ ", command, exact, None, false);
+                assert_eq!(
+                    result,
+                    if truncated {
+                        TRUNCATED_COMMAND_PLACEHOLDER
+                    } else if exact {
+                        command
+                    } else {
+                        UNAVAILABLE_COMMAND_PLACEHOLDER
+                    }
+                );
+            }
+        }
+        assert_eq!(
+            super::refused_native_command_capture("", true, false),
+            UNAVAILABLE_COMMAND_PLACEHOLDER
+        );
+        assert_eq!(
+            resolve_submitted_command(
+                &super::refused_native_command_capture(command, true, false),
+                "$ ",
+                command,
+                true,
+                Some(command),
+                true
+            ),
+            "",
+            "reviewed submissions must still reject an unavailable rendered identity"
         );
     }
 
