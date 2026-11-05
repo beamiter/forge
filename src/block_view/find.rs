@@ -2798,7 +2798,9 @@ pub(crate) fn palette_activation_test_view(mode: crate::config::TerminalMode) ->
             None,
             None,
             &[],
-            |_, _, _, _| crate::pty::OwnedPty::for_tests(crate::pty::PtyForeground::Shell),
+            |_, _, _, _| {
+                crate::pty::OwnedPty::for_live_display_tests(crate::pty::PtyForeground::Shell)
+            },
         )
         .unwrap(),
     )

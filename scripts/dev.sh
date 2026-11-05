@@ -104,6 +104,8 @@ case "${CMD}" in
             set -Eeuo pipefail
             bash scripts/privacy-check.sh
             python3 tools/check-process-bundle.py
+            python3 scripts/check-shared-core-pin.py
+            python3 scripts/test-shared-core-pin.py
             cargo fmt --all -- --check
             cargo check --all-targets --all-features --locked
             cargo test --all-targets --all-features --locked --no-fail-fast

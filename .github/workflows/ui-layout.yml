@@ -32,7 +32,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Materialize bundled shared core
+      - name: Fetch locked shared core
         run: bash scripts/materialize-shared-core.sh
 
       - name: Install GTK, VTE, and isolated display

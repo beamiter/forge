@@ -25,7 +25,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Materialize bundled shared core
+      - name: Fetch locked shared core
         shell: bash
         run: |
           if [[ -f "scripts/materialize-shared-core.sh" ]]; then

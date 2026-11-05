@@ -26,7 +26,7 @@ fn pane(config: &Config, mode: TerminalMode) -> TermView {
         None,
         None,
         &[],
-        |_, _, _, _| crate::pty::OwnedPty::for_tests(PtyForeground::Shell),
+        |_, _, _, _| crate::pty::OwnedPty::for_live_display_tests(PtyForeground::Shell),
     )
     .expect("nonexecuting font fixture PTY")
 }

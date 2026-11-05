@@ -7,14 +7,18 @@ with the registry dependencies, so the Flatpak build uses the locked sources
 offline.
 
 Regenerate source manifests with `scripts/update-flatpak-cargo-sources.sh
---update` after changing Cargo.lock. Regenerate the bundled core snapshot with
-`scripts/package-shared-core.sh /path/to/exact-pinned-core` after shared-core
-changes. The source directory must contain the exact pinned commit without
-local edits. Update `packaging/jterm-core-revision` and
-`packaging/jterm-core-origin.json` alongside the archive and `.sha256` file.
-The archive retains the same source revision for isolated path-based consumers;
-the current Flatpak build uses its generated Git source entry.
-A staged release can be checked against a local commit before publication; the
-origin record states that boundary explicitly. Push that exact core commit
-before remote builds acquire the new dependency. The source archive SHA-256
-and the full source tree NAR hash used by Nix are separate values.
+--update` after changing Cargo.lock. Cargo, Nix, Flatpak, and extracted production
+fixtures now use the published Git source. `scripts/check-shared-core-pin.py`
+rejects committed path overrides, mismatched test pins, stale lock identities,
+and an alternate Flatpak or Nix core source.
+
+The older `packaging/jterm-core-src.tar.gz`, revision and origin files are
+historical snapshots, not the source used by the current builds. The compatibility
+entrypoint `scripts/materialize-shared-core.sh` only checks the production pin
+and runs `cargo fetch --locked`; it never extracts that archive or picks a sibling.
+Use an explicit command-scoped Cargo override for local candidate experiments,
+and do not report those results as exact production-pin validation.
+
+Nix's full source-tree NAR hash is separate from an archive SHA-256. Repinning
+requires updating the `jterm_core-0.2.0` output hash as well as the manifest,
+lockfile, dependency policy and generated Flatpak sources.

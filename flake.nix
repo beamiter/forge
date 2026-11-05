@@ -23,15 +23,8 @@
           package = pkgs.rustPlatform.buildRustPackage {
             pname = manifest.package.name;
             version = manifest.package.version;
-            # Stage the exact bundled candidate core beside the app so the
-            # relative Cargo source override also works in the Nix sandbox.
-            src = pkgs.runCommand "forge-desktop-session-source" { } ''
-              mkdir -p "$out/forge" "$out/jterm_core"
-              cp -R ${self}/. "$out/forge/"
-              tar -xzf ${self}/packaging/jterm-core-src.tar.gz -C "$out/jterm_core"
-            '';
-            postUnpack = ''sourceRoot="$sourceRoot/forge"'';
-            # The bundled core is the explicit candidate path dependency.
+            src = self;
+            # Shared sources are immutable Git dependencies in Cargo.lock.
 
             cargoLock = {
               lockFile = ./Cargo.lock;
@@ -43,6 +36,8 @@
                 "jagent-0.7.0" = "sha256-2PO6UiTrhwa2JUBznPTXFV42KxJ3H8qctBTg7WNxZfA=";
                 # git+https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa569540091524d637a7115b64c587b9177a55b
                 "companion-core-0.1.0" = "sha256-yQQw/Viz2gzouHRdutU6TtVL3yqDI7koYbN/leWsf7I=";
+                # git+https://github.com/beamiter/jterm_core.git?rev=f8566bb9cb6e9cca3258c8050c6dc4e9b96da8ff#f8566bb9cb6e9cca3258c8050c6dc4e9b96da8ff
+                "jterm_core-0.2.0" = "sha256-zEC7/WI43Y4CiPCq+OStmEVcFzEGtnRVEMe+zOS2FYo=";
               };
             };
             strictDeps = true;
