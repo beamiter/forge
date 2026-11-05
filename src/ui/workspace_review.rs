@@ -313,7 +313,7 @@ impl WorkspaceReview {
                 self.report_loading = false;
                 match result {
                     Ok(WorkspaceReply::Result { report }) if report.conversation == id => {
-                        self.report = Some(report);
+                        self.report = Some(*report);
                         self.notice = None;
                     }
                     Err(error) => self.notice = Some(format!("Result evidence: {error}")),
@@ -522,6 +522,49 @@ mod tests {
         );
         assert!(!state.receive(1, Err("Previous task is gone".into())));
         assert!(state.report.is_none());
+        assert!(state.notice.is_none());
+    }
+
+    #[test]
+    fn boxed_result_receipt_preserves_exact_task_identity_once() {
+        let id = ConversationId("current".into());
+        let mut state = WorkspaceReview {
+            selected: Some(id.clone()),
+            generation: 7,
+            ..Default::default()
+        };
+        state.pending.insert(
+            42,
+            Pending::Result {
+                id: id.clone(),
+                generation: 7,
+            },
+        );
+        let report = WorkspaceResultReport {
+            conversation: id.clone(),
+            task_id: jterm_core::agent_task::TaskId::new(),
+            run_id: "captured-run".into(),
+            source_sequence: 9,
+            baseline: None,
+            current: None,
+            validation: None,
+            validation_current: false,
+            validation_status: "Not run".into(),
+            validation_output: String::new(),
+            validation_output_truncated: false,
+            error: None,
+        };
+        assert!(state.receive(
+            42,
+            Ok(WorkspaceReply::Result {
+                report: Box::new(report)
+            })
+        ));
+        let captured = state.report.as_ref().unwrap();
+        assert_eq!(captured.conversation, id);
+        assert_eq!(captured.run_id, "captured-run");
+        assert_eq!(captured.source_sequence, 9);
+        assert!(!state.receive(42, Err("duplicate late response".into())));
         assert!(state.notice.is_none());
     }
 }
