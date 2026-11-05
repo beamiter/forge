@@ -1,7 +1,7 @@
 //! Native workspace routing. Browsing never sends input into a hidden PTY.
 use super::workspace_navigation::{Action as WorkspaceAction, Row};
 use super::*;
-use gtk4::prelude::WidgetExt;
+use gtk4::prelude::{CastNone, WidgetExt};
 
 impl UiState {
     pub(crate) fn show_terminal_workspace(&self) {
