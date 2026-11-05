@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "contract": "five-repository-host-v1",
+  "frozen": false,
+  "repositories": [
+    {
+      "name": "jterm_core",
+      "full_name": "beamiter/jterm_core",
+      "revision": "c1aebbe7b6ad4a8edb98582ea282d6e4d2ba6816"
+    },
+    {
+      "name": "anvil",
+      "full_name": "beamiter/anvil",
+      "revision": "30b68407c9bbe1e1139f2622b346ea2f96ea5070"
+    },
+    {
+      "name": "forge",
+      "full_name": "beamiter/forge",
+      "revision": "c53d59837054469dfa8fcea1604d6de385b4bd12"
+    },
+    {
+      "name": "ember",
+      "full_name": "beamiter/ember",
+      "revision": "3b5a132170fd438d84e8bad18568492b59216833"
+    },
+    {
+      "name": "frost",
+      "full_name": "beamiter/frost",
+      "revision": "0d8d4c942355e2d446fb769909a43c3c33ded011"
+    }
+  ]
+}

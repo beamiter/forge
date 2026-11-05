@@ -1,0 +1,12 @@
+[package]
+name = "five-repository-mission-acceptance"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+jterm_core = { git = "https://github.com/beamiter/jterm_core.git", rev = "c1aebbe7b6ad4a8edb98582ea282d6e4d2ba6816" }
+serde_json = "=1.0.151"
+serde = "=1.0.229"
+
+[workspace]

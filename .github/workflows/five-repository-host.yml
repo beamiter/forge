@@ -1,0 +1,94 @@
+name: Five-repository host contract
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_set_json:
+        description: Reviewed frozen-candidate JSON, data only; all five exact public commits
+        required: true
+        type: string
+      candidate_set_sha256:
+        description: Exact digest of the reviewed and frozen five-repository set
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: five-repository-host-${{ inputs.candidate_set_sha256 }}
+  cancel-in-progress: false
+
+jobs:
+  host-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      EXPECTED_SET: ${{ inputs.candidate_set_sha256 }}
+      FROZEN_CANDIDATES_JSON: ${{ inputs.candidate_set_json }}
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+      RUSTUP_TOOLCHAIN: "1.86.0"
+    steps:
+      - name: Checkout the reviewed acceptance implementation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Test the contract without network or host execution
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/mission-acceptance/test_contract.py
+          PYTHONOPTIMIZE=1 python3 scripts/mission-acceptance/test_contract.py
+
+      - name: Verify frozen public heads and successful exact-head CI
+        run: |
+          set -Eeuo pipefail
+          test "$GITHUB_REF" = refs/heads/master
+          root="$RUNNER_TEMP/five-repository-host-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          printf 'ACCEPTANCE_ROOT=%s\n' "$root" >> "$GITHUB_ENV"
+          input="$RUNNER_TEMP/frozen-mission-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.json"
+          printf '%s' "$FROZEN_CANDIDATES_JSON" > "$input"
+          python3 scripts/mission-acceptance/collect.py prepare "$root" "$EXPECTED_SET" "$input"
+
+      - name: Install the pinned official Rust toolchain
+        run: |
+          set -Eeuo pipefail
+          rustup toolchain install 1.86.0 --profile minimal --component rustfmt,clippy
+          test "$(rustc +1.86.0 --version | awk '{print $2}')" = 1.86.0
+          test "$(cargo +1.86.0 --version | awk '{print $2}')" = 1.86.0
+          rustc +1.86.0 -vV > "$ACCEPTANCE_ROOT/evidence/rust-toolchain.txt"
+          cargo +1.86.0 --version >> "$ACCEPTANCE_ROOT/evidence/rust-toolchain.txt"
+          rustup run 1.86.0 rustfmt --version >> "$ACCEPTANCE_ROOT/evidence/rust-toolchain.txt"
+          rustup run 1.86.0 clippy-driver --version >> "$ACCEPTANCE_ROOT/evidence/rust-toolchain.txt"
+          stat -c '%u %a %n' / /usr /usr/bin /usr/bin/git > "$ACCEPTANCE_ROOT/evidence/git-trust-preconditions.txt"
+
+      - name: Build and lint the exact-core host contract harness
+        run: |
+          set -Eeuo pipefail
+          manifest=scripts/mission-acceptance/harness/Cargo.toml
+          cargo +1.86.0 fmt --manifest-path "$manifest" -- --check
+          cargo +1.86.0 clippy --locked --manifest-path "$manifest" -- -D warnings
+          cargo +1.86.0 test --locked --manifest-path "$manifest" 2>&1 | tee "$ACCEPTANCE_ROOT/evidence/harness-unit.log"
+          cargo +1.86.0 build --locked --manifest-path "$manifest" 2>&1 | tee "$ACCEPTANCE_ROOT/evidence/harness-build.log"
+          sha256sum scripts/mission-acceptance/harness/Cargo.lock > "$ACCEPTANCE_ROOT/evidence/harness-lock.sha256"
+
+      - name: Exercise the real host against the exact five checkouts
+        run: |
+          set -Eeuo pipefail
+          scripts/mission-acceptance/harness/target/debug/five-repository-mission-acceptance "$ACCEPTANCE_ROOT" 2>&1 | tee "$ACCEPTANCE_ROOT/evidence/harness-run.log"
+
+      - name: Recheck source cleanliness and unchanged public heads
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/mission-acceptance/collect.py finish "$ACCEPTANCE_ROOT" "$EXPECTED_SET"
+
+      - name: Preserve scoped logs and receipts, excluding repositories and host state
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: five-repository-host-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/five-repository-host-${{ github.run_id }}-${{ github.run_attempt }}/evidence/
+          if-no-files-found: warn
+          retention-days: 14
