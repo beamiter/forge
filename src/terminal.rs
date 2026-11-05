@@ -681,6 +681,7 @@ fn spawn_shell(
     launch_owner: Rc<launch_owner::LaunchOwner>,
     env_extra: Vec<(String, String)>,
     auto_gui: bool,
+    allow_home_fallback: bool,
     on_settled: Option<Box<dyn FnOnce()>>,
     on_resolved: Box<dyn FnOnce(Result<(), String>)>,
 ) {
@@ -783,13 +784,18 @@ fn spawn_shell(
 
     // If initial commands are provided, send them after the shell starts.
 
-    crate::gtk_spawn::spawn(
+    let spawn = if allow_home_fallback {
+        crate::gtk_spawn::spawn_with_home_fallback
+    } else {
+        crate::gtk_spawn::spawn
+    };
+    spawn(
         terminal,
         &argv,
         envv,
         !frozen,
         spawn_working_directory,
-        move |result| {
+        move |result: std::io::Result<Arc<ChildLifecycle>>| {
             resolve_spawn(
                 &terminal_for_pid,
                 launch_owner,

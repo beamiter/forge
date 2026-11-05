@@ -30,7 +30,9 @@ fn fold_actions_update_visible_and_parked_geometry() {
             None,
             None,
             &[],
-            |_, _, _, _| crate::pty::OwnedPty::for_tests(crate::pty::PtyForeground::Shell),
+            |_, _, _, _| {
+                crate::pty::OwnedPty::for_live_display_tests(crate::pty::PtyForeground::Shell)
+            },
         )
         .unwrap();
         // A long document keeps the last card parked even after bulk folding.

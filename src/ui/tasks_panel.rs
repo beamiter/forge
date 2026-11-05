@@ -2669,6 +2669,18 @@ mod tests {
         }
         assert_page_label(&view, "Read-only approval request details, page 1 of 2");
         let body = expander.child().unwrap();
+        // GTK sorts Tab targets by their allocated bounds. Newly expanded
+        // children can accept grab_focus before the next layout frame, while
+        // their zero-sized bounds still produce the wrong traversal order.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !view.is_mapped() || view.height() == 0 || next.width() == 0 || close.width() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expanded approval details did not receive a layout frame"
+            );
+            gtk4::glib::MainContext::default().iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
         assert!(descendants(&body)
             .iter()
             .filter_map(|widget| widget.clone().downcast::<Button>().ok())

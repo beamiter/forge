@@ -13,7 +13,7 @@ fn resize_reanchor_does_not_absorb_shell_side_prefill() {
         None,
         None,
         &[],
-        |_, _, _, _| crate::pty::OwnedPty::for_tests(crate::pty::PtyForeground::Shell),
+        |_, _, _, _| crate::pty::OwnedPty::for_live_display_tests(crate::pty::PtyForeground::Shell),
     )
     .unwrap();
     let window = gtk4::Window::builder()
@@ -89,7 +89,7 @@ fn block_dock_keeps_one_native_surface_and_physical_grid() {
         None,
         None,
         &[],
-        |_, _, _, _| crate::pty::OwnedPty::for_tests(crate::pty::PtyForeground::Shell),
+        |_, _, _, _| crate::pty::OwnedPty::for_live_display_tests(crate::pty::PtyForeground::Shell),
     )
     .unwrap();
     let window = gtk4::Window::builder()
@@ -187,7 +187,7 @@ fn real_more_fold_restores_native_height_and_document_span() {
         None,
         None,
         &[],
-        |_, _, _, _| crate::pty::OwnedPty::for_tests(crate::pty::PtyForeground::Shell),
+        |_, _, _, _| crate::pty::OwnedPty::for_live_display_tests(crate::pty::PtyForeground::Shell),
     )
     .unwrap();
     let window = gtk4::Window::builder()

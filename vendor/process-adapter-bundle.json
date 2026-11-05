@@ -4,7 +4,7 @@
   "core_pin_verification": "Published Git revision verified through the remote master and Cargo metadata on 2026-11-05. Adapter files, source origins and checksums are unchanged. Native adapter acceptance for the new frontend commit remains a separate hosted CI gate.",
   "files_sha256": {
     "src/gtk_process.rs": "d04bc567730d352c00a8feb9da72211553c0f6fda6a484fa389c5fa61cd84015",
-    "src/gtk_spawn.rs": "2e4668330a6b8510713944ccc4d07a381531d029233a84bf0ba857ac5d36c2cb",
+    "src/gtk_spawn.rs": "6614651ce110c538fdd8659fd00ee042c402befd7ac4caf6a7f361967dc87ecc",
     "tools/check-process-bundle.py": "72e4641349af09b2ac91ad92a80aedc0c4599c9cce11082f9f4d9aa823ccff19",
     "vendor/companion-process/Cargo.toml": "46cfd243bd73a0b8d0c94e10a4c456e719123d153008b02f043ad122ee7c66e2",
     "vendor/companion-process/LICENSE": "df864a86870c22b4a37004850372cd147b82495362f64676fecbe28f27f58d42",

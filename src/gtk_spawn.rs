@@ -5,7 +5,7 @@ use crate::gtk_process::{self, PendingLaunch};
 use jterm_core::process::{ChildLifecycle, EscalationPolicy, ReapOwner};
 use std::{
     collections::BTreeMap,
-    ffi::{CString, OsStr, OsString},
+    ffi::{CStr, CString, OsStr, OsString},
     io::{self, Read},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
@@ -31,6 +31,7 @@ struct Prepared {
     argv: Vec<CString>,
     environment: Vec<CString>,
     cwd: Option<CString>,
+    fallback_cwd: Option<CString>,
     fallback_argv: Vec<CString>,
     descriptor_limit: u64,
 }
@@ -40,7 +41,13 @@ fn invalid(detail: &str) -> io::Error {
 }
 
 impl Prepared {
-    fn new(argv: &[&str], envv: &[&str], inherit: bool, cwd: Option<&str>) -> io::Result<Self> {
+    fn new(
+        argv: &[&str],
+        envv: &[&str],
+        inherit: bool,
+        cwd: Option<&str>,
+        allow_home_fallback: bool,
+    ) -> io::Result<Self> {
         let Some(program) = argv.first().filter(|program| !program.is_empty()) else {
             return Err(invalid("terminal executable is empty"));
         };
@@ -82,6 +89,14 @@ impl Prepared {
             .map(CString::new)
             .transpose()
             .map_err(|_| invalid("terminal working directory contains a NUL byte"))?;
+        // Preserve VTE's home fallback when a restored directory disappeared.
+        // Resolve GLib's cached home before fork, not in the multithreaded child.
+        let fallback_cwd = cwd
+            .as_ref()
+            .filter(|_| allow_home_fallback)
+            .map(|_| CString::new(glib::home_dir().as_os_str().as_bytes()))
+            .transpose()
+            .map_err(|_| invalid("terminal home directory contains a NUL byte"))?;
         let mut fallback_argv = vec![CString::new("/bin/sh").unwrap(), executable.clone()];
         fallback_argv.extend(argv.iter().skip(1).cloned());
         let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
@@ -96,9 +111,25 @@ impl Prepared {
             argv,
             environment,
             cwd,
+            fallback_cwd,
             fallback_argv,
             descriptor_limit: limit.rlim_cur,
         })
+    }
+}
+
+/// Only async-signal-safe directory changes run after fork. If both paths
+/// fail, report the requested directory's error rather than hiding it behind
+/// the fallback. Exec errors still come from the subsequent execve unchanged.
+unsafe fn change_directory(cwd: &CStr, fallback: Option<&CStr>) -> io::Result<()> {
+    if unsafe { libc::chdir(cwd.as_ptr()) } == 0 {
+        return Ok(());
+    }
+    let requested_error = io::Error::last_os_error();
+    if fallback.is_some_and(|home| unsafe { libc::chdir(home.as_ptr()) } == 0) {
+        Ok(())
+    } else {
+        Err(requested_error)
     }
 }
 
@@ -318,6 +349,31 @@ pub(crate) fn spawn(
     cwd: Option<&str>,
     callback: impl FnOnce(io::Result<Arc<ChildLifecycle>>) + 'static,
 ) -> Rc<PendingLaunch> {
+    spawn_with_directory_policy(terminal, argv, envv, inherit, cwd, false, callback)
+}
+
+/// Only an ordinary local recovery action may choose the fallback disclosed
+/// by its panel. Task/remote launches keep the strict `spawn` entry point.
+pub(crate) fn spawn_with_home_fallback(
+    terminal: &Terminal,
+    argv: &[&str],
+    envv: &[&str],
+    inherit: bool,
+    cwd: Option<&str>,
+    callback: impl FnOnce(io::Result<Arc<ChildLifecycle>>) + 'static,
+) -> Rc<PendingLaunch> {
+    spawn_with_directory_policy(terminal, argv, envv, inherit, cwd, true, callback)
+}
+
+fn spawn_with_directory_policy(
+    terminal: &Terminal,
+    argv: &[&str],
+    envv: &[&str],
+    inherit: bool,
+    cwd: Option<&str>,
+    allow_home_fallback: bool,
+    callback: impl FnOnce(io::Result<Arc<ChildLifecycle>>) + 'static,
+) -> Rc<PendingLaunch> {
     if let Some(existing) = gtk_process::vte_launch(terminal).filter(|launch| !launch.ready()) {
         glib::idle_add_local_once(move || {
             callback(Err(io::Error::new(
@@ -337,7 +393,7 @@ pub(crate) fn spawn(
         );
         return launch;
     }
-    let prepared = match Prepared::new(argv, envv, inherit, cwd) {
+    let prepared = match Prepared::new(argv, envv, inherit, cwd, allow_home_fallback) {
         Ok(prepared) => prepared,
         Err(error) => {
             fail_before_fork(launch.clone(), callback, error);
@@ -398,13 +454,8 @@ pub(crate) fn spawn(
                 );
             }
             if let Some(cwd) = &prepared.cwd {
-                if libc::chdir(cwd.as_ptr()) != 0 {
-                    child_error(
-                        write.as_raw_fd(),
-                        io::Error::last_os_error()
-                            .raw_os_error()
-                            .unwrap_or(libc::EIO),
-                    );
+                if let Err(error) = change_directory(cwd, prepared.fallback_cwd.as_deref()) {
+                    child_error(write.as_raw_fd(), error.raw_os_error().unwrap_or(libc::EIO));
                 }
             }
             let ready = b'S';
@@ -651,6 +702,7 @@ mod tests {
             ],
             false,
             Some("/tmp"),
+            true,
         )
         .unwrap();
         assert!(options.executable.as_bytes().ends_with(b"/sh"));
@@ -662,8 +714,91 @@ mod tests {
         assert_eq!(options.environment.len(), 3);
         assert_eq!(options.fallback_argv[0].as_bytes(), b"/bin/sh");
         assert_eq!(options.fallback_argv[2].as_bytes(), b"-c");
-        assert!(Prepared::new(&["sh"], &["PATH=/usr/bin", "BAD"], false, None).is_err());
-        assert!(Prepared::new(&["sh", "bad\0argument"], &["PATH=/usr/bin"], false, None).is_err());
+        assert_eq!(options.cwd.as_deref().unwrap().to_bytes(), b"/tmp");
+        assert_eq!(
+            options.fallback_cwd.as_deref().unwrap().to_bytes(),
+            glib::home_dir().as_os_str().as_bytes()
+        );
+        assert!(Prepared::new(&["sh"], &["PATH=/usr/bin", "BAD"], false, None, false).is_err());
+        assert!(Prepared::new(
+            &["sh", "bad\0argument"],
+            &["PATH=/usr/bin"],
+            false,
+            None,
+            false
+        )
+        .is_err());
+        let strict = Prepared::new(
+            &["/bin/sh"],
+            &[],
+            false,
+            Some("/forge-test/missing-directory"),
+            false,
+        )
+        .unwrap();
+        assert!(
+            strict.fallback_cwd.is_none(),
+            "exact task cwd must fail closed"
+        );
+        let no_directory = Prepared::new(&["/bin/sh"], &[], false, None, true).unwrap();
+        assert!(no_directory.cwd.is_none());
+        assert!(no_directory.fallback_cwd.is_none());
+    }
+
+    #[test]
+    fn directory_fallback_keeps_requested_precedence_and_original_errors() {
+        let root = std::env::temp_dir().join(format!(
+            "forge-cwd-fallback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("requested")).unwrap();
+        fs::create_dir_all(root.join("home")).unwrap();
+        fs::write(root.join("not-a-directory"), b"fixture").unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let path = |name| CString::new(root.join(name).as_os_str().as_bytes()).unwrap();
+        let requested = path("requested");
+        let home = path("home");
+        let missing = path("missing");
+        let not_directory = path("not-a-directory");
+        for (cwd, fallback, expected, error) in [
+            (&requested, Some(&home), Some(&requested), 0),
+            (&requested, Some(&missing), Some(&requested), 0),
+            (&missing, Some(&home), Some(&home), 0),
+            (&not_directory, Some(&home), Some(&home), 0),
+            (&missing, None, None, libc::ENOENT),
+            (&not_directory, Some(&missing), None, libc::ENOTDIR),
+        ] {
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                // Never change the multithreaded test runner's own cwd. All
+                // paths and the comparison buffer exist before the syscall.
+                let outcome = unsafe { change_directory(cwd, fallback.map(CString::as_c_str)) };
+                let mut buffer = [0_i8; 4096];
+                let valid = if let Some(expected) = expected {
+                    outcome.is_ok()
+                        && !unsafe { libc::getcwd(buffer.as_mut_ptr(), buffer.len()) }.is_null()
+                        && unsafe { CStr::from_ptr(buffer.as_ptr()) } == expected.as_c_str()
+                } else {
+                    outcome.err().and_then(|error| error.raw_os_error()) == Some(error)
+                };
+                unsafe { libc::_exit(if valid { 0 } else { 1 }) };
+            }
+            let mut status = 0;
+            loop {
+                let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+                if waited == pid {
+                    break;
+                }
+                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EINTR));
+            }
+            assert_eq!(status, 0, "cwd {cwd:?}, fallback {fallback:?}");
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

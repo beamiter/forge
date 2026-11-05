@@ -443,9 +443,19 @@ impl Manager {
         }
         if !matches!(request.action, SessionBatchAction::Pin(_))
             && request.keys.iter().any(|(provider, id)| {
-                self.organization_drafts
+                // Organization drafts follow the full workspace identity,
+                // including the provider home, rather than the library key.
+                // Include hidden catalog rows: batch selection outlives filters.
+                self.catalog
                     .borrow()
-                    .contains_key(&format!("{}:{id}", provider.label()))
+                    .sessions
+                    .iter()
+                    .filter(|session| session.provider == *provider && session.id == *id)
+                    .any(|session| {
+                        self.organization_drafts
+                            .borrow()
+                            .contains_key(&super::identity(session))
+                    })
             })
         {
             self.bulk.notice.set_text("Save or Revert the selected sessions' name/tag drafts before archiving or changing their tags.");
@@ -711,7 +721,16 @@ mod native_tests {
         assert!(library.borrow().snapshot().is_pinned(a.0, &a.1));
         assert!(library.borrow().snapshot().is_pinned(b.0, &b.1));
         assert_eq!(manager.bulk.keys(), vec![a.clone()]);
+        assert_eq!(
+            manager
+                .selected_session()
+                .map(|session| (session.provider, session.id)),
+            Some(a.clone()),
+            "edit the same session targeted by the batch"
+        );
+        assert!(manager.alias.is_sensitive());
         manager.alias.set_text("Unsaved name retained");
+        assert!(manager.organization_dirty.get());
         button(&manager, "Archive").emit_clicked();
         assert!(manager.bulk.notice.text().contains("Save or Revert"));
         assert_eq!(manager.alias.text().as_str(), "Unsaved name retained");

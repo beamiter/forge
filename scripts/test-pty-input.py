@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Test extracted production PTY admission and the pinned core filter on Linux.
 
-Requires rustc, the path-dependency jterm_core checkout (the sibling tree or
-the materialized bundle) and the fetched pinned jagent checkout (cargo fetch),
-or set JTERM_CORE_SOURCE and JAGENT_SOURCE. No GTK build or replacement input filter is used.
+Requires rustc and the exact Git-pinned jterm_core and jagent checkouts
+(cargo fetch --locked), or explicit JTERM_CORE_SOURCE and JAGENT_SOURCE paths
+whose Git identities match those pins. A manifest explicitly using a development
+path dependency may use that declared path. No GTK build or replacement input
+filter is used.
 FORGE_INPUT_SOURCE can point at another Forge tree for baseline comparisons.
 """
 from pathlib import Path

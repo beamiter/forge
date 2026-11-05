@@ -29,7 +29,9 @@ fn task_button_held_enter_never_submits_to_focused_terminal() {
                 None,
                 None,
                 &[],
-                |_, _, _, _| crate::pty::OwnedPty::for_tests(crate::pty::PtyForeground::Shell),
+                |_, _, _, _| {
+                    crate::pty::OwnedPty::for_live_display_tests(crate::pty::PtyForeground::Shell)
+                },
             )
             .unwrap(),
         );

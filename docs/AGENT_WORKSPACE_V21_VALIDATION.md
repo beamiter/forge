@@ -159,3 +159,51 @@ The first Mission native build found a missing GTK optional-cast trait import,
 fixed in `d0fd5e8`. Its next hosted Clippy run found one needless borrow in the
 native Mission test; that test expression has been corrected without allowing
 warnings. These findings are not native acceptance of the Mission UI.
+
+## Hosted checkpoint: d9df27f
+
+[CI run 41955538580](https://github.com/beamiter/forge/actions/runs/41955538580)
+passed the real Bash keyboard/clipboard matrix with the unchanged geometry
+assertion, confirming the rejected-range fallback fix. Its PTY/Pango/Vim,
+synthetic F13, shell metadata/provenance, independent font, top-tab geometry and
+exact-search stages all passed. The main test binary passed 2,285 ordinary tests;
+240 display/host/manual tests remained explicitly ignored there and are not
+counted as native passes. Strict Clippy, Rustfmt, Rustdoc, release, Nix and the
+other non-GTK CI jobs passed. The separate
+[Native Vim](https://github.com/beamiter/forge/actions/runs/41955538615),
+[native conversation](https://github.com/beamiter/forge/actions/runs/41955538518)
+and [Flatpak](https://github.com/beamiter/forge/actions/runs/41955538543)
+workflows passed, including Flatpak build/install and X11/Wayland smoke.
+
+The broad GTK runner finally passed registration and ran the Mission editing
+regression successfully. It started 140 of 173 named cases: 102 passed, 37 failed,
+and the current case was interrupted at the job's 20-minute limit; 33 had not
+started. Those failures and unexecuted cases remain open acceptance gates. The
+artifact SHA256 is
+`f9add3b2f5a8d19cc45a664d21fe9d5162ac71d8805c472f632fd1fe54a15871`.
+
+Several display fixtures still installed the real asynchronous reader over an
+immediately-exiting inert child. Their later prompt replay was then correctly
+rejected as belonging to a retired process. The display-only fixtures now retain
+the owned inert child until teardown, as the already-passing font/F13 fixtures do.
+Synchronous dispatch/commit harnesses and tests of actual exit behavior remain
+separate. The complete runner has a 35-minute job budget and a 120-second deadline
+per native case, so a stuck case fails explicitly without hiding the remaining
+cases. Timeout/signal status and the first failure remain fatal. This scheduling
+change alone does not resolve or waive any of the 37 assertions.
+
+The newly reached cases also exposed production issues unrelated to PTY capture:
+workflow controls could act during the dialog's closing animation, and batch
+session edits looked up pending organization drafts using an obsolete identity.
+The fixes retire callbacks when close starts and check the same full session
+identity as the draft editor. Cwd recovery is an explicit ordinary-local retry
+policy only: generic, task and remote launches continue to reject an unavailable
+required directory. Closed-pane cleanup checks reaping of the original child,
+not a UI callback that the closed-pane guard intentionally suppresses.
+
+Other fixture expectations are aligned with existing contracts rather than
+production behavior being changed to satisfy them: the shared navigation minimum,
+real allocated Tab targets, ten-second elapsed labels and a static but still
+visible organism. Pixel comparisons wait for stable geometry without forcing a
+full redraw; their unchanged pixel assertions still decide success. Native
+verification of these additional fixes remains pending the next exact-commit run.

@@ -30,7 +30,7 @@ fn collapsed_output_navigation(mode: crate::config::TerminalMode) {
         None,
         None,
         &[],
-        |_, _, _, _| crate::pty::OwnedPty::for_tests(crate::pty::PtyForeground::Shell),
+        |_, _, _, _| crate::pty::OwnedPty::for_live_display_tests(crate::pty::PtyForeground::Shell),
     )
     .unwrap();
     // A long document keeps the last card parked even after bulk folding.
@@ -200,7 +200,7 @@ fn retained_scrollback_case(mode: crate::config::TerminalMode, new_lines: usize)
         None,
         None,
         &[],
-        |_, _, _, _| crate::pty::OwnedPty::for_tests(crate::pty::PtyForeground::Shell),
+        |_, _, _, _| crate::pty::OwnedPty::for_live_display_tests(crate::pty::PtyForeground::Shell),
     )
     .unwrap();
     let window = gtk::Window::builder()
@@ -371,7 +371,7 @@ fn live_find_change_case(mode: crate::config::TerminalMode, change: &str) {
         None,
         None,
         &[],
-        |_, _, _, _| crate::pty::OwnedPty::for_tests(crate::pty::PtyForeground::Shell),
+        |_, _, _, _| crate::pty::OwnedPty::for_live_display_tests(crate::pty::PtyForeground::Shell),
     )
     .unwrap();
     let window = gtk::Window::builder()

@@ -2380,12 +2380,26 @@ fn refresh_workflow_picker_query(
     }
 }
 
-/// Retire the argument form only after the original target accepts the text.
-/// Acceptance may only enqueue PTY input; it does not acknowledge later I/O.
-fn workflow_dialog_if_open(dialog: &glib::WeakRef<adw::Dialog>) -> Option<adw::Dialog> {
-    dialog.upgrade().filter(|dialog| dialog.parent().is_some())
+fn workflow_dialog_closed(dialog: &adw::Dialog) -> Rc<Cell<bool>> {
+    let closed = Rc::new(Cell::new(false));
+    let flag = closed.clone();
+    // Adwaita emits `closed` when closing starts, but retains the dialog's
+    // parent during the animation. Parentage alone cannot retire callbacks.
+    dialog.connect_closed(move |_| flag.set(true));
+    closed
 }
 
+fn workflow_dialog_if_open(
+    dialog: &glib::WeakRef<adw::Dialog>,
+    closed: &Cell<bool>,
+) -> Option<adw::Dialog> {
+    dialog
+        .upgrade()
+        .filter(|dialog| !closed.get() && dialog.parent().is_some())
+}
+
+/// Retire the argument form only after the original target accepts the text.
+/// Acceptance may only enqueue PTY input; it does not acknowledge later I/O.
 fn finish_workflow_insertion(insert: impl FnOnce() -> bool, finish: impl FnOnce()) {
     if insert() {
         finish();
@@ -6354,6 +6368,7 @@ impl UiState {
             .content_width(520)
             .build();
         super::reference_shell::style_workspace_dialog(&dialog);
+        let closed = workflow_dialog_closed(&dialog);
 
         let header_bar = adw::HeaderBar::new();
         let body = gtk4::Box::new(Orientation::Vertical, 8);
@@ -6445,10 +6460,11 @@ impl UiState {
             let form_for_reset = form.clone();
             let row_for_reset = row.downgrade();
             let dialog_for_reset = dialog.downgrade();
+            let closed_for_reset = closed.clone();
             let refresh_for_reset = refresh_outstanding.clone();
             let sync_for_reset = programmatic_sync.clone();
             reset.connect_clicked(move |_| {
-                if workflow_dialog_if_open(&dialog_for_reset).is_none() {
+                if workflow_dialog_if_open(&dialog_for_reset, &closed_for_reset).is_none() {
                     return;
                 }
                 let Some(row_for_reset) = row_for_reset.upgrade() else {
@@ -6483,8 +6499,10 @@ impl UiState {
         let pane_for_run = Some(pane.root_widget().downgrade());
         let ui_for_run = self.clone();
         let dialog_for_run = dialog.downgrade();
+        let closed_for_run = closed.clone();
         run_btn.connect_clicked(move |_| {
-            let Some(dialog_for_run) = workflow_dialog_if_open(&dialog_for_run) else {
+            let Some(dialog_for_run) = workflow_dialog_if_open(&dialog_for_run, &closed_for_run)
+            else {
                 return;
             };
             let Some(pane_for_run) = ui_for_run.palette_input_target(&pane_for_run) else {
@@ -6508,6 +6526,7 @@ impl UiState {
                     finish_workflow_insertion(
                         || ui_for_run.insert_review_text(&pane_for_run, &resolved),
                         || {
+                            closed_for_run.set(true);
                             dialog_for_run.force_close();
                             pane_for_run.grab_focus();
                         },
@@ -6530,12 +6549,15 @@ impl UiState {
         let key_controller = EventControllerKey::new();
         key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let dialog_for_key = dialog.downgrade();
+        let closed_for_key = closed;
         let run_btn_for_key = run_btn.downgrade();
         key_controller.connect_key_pressed(move |_, keyval, _, state| {
-            let Some(dialog_for_key) = workflow_dialog_if_open(&dialog_for_key) else {
+            let Some(dialog_for_key) = workflow_dialog_if_open(&dialog_for_key, &closed_for_key)
+            else {
                 return false.into();
             };
             if keyval == Key::Escape {
+                closed_for_key.set(true);
                 dialog_for_key.force_close();
                 return true.into();
             }
@@ -6974,6 +6996,7 @@ mod tests {
         };
         let window = adw::Window::new();
         let dialog = adw::Dialog::new();
+        let closed = super::workflow_dialog_closed(&dialog);
         let body = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         let row = adw::EntryRow::new();
         let reset = gtk4::Button::with_label("Reset");
@@ -6987,18 +7010,20 @@ mod tests {
         let calls = Rc::new(Cell::new(0));
         {
             let dialog = weak_dialog.clone();
+            let closed = closed.clone();
             let calls = calls.clone();
             insert.connect_clicked(move |_| {
-                if super::workflow_dialog_if_open(&dialog).is_some() {
+                if super::workflow_dialog_if_open(&dialog, &closed).is_some() {
                     calls.set(calls.get() + 1);
                 }
             });
         }
         {
             let dialog = weak_dialog.clone();
+            let closed = closed.clone();
             let row = weak_row.clone();
             reset.connect_clicked(move |_| {
-                if super::workflow_dialog_if_open(&dialog).is_some() {
+                if super::workflow_dialog_if_open(&dialog, &closed).is_some() {
                     if let Some(row) = row.upgrade() {
                         row.set_text("reset");
                     }
@@ -7007,13 +7032,25 @@ mod tests {
         }
         window.present();
         dialog.present(Some(&window));
-        pump();
+        // Adwaita opens its sheet on the second frame and then assigns focus.
+        // Draining currently pending sources does not wait for those frames.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while dialog.focus().is_none() {
+            assert!(std::time::Instant::now() < deadline, "form did not open");
+            pump();
+        }
         insert.emit_clicked();
         assert_eq!(calls.get(), 1);
+        row.set_text("retained");
         dialog.force_close();
-        pump();
+        assert!(
+            closed.get(),
+            "close must retire callbacks before the animation"
+        );
         insert.emit_clicked();
         assert_eq!(calls.get(), 1, "late submit after close must be inert");
+        reset.emit_clicked();
+        assert_eq!(row.text().as_str(), "retained", "late reset must be inert");
         drop((insert, reset, row, body, dialog));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while weak_dialog.upgrade().is_some() || weak_row.upgrade().is_some() {

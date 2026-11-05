@@ -6234,7 +6234,7 @@ mod tests {
             None,
             &[],
             |_argv, _cwd, _env, _token| {
-                crate::pty::OwnedPty::for_tests(crate::pty::PtyForeground::Other)
+                crate::pty::OwnedPty::for_live_display_tests(crate::pty::PtyForeground::Other)
             },
         )
         .expect("a Block pane over a test PTY");

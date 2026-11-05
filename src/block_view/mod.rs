@@ -20262,7 +20262,8 @@ pub struct BlockAgentEvidence {
     pub(crate) finished_at: Option<std::time::SystemTime>,
 }
 
-/// Nonexecuting PTY fixture shared with the organism's display regressions.
+/// Inert live PTY fixture shared with the organism's display regressions.
+/// The asynchronous reader must retain its owner while GTK renders.
 #[cfg(test)]
 pub(crate) fn organism_settings_test_view() -> Rc<TermView> {
     let view: Rc<TermView> = TermView::new_with_spawner(
@@ -20273,7 +20274,7 @@ pub(crate) fn organism_settings_test_view() -> Rc<TermView> {
         None,
         &[],
         |_argv, _cwd, _env, _token| {
-            crate::pty::OwnedPty::for_tests(crate::pty::PtyForeground::Shell)
+            crate::pty::OwnedPty::for_live_display_tests(crate::pty::PtyForeground::Shell)
         },
     )
     .expect("nonexecuting organism test PTY")
@@ -20720,7 +20721,7 @@ mod tests {
                     None,
                     &[],
                     |_argv, _cwd, _env, _token| {
-                        crate::pty::OwnedPty::for_tests(PtyForeground::Shell)
+                        crate::pty::OwnedPty::for_live_display_tests(PtyForeground::Shell)
                     },
                 )
                 .expect("nonexecuting SSH fixture PTY");
@@ -22171,7 +22172,9 @@ mod tests {
             None,
             None,
             &[],
-            |_argv, _cwd, _env, _token| crate::pty::OwnedPty::for_tests(PtyForeground::Other),
+            |_argv, _cwd, _env, _token| {
+                crate::pty::OwnedPty::for_live_display_tests(PtyForeground::Other)
+            },
         )
         .expect("a Block pane over a test PTY");
         let card = super::FinishedBlock::new(
@@ -22273,7 +22276,9 @@ mod tests {
             None,
             None,
             &[],
-            |_argv, _cwd, _env, _token| crate::pty::OwnedPty::for_tests(PtyForeground::Other),
+            |_argv, _cwd, _env, _token| {
+                crate::pty::OwnedPty::for_live_display_tests(PtyForeground::Other)
+            },
         )
         .expect("a Block pane over a test PTY");
         let window = gtk4::Window::builder()
@@ -22332,7 +22337,9 @@ mod tests {
                 None,
                 None,
                 &[],
-                |_argv, _cwd, _env, _token| crate::pty::OwnedPty::for_tests(PtyForeground::Other),
+                |_argv, _cwd, _env, _token| {
+                    crate::pty::OwnedPty::for_live_display_tests(PtyForeground::Other)
+                },
             )
             .unwrap()
         };
@@ -22610,7 +22617,9 @@ mod tests {
             None,
             None,
             &[],
-            |_argv, _cwd, _env, _token| crate::pty::OwnedPty::for_tests(PtyForeground::Other),
+            |_argv, _cwd, _env, _token| {
+                crate::pty::OwnedPty::for_live_display_tests(PtyForeground::Other)
+            },
         )
         .expect("a Block pane over a test PTY");
         let window = gtk4::Window::builder()
@@ -22689,7 +22698,9 @@ mod tests {
             None,
             None,
             &[],
-            |_argv, _cwd, _env, _token| crate::pty::OwnedPty::for_tests(PtyForeground::Other),
+            |_argv, _cwd, _env, _token| {
+                crate::pty::OwnedPty::for_live_display_tests(PtyForeground::Other)
+            },
         )
         .expect("a Block pane over a test PTY");
         let window = gtk4::Window::builder()
@@ -22761,7 +22772,9 @@ mod tests {
                 None,
                 None,
                 &[],
-                |_argv, _cwd, _env, _token| crate::pty::OwnedPty::for_tests(PtyForeground::Other),
+                |_argv, _cwd, _env, _token| {
+                    crate::pty::OwnedPty::for_live_display_tests(PtyForeground::Other)
+                },
             )
             .unwrap(),
         );
@@ -22875,7 +22888,9 @@ mod tests {
             None,
             None,
             &[],
-            |_argv, _cwd, _env, _token| crate::pty::OwnedPty::for_tests(PtyForeground::Other),
+            |_argv, _cwd, _env, _token| {
+                crate::pty::OwnedPty::for_live_display_tests(PtyForeground::Other)
+            },
         )
         .expect("a Block pane over a test PTY");
         let window = gtk4::Window::builder()
@@ -23036,7 +23051,9 @@ mod tests {
             None,
             None,
             &[],
-            |_argv, _cwd, _env, _token| crate::pty::OwnedPty::for_tests(PtyForeground::Other),
+            |_argv, _cwd, _env, _token| {
+                crate::pty::OwnedPty::for_live_display_tests(PtyForeground::Other)
+            },
         )
         .unwrap();
         let owner = gtk4::Window::builder()
@@ -23443,7 +23460,9 @@ mod tests {
             None,
             None,
             &[],
-            |_argv, _cwd, _env, _token| crate::pty::OwnedPty::for_tests(PtyForeground::Other),
+            |_argv, _cwd, _env, _token| {
+                crate::pty::OwnedPty::for_live_display_tests(PtyForeground::Other)
+            },
         )
         .expect("a Block pane over a test PTY");
         let window = gtk4::Window::builder()
@@ -23532,7 +23551,9 @@ mod tests {
             None,
             None,
             &[],
-            |_argv, _cwd, _env, _token| crate::pty::OwnedPty::for_tests(PtyForeground::Other),
+            |_argv, _cwd, _env, _token| {
+                crate::pty::OwnedPty::for_live_display_tests(PtyForeground::Other)
+            },
         )
         .expect("a Block pane over a test PTY");
         // Somewhere else for focus to go, as an Alt+Tab or a click would.
@@ -33530,7 +33551,7 @@ mod tests {
             None,
             None,
             &[],
-            |_, _, _, _| crate::pty::OwnedPty::for_tests(PtyForeground::Shell),
+            |_, _, _, _| crate::pty::OwnedPty::for_live_display_tests(PtyForeground::Shell),
         )
         .expect("nonexecuting chat PTY");
         let window = gtk4::Window::builder()
@@ -33907,6 +33928,8 @@ mod tests {
         }
     }
 
+    // Unlike synchronous reader/commit harnesses, this surface owns an active
+    // GTK reader: keep its inert child alive until the fixture is torn down.
     fn chat_display_view(mode: crate::config::TerminalMode) -> super::TermView {
         super::TermView::new_with_spawner(
             &crate::config::Config::safe_defaults(),
@@ -33915,7 +33938,7 @@ mod tests {
             None,
             None,
             &[],
-            |_, _, _, _| crate::pty::OwnedPty::for_tests(PtyForeground::Shell),
+            |_, _, _, _| crate::pty::OwnedPty::for_live_display_tests(PtyForeground::Shell),
         )
         .unwrap()
     }

@@ -3037,7 +3037,7 @@ mod tests {
                 None,
                 &[],
                 |_argv, _cwd, _env, _token| {
-                    crate::pty::OwnedPty::for_tests(crate::pty::PtyForeground::Other)
+                    crate::pty::OwnedPty::for_live_display_tests(crate::pty::PtyForeground::Other)
                 },
             )
             .unwrap(),
@@ -3229,7 +3229,7 @@ mod tests {
                 Some("history-fixture"),
                 &[],
                 |_argv, _cwd, _env, _token| {
-                    crate::pty::OwnedPty::for_tests(crate::pty::PtyForeground::Other)
+                    crate::pty::OwnedPty::for_live_display_tests(crate::pty::PtyForeground::Other)
                 },
             )
             .expect("real Unified pane over an inert PTY"),

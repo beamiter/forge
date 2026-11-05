@@ -76,7 +76,9 @@ impl Fixture {
             None,
             None,
             &[],
-            |_, _, _, _| crate::pty::OwnedPty::for_tests(crate::pty::PtyForeground::Shell),
+            |_, _, _, _| {
+                crate::pty::OwnedPty::for_live_display_tests(crate::pty::PtyForeground::Shell)
+            },
         )
         .expect("nonexecuting find PTY");
         for id in 1..=CARD_COUNT {

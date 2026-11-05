@@ -5312,7 +5312,8 @@ mod tests {
         assert_eq!(snapshot.context.behavior, Behavior::WatchAgent);
         assert_eq!(snapshot.context.watch_rhythm, WatchRhythm::Waiting);
         assert_eq!(snapshot.growth, growth);
-        assert!(snapshot.activity.contains("42s elapsed"));
+        // Inspection shares the accessible status label's ten-second buckets.
+        assert_eq!(snapshot.activity, "Shell Agent is working · 40s elapsed");
         assert_eq!(snapshot.latest, "Watching the local Shell Agent work");
         assert!(context_explanation(snapshot.context).contains("has not finished"));
         assert_eq!(state_summary(life.get()), state);
@@ -5531,9 +5532,17 @@ mod tests {
         }
         let before = runtime.spatial_renders.get();
         runtime.motion.set(OrganismMotion::Static);
+        runtime.live_body.set_text("stale static fixture");
         presence.focus_view(Some(&view));
+        assert_eq!(runtime.spatial_renders.get(), before + 1);
+        assert_ne!(runtime.live_body.text().as_str(), "stale static fixture");
+        let static_sprite = runtime.live_body.text();
+        runtime.surface_frame.set(runtime.surface_frame.get() + 20);
         runtime.refresh_surface(&view, Instant::now());
-        assert_eq!(runtime.spatial_renders.get(), before);
+        // Static still owns a visible body; only its animation frame is frozen.
+        assert_eq!(runtime.spatial_renders.get(), before + 2);
+        assert_eq!(runtime.live_body.text(), static_sprite);
+        let before = runtime.spatial_renders.get();
         runtime.enabled.set(false);
         runtime.motion.set(OrganismMotion::Full);
         runtime.refresh_surface(&view, Instant::now());
@@ -5689,6 +5698,41 @@ mod tests {
             }
             assert!(ready(), "inline paint fixture did not settle");
         };
+        let settle_geometry = || {
+            let geometry = || {
+                (
+                    window.width(),
+                    window.height(),
+                    runtime.card.compute_bounds(window),
+                    runtime.status.compute_bounds(window),
+                    runtime.sprite.compute_bounds(window),
+                )
+            };
+            let clock = window.frame_clock().expect("mapped paint fixture");
+            let started = Instant::now();
+            let mut previous = geometry();
+            let mut stable_frames = 0;
+            while stable_frames < 2 {
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "inline paint geometry did not settle"
+                );
+                let before = paint.current();
+                // A changed font can allocate the label in one frame and its
+                // scrolled parent in the next. Observe two stable frame ends
+                // before comparing pixels. Requesting this phase does not
+                // invalidate nodes or expose/redraw the native surface.
+                clock.request_phase(gtk4::gdk::FrameClockPhase::AFTER_PAINT);
+                wait(&|| paint.current() > before);
+                let current = geometry();
+                stable_frames = if current == previous {
+                    stable_frames + 1
+                } else {
+                    0
+                };
+                previous = current;
+            }
+        };
         let log_state = |stage: &str| {
             let origin = runtime
                 .card
@@ -5722,6 +5766,7 @@ mod tests {
         );
         let _style = FixtureStyle(display, provider.clone());
         runtime.card.add_css_class("organism-paint-fixture");
+        settle_geometry();
 
         for stage in 0..6 {
             log_state(&format!("stage-{stage}-before-change"));
@@ -5763,6 +5808,7 @@ mod tests {
                     && (stage != 3 || window.width() != old_width)
                     && (stage != 5 || window.width() == starting_width)
             });
+            settle_geometry();
             let current = runtime.card.compute_bounds(window).unwrap();
             // GTK's native snapshot adds this offset when drawing into the surface.
             let (tx, ty) = window.surface_transform();

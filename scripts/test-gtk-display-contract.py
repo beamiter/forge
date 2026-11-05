@@ -38,7 +38,8 @@ elif name == "xvfb-run":
     assert args[:2] == ["--auto-servernum", "--server-args=-screen 0 1280x800x24 -nolisten tcp"], args
     os.execvp(args[2], args[2:])
 elif name == "timeout":
-    assert args[:3] == ["--signal=TERM", "--kill-after=10s", "240s"], args
+    assert args[:2] == ["--signal=TERM", "--kill-after=10s"], args
+    assert args[2] in ("120s", "240s"), args
     os.execvp(args[3], args[3:])
 elif name == "cargo":
     prefix = ["test", "--lib", "--all-features", "--locked"]
@@ -157,6 +158,9 @@ def main():
             else:
                 assert [r["args"][4] for r in calls] == tests, mode
                 assert len({r["pid"] for r in calls}) == len(tests), mode
+                deadlines = [r for r in records if r["command"] == "timeout"]
+                assert sum(r["args"][2] == "120s" for r in deadlines) == len(tests), mode
+                assert sum(r["args"][2] == "240s" for r in deadlines) == (mode == "diagnostic"), mode
                 for call, test in zip(calls, tests):
                     for key, value in {"GTK_A11Y": "test" if test in A11Y else "none",
                                        "GTK_IM_MODULE": "simple" if test in IME else "inherited",

@@ -3,6 +3,16 @@
 use super::launch_state::LaunchState;
 use super::*;
 
+fn home_fallback_allowed(
+    local_recovery_enabled: bool,
+    owner_attached: bool,
+    retrying_failed_launch: bool,
+    remote: bool,
+    task_owned: bool,
+) -> bool {
+    local_recovery_enabled && owner_attached && retrying_failed_launch && !remote && !task_owned
+}
+
 pub(super) struct LaunchRecovery {
     pub(super) panel: gtk4::Box,
     pub(super) state: Rc<RefCell<LaunchState>>,
@@ -170,6 +180,21 @@ impl LaunchRecovery {
         let Some(terminal) = self.terminal.upgrade() else {
             return;
         };
+        let root = self.root.upgrade();
+        let leaf = root
+            .as_ref()
+            .and_then(|root| crate::ui::PaneLeaf::from_widget(root.upcast_ref()));
+        // Initial and task/remote launches require the exact requested cwd.
+        // Only Retry in an attached ordinary local panel has disclosed the fallback.
+        // Missing PaneLeaf ownership is unknown, never implicit local authority.
+        let allow_home_fallback = home_fallback_allowed(
+            self.enabled.get(),
+            leaf.is_some(),
+            self.state.borrow().failed(),
+            leaf.as_ref().is_some_and(|leaf| leaf.is_remote()),
+            leaf.as_ref()
+                .is_some_and(|leaf| leaf.task_role().is_some() || leaf.task_session_id().is_some()),
+        );
         self.retry.set_label("Launching…");
         self.shell.set_editable(false);
         self.cwd.set_editable(false);
@@ -182,6 +207,7 @@ impl LaunchRecovery {
             self.owner.clone(),
             self.env_extra.clone(),
             self.auto_gui,
+            allow_home_fallback,
             self.on_settled.borrow_mut().take(),
             Box::new(move |result| {
                 let Some(recovery) = weak.upgrade() else {
@@ -274,6 +300,25 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn home_fallback_requires_disclosed_local_retry_without_task_or_remote_ownership() {
+        for enabled in [false, true] {
+            for attached in [false, true] {
+                for retry in [false, true] {
+                    for remote in [false, true] {
+                        for task in [false, true] {
+                            assert_eq!(
+                                home_fallback_allowed(enabled, attached, retry, remote, task),
+                                enabled && attached && retry && !remote && !task,
+                                "unknown/detached ownership cannot authorize a directory fallback"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Synthetic no-shell child: isolated Python only reads terminal bytes and
     // acknowledges them. No rc files, user commands, credentials or network.
     const SENSOR: &str = "import os,sys,tty\ntty.setraw(0)\nos.write(1,b'F10-CWD-MATCH\\r\\n' if os.path.samefile(os.getcwd(),sys.argv[1] if len(sys.argv)>1 else '/tmp') else b'F10-CWD-MISMATCH\\r\\n')\nos.write(1,b'F10-READY\\r\\n')\nb=b''\nwhile True:\n c=os.read(0,1)\n if not c: break\n if c==b'\\r':\n  os.write(1,b'F10-ACK:'+b+b'\\r\\n'); b=b''\n else: b+=c\n";
@@ -322,6 +367,26 @@ mod tests {
         );
         assert!(focus.has_focus(), "entry delegate must have keyboard focus");
         focus
+    }
+
+    fn close_and_assert_reaped(main: &glib::MainContext, view: &VteTerminalView) {
+        let child = view.child_lifecycle().expect("admitted child lifecycle");
+        let pid = child.pid();
+        view.kill();
+        pump_until(main, "closed child cleanup", || {
+            child.exit_code().is_some() && view.launch_recovery.state.borrow().child_exited()
+        });
+        // A closed pane suppresses UI exit callbacks, but its exclusive wait
+        // owner must still finish reaping the original child.
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
 
     #[test]
@@ -380,8 +445,8 @@ mod tests {
         recovery.retry.emit_clicked();
         assert!(recovery.state.borrow().failed());
         leaf.set_remote(false);
-        // VTE falls back home for missing cwd. Only a genuine exec failure
-        // belongs to the failed-launch/retry path.
+        // An explicit local retry preserves VTE's home fallback for missing
+        // cwd, while a genuine exec failure remains a failed launch.
         recovery.shell.set_text("/forge-test/another-missing-shell");
         recovery.cwd.set_text("/forge-test/missing-directory");
         recovery.retry.emit_clicked();
@@ -431,8 +496,8 @@ mod tests {
         );
         assert!(!view.vte().has_focus());
         assert_eq!(failures.get(), 2);
-        view.kill();
-        pump_until(&main, "child cleanup", || exits.get() == 1);
+        close_and_assert_reaped(&main, &view);
+        assert_eq!(exits.get(), 0, "closed panes cannot receive late UI exits");
         crate::ui::PaneLeaf::detach_from(&view.widget());
         window.close();
     }
@@ -442,7 +507,7 @@ mod tests {
         gtk4::init().expect("GTK display");
         let main = glib::MainContext::default();
         let _guard = main.acquire().unwrap();
-        // VTE uses g_get_home_dir(), which need not match a later HOME edit.
+        // Recovery follows VTE's g_get_home_dir(), not a later HOME edit.
         // The sensor compares directory identity; it writes no home files and
         // never prints either the requested path or the real home directory.
         let home = glib::home_dir()
@@ -506,8 +571,8 @@ mod tests {
             1
         );
         assert_eq!(failures.get(), 1, "cwd fallback is not a launch failure");
-        view.kill();
-        pump_until(&main, "fallback child cleanup", || exits.get() == 1);
+        close_and_assert_reaped(&main, &view);
+        assert_eq!(exits.get(), 0, "closed panes cannot receive late UI exits");
         crate::ui::PaneLeaf::detach_from(&view.widget());
         window.close();
     }

@@ -4,6 +4,30 @@ use libadwaita::{self as adw, prelude::*};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+fn navigation_fixture_widths() -> (i32, i32) {
+    let initial = NAV_MIN + 20;
+    let narrow = token::RAIL_WIDTH as i32
+        + token::MIN_CENTER_WIDTH as i32
+        + token::SIDEBAR_DIVIDER_WIDTH as i32
+        + initial;
+    (initial, narrow)
+}
+
+#[test]
+fn navigation_drag_fixture_has_a_visible_clamp() {
+    let (initial, narrow) = navigation_fixture_widths();
+    let requested = initial + 60;
+    assert!(requested <= NAV_MAX);
+    let wide = token::Layout::for_size_with_sidebars(1356.0, 704.0, initial as f32, 306.0);
+    assert_eq!(wide.navigation.unwrap().width, initial as f32);
+    let clamped =
+        token::Layout::for_size_with_sidebars(narrow as f32, 600.0, requested as f32, 346.0);
+    assert!(clamped.inspector.is_none());
+    let navigation = clamped.navigation.expect("clamp must not hide navigation");
+    assert!(navigation.width >= NAV_MIN as f32);
+    assert!(navigation.width < requested as f32);
+}
+
 fn settle() {
     let until = Instant::now() + Duration::from_millis(120);
     while Instant::now() < until {
@@ -43,7 +67,10 @@ fn native_sidebar_drags_preserve_requests_and_input_focus() {
     adw::init().expect("GTK/Adwaita display");
     crate::ui::reference_shell::install_css();
     let config = Rc::new(RefCell::new(Config::safe_defaults()));
-    config.borrow_mut().sidebar_width = 237;
+    // Start above the current shared minimum, rather than already clamped.
+    // The native drag's origin is the allocated width, not an invalid request.
+    let (initial_navigation, narrow_width) = navigation_fixture_widths();
+    config.borrow_mut().sidebar_width = initial_navigation as u32;
     config.borrow_mut().ai_panel_width = 306;
     config.borrow_mut().sidebar_visible = true;
     let navigation = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -244,8 +271,14 @@ fn native_sidebar_drags_preserve_requests_and_input_focus() {
     let drag = |paned: &gtk::Paned, offset: i32| {
         drag_widget(&handle(paned).expect("real GtkPaned handle"), offset)
     };
+    assert_eq!(left.position(), initial_navigation);
     drag(&left, 60);
-    assert!((config.borrow().sidebar_width as i32 - 297).abs() <= 2);
+    assert!(
+        (config.borrow().sidebar_width as i32 - (initial_navigation + 60)).abs() <= 2,
+        "navigation drag must persist its allocated origin plus offset: saved={}, position={}",
+        config.borrow().sidebar_width,
+        left.position()
+    );
     drag(&right, -40);
     assert!((config.borrow().ai_panel_width as i32 - 346).abs() <= 2);
     let saved = (
@@ -253,9 +286,13 @@ fn native_sidebar_drags_preserve_requests_and_input_focus() {
         config.borrow().ai_panel_width,
     );
     assert_eq!(saves.get(), 2);
-    window.set_default_size(700, 600);
+    // Leave enough room for a visible minimum-width navigation and the center,
+    // but less than the saved navigation width. Smaller windows hide it.
+    window.set_default_size(narrow_width, 600);
     settle();
     assert!(!inspector.is_visible());
+    assert!(navigation.is_visible());
+    assert!(left.position() >= NAV_MIN);
     assert!(
         left.position() < saved.0 as i32,
         "narrow layout must exercise a real clamp"

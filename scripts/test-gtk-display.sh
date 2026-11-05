@@ -30,7 +30,7 @@ export XDG_STATE_HOME="${test_xdg_root}/state"
 export XDG_CACHE_HOME="${test_xdg_root}/cache"
 export XDG_RUNTIME_DIR="${test_xdg_root}/runtime"
 
-for command in dbus-run-session xvfb-run xdotool; do
+for command in dbus-run-session xvfb-run xdotool timeout; do
     if ! command -v "${command}" >/dev/null 2>&1; then
         printf 'Error: %s is required for display-backed tests.\n' "${command}" >&2
         exit 1
@@ -304,7 +304,10 @@ for test_name in "${tests[@]}"; do
     if [[ "$test_name" == block_view::tests::native_ime_commit_cancel_and_independent_ptys || "$test_name" == block_view::tests::native_ime_send_button_preserves_composition ]]; then
         fixture_im_module=simple
     fi
-    if GTK_IM_MODULE="$fixture_im_module" GTK_A11Y="$a11y_backend" dbus-run-session "${dbus_run_args[@]}" -- \
+    # A wedged fixture must fail explicitly and leave the remaining cases runnable.
+    if GTK_IM_MODULE="$fixture_im_module" GTK_A11Y="$a11y_backend" \
+        timeout --signal=TERM --kill-after=10s 120s \
+        dbus-run-session "${dbus_run_args[@]}" -- \
         xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
         cargo test --lib --all-features --locked "${test_name}" -- \
         --ignored --exact --nocapture; then

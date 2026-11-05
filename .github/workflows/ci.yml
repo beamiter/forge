@@ -177,7 +177,9 @@ jobs:
   gtk-display:
     name: GTK display regression
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # The complete 173-case isolated suite follows compile and native matrices.
+    # A 20-minute job cutoff interrupted it before all failures were reported.
+    timeout-minutes: 35
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
