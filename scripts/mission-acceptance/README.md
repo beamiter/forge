@@ -13,10 +13,11 @@ On an ordinary GitHub-hosted Ubuntu 24.04 runner, use only these public reposito
 `c1aebbe7b6ad4a8edb98582ea282d6e4d2ba6816` and carries its own Cargo.lock.
 
 The job reads the exact frozen five master refs and each predeclared exact-head
-master workflow before checkout. All gates require push runs except the fixed
-Anvil `link-recovery.yml` source/build gate, whose path filter may require an
-explicit `workflow_dispatch` at that same master SHA. Its native lanes remain
-SKIPPED and are not accepted as native recovery evidence. Missing, pending,
+master workflow before checkout. All gates require push runs except two fixed paths-filtered workflows:
+Anvil `link-recovery.yml` and Forge `flatpak.yml`. These require an explicit
+`workflow_dispatch` at that same master SHA when no push run exists. Anvil
+link-recovery native lanes remain SKIPPED and are not accepted as native recovery
+evidence; the Forge Flatpak bundle and smoke job must actually succeed. Missing, pending,
 failed, cancelled and skipped
 workflows fail closed. A newer failed run cannot be hidden by an older pass.
 All frontend native Mission modules must exist at the published candidate.
@@ -84,8 +85,8 @@ and `scripts/mission-acceptance/`. Core does not change just to host this job:
 that would unnecessarily change the pin required by all four frontends.
 
 1. Review the implementation and let the selected frontend's normal gates pass
-   after its authorized publication. Finish all final exact-head gates first. Run Anvil link-recovery manually on
-   master if its paths-filtered push workflow did not run; record its source/build
+   after its authorized publication. Finish all final exact-head gates first. Run Anvil link-recovery and Forge Flatpak manually on master if their
+   paths-filtered push workflows did not run. Record Anvil link-recovery source/build
    scope and native SKIPPED status without substituting another gate.
 2. Read all five current master SHAs, native evidence and exact-head workflow
    results. Prepare a separate JSON input using the example's schema. Only after
@@ -106,7 +107,7 @@ example stops before any network request or output directory creation.
 
 ## Validation performed in the assistant cloud machine
 
-- 49 offline collector/security/source-mutation tests passed in normal and optimized
+- 52 offline collector/security/source-mutation tests passed in normal and optimized
   Python modes.
 - Fourteen pure Rust fault-injection tests passed using the official Rust 1.86.0
   toolchain, covering exact CAS rejection, independent readback failures and

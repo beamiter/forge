@@ -20,10 +20,11 @@ WORKFLOWS = {
     "ember": ("ci.yml", "security.yml", "ui-layout.yml"),
     "frost": ("ci.yml", "native-desktop.yml", "native-provider-acceptance.yml", "vim9-rewrite.yml", "ui-layout.yml"),
 }
-# This source/build-only workflow has a push paths filter. A manual run of the
-# exact master is required when unrelated changes produce no push run. This is
-# the sole exception; its native recovery lanes remain explicitly SKIPPED.
-MANUAL_WORKFLOWS = frozenset({("anvil", "link-recovery.yml")})
+# These two workflows have push paths filters. A manual run of the exact master
+# is required when unrelated changes produce no push run. No other workflow may
+# substitute a manual run. Anvil link recovery remains source/build-only with
+# native recovery lanes explicitly SKIPPED. Forge Flatpak retains its full job.
+MANUAL_WORKFLOWS = frozenset({("anvil", "link-recovery.yml"), ("forge", "flatpak.yml")})
 MISSION_FILES = {"anvil": "src/workspace_mission_ui.rs", "forge": "src/ui/workspace_missions.rs", "ember": "src/workspace_missions.rs", "frost": "src/workspace_mission.rs"}
 HERE = Path(__file__).resolve().parent
 

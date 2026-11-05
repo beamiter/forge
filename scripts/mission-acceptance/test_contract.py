@@ -124,7 +124,26 @@ class Contract(unittest.TestCase):
         selected=collector.select_runs(self.item,data)
         self.assertEqual(len(selected),5)
         self.assertTrue(any(all(r[k]==v for k,v in link.items()) for r in selected))
-        self.assertEqual(collector.MANUAL_WORKFLOWS,{("anvil","link-recovery.yml")})
+        self.assertEqual(collector.MANUAL_WORKFLOWS,{("anvil","link-recovery.yml"),("forge","flatpak.yml")})
+    def test_forge_flatpak_allows_only_successful_exact_master_manual_run(self):
+        self.item=next(r for r in self.manifest["repositories"] if r["name"]=="forge")
+        data=self.runs();flatpak=next(r for r in data["workflow_runs"] if r["path"].endswith("/flatpak.yml"))
+        flatpak["event"]="workflow_dispatch"
+        self.assertEqual(len(collector.select_runs(self.item,data)),4)
+        for key,value in (("head_sha","0"*40),("head_branch","candidate"),("event","pull_request"),("status","in_progress"),("conclusion","failure"),("conclusion","skipped")):
+            changed=copy.deepcopy(data)
+            next(r for r in changed["workflow_runs"] if r["path"].endswith("/flatpak.yml"))[key]=value
+            with self.assertRaises(ValueError):collector.select_runs(self.item,changed)
+    def test_forge_other_workflows_cannot_substitute_manual_run(self):
+        self.item=next(r for r in self.manifest["repositories"] if r["name"]=="forge")
+        data=self.runs();data["workflow_runs"][0]["event"]="workflow_dispatch"
+        with self.assertRaises(ValueError):collector.select_runs(self.item,data)
+    def test_newer_flatpak_failure_cannot_hide_behind_older_green(self):
+        self.item=next(r for r in self.manifest["repositories"] if r["name"]=="forge")
+        for newer_event,older_event in (("workflow_dispatch","push"),("push","workflow_dispatch")):
+            data=self.runs();old=next(r for r in data["workflow_runs"] if r["path"].endswith("/flatpak.yml"));old["event"]=older_event
+            new=copy.deepcopy(old);new.update(id=100,event=newer_event,conclusion="failure");data["workflow_runs"].append(new)
+            with self.assertRaises(ValueError):collector.select_runs(self.item,data)
     def test_manual_link_recovery_rejects_wrong_head_and_branch(self):
         for key,value in (("head_sha","0"*40),("head_branch","candidate"),("event","pull_request")):
             data,link=self.anvil_runs();link[key]=value
