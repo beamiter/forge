@@ -53,6 +53,74 @@ host=0; wm=0; display=0
         self.assertEqual(result.stderr, '')
 
 
+class GtkDependencyAcquisitionTests(unittest.TestCase):
+    def step(self):
+        workflow = (HERE.parents[2] / '.github/workflows/ci.yml').read_text()
+        start = workflow.index('      - name: Install GTK display test dependencies\n')
+        end = workflow.index('\n      - name:', start + 1)
+        return workflow[start:end]
+
+    def run_step(self, failure):
+        step = self.step()
+        self.assertIn('        timeout-minutes: 6\n', step)
+        self.assertIn('        shell: bash\n', step)
+        body = step.split('        run: |\n', 1)[1]
+        script = '\n'.join(line[10:] for line in body.splitlines()) + '\n'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / 'calls.jsonl'
+            # Execute the actual step shell with an inert sudo replacement.
+            # It records apt's arguments and source bytes; it never runs apt.
+            fake = root / 'sudo'
+            fake.write_text('''#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+if not args or args[0] != 'apt-get':
+    raise SystemExit(91)
+source = next(a.split('=', 1)[1] for a in args if a.startswith('Dir::Etc::sourcelist='))
+with open(os.environ['APT_LOG'], 'a') as stream:
+    stream.write(json.dumps({'args': args, 'source': source, 'text': pathlib.Path(source).read_text()}) + '\\n')
+raise SystemExit(int(os.environ['APT_FAILURE']))
+''')
+            fake.chmod(0o755)
+            env = {**os.environ, 'PATH': str(root) + os.pathsep + os.environ['PATH'],
+                   'TMPDIR': directory, 'APT_LOG': str(log), 'APT_FAILURE': str(failure)}
+            result = subprocess.run(['bash', '-c', script], env=env, capture_output=True,
+                                    text=True, timeout=5)
+            calls = [json.loads(line) for line in log.read_text().splitlines()]
+            self.assertEqual(result.returncode, failure, result.stderr)
+            for call in calls:
+                self.assertFalse(Path(call['source']).exists(), 'Temporary apt source was not cleaned')
+            return calls
+
+    def test_official_signed_sources_bounds_and_all_native_packages(self):
+        calls = self.run_step(0)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]['args'][-1], 'update')
+        sources = [
+            'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu noble main universe',
+            'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu noble-updates main universe',
+            'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://security.ubuntu.com/ubuntu noble-security main universe',
+        ]
+        for call in calls:
+            self.assertEqual(call['text'].splitlines(), sources)
+            for option in ('Dir::Etc::sourceparts=-', 'Acquire::Retries=2',
+                           'Acquire::http::Timeout=30', 'Acquire::https::Timeout=30'):
+                self.assertIn(option, call['args'])
+        args = calls[1]['args']
+        self.assertEqual(args[args.index('install'):], [
+            'install', '--no-install-recommends', '-y', 'pkg-config', 'libgtk-4-dev',
+            'libadwaita-1-dev', 'libvte-2.91-gtk4-dev', 'vim', 'ripgrep', 'libpcre2-dev',
+            'xvfb', 'xdotool', 'xauth', 'libxtst6', 'python3', 'gdb', 'dbus-x11',
+            'sway', 'wtype', 'grim', 'fonts-dejavu-core', 'fonts-liberation',
+            'fonts-noto-cjk', 'fonts-noto-color-emoji'])
+
+    def test_failed_update_stops_before_install_and_cleans_source(self):
+        calls = self.run_step(42)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]['args'][-1], 'update')
+
+
 def candidates():
     return {'schema': 1, 'contract': 'five-repository-host-v1', 'frozen': True,
             'repositories': [{'name': name, 'full_name': 'beamiter/' + name,
