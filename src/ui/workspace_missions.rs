@@ -4,7 +4,8 @@ use super::workspace_navigation::{Action, Row};
 use gtk::prelude::*;
 use gtk4 as gtk;
 use jterm_core::agent_workspace::{
-    ConversationId, MissionWorkbench, WorkspaceMission, WorkspaceMissionReport,
+    ConversationId, MissionWorkbench, WorkspaceMission, WorkspaceMissionAttention,
+    WorkspaceMissionReport,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -19,6 +20,13 @@ pub(crate) struct MissionWidgets {
     state: Rc<RefCell<MissionWorkbench>>,
     catalog: gtk::Box,
     catalog_rows: Rc<RefCell<HashMap<String, gtk::Button>>>,
+    attention: gtk::Box,
+    attention_rows: RefCell<HashMap<String, AttentionWidgets>>,
+    attention_heading: gtk::Label,
+    attention_notice: gtk::Label,
+    attention_text: gtk::TextBuffer,
+    attention_rendered: RefCell<String>,
+    attention_evidence: RefCell<super::workspace_mission_evidence::MissionEvidence>,
     editor: gtk::TextBuffer,
     editor_view: gtk::TextView,
     status: gtk::Label,
@@ -35,6 +43,11 @@ pub(crate) struct MissionWidgets {
     submitted: RefCell<Option<String>>,
     rendering: Rc<Cell<bool>>,
     loaded: Rc<RefCell<Option<(String, u64)>>>,
+}
+
+struct AttentionWidgets {
+    button: gtk::Button,
+    item: Rc<RefCell<WorkspaceMissionAttention>>,
 }
 
 impl std::ops::Deref for MissionSurface {
@@ -175,6 +188,30 @@ impl MissionSurface {
         let status = label("Open a saved Mission or create a new plan.");
         status.set_selectable(true);
         root.append(&status);
+        let attention_heading = label("Needs you · select a Mission");
+        attention_heading.add_css_class("heading");
+        root.append(&attention_heading);
+        let attention = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        root.append(&attention);
+        let attention_notice = label("");
+        root.append(&attention_notice);
+        let attention_view = gtk::TextView::new();
+        attention_view.set_editable(false);
+        attention_view.set_cursor_visible(false);
+        attention_view.set_monospace(true);
+        attention_view.set_wrap_mode(gtk::WrapMode::WordChar);
+        let attention_text = attention_view.buffer();
+        let attention_scroll = gtk::ScrolledWindow::new();
+        attention_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        attention_scroll.set_min_content_height(120);
+        attention_scroll.set_max_content_height(320);
+        attention_scroll.set_propagate_natural_height(true);
+        attention_scroll.set_child(Some(&attention_view));
+        let attention_details =
+            gtk::Expander::new(Some("Selected reason and exact captured evidence"));
+        attention_details.set_expanded(true);
+        attention_details.set_child(Some(&attention_scroll));
+        root.append(&attention_details);
         root.append(&label("Editable plan: paths, candidate commits, target refs, exact core pins, required checks and task/run references. Host-owned evidence is shown separately below."));
         let view = gtk::TextView::new();
         view.set_monospace(true);
@@ -208,6 +245,13 @@ impl MissionSurface {
             state,
             catalog,
             catalog_rows: Rc::new(RefCell::new(HashMap::new())),
+            attention,
+            attention_rows: RefCell::new(HashMap::new()),
+            attention_heading,
+            attention_notice,
+            attention_text,
+            attention_rendered: RefCell::new(String::new()),
+            attention_evidence: RefCell::new(Default::default()),
             editor,
             editor_view: view,
             status,
@@ -391,7 +435,19 @@ impl MissionSurface {
 
     pub fn poll(&self) {
         self.state.borrow_mut().poll();
+        let current = self.current_attention();
+        self.attention_evidence
+            .borrow_mut()
+            .poll(&current, self.dirty.get());
         self.render();
+    }
+
+    fn current_attention(&self) -> Vec<WorkspaceMissionAttention> {
+        let data = self.state.borrow();
+        data.selected
+            .as_ref()
+            .map(|mission| mission.attention_items(data.report.as_ref()))
+            .unwrap_or_default()
     }
 
     pub fn rows(&self, project: Option<&std::path::Path>) -> Vec<Row> {
@@ -408,6 +464,7 @@ impl MissionSurface {
             })
             .map(|mission| {
                 let report = data.report_for(&mission.id);
+                let attention = mission.attention_items(report);
                 let dirty = self.dirty.get()
                     && data
                         .selected
@@ -417,7 +474,7 @@ impl MissionSurface {
                     action: Action::Mission(mission.id.clone()),
                     title: mission.title.clone(),
                     detail: format!(
-                        "Mission · {} · {} repositories",
+                        "Mission · {} · {} repositories{}",
                         if dirty {
                             "Unsaved edits"
                         } else {
@@ -425,7 +482,15 @@ impl MissionSurface {
                                 .map(|r| r.state.label())
                                 .unwrap_or("Inspection needed")
                         },
-                        mission.repositories.len()
+                        mission.repositories.len(),
+                        attention
+                            .first()
+                            .map(|item| format!(
+                                " · {} ({} reasons)",
+                                item.kind.label(),
+                                attention.len()
+                            ))
+                            .unwrap_or_default()
                     ),
                     searchable: format!(
                         "{} {}",
@@ -439,7 +504,7 @@ impl MissionSurface {
                     ),
                     active: false,
                     busy: false,
-                    attention: dirty || report.is_none_or(WorkspaceMissionReport::needs_attention),
+                    attention: dirty || !attention.is_empty(),
                     archived: false,
                     pinned: false,
                     project: project
@@ -525,6 +590,7 @@ impl MissionSurface {
         } else {
             report_text(data.report.as_ref())
         });
+        self.render_attention(&data);
         let link_key = data
             .selected
             .as_ref()
@@ -581,6 +647,100 @@ impl MissionSurface {
             }
         }
     }
+
+    fn render_attention(&self, data: &MissionWorkbench) {
+        let items = data
+            .selected
+            .as_ref()
+            .map(|mission| mission.attention_items(data.report.as_ref()))
+            .unwrap_or_default();
+        let dirty = self.dirty.get();
+        let mut evidence = self.attention_evidence.borrow_mut();
+        evidence.reconcile(&items, dirty);
+        self.attention_heading.set_text(&if dirty {
+            "Needs you · unsaved plan; evidence actions are unavailable".into()
+        } else if data.selected.is_none() {
+            "Needs you · select a Mission".into()
+        } else {
+            format!("Needs you · {} current reasons", items.len())
+        });
+        self.attention_notice.set_text(&evidence.notice);
+        let text = evidence.text();
+        if *self.attention_rendered.borrow() != text {
+            self.attention_text.set_text(&text);
+            *self.attention_rendered.borrow_mut() = text;
+        }
+        let mut rows = self.attention_rows.borrow_mut();
+        rows.retain(|id, row| {
+            if items.iter().any(|item| &item.id == id) {
+                true
+            } else {
+                self.attention.remove(&row.button);
+                false
+            }
+        });
+        let mut previous: Option<gtk::Button> = None;
+        for item in &items {
+            let row = rows.entry(item.id.clone()).or_insert_with(|| {
+                let button = gtk::Button::new();
+                let snapshot = Rc::new(RefCell::new(item.clone()));
+                let callback_item = snapshot.clone();
+                let weak = Rc::downgrade(&self.0);
+                button.connect_clicked(move |_| {
+                    let Some(surface) = weak.upgrade().map(MissionSurface) else {
+                        return;
+                    };
+                    let current = surface.current_attention();
+                    surface.attention_evidence.borrow_mut().select(
+                        &callback_item.borrow(),
+                        &current,
+                        surface.dirty.get(),
+                    );
+                    surface.render();
+                });
+                self.attention.append(&button);
+                AttentionWidgets {
+                    button,
+                    item: snapshot,
+                }
+            });
+            *row.item.borrow_mut() = item.clone();
+            let caption = format!(
+                "{} · {}{} · review details{}",
+                item.repository
+                    .as_ref()
+                    .map(|repository| repository.full_name.as_str())
+                    .unwrap_or("Mission"),
+                item.kind.label(),
+                item.check_name
+                    .as_ref()
+                    .map(|name| format!(" · {name}"))
+                    .unwrap_or_default(),
+                if item.task.is_some() {
+                    " and exact receipt"
+                } else {
+                    ""
+                },
+            );
+            if row.button.label().as_deref() != Some(caption.as_str()) {
+                row.button.set_label(&caption);
+                super::workspace_navigation::wrap_button_labels(&row.button);
+            }
+            row.button.set_sensitive(!dirty && !data.busy);
+            if evidence
+                .selected
+                .as_ref()
+                .is_some_and(|selected| selected == item)
+            {
+                row.button.add_css_class("suggested-action");
+            } else {
+                row.button.remove_css_class("suggested-action");
+            }
+            self.attention
+                .reorder_child_after(&row.button, previous.as_ref());
+            previous = Some(row.button.clone());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -615,6 +775,29 @@ mod tests {
         }
         surface.render();
         let original_row = surface.catalog_rows.borrow()[&plan.id].clone();
+        let reason = surface.current_attention()[0].clone();
+        let attention_row = surface.attention_rows.borrow()[&reason.id].button.clone();
+        attention_row.emit_clicked();
+        assert_eq!(
+            surface.attention_evidence.borrow().selected.as_ref(),
+            Some(&reason)
+        );
+        assert!(surface.attention_evidence.borrow().report.is_none());
+        // Even a queued callback with the same row identity must match the
+        // complete current reason, not merely its stable ID or revision.
+        surface.attention_rows.borrow()[&reason.id]
+            .item
+            .borrow_mut()
+            .detail
+            .push_str(" old");
+        attention_row.emit_clicked();
+        assert!(surface.attention_evidence.borrow().selected.is_none());
+        assert!(surface.attention_notice.text().contains("changed"));
+        assert_eq!(
+            surface.attention_rows.borrow()[&reason.id].button,
+            attention_row
+        );
+        attention_row.emit_clicked();
         let initial = surface
             .editor
             .text(
@@ -627,6 +810,8 @@ mod tests {
         surface.state.borrow_mut().busy = true;
         surface.editor.set_text(&format!("{initial} "));
         surface.render();
+        assert!(!attention_row.is_sensitive());
+        assert!(surface.attention_evidence.borrow().selected.is_none());
         plan.revision = 2;
         {
             let mut state = surface.state.borrow_mut();

@@ -1,0 +1,95 @@
+{
+  "schema": 1,
+  "status": "not_run",
+  "candidate_set_frozen": false,
+  "compiled_core": "4ffa774138ee89dc2916ce21786c45e411196ca4",
+  "scope": "Real task experiments, not substituted by CI prerequisites or protocol fixtures",
+  "repetitions_per_task": 3,
+  "required_metrics": [
+    "elapsed_seconds",
+    "human_interventions",
+    "model_and_provider",
+    "reported_token_or_cost_usage_if_available",
+    "environment_and_backend",
+    "full_source_sha_set",
+    "host_binary_sha256",
+    "raw_evidence_sha256"
+  ],
+  "cards": [
+    {
+      "id": "T02",
+      "title": "Propagate one real shared-core change to four terminals",
+      "status": "not_run",
+      "preconditions": [
+        "Five published exact candidates with one core pin and reviewed CI",
+        "Real saved Mission and existing authorized hosted tasks at the exact checkouts"
+      ],
+      "procedure": [
+        "Read the exact Mission through all four actual native frontends",
+        "Run the original task validation through existing authorized controls",
+        "Read each exact task/run receipt and rerun the read-only continuation preflight",
+        "Inspect the Mission after all actual validation/publication requirements are met"
+      ],
+      "acceptance": [
+        "Actual core and four adapter paths are covered by task evidence",
+        "Four native frontends display the same saved identity and scoped receipts",
+        "Record all three real repetitions and raw evidence hashes"
+      ],
+      "non_substitutes": [
+        "Five green independent CIs",
+        "Four protocol clients",
+        "Fake providers or database-seeded receipt rows"
+      ]
+    },
+    {
+      "id": "T09",
+      "title": "Reproduce and repair stale inspection or review evidence",
+      "status": "not_run",
+      "preconditions": [
+        "A real reproducible stale receipt scenario in disposable task worktrees",
+        "Do not mutate the frozen positive acceptance checkouts"
+      ],
+      "procedure": [
+        "Capture the current receipt and its exact task/run/sequence",
+        "Change the actual acceptance contract or worktree through authorized controls",
+        "Verify old evidence stays stale and Needs-you persists across refresh/reopen",
+        "Repair the cause and run a new original validation after the new evidence boundary"
+      ],
+      "acceptance": [
+        "An old or late receipt cannot restore current success",
+        "A new real validation receipt is bound to the changed contract and checkout",
+        "Record all three real repetitions and raw evidence hashes"
+      ],
+      "non_substitutes": [
+        "Synthetic unit-test receipts",
+        "Changing timestamps or SQLite rows",
+        "Disabling freshness guards"
+      ]
+    },
+    {
+      "id": "T10",
+      "title": "Observe real partial publication and eventual integration",
+      "status": "not_run",
+      "preconditions": [
+        "An authorized staged real publication with fixed candidate identities",
+        "No forced push and no writes from this read-only preflight"
+      ],
+      "procedure": [
+        "Observe a real unpublished local candidate and dated current public master",
+        "Record the actual repository publication and integration transitions",
+        "Distinguish a wrong dependency pin from missing remote ancestry",
+        "Reopen the host and re-inspect the exact saved plan without restoring historical pass gates"
+      ],
+      "acceptance": [
+        "Dated public refs and ancestry identify the actual staged candidates",
+        "Partial integration cannot be called complete",
+        "Record all three real repetitions and raw evidence hashes"
+      ],
+      "non_substitutes": [
+        "A negative local clone used by host-contract tests",
+        "Unsupported local origin errors",
+        "A provider narrative claiming it pushed"
+      ]
+    }
+  ]
+}

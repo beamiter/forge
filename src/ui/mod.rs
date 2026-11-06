@@ -53,6 +53,7 @@ mod workspace_chats;
 mod workspace_cli;
 mod workspace_context;
 mod workspace_context_ui;
+mod workspace_mission_evidence;
 mod workspace_missions;
 pub(crate) mod workspace_navigation;
 mod workspace_remote;

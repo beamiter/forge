@@ -44,6 +44,25 @@ report or refreshing expires its current gates in the shared controller; a saved
 success is not proof that a checkout or remote ref is still unchanged. Missing,
 stale, blocked, failed and not-run checks remain visible.
 
+The Mission workbench now lists the shared core's specific Needs-you reasons,
+including validation failure/block/staleness, missing candidates, mismatched
+dependencies and unverified publication. Navigation rows expose the leading
+reason. The selected Mission's GTK reason rows retain stable identities; the
+full current entry, including its receipt and detail, is checked before a click
+can capture evidence. Unsaved edits disable these actions and clear old captures.
+
+Selecting a reason shows its candidate, check, environment and receipt. When
+the shared core can unambiguously bind that receipt to a linked task run, Forge
+makes one read-only result request and displays the validation log and captured
+worktree diff on this page. The conversation, task, run and exact receipt must
+match; a newer run or event is not silently substituted. Output truncation,
+failed/stale validation and capture errors remain explicit. A reason without
+an exact run still shows its saved details, without inventing an evidence link.
+The diff is labelled as a current worktree capture with its time and fingerprint,
+not as the historical validation input. Each visible log/diff is capped at
+256 KiB on a UTF-8 boundary and labelled when truncated.
+No action starts a provider, runs validation, changes a plan or publishes code.
+
 ## Editing and recovery boundaries
 
 The editor checks Mission ID and revision before saving. A save acknowledgement
@@ -62,10 +81,10 @@ any task or plan write.
 ## Source and verification
 
 The production/test dependency is the public shared-core commit
-`c1aebbe7b6ad4a8edb98582ea282d6e4d2ba6816`. Cargo.lock, dependency policy,
+`4ffa774138ee89dc2916ce21786c45e411196ca4`. Cargo.lock, dependency policy,
 Flatpak's generated sources, Nix's source hash and adapter compatibility records
 all name that source. Its NAR is
-`sha256-vKRvyUof0eHoPokl2bXa8H8KWlHeZFwyzGBrIWDk8Ww=`. The global sibling path
+`sha256-CZinWRNrlmclrkzh9GbiKs/SEGraa5xlIL1GyIIljuk=`. The global sibling path
 patch and historical archive are not build inputs.
 
 Local Rustfmt, five production-source mutation tests, seven real Linux PTY input
@@ -76,9 +95,16 @@ actual locked public core in a temporary harness that includes the production
 helpers and review module. That harness does not compile the GTK surface.
 Local full-app Clippy was attempted and stopped at missing `glib-2.0.pc`; no
 native acceptance is inferred from the headless helper results.
+The Needs-you follow-up additionally passed six production-source evidence
+tests and strict helper Clippy against the published attention API revision.
+Fifteen source-pin mutation tests pass at Python optimization levels 0, 1 and 2,
+including actual CLI refusal checks. Cargo metadata resolves exactly the
+published core, both adapter bundles retain their checksums, and Flatpak sources
+were regenerated with the pinned generator. These checks do not compile GTK.
 The added GTK regression exercises pending-save edits, stale-revision rejection,
 retained rows, attention/evidence state, narrow minimum width and callback
-release. It is explicitly registered in `scripts/test-gtk-display.sh` and runs in
+release, plus retained reason rows, rejected stale callbacks and draft-driven
+capture invalidation. It is explicitly registered in `scripts/test-gtk-display.sh` and runs in
 an isolated process/display, not the ordinary headless test process.
 
 This integration is not a claim that the five-repository delivery is completed.

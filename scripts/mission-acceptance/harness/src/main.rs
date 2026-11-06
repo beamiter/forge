@@ -522,7 +522,7 @@ fn flow(root: &Path, input: &Value) -> Result<Value, String> {
     check_no_validation(&dirty_report)?;
     save(root, "07-negative-dirty.json", &dirty_report)?;
     fs::remove_file(dirty).map_err(|e| e.to_string())?;
-    const CORE: &str = "c1aebbe7b6ad4a8edb98582ea282d6e4d2ba6816";
+    const CORE: &str = "4ffa774138ee89dc2916ce21786c45e411196ca4";
     const OLD_CORE: &str = "f8566bb9cb6e9cca3258c8050c6dc4e9b96da8ff";
     for name in ["Cargo.toml", "Cargo.lock"] {
         let path = negative.join(name);
@@ -827,5 +827,21 @@ mod tests {
         let mut report = unpublished_report();
         report.integration_observation.as_mut().unwrap().candidate = "c".repeat(40);
         assert!(check_unpublished(&report, &"b".repeat(40), &"a".repeat(40)).is_err());
+    }
+}
+
+// Exercise the actual production reducer under the same pinned core, without GTK.
+#[cfg(test)]
+#[path = "../../../../src/ui/workspace_mission_evidence.rs"]
+mod forge_mission_evidence;
+
+#[cfg(test)]
+mod evidence_poll_regression {
+    #[test]
+    fn empty_poll_does_not_create_evidence() {
+        let mut evidence = super::forge_mission_evidence::MissionEvidence::default();
+        evidence.poll(&[], false);
+        assert!(evidence.report.is_none());
+        assert!(evidence.selected.is_none());
     }
 }

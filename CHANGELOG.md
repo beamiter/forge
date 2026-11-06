@@ -6,6 +6,16 @@ All notable user-visible and operational changes are recorded here.
 
 ### Highlights
 
+- Mission Needs-you now shows concrete shared reasons and exact candidate,
+  check, environment and receipt details. Linked validation logs and worktree
+  diffs are captured read-only only when the task, run and exact receipt match;
+  newer results, stale callbacks and unsaved drafts cannot substitute evidence.
+
+- The production shared-core source guard remains active under Python's `-O`,
+  `-OO` and `PYTHONOPTIMIZE` modes. Mutation regressions cover stale pins,
+  local overrides, duplicate sources and malformed manifests in all three
+  optimization levels, so build settings cannot silently disable the gate.
+
 - The Block workspace's bottom input now always reserves three full lines of
   text while idle instead of collapsing to the prompt's one or two rows. It
   still grows for multiline commands, completion menus and anything else the

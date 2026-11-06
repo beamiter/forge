@@ -179,6 +179,7 @@ name = "five-repository-mission-acceptance"
 version = "0.1.0"
 dependencies = [
  "jterm_core",
+ "libc",
  "serde",
  "serde_json",
 ]
@@ -337,7 +338,7 @@ dependencies = [
 [[package]]
 name = "jterm_core"
 version = "0.2.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=c1aebbe7b6ad4a8edb98582ea282d6e4d2ba6816#c1aebbe7b6ad4a8edb98582ea282d6e4d2ba6816"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=4ffa774138ee89dc2916ce21786c45e411196ca4#4ffa774138ee89dc2916ce21786c45e411196ca4"
 dependencies = [
  "companion-client",
  "companion-core",

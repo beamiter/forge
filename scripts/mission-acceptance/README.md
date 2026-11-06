@@ -10,7 +10,7 @@ the native evidence. The manual job requires explicit frozen invocation data.
 On an ordinary GitHub-hosted Ubuntu 24.04 runner, use only these public repositories:
 `beamiter/jterm_core`, `beamiter/anvil`, `beamiter/forge`, `beamiter/ember`,
 `beamiter/frost`. The harness pins published core
-`c1aebbe7b6ad4a8edb98582ea282d6e4d2ba6816` and carries its own Cargo.lock.
+`4ffa774138ee89dc2916ce21786c45e411196ca4` and carries its own Cargo.lock.
 
 The job reads the exact frozen five master refs and each predeclared exact-head
 master workflow before checkout. All gates require push runs except two fixed paths-filtered workflows:
@@ -105,22 +105,31 @@ The optional checked-in `frozen-candidates.json` is a disabled example only. The
 workflow uses its explicit dispatch input. Default local invocation with the
 example stops before any network request or output directory creation.
 
-## Validation performed in the assistant cloud machine
+## Local verification and recovery status
 
-- 52 offline collector/security/source-mutation tests passed in normal and optimized
-  Python modes.
-- Fourteen pure Rust fault-injection tests passed using the official Rust 1.86.0
-  toolchain, covering exact CAS rejection, independent readback failures and
-  proof of unpublished commits against an actually observed public remote.
-- The exact locked Rust harness passed build, strict Clippy and rustfmt with
-  explicit Rust 1.86.0. A version probe executed inside Forge's repository, whose
-  toolchain file says stable, still recorded rustc/Cargo 1.86.0 and their matching
-  rustfmt/Clippy components. No default toolchain was changed.
-- Workflow YAML, pinned action syntax and every embedded Bash block were checked.
-- Full host scenarios were NOT run: final candidates are not frozen, and this
-  cloud environment previously rejected production Git trust and host socket
-  creation. The new job retains those guards and awaits the authorized standard
-  runner. No local pass is claimed for those host scenarios or for the CI job.
+The former unpublished PR4 integration was not available in the replacement
+cloud checkout. Its source was semantically reconstructed from the published
+base and documented contract. This is not a byte-identical restoration, and
+historical test counts are not presented as new results. New tests, source hashes
+and logs must be recorded before publication. No real five-repository host run
+or existing-task validation was performed during recovery.
+
+New recovery checks passed with Rust 1.86.0: 21 host/reducer tests plus 23
+preflight tests, strict all-target Clippy, locked build and rustfmt. The 56 Python
+contract tests passed both normally and under PYTHONOPTIMIZE=1. Three executable
+negative-state checks returned blocked without creating runtime directories.
+These are local contract tests, not a real host or five-repository acceptance.
+
+The harness now also compiles the actual Forge Mission evidence reducer in its
+unit-test target, without GTK, using the same exact core dependency. The optional
+read-only continuation executable has its own input, identity, race and evidence
+tests. Both are covered by the harness Cargo operations; the root application's
+RustSec/deny audits do not automatically cover this independent lockfile.
+
+See [VALIDATION_CONTINUATION.md](VALIDATION_CONTINUATION.md) for the existing-host
+read-only preflight and [acceptance-cards.json](acceptance-cards.json) for the
+explicitly not-run T02/T09/T10 experiments. The manual CI workflow does not start
+this preflight or invent the real tasks it requires.
 
 This host contract is one step toward the original V3 acceptance. Four actual
 native applications sharing a visible Mission, real hosted task validation,

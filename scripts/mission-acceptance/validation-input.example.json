@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "frozen": false,
+  "core": "4ffa774138ee89dc2916ce21786c45e411196ca4",
+  "state_dir": "",
+  "mission_id": "",
+  "mission_revision": 0,
+  "repositories": [
+    {
+      "full_name": "beamiter/jterm_core",
+      "revision": "4ffa774138ee89dc2916ce21786c45e411196ca4",
+      "baseline": "",
+      "path": ""
+    },
+    {
+      "full_name": "beamiter/anvil",
+      "revision": "",
+      "baseline": "",
+      "path": ""
+    },
+    {
+      "full_name": "beamiter/forge",
+      "revision": "",
+      "baseline": "",
+      "path": ""
+    },
+    {
+      "full_name": "beamiter/ember",
+      "revision": "",
+      "baseline": "",
+      "path": ""
+    },
+    {
+      "full_name": "beamiter/frost",
+      "revision": "",
+      "baseline": "",
+      "path": ""
+    }
+  ]
+}

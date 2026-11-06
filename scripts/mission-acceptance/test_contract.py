@@ -221,4 +221,39 @@ class Contract(unittest.TestCase):
         self.assertIn('rustup run 1.86.0 rustfmt --version',workflow)
         self.assertIn('rustup run 1.86.0 clippy-driver --version',workflow)
 
+
+class RecoveredIntegrationContract(unittest.TestCase):
+    def test_all_compiled_core_sources_and_lock_agree(self):
+        import tomllib
+        manifest=tomllib.loads((HERE/"harness/Cargo.toml").read_text())
+        self.assertEqual(manifest["dependencies"]["jterm_core"]["rev"],collector.CORE)
+        lock=tomllib.loads((HERE/"harness/Cargo.lock").read_text())
+        entries=[p for p in lock["package"] if p["name"]=="jterm_core"]
+        self.assertEqual(len(entries),1)
+        self.assertEqual(entries[0]["source"],f"git+https://github.com/beamiter/jterm_core.git?rev={collector.CORE}#{collector.CORE}")
+        for name in ("main.rs","bin/mission-validation-continuation.rs"):
+            self.assertIn(f'const CORE: &str = "{collector.CORE}";', (HERE/"harness/src"/name).read_text())
+    def test_both_examples_are_unfrozen_and_runtime_identity_blank(self):
+        candidate=json.loads((HERE/"frozen-candidates.json").read_text())
+        validation=json.loads((HERE/"validation-input.example.json").read_text())
+        self.assertIs(candidate["frozen"],False);self.assertIs(validation["frozen"],False)
+        self.assertEqual(validation["core"],collector.CORE)
+        for key in ("state_dir","mission_id"):
+            self.assertEqual(validation[key],"")
+        self.assertEqual(validation["mission_revision"],0)
+    def test_real_task_cards_are_not_run_and_disallow_substitutes(self):
+        cards=json.loads((HERE/"acceptance-cards.json").read_text())
+        self.assertEqual(cards["status"],"not_run")
+        self.assertIs(cards["candidate_set_frozen"],False)
+        self.assertEqual({c["id"] for c in cards["cards"]},{"T02","T09","T10"})
+        self.assertEqual(cards["repetitions_per_task"],3)
+        for card in cards["cards"]:
+            self.assertEqual(card["status"],"not_run")
+            self.assertGreaterEqual(len(card["non_substitutes"]),3)
+    def test_production_evidence_reducer_is_test_only(self):
+        main=(HERE/"harness/src/main.rs").read_text()
+        self.assertIn('#[cfg(test)]\n#[path = "../../../../src/ui/workspace_mission_evidence.rs"]\nmod forge_mission_evidence;',main)
+        self.assertTrue((HERE.parents[1]/"src/ui/workspace_mission_evidence.rs").is_file())
+        self.assertIn('evidence.poll(&[], false)',main)
+
 if __name__=="__main__":unittest.main()
