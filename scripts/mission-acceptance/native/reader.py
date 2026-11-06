@@ -313,6 +313,102 @@ def frost_sidebar_open_targets(rows, window):
     return result
 
 
+def frost_lines(rows, complete=False):
+    """Keep separate OCR views/lines separate; never repair observed words."""
+    lines = {}
+    for row in rows:
+        key = tuple(row[k] for k in ('page_num', 'block_num', 'par_num', 'line_num'))
+        lines.setdefault(key, []).append(row)
+    result = []
+    for words in lines.values():
+        if complete and any(not 80 <= w['conf'] <= 100 for w in words):
+            continue
+        text = ' '.join(w['text'] for w in words if 80 <= w['conf'] <= 100)
+        if text:
+            result.append((min(w['top'] for w in words), min(w['left'] for w in words), text))
+    return '\n'.join(text for _, _, text in sorted(result))
+
+
+def frost_panel_scope(rows, window):
+    headings = []
+    for rect in phrases(rows, 'Missions'):
+        # A standalone heading, not the sidebar badge or matching body prose.
+        peers = [r for r in rows if r['top'] < rect[1]+rect[3]
+                 and r['top']+r['height'] > rect[1] and r['left'] >= window[2]/2]
+        if len(peers) == 1 and peers[0]['text'] == 'Missions':
+            headings.append(rect)
+    descriptions = phrases(rows, 'Acceptance goals, exact versions and delivery receipts')
+    if len(headings) != 1 or len(descriptions) != 1:
+        return None
+    a, b = headings[0], descriptions[0]
+    if (a[0] < window[2]/2 or abs(a[0]-b[0]) > a[3]
+            or not 0 < b[1]-a[1]-a[3] < a[3]*3):
+        return None
+    left = min(a[0], b[0]); top = max(0, a[1]-a[3])
+    return [left, top, window[2]-left, window[3]-top]
+
+
+def frost_components(raw, window):
+    """Measured bright components from the actual threshold image, not targets."""
+    result = []
+    require(raw.startswith('Objects (id: bounding-box centroid area mean-color):'),
+            'Invalid Frost image components')
+    for line in raw.splitlines()[1:]:
+        match = re.fullmatch(r'\s*\d+: (\d+)x(\d+)\+(\d+)\+(\d+) '
+                             r'[0-9.]+,[0-9.]+ ([0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?) gray\((0|255)\)', line)
+        require(match is not None, 'Invalid Frost image component')
+        w, h, x, y = map(int, match.groups()[:4]); area = float(match[5])
+        rect = [x, y, w, h]
+        require(inside(rect, [0, 0, *window[2:]]) and 0 < area <= w*h,
+                'Frost image component escaped captured window')
+        if match[6] == '255':
+            result.append(dict(rect=rect, fill=area/(w*h)))
+    return result
+
+
+def frost_identity_crop(rows, window):
+    scope = frost_panel_scope(rows, window)
+    identities, revisions = phrases(rows, 'Mission ID:'), phrases(rows, 'Plan revision')
+    filters, titles = phrases(rows, 'Needs you: unfinished repositories'), phrases(rows, 'Title')
+    if scope is None or any(len(anchors) != 1 for anchors in (identities, revisions, filters, titles)):
+        return None
+    a, b = identities[0], revisions[0]; pad = max(a[3], b[3])
+    # Only the selected-plan header, after the catalog filter and before the
+    # Title field. Identical prose in Goal/repository content is not identity.
+    if (any(not inside(r, scope) for r in (a,b,filters[0],titles[0]))
+            or abs(a[0]-scope[0]) > pad or abs(a[0]-b[0]) > pad
+            or not filters[0][1]+filters[0][3] < a[1]
+            or not 0 < b[1]-a[1]-a[3] <= pad*3
+            or not 0 < titles[0][1]-b[1]-b[3] <= pad*3
+            or abs(titles[0][0]-a[0]) > pad):
+        return None
+    x, y = a[0]-pad, a[1]-pad
+    rect = [x, y, window[2]-x, b[1]+b[3]+pad-y]
+    return rect if inside(rect, [0, 0, *window[2:]]) else None
+
+
+def frost_toolbar_targets(observation, label, window):
+    rows = observation['rows']
+    descriptions = phrases(rows, 'Acceptance goals, exact versions and delivery receipts')
+    filters = phrases(rows, 'Needs you: unfinished repositories')
+    scope = observation.get('frost_panel_scope')
+    if (not scope or frost_panel_scope(rows, window) is None
+            or len(descriptions) != 1 or len(filters) != 1):
+        return []
+    top = descriptions[0][1]+descriptions[0][3]; bottom = filters[0][1]
+    buttons = sorted((b for b in observation.get('frost_buttons', [])
+        if inside(b['rect'], scope) and top <= b['rect'][1]
+        and b['rect'][1]+b['rect'][3] <= bottom), key=lambda b:b['rect'][0])
+    if [b['text'] for b in buttons] != ['Refresh', 'Back', 'New Mission']:
+        return []
+    a, b, c = [item['rect'] for item in buttons]
+    if (len({(r[1], r[3]) for r in (a,b,c)}) != 1
+            or any(not 0 < q[0]-p[0]-p[2] < p[3] for p,q in ((a,b),(b,c)))):
+        return []
+    return [dict(label=label, rect=r, node=None) for button in buttons if button['text'] == label
+            for r in phrases(button['rows'], label)]
+
+
 def expected_fields(plan):
     fields = {'identity': plan['id'], 'title': plan['title'], 'goal': plan['goal'],
               'required_environment': plan['required_environment']}
@@ -413,6 +509,12 @@ INSPECTION_INVALID = (
 )
 
 
+def observation_notice_text(observation):
+    # Alternate segmentation must never erase a warning from the same image.
+    # This combined channel is for rejection only, never semantic bindings.
+    return observation['visible_text'] + '\n' + frost_lines(observation.get('frost_source_rows', []))
+
+
 def inspection_obstacles(text):
     return [message for message in (*INSPECTION_BUSY, *INSPECTION_INVALID) if message in text]
 
@@ -478,7 +580,7 @@ def frost_catalog_bounds(rows, plan):
 
 def clean_inspection_status(app, observation, plan):
     """Require a visible, source-defined notice-free status/header region."""
-    text = observation['visible_text']
+    text = observation_notice_text(observation)
     if inspection_obstacles(text):
         return False
     if app == 'anvil':
@@ -510,7 +612,8 @@ def clean_inspection_status(app, observation, plan):
     bottom,top=anchors[0][1]+anchors[0][3],catalog[0][1]
     # In the real Frost drawer the optional busy/notice text is between this
     # checkbox and catalog. Do not discard low-confidence words in this band.
-    return bottom <= top and not any(bottom <= r['top'] < top for r in rows)
+    notice_rows = rows + observation.get('frost_source_rows', [])
+    return bottom <= top and not any(bottom <= r['top'] < top for r in notice_rows)
 
 
 def missing_coverage(app, plan, coverage):
@@ -569,6 +672,7 @@ class Reader:
         self.deadline = time.monotonic() + 300
         self.observation_deadline = None
         self.observation_probe = {}
+        self.frost_scope = None
         self.inputs = []
         self.coverage = {'fields': {}, 'identity_bindings': [], 'candidate_bindings': {}, 'core_pin_bindings': {},
                          'supplementary_values': {}, 'stages': {}, 'reasons': [],
@@ -684,6 +788,7 @@ class Reader:
                                         stderr=subprocess.STDOUT, start_new_session=True)
         self.process_identity = None
         self.window, self.window_rect = None, None
+        self.frost_scope = None
         self.window_probe, self.last_command = {}, None
         attempts = []
         try:
@@ -724,6 +829,8 @@ class Reader:
                 try:
                     return self.observe_once(label, control=control)
                 except ObservationNotReady as error:
+                    if self.app == 'frost':
+                        self.frost_scope = None  # A discarded frame cannot seed later scroll evidence.
                     # Security/process/host errors are never caught here, even
                     # if a transient observation happened immediately before.
                     self.checkpoint()
@@ -784,11 +891,7 @@ class Reader:
             raw = self.run(['tesseract', str(transformed), 'stdout', '--psm', '11', 'tsv'])
             (self.out / (stem + '.tsv')).write_text(raw)
             rows = ocr_rows(raw)
-            lines = {}
-            for r in rows:
-                if r['conf'] >= 80:
-                    lines.setdefault(tuple(r[k] for k in ('page_num','block_num','par_num','line_num')), []).append(r['text'])
-            observation = dict(rows=rows, visible_text='\n'.join(' '.join(words) for words in lines.values()))
+            observation = self.frost_readout(png, stem, rows, regions=not label.startswith('scroll-target'))
             self.scroll_rect = self.window_rect
         if self.app != 'frost':
             spatial = sorted(observation['scoped_nodes'], key=lambda n: (n.get('rect',[0,0])[1], n.get('rect',[0,0])[0]))
@@ -804,6 +907,87 @@ class Reader:
         (self.out / (stem + '.json')).write_text(json.dumps(observation, indent=2) + '\n')
         return observation
 
+    def frost_readout(self, png, stem, rows, regions=True):
+        # All alternate views are deterministic crops of this same owned frame.
+        # Clear ImageMagick's virtual X11 page offset before any local crop.
+        scope = frost_panel_scope(rows, self.window_rect)
+        binding = (self.process.pid, tuple(sorted((self.process_identity or {}).items())),
+                   self.window, tuple(self.window_rect))
+        if not self.mission_open:
+            self.frost_scope = None
+        elif scope:
+            self.frost_scope = (binding, scope)
+        elif (self.frost_scope and self.frost_scope[0] == binding
+              and not any(r['text'] == 'Missions' and r['left'] >= self.window_rect[2]/2 for r in rows)
+              and not phrases(rows, 'Acceptance goals, exact versions and delivery receipts')):
+            scope = self.frost_scope[1]
+        else:
+            self.frost_scope = None
+        observation = dict(rows=rows, frost_source_rows=rows[:], frost_panel_scope=scope,
+                           frost_buttons=[], identity_views=[])
+        components = self.run(['convert', '-precision', '16', str(png), '+repage', '-colorspace', 'Gray', '-threshold', '22%',
+            '-define', 'connected-components:verbose=true', '-connected-components', '8', 'null:'])
+        components = frost_components(components, self.window_rect)
+        observation['frost_components'] = components
+        buttons = [c['rect'] for c in components if regions and scope and inside(c['rect'], scope)
+                   and 16 <= c['rect'][3] <= 60 and c['rect'][2] >= c['rect'][3]*1.5
+                   and c['fill'] >= .7]
+        require(len(buttons) <= 16, 'Frost public button observation bound exceeded')
+
+        def crop_view(rect, suffix, button=False):
+            x,y,w,h = rect
+            # Remove only the measured filled rectangle's one-pixel rounded
+            # outline, not arbitrary OCR characters. Padding supplies white
+            # background to the single-line segmenter, never invented text.
+            inset, border = (1, 5) if button else (0, 0)
+            crop = [x+inset, y+inset, w-2*inset, h-2*inset]
+            path = self.out / (stem+'.'+suffix+'.png')
+            command = ['convert', str(png), '+repage', '-crop', '%dx%d+%d+%d' %
+                       (crop[2],crop[3],crop[0],crop[1]), '+repage', '-colorspace', 'Gray']
+            if button:
+                command += ['-threshold', '22%']
+            command += ['-resize', '200%']
+            if border:
+                command += ['-bordercolor', 'white', '-border', str(border*2)]
+            self.run(command+[str(path)])
+            raw = self.run(['tesseract', str(path), 'stdout', '--psm', '7' if button else '6', 'tsv'])
+            (self.out / (stem+'.'+suffix+'.tsv')).write_text(raw)
+            found = ocr_rows(raw)
+            for word in found:
+                word['left'] += crop[0]-border; word['top'] += crop[1]-border
+                word['block_num'] = suffix+':'+word['block_num']
+            # No words straddling a crop edge, including low-confidence ones,
+            # can be silently omitted to manufacture a complete control.
+            valid = all(inside([r[k] for k in ('left','top','width','height')], crop) for r in found)
+            return dict(rect=rect, rows=found, text=frost_lines(found, complete=True) if valid else '',
+                        image=path.name, psm=7 if button else 6, unclipped=valid)
+
+        for index, rect in enumerate(sorted(buttons, key=lambda r:(r[1],r[0]))):
+            view = crop_view(rect, 'button-%02d' % index, button=True)
+            observation['frost_buttons'].append(view)
+            source = [r for r in rows if inside([r[k] for k in ('left','top','width','height')], rect)]
+            source_text = frost_lines(source, complete=True)
+            if source_text in ('Refresh', 'Back', 'Inspect delivery') and view['text']:
+                require(source_text == view['text'], 'Conflicting high-confidence Frost controls')
+            # Replace only this same frame's measured button rectangle. Keep
+            # every crop word (including low confidence) for notice detection.
+            if view['unclipped'] and view['rows']:
+                rows = [r for r in rows if not inside([r[k] for k in ('left','top','width','height')], rect)]
+                rows += view['rows']
+        identity = frost_identity_crop(rows, self.window_rect) if regions else None
+        if identity:
+            view = crop_view(identity, 'identity')
+            # A valid but conflicting high-confidence ID in any view is a
+            # hard contradiction. A '?' is not normalized into an identifier.
+            ids = {r['text'] for r in [*rows, *view['rows']] if 80 <= r['conf'] <= 100
+                   and re.fullmatch(r'mission:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', r['text'])}
+            require(len(ids) <= 1, 'Conflicting high-confidence Mission identities')
+            observation['identity_views'].append(view)
+        observation['rows'] = rows
+        # Sort complete line groups, not individual words whose tops differ.
+        observation['visible_text'] = frost_lines(rows)
+        return observation
+
     def targets(self, observation, purpose):
         if self.app != 'frost':
             result = []
@@ -813,8 +997,12 @@ class Reader:
                     result.append(dict(label=n['name'], rect=n['rect'], node=n['path']))
             return result
         rows = observation['rows']
-        if purpose in ('refresh', 'inspect'):
-            labels = [(REFRESH if purpose == 'refresh' else INSPECT)[self.app]]
+        if purpose in ('refresh', 'close_mission'):
+            label = REFRESH[self.app] if purpose == 'refresh' else 'Back'
+            return [dict(t, rect=[t['rect'][0]+self.window_rect[0], t['rect'][1]+self.window_rect[1], *t['rect'][2:]])
+                    for t in frost_toolbar_targets(observation, label, self.window_rect)]
+        if purpose == 'inspect':
+            labels = [INSPECT[self.app]]
         elif purpose == 'open':
             return [dict(target, rect=[target['rect'][0]+self.window_rect[0],
                                       target['rect'][1]+self.window_rect[1], *target['rect'][2:]])
@@ -823,13 +1011,18 @@ class Reader:
             return [dict(label=self.plan['title'],
                          rect=[r[0]+self.window_rect[0],r[1]+self.window_rect[1],*r[2:]],node=None)
                     for r in frost_catalog_bounds(rows,self.plan)]
-        elif purpose == 'close_mission':
-            labels = ['Back']
         else:
             labels = []
         result = []
         for label in labels:
             for rect in phrases(rows, label):
+                if purpose == 'inspect':
+                    env = phrases(rows, 'Required environment'); attention = phrases(rows, 'Needs your attention')
+                    if (frost_panel_scope(rows, self.window_rect) is None or len(env) != 1 or len(attention) != 1
+                            or not env[0][1]+env[0][3] <= rect[1] < attention[0][1]
+                            or not any(b['text'] == label and inside(rect, b['rect'])
+                                       for b in observation.get('frost_buttons', []))):
+                        continue
                 rect = [rect[0]+self.window_rect[0], rect[1]+self.window_rect[1], *rect[2:]]
                 result.append(dict(label=label, rect=rect, node=None))
         return result
@@ -851,8 +1044,30 @@ class Reader:
         # Public wheel over the observed viewport's gutter avoids editing and
         # avoids nested multiline Goal/JSON text inputs consuming the wheel.
         point = [x+w-12, y+h//2]
+        evidence = []
+        if self.app == 'frost':
+            # The old window gutter landed at the scrollbar's exclusive right
+            # edge and never scrolled. Wheel only over a currently observed,
+            # unique Mission scrollbar thumb, never a guessed content point.
+            choices = []
+            for label in ('scroll-target', 'scroll-target-settled'):
+                obs = self.observe(label, control=True)
+                scope = obs.get('frost_panel_scope')
+                thumbs = [c['rect'] for c in obs.get('frost_components', []) if scope
+                    and inside(c['rect'], scope) and c['rect'][0] > self.window_rect[2]*.9
+                    and 4 <= c['rect'][2] <= 16 and c['rect'][3] > c['rect'][2]*3 and c['fill'] >= .95]
+                require(len(thumbs) == 1, 'No unique observed Mission scrollbar')
+                choices.append((thumbs[0], obs['window'], tuple(obs['window_rect'])))
+                evidence.append(obs['evidence'])
+            require(choices[0] == choices[1], 'Mission scrollbar changed before wheel input')
+            self.bind_window()
+            require((self.window, tuple(self.window_rect)) == choices[0][1:],
+                    'Owned window changed before scrollbar input')
+            sx,sy,sw,sh = choices[0][0]
+            point = [self.window_rect[0]+sx+sw//2, self.window_rect[1]+sy+sh//2]
         require(inside([*point,1,1], self.window_rect), 'Scroll gutter escaped owned window')
-        self.inputs.append(dict(kind='wheel', amount=amount, x=point[0],y=point[1], pid=self.process.pid))
+        self.inputs.append(dict(kind='wheel', amount=amount, x=point[0],y=point[1], pid=self.process.pid,
+                                **({'evidence': evidence} if evidence else {})))
         self.run(['xdotool', 'mousemove', *map(str, point), 'click', '--repeat', str(abs(amount)),
                   '--delay', '40', '5' if amount > 0 else '4'])
         time.sleep(.2)
@@ -869,7 +1084,7 @@ class Reader:
                 again = self.targets(second, purpose)
                 if label is not None:
                     again = [t for t in again if t['label'] == label]
-                if again == choices and not any(s in second['visible_text'] for s in ('Reading the host', 'Waiting for the host')):
+                if again == choices and not any(s in observation_notice_text(second) for s in ('Reading the host', 'Waiting for the host')):
                     self.click(choices[0], purpose, second['evidence'])
                     return
             if purpose in ('select', 'refresh', 'open', 'menu'):
@@ -889,14 +1104,16 @@ class Reader:
     def absorb(self, observation, stage):
         text = observation['visible_text']
         if stage == 'inspected':
-            for problem in inspection_obstacles(text):
+            for problem in inspection_obstacles(observation_notice_text(observation)):
                 self.coverage['inspection_errors'].append(dict(problem=problem,evidence=observation['evidence']))
             if clean_inspection_status(self.app, observation, self.plan):
                 self.coverage['inspection_status'].append(dict(stage=stage,evidence=observation['evidence']))
             for entry in inspection_validation(text, self.plan):
                 self.coverage['inspection_validation'].setdefault(entry['repository'],[]).append(
                     dict(entry,stage=stage,evidence=observation['evidence']))
-        if bound_identity(text, self.plan):
+        identity_texts = ([v['text'] for v in observation.get('identity_views', [])]
+                          if self.app == 'frost' else [text])
+        if any(bound_identity(value, self.plan) for value in identity_texts):
             self.coverage['identity_bindings'].append(dict(stage=stage,evidence=observation['evidence']))
         for name,basis in bound_core_pins(text,self.plan).items():
             self.coverage['core_pin_bindings'].setdefault(name,[]).append(
@@ -906,6 +1123,9 @@ class Reader:
         for key, value in self.fields.items():
             if self.app == 'frost':
                 present = bool(phrases(observation['rows'], value))
+                if key == 'identity':
+                    present = any(bound_identity(v['text'], self.plan)
+                                   for v in observation.get('identity_views', []))
             else:
                 present = exact_visible(text, value)
             if present:
@@ -946,6 +1166,7 @@ class Reader:
         elif self.app in ('ember', 'frost'):
             self.press('close_mission')
             self.mission_open = False
+            self.frost_scope = None
         else:
             # Forge has no Mission close/back control in the frozen source.
             # Do not invent a target or create a terminal to manufacture one.
@@ -974,6 +1195,7 @@ class Reader:
                 require(self.process.returncode == 0, 'Native app did not exit normally')
                 self.process = None
                 self.mission_open = False
+                self.frost_scope = None
                 self.log.close()
                 return
             time.sleep(.1)
@@ -985,7 +1207,7 @@ class Reader:
             self.scroll(-30)
         for attempt in range(20):
             first = self.observe('inspect-completion-%02d' % attempt, control=True)
-            obstacles = inspection_obstacles(first['visible_text'])
+            obstacles = inspection_obstacles(observation_notice_text(first))
             fatal = [p for p in obstacles if p in INSPECTION_INVALID and p != 'Inspect current delivery']
             ready = (clean_inspection_status(self.app, first, self.plan) if self.app == 'frost'
                      else len(self.targets(first, 'inspect')) == 1)
@@ -995,7 +1217,7 @@ class Reader:
                 second = self.observe('inspect-completion-%02d-settled' % attempt, control=True)
                 ready_again = (clean_inspection_status(self.app, second, self.plan) if self.app == 'frost'
                                else self.targets(second,'inspect') == self.targets(first,'inspect'))
-                if ready_again and not inspection_obstacles(second['visible_text']):
+                if ready_again and not inspection_obstacles(observation_notice_text(second)):
                     self.coverage['stages']['inspection_ready'] = dict(status='settled',
                         evidence=[first['evidence'],second['evidence']],
                         basis='notice_free_header' if self.app=='frost' else 'enabled_sensitive_inspect_control')

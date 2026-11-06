@@ -33,6 +33,7 @@ class BusFixture:
         self.calls = []
         self.module = SimpleNamespace(SessionBus=lambda: self,
             bus=SimpleNamespace(BusConnection=lambda address: self),
+            UInt32=int, Int32=int,
             Interface=lambda obj, interface: self.endpoint(*obj, interface))
 
     def get_object(self, owner, path, introspect=True):

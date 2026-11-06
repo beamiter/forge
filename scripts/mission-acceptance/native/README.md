@@ -67,16 +67,21 @@ inspection may restore current source observations, never validation completion.
 
 ## Status and result scope
 
-The latest executed round, [42228324473, attempt 1](https://github.com/beamiter/forge/actions/runs/42228324473),
+The latest executed round, [42245525353, attempt 1](https://github.com/beamiter/forge/actions/runs/42245525353),
 **failed native acceptance**. Its five production builds and 21 prerequisite
 checks passed. The final independent host check passed with the full saved plan
 unchanged and both native/conversation catalogs empty. No complete native
 Mission inspection, refresh or reopen sequence passed.
 
-The first Anvil/Forge captures were still blank before accessibility registration;
-Ember reached the selected Mission before its accessibility tree changed during
-observation; Frost's visible Missions entry had a middle dot read as a hyphen by
-OCR. These are retained failures, not passes inferred from source or screenshots.
+Anvil, Forge and Ember reached rendered windows, but the read-only AT-SPI
+observer sent a signed coordinate argument where the protocol requires unsigned.
+They stopped before any Mission input. Frost opened and selected the saved
+Mission, but OCR did not bind its exact ID or find Refresh, and the scroll samples
+did not move. Inspect therefore remained unexecuted. These are retained failures,
+not passes inferred from source or screenshots. The preceding
+[42228324473 round](https://github.com/beamiter/forge/actions/runs/42228324473) also
+remains failed; its blank-frame, changing-tree and Missions-entry observations
+must not be combined with this round to claim a completed sequence.
 Pure observer regression tests do not replace another exact-head native run.
 Frost now displays the stable Mission ID, but its exact identity/revision and
 repository-bound fields must still be observed in every required stage.
@@ -98,6 +103,12 @@ with assertions from source code or an earlier CI run.
 
 ## Observation readiness
 
+AT-SPI requests keep introspection disabled and use explicit protocol types:
+unsigned SCREEN coordinates for Component.GetExtents and Text.GetRangeExtents,
+signed text offsets for Text.GetText and Text.GetRangeExtents. Signature tests
+use a typed mock when dbus-python is unavailable locally; they are not a real
+D-Bus or native-application pass. Protocol errors remain hard failures.
+
 X11 window mapping is not proof of a painted frame or an accessible tree.
 Each observation has at most 20 attempts within 15 seconds, also bounded by the
 unchanged 300-second per-app deadline. An unregistered accessibility root, a
@@ -113,3 +124,22 @@ control-specific OCR rule, not a correction of Mission
 IDs, candidate hashes, core pins or other text. The whole high-confidence line,
 sidebar context, actual word boxes and two matching observations must identify
 one control before pointer input is allowed.
+
+Frost also preserves full-frame OCR while reading measured public button and
+Mission-header crops from the same owned screenshot. The header must contain
+the actual Mission ID and revision between the catalog and Title; body text
+cannot substitute. Crops never repair identifiers or hashes, lower confidence
+80, or choose an ID because it matches the expected plan. Conflicting valid
+high-confidence IDs reject the frame. The preserved pre-crop OCR copy is an
+additional rejection-only channel for busy, stale or error notices; it cannot
+grant identity evidence. Base OCR still supplies public sidebar/catalog anchors.
+Refresh and Back require the complete observed toolbar, and Inspect remains
+bound to its environment-to-attention band. These pointer targets need two equal
+current observations and the existing ownership/deadline checks.
+
+Frost wheel input uses the center of a unique observed Mission scrollbar thumb,
+not the window's outside gutter. Two current captures must agree on the thumb
+and owned window. Cached panel bounds are bound to process birth and window and
+are cleared on close, relaunch or a discarded observation. Real-pixel replay
+proves recognition and coordinate placement only; actual scrolling and the
+complete inspection/refresh/reopen sequence require a later native experiment.

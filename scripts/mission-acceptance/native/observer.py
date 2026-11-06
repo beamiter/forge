@@ -119,6 +119,10 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None):
         check()
         # Do not let implicit introspection introduce an unbounded D-Bus call.
         return dbus.Interface(bus.get_object(owner, path, introspect=False), interface)
+    # With introspection disabled, Python ints default to signed D-Bus 'i'.
+    # AT-SPI Component.GetExtents takes 'u'; Text.GetText takes 'ii' and
+    # Text.GetRangeExtents takes 'iiu'. SCREEN is coordinate type 0.
+    screen = dbus.UInt32(0)
     session = dbus.SessionBus()
     address = iface(session, 'org.a11y.Bus', '/org/a11y/bus', 'org.a11y.Bus').GetAddress(timeout=remaining())
     bus = dbus.bus.BusConnection(str(address))
@@ -161,12 +165,12 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None):
                  role=int(obj.GetRole(timeout=remaining())), states=list(map(int, obj.GetState(timeout=remaining()))),
                  interfaces=interfaces, children=children_of(path))
         if COMPONENT in interfaces:
-            n['rect'] = list(map(int, iface(bus, owner, path, COMPONENT).GetExtents(0, timeout=remaining())))
+            n['rect'] = list(map(int, iface(bus, owner, path, COMPONENT).GetExtents(screen, timeout=remaining())))
         if TEXT in interfaces:
             count = int(props.Get(TEXT, 'CharacterCount', timeout=remaining()))
             if not 0 <= count <= 131072:
                 raise RuntimeError('Text bound exceeded')
-            n['text'] = str(iface(bus, owner, path, TEXT).GetText(0, count, timeout=remaining()))
+            n['text'] = str(iface(bus, owner, path, TEXT).GetText(dbus.Int32(0), dbus.Int32(count), timeout=remaining()))
         nodes.append(n)
         queue.extend((p, path) for p in n['children'])
     tree = dict(pid=pid, owner=owner, root=root, nodes=nodes)
@@ -190,7 +194,8 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None):
             for line in text.splitlines(keepends=True):
                 end = offset + len(line.rstrip('\r\n'))
                 if end > offset:
-                    rect = iface(bus, owner, n['path'], TEXT).GetRangeExtents(offset, end, 0, timeout=remaining())
+                    rect = iface(bus, owner, n['path'], TEXT).GetRangeExtents(
+                        dbus.Int32(offset), dbus.Int32(end), screen, timeout=remaining())
                     if inside(list(map(int, rect)), clip):
                         lines.append(line.rstrip('\r\n'))
                 offset += len(line)
@@ -227,7 +232,8 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None):
             count = int(props.Get(TEXT, 'CharacterCount', timeout=remaining()))
             if not 0 <= count <= 131072:
                 raise RuntimeError('Text bound exceeded')
-            if count != len(n['text']) or str(iface(bus,owner,n['path'],TEXT).GetText(0,count,timeout=remaining())) != n['text']:
+            if count != len(n['text']) or str(iface(bus,owner,n['path'],TEXT).GetText(
+                    dbus.Int32(0),dbus.Int32(count),timeout=remaining())) != n['text']:
                 changes.append('text')
     if int(broker.GetConnectionUnixProcessID(owner, timeout=remaining())) != pid:
         raise RuntimeError('Accessibility PID changed')

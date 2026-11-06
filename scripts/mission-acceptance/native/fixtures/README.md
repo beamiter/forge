@@ -22,3 +22,21 @@ Original artifact SHA-256 digests:
 
 Replay and mutated negative cases are pure observer tests. They do not prove
 that a new native GUI run, Mission read, or end-to-end acceptance passed.
+
+## Public Mission panel replay
+
+`frost-mission-panel.png` is the exact public panel crop at `(680, 90)` with size
+`520 x 750` from `native-reader/frost/018-refresh.png` in run
+[42245525353, attempt 1](https://github.com/beamiter/forge/actions/runs/42245525353).
+Artifact `13517852843` has ZIP SHA256
+`a4809cf82770410ce978484622b4631dd860be4ef2e7442e59b3af58733e79d2`.
+The crop excludes terminal, hostname and sidebar pixels. Its displayed Mission
+is the isolated public acceptance fixture, not a user's task.
+
+`frost-mission-controls.tsv` and `frost-mission-fields.tsv` retain 81 and 69
+verbatim OCR word rows respectively, wholly inside this crop, with original
+full-window coordinates. Only line endings are normalized to LF; no recognized
+string, numeric field or confidence was corrected.
+Tests can add a black surround and virtual page offset as scaffolding; that is
+not a screenshot of another native run. Replay verifies only strict recognition
+and measured input placement. The original native experiment remains failed.
