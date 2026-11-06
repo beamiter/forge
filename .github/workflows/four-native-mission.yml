@@ -1,0 +1,175 @@
+name: Four native shared Mission readers
+
+# Manual, separately reviewed frozen inputs only. This is not a provider gate.
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_set_json:
+        description: Reviewed frozen five-repository JSON; workflow Forge commit must match
+        required: true
+        type: string
+      candidate_set_sha256:
+        description: Exact reviewed five-repository candidate-set digest
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: four-native-mission-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  EXPECTED_SET: ${{ inputs.candidate_set_sha256 }}
+  FROZEN_CANDIDATES_JSON: ${{ inputs.candidate_set_json }}
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  CARGO_BUILD_JOBS: "2"
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Pure negative and provenance contracts
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/mission-acceptance/test_contract.py
+          python3 -m unittest discover -s scripts/mission-acceptance/native -p 'test_*.py'
+          PYTHONOPTIMIZE=1 python3 -m unittest discover -s scripts/mission-acceptance/native -p 'test_*.py'
+          bash -n scripts/mission-acceptance/native/build.sh scripts/mission-acceptance/native/run.sh
+      - name: Verify reviewed public master heads, source pins, cleanliness and all required CI
+        run: |
+          set -Eeuo pipefail
+          test "$GITHUB_REF" = refs/heads/master
+          root="$RUNNER_TEMP/native-preflight-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          input="$RUNNER_TEMP/native-candidates-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.json"
+          printf '%s' "$FROZEN_CANDIDATES_JSON" > "$input"
+          python3 scripts/mission-acceptance/collect.py prepare "$root" "$EXPECTED_SET" "$input"
+          python3 scripts/mission-acceptance/native/provenance.py security-before "$root" "$EXPECTED_SET"
+      - name: Preserve preflight evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: native-preflight-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-preflight-${{ github.run_id }}-${{ github.run_attempt }}/evidence/
+          if-no-files-found: warn
+          retention-days: 14
+
+  build:
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        include:
+          - component: jterm_core
+            toolchain: 1.86.0
+          - component: anvil
+            toolchain: 1.99.1
+          - component: forge
+            toolchain: 1.99.1
+          - component: ember
+            toolchain: 1.99.1
+          - component: frost
+            toolchain: 1.99.1
+    env:
+      COMPONENT: ${{ matrix.component }}
+      RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Clone and audit the same exact frozen source set
+        run: |
+          set -Eeuo pipefail
+          root="$RUNNER_TEMP/native-build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          input="$RUNNER_TEMP/native-candidates-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.json"
+          printf '%s' "$FROZEN_CANDIDATES_JSON" > "$input"
+          printf 'ACCEPTANCE_ROOT=%s\n' "$root" >> "$GITHUB_ENV"
+          python3 scripts/mission-acceptance/native/provenance.py clone "$root" "$EXPECTED_SET" "$input"
+      - name: Install only signed official Ubuntu HTTPS dependencies with bounded acquisition
+        timeout-minutes: 6
+        run: timeout 350 bash scripts/mission-acceptance/native/build.sh packages "$COMPONENT"
+      - name: Install explicit official per-component Rust without changing defaults
+        timeout-minutes: 6
+        run: |
+          set -Eeuo pipefail
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt,clippy
+          test "$(rustc "+$RUSTUP_TOOLCHAIN" --version | awk '{print $2}')" = "$RUSTUP_TOOLCHAIN"
+          test "$(cargo "+$RUSTUP_TOOLCHAIN" --version | awk '{print $2}')" = "$RUSTUP_TOOLCHAIN"
+      - name: Build full production executable and release assets
+        timeout-minutes: 50
+        run: |
+          set -Eeuo pipefail
+          bash scripts/mission-acceptance/native/build.sh build "$ACCEPTANCE_ROOT" "$COMPONENT" "$EXPECTED_SET" \
+            2>&1 | tee "$ACCEPTANCE_ROOT/evidence/native-build.log"
+      - name: Preserve only successful exact build artifacts for this run and attempt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: native-build-${{ matrix.component }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-build-${{ github.run_id }}-${{ github.run_attempt }}/build-artifact/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+      - name: Preserve build receipts and diagnostics even on failure
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: native-compile-evidence-${{ matrix.component }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-build-${{ github.run_id }}-${{ github.run_attempt }}/evidence/
+          if-no-files-found: warn
+          retention-days: 14
+
+  native-readers:
+    needs: [preflight, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Repeat exact source and current public master CI gates before runtime
+        id: prepare
+        run: |
+          set -Eeuo pipefail
+          root="$RUNNER_TEMP/four-native-mission-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          input="$RUNNER_TEMP/native-candidates-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.json"
+          printf '%s' "$FROZEN_CANDIDATES_JSON" > "$input"
+          printf 'ACCEPTANCE_ROOT=%s\n' "$root" >> "$GITHUB_ENV"
+          python3 scripts/mission-acceptance/collect.py prepare "$root" "$EXPECTED_SET" "$input"
+          python3 scripts/mission-acceptance/native/provenance.py security-before "$root" "$EXPECTED_SET"
+      # No token, external repository or run-id: download-artifact is restricted
+      # to this workflow run. Exact names exclude build-evidence artifacts.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: native-build-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-artifacts
+          merge-multiple: false
+      - name: Install official native UI, accessibility and observation packages
+        timeout-minutes: 6
+        run: timeout 350 bash scripts/mission-acceptance/native/build.sh packages runtime
+      - name: Verify artifact provenance and read one real Mission in four installed applications
+        timeout-minutes: 40
+        run: |
+          set -Eeuo pipefail
+          bash scripts/mission-acceptance/native/run.sh "$ACCEPTANCE_ROOT" "$RUNNER_TEMP/native-artifacts" "$EXPECTED_SET"
+      - name: Recheck unchanged plans, source, current heads and successful exact-head CI
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/mission-acceptance/native/finish.py "$ACCEPTANCE_ROOT" "$EXPECTED_SET" "$RUNNER_TEMP/native-artifacts"
+      - name: Preserve scoped screenshots, observations and receipts only, never HOME or host state
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: four-native-mission-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/four-native-mission-${{ github.run_id }}-${{ github.run_attempt }}/evidence/
+          if-no-files-found: warn
+          retention-days: 14
