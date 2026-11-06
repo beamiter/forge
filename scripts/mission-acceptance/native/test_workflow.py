@@ -121,6 +121,55 @@ raise SystemExit(int(os.environ['APT_FAILURE']))
         self.assertEqual(calls[0]['args'][-1], 'update')
 
 
+class RuntimeFailureDiagnosticsTests(unittest.TestCase):
+    def test_actual_shell_tail_preserves_both_exit_codes(self):
+        source = (HERE / 'run.sh').read_text()
+        tail = source[source.index('# Preserve both independent failures;'):]
+        for reader_code, state_code in ((0, 0), (1, 2), (0, 2), (1, 0)):
+            with self.subTest(reader=reader_code, state=state_code), tempfile.TemporaryDirectory() as directory:
+                script = 'reader_status=$1; state_status=$2; evidence=$3\n' + tail
+                result = subprocess.run(['bash', '-c', script, 'test-exit-codes', str(reader_code),
+                                         str(state_code), directory], capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, reader_code or state_code, result.stderr)
+                self.assertEqual(json.loads((Path(directory) / 'native-exit-codes.json').read_text()), {
+                    'schema': 1, 'scope': 'process_exit_codes_only_not_verification',
+                    'reader_exit_code': reader_code, 'state_check_exit_code': state_code})
+
+    def test_host_and_reader_errors_remain_separate_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory)
+            (evidence / 'native-reader').mkdir()
+            (evidence / 'native-reader/result.json').write_text(json.dumps({
+                'applications': {'anvil': {'status': 'failed', 'error': 'No owned app window'},
+                                 'foreign': {'error': 'not an allowed application'}}}))
+            (evidence / 'native-state-check.json').write_text(json.dumps({
+                'status': 'failed', 'error': 'conversation_catalog_not_empty'}))
+            (evidence / 'native-exit-codes.json').write_text(json.dumps({
+                'scope': 'process_exit_codes_only_not_verification',
+                'reader_exit_code': 1, 'state_check_exit_code': 2}))
+            details = finish.failure_details(evidence)
+            self.assertEqual(details, {'scope': 'diagnostic_only_not_verification',
+                'application_errors': {'anvil': 'No owned app window'},
+                'host_state_error': 'conversation_catalog_not_empty',
+                'reader_exit_code': 1, 'state_check_exit_code': 2})
+
+    def test_missing_oversize_or_symlink_diagnostics_do_not_become_passes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory)
+            expected = {'scope': 'diagnostic_only_not_verification', 'application_errors': {},
+                        'host_state_error': 'no bounded error receipt'}
+            self.assertEqual(finish.failure_details(evidence), expected)
+            (evidence / 'native-state-check.json').write_text('x' * (1024 * 1024 + 1))
+            self.assertEqual(finish.failure_details(evidence), expected)
+            (evidence / 'native-state-check.json').unlink()
+            (evidence / 'target.json').write_text('{"error":"must not follow"}')
+            (evidence / 'native-state-check.json').symlink_to(evidence / 'target.json')
+            self.assertEqual(finish.failure_details(evidence), expected)
+            (evidence / 'native-state-check.json').unlink()
+            os.mkfifo(evidence / 'native-state-check.json')
+            self.assertEqual(finish.failure_details(evidence), expected)
+
+
 def candidates():
     return {'schema': 1, 'contract': 'five-repository-host-v1', 'frozen': True,
             'repositories': [{'name': name, 'full_name': 'beamiter/' + name,
@@ -260,6 +309,12 @@ class FinalScopeTests(unittest.TestCase):
                 data = list(results()); data[1]['applications'][app]['status'] = status
                 with self.subTest(app=app, status=status), self.assertRaises(ValueError):
                     finish.validate_results(*data)
+
+    def test_failed_host_receipt_preserves_reason_and_never_passes(self):
+        seed, reader, state = results()
+        state.update(status='failed', error='conversation_catalog_not_empty')
+        with self.assertRaisesRegex(ValueError, 'Host-state check did not pass: conversation_catalog_not_empty'):
+            finish.validate_results(seed, reader, state)
 
     def test_missing_extra_application_fails(self):
         for name in p.APPS:

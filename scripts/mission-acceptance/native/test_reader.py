@@ -8,11 +8,12 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import reader
 import observer
+import provenance
 
 
 def plan():
@@ -97,7 +98,7 @@ class PermissionTests(unittest.TestCase):
             path=Path(td)/'config.toml'
             base='ai_enabled=false\neva_companion_enabled=false\nagent_workspace_enabled=true\nshell="/bin/bash"\nterminal_mode="block"\n'
             for app in reader.APPS:
-                extra='startup_commands=""\njsh_update_check="never"\n' if app in ('anvil','forge') else 'restore_session=false\ninitial_width=1200\ninitial_height=850\n'
+                extra='jsh_update_check="never"\n' if app in ('anvil','forge') else 'restore_session=false\ninitial_width=1200\ninitial_height=850\n'
                 if app=='frost': extra+='inspector_width=520.0\n'
                 path.write_text(base+extra); self.assertEqual(len(reader.safe_config(app,path)),64)
                 for bad in [(base+extra).replace('ai_enabled=false','ai_enabled=true'),
@@ -106,6 +107,29 @@ class PermissionTests(unittest.TestCase):
                             (base+extra).replace('shell="/bin/bash"','shell="/tmp/unsafe"')]:
                     path.write_text(bad)
                     with self.assertRaises(RuntimeError): reader.safe_config(app,path)
+
+    def test_generated_config_disables_ai_eva_without_startup_commands(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); (root/'evidence').mkdir()
+            (root/'evidence/native-seed.json').write_text(json.dumps({'mission':plan()}))
+            host=root/'host';host.write_bytes(b'not an executable')
+            for app in reader.APPS:
+                binary=root/'installed'/app/'.local/bin'/app
+                binary.parent.mkdir(parents=True);binary.write_bytes(b'not an executable')
+            env={key:td for key in reader.ENV_KEYS}
+            env.update(XDG_CONFIG_HOME=str(root/'config'),JTERM_WORKSPACE_STATE_DIR=str(root/'state'))
+            with patch.dict(os.environ,env,clear=True):
+                provenance.reader_manifest(root,root/'state',host)
+            for app in reader.APPS:
+                config=root/'config'/app/'config.toml';original=config.read_text()
+                reader.safe_config(app,config)
+                parsed=reader.tomllib.loads(original)
+                self.assertIs(parsed['ai_enabled'],False)
+                self.assertIs(parsed['eva_companion_enabled'],False)
+                self.assertNotIn('startup_commands',parsed)
+                for invalid in ('startup_commands=""\n','startup_commands="echo not-allowed"\n'):
+                    config.write_text(original+invalid)
+                    with self.assertRaises(RuntimeError):reader.safe_config(app,config)
 
     def test_manifest_does_not_allow_ambient_injection(self):
         with tempfile.TemporaryDirectory() as td:
@@ -382,6 +406,217 @@ class FailClosedInspectionTests(unittest.TestCase):
             self.assertEqual(observer.visible(nodes[path],nodes,bounds),expected)
         t['nodes'][2]['parent']=root
         with self.assertRaises(RuntimeError):observer.mission_content_scope(t,reader.FRAME['ember'],[0,0,800,600])
+
+
+class NativeStartupTests(unittest.TestCase):
+    """Replay the installed xdotool 3.20160805.1 output/exit contracts.
+
+    cmd_search.c defaults SEARCH_ANY; xdo_search.c visits the unnamed root
+    first and matches its empty name to .*. cmd_getwindowpid.c returns exit 1
+    for that root. No X server, app, host, shell or provider is started here.
+    """
+    def setUp(self):
+        temporary=tempfile.TemporaryDirectory();self.addCleanup(temporary.cleanup)
+        self.out=Path(temporary.name)
+        self.identity=dict(pid=21,start_ticks='100',executable='/tmp/installed/anvil',state_dir='/tmp/shared')
+        self.process=Mock(pid=21);self.process.poll.return_value=None
+        self.host=Mock()
+        self.r=reader.Reader('anvil',dict(binary=self.identity['executable'],sha256='a'*64,
+                                        config='/tmp/config.toml'),
+                             dict(HOME='/tmp/fresh',JTERM_WORKSPACE_STATE_DIR='/tmp/shared'),
+                             plan(),self.host,self.out)
+        self.r.process=self.process;self.r.process_identity=self.identity.copy()
+        self.calls=[];self.search_count=0;self.empty_searches=0
+        self.window_ids=['4194307'];self.window_pids={'4194307':21};self.active='4194307'
+        self.names={'4194307':'Anvil'};self.geometry_overrides={}
+        self.addCleanup(lambda:self.r.log.close() if self.r.log and not self.r.log.closed else None)
+
+    def tool(self,command,**kwargs):
+        self.calls.append(command)
+        out='';err='';code=0
+        if command[0]=='import':
+            Path(command[-1]).write_bytes(b'diagnostic screenshot stub, not UI evidence')
+        elif command[1]=='search':
+            self.search_count+=1
+            if self.search_count<=self.empty_searches:
+                code=1
+            else:
+                # 0x21f is the real CI Xvfb root, serialized as decimal by xdotool.
+                ids=self.window_ids if '--all' in command else ['543',*self.window_ids]
+                out=''.join(wid+'\n' for wid in ids)
+                code=0 if ids else 1
+        elif command[1]=='getwindowpid':
+            pid=self.window_pids.get(command[-1])
+            if pid is None:
+                code=1;err='window %s has no pid associated with it.\n' % command[-1]
+            else:out=str(pid)+'\n'
+        elif command[1]=='getwindowname':out=self.names.get(command[-1],'Other owned window')+'\n'
+        elif command[1]=='getwindowgeometry':
+            wid=command[-1]
+            out=self.geometry_overrides.get(wid,'WINDOW=%s\nX=80\nY=40\nWIDTH=1200\nHEIGHT=850\nSCREEN=0\n' % wid)
+        elif command[1]=='getactivewindow':out=self.active+'\n'
+        else:raise AssertionError('Unexpected command: '+repr(command))
+        return reader.subprocess.CompletedProcess(command,code,out,err)
+
+    def launch(self):
+        with patch('reader.sha256',return_value='a'*64),patch('reader.safe_config'), \
+             patch('reader.subprocess.Popen',return_value=self.process) as spawn,patch('reader.time.sleep'):
+            self.r.launch(1)
+        spawn.assert_called_once()
+
+    def test_pid_and_name_search_is_conjunctive_then_owner_and_active_are_rechecked(self):
+        for app in reader.APPS:
+            self.r.app=app;self.calls=[]
+            with patch('reader.proc_identity',return_value=self.identity), \
+                 patch('reader.subprocess.run',side_effect=self.tool):
+                self.r.bind_window()
+            self.assertEqual(self.calls[0],['xdotool','search','--all','--onlyvisible','--pid','21','--name','.*'])
+            self.assertIn(['xdotool','getwindowpid','4194307'],self.calls)
+            self.assertIn(['xdotool','getactivewindow'],self.calls)
+            self.assertNotIn(['xdotool','getwindowpid','543'],self.calls)
+            self.assertEqual(self.r.window,'4194307')
+            self.assertEqual(self.r.window_rect,[80,40,1200,850])
+
+    def test_real_shell_geometry_output_is_data_and_bound_to_window(self):
+        raw='WINDOW=4194307\nX=-8\nY=40\nWIDTH=1200\nHEIGHT=850\nSCREEN=0\n'
+        self.assertEqual(reader.window_geometry(raw,'4194307'),[-8,40,1200,850])
+        for invalid in [raw.replace('WINDOW=4194307','WINDOW=99'),raw.replace('WIDTH=1200','WIDTH=0'),
+                        raw+'X=1\n',raw.replace('SCREEN=0\n',''),raw+'HOOK=$(touch /tmp/unsafe)\n',
+                        raw.replace('Y=40','Y=not-a-number')]:
+            with self.subTest(raw=invalid),self.assertRaises(RuntimeError):
+                reader.window_geometry(invalid,'4194307')
+
+    def test_search_pid_change_and_pidless_window_never_bind(self):
+        for value,message in [(99,'foreign PID'),(None,'has no pid associated')]:
+            self.window_pids['4194307']=value
+            with patch('reader.proc_identity',return_value=self.identity), \
+                 patch('reader.subprocess.run',side_effect=self.tool):
+                with self.assertRaisesRegex(RuntimeError,message):self.r.bind_window()
+            self.assertIsNone(self.r.window)
+            self.assertEqual(self.r.inputs,[])
+
+    def test_bad_or_duplicate_search_ids_fail_closed(self):
+        for ids in [['4194307','4194307'],['not-a-window'],['0'],['-1']]:
+            self.window_ids=ids
+            with patch('reader.proc_identity',return_value=self.identity), \
+                 patch('reader.subprocess.run',side_effect=self.tool):
+                with self.assertRaises(RuntimeError):self.r.bind_window()
+            self.assertIsNone(self.r.window)
+
+    def test_missing_ambiguous_small_or_inactive_window_does_not_bind(self):
+        with patch('reader.proc_identity',return_value=self.identity), \
+             patch('reader.subprocess.run',side_effect=self.tool):
+            self.window_ids=[]
+            with self.assertRaises(reader.WindowNotReady):self.r.bind_window()
+            self.window_ids=['4194307','4194308'];self.window_pids['4194308']=21
+            with self.assertRaisesRegex(reader.WindowNotReady,'2 candidates'):self.r.bind_window()
+            self.window_ids=['4194307'];self.active='543'
+            with self.assertRaisesRegex(reader.WindowNotReady,'not the active'):self.r.bind_window()
+            self.active='4194307'
+            self.geometry_overrides['4194307']='WINDOW=4194307\nX=0\nY=0\nWIDTH=1\nHEIGHT=1\nSCREEN=0\n'
+            with self.assertRaisesRegex(reader.WindowNotReady,'0 candidates'):self.r.bind_window()
+        self.assertIsNone(self.r.window);self.assertEqual(self.r.inputs,[])
+
+    def test_anvil_separate_mission_window_still_requires_exact_active_frame(self):
+        self.window_ids=['4194307','4194308'];self.window_pids['4194308']=21
+        self.names['4194308']=reader.FRAME['anvil']
+        with patch('reader.proc_identity',return_value=self.identity), \
+             patch('reader.subprocess.run',side_effect=self.tool):
+            self.r.bind_window();self.assertEqual(self.r.window,'4194307')
+            self.r.mission_open=True
+            with self.assertRaisesRegex(reader.WindowNotReady,'not the active'):self.r.bind_window()
+            self.active='4194308';self.r.bind_window();self.assertEqual(self.r.window,'4194308')
+
+    def test_launch_retries_empty_search_without_replacing_process_identity(self):
+        self.empty_searches=2
+        with patch('reader.proc_identity',return_value=self.identity), \
+             patch('reader.subprocess.run',side_effect=self.tool):self.launch()
+        self.assertEqual(self.search_count,3)
+        self.assertEqual(self.r.process_identity,self.identity)
+        self.assertEqual(self.r.coverage['stages']['launch_1']['identity'],self.identity)
+        self.assertEqual(self.r.inputs,[])
+
+    def test_exhausted_startup_preserves_last_error_and_guarded_diagnostic(self):
+        self.active='543'
+        with patch('reader.proc_identity',return_value=self.identity), \
+             patch('reader.subprocess.run',side_effect=self.tool):
+            with self.assertRaisesRegex(RuntimeError,'startup bound; last failure: .*not the active'):self.launch()
+        report=json.loads((self.out/'startup-1.json').read_text())
+        self.assertEqual(len(report['attempts']),100)
+        self.assertEqual(report['window_probe']['active_window'],543)
+        self.assertEqual(report['last_command']['argv'],['xdotool','getactivewindow'])
+        self.assertTrue((self.out/report['screenshot']).is_file())
+        self.assertEqual(self.r.coverage['stages'],{})
+        self.assertEqual(self.r.inputs,[])
+
+    def test_tool_failure_details_survive_failed_screenshot(self):
+        self.window_pids['4194307']=None
+        def failing_capture(command,**kwargs):
+            if command[0]=='import':return reader.subprocess.CompletedProcess(command,1,'','capture unavailable')
+            return self.tool(command,**kwargs)
+        with patch('reader.proc_identity',return_value=self.identity), \
+             patch('reader.subprocess.run',side_effect=failing_capture):
+            with self.assertRaisesRegex(RuntimeError,'getwindowpid.*has no pid associated'):self.launch()
+        report=json.loads((self.out/'startup-1.json').read_text())
+        self.assertEqual(report['last_command']['argv'],['xdotool','getwindowpid','4194307'])
+        self.assertEqual(report['last_command']['returncode'],1)
+        self.assertIn('has no pid associated',report['last_command']['stderr'])
+        self.assertIn('capture unavailable',report['screenshot_error'])
+        self.assertNotIn('screenshot',report)
+
+    def test_changed_birth_executable_or_shared_state_is_fatal_without_retry_or_input(self):
+        for field,value in [('start_ticks','101'),('executable','/tmp/replacement'),('state_dir','/tmp/other')]:
+            with self.subTest(field=field):
+                changed=dict(self.identity,**{field:value});self.calls=[]
+                with patch('reader.proc_identity',side_effect=[self.identity,changed,changed]), \
+                     patch('reader.subprocess.run',side_effect=self.tool):
+                    with self.assertRaisesRegex(RuntimeError,'identity changed'):self.launch()
+                report=json.loads((self.out/'startup-1.json').read_text())
+                self.assertEqual(report['attempts'],[])
+                self.assertEqual(report['process_identity'],self.identity)
+                self.assertIn('identity changed',report['screenshot_error'])
+                self.assertEqual(self.calls,[])
+                self.r.log.close()
+
+    def test_wrong_initial_executable_or_state_fails_before_window_search(self):
+        for field,value,message in [('executable','/tmp/replacement','Wrong app executable'),
+                                    ('state_dir','/tmp/other','Wrong shared state')]:
+            with self.subTest(field=field),patch('reader.proc_identity',return_value=dict(self.identity,**{field:value})), \
+                 patch('reader.subprocess.run',side_effect=self.tool):
+                with self.assertRaisesRegex(RuntimeError,message):self.launch()
+            self.assertEqual(self.calls,[])
+            self.assertEqual(self.r.coverage['stages'],{})
+            self.r.log.close()
+
+    def test_host_failure_is_not_downgraded_to_a_window_retry(self):
+        self.host.check.side_effect=[None,RuntimeError('Independent host identity changed'),RuntimeError('Independent host identity changed')]
+        with patch('reader.proc_identity',return_value=self.identity), \
+             patch('reader.subprocess.run',side_effect=self.tool):
+            with self.assertRaisesRegex(RuntimeError,'Independent host identity changed'):self.launch()
+        report=json.loads((self.out/'startup-1.json').read_text())
+        self.assertEqual(report['attempts'],[])
+        self.assertEqual(self.calls,[])
+
+    def test_exited_app_fails_before_window_search(self):
+        self.process.poll.side_effect=[None,9,9]
+        with patch('reader.proc_identity',return_value=self.identity), \
+             patch('reader.subprocess.run',side_effect=self.tool):
+            with self.assertRaisesRegex(RuntimeError,'exited unexpectedly'):self.launch()
+        self.assertEqual(self.calls,[])
+        self.assertEqual(self.r.coverage['stages'],{})
+
+    def test_hung_tool_records_exact_command_without_retry_or_budget_expansion(self):
+        def timeout_search(command,**kwargs):
+            if command[1]=='search':raise reader.subprocess.TimeoutExpired(command,kwargs['timeout'])
+            return self.tool(command,**kwargs)
+        with patch('reader.proc_identity',return_value=self.identity), \
+             patch('reader.subprocess.run',side_effect=timeout_search):
+            with self.assertRaisesRegex(RuntimeError,'timed out after 15 seconds: xdotool search'):self.launch()
+        report=json.loads((self.out/'startup-1.json').read_text())
+        self.assertEqual(report['attempts'],[])
+        self.assertEqual(report['last_command']['status'],'timed_out')
+        self.assertEqual(report['last_command']['timeout'],15)
+        self.assertEqual(self.r.coverage['stages'],{})
 
 
 class HostTests(unittest.TestCase):

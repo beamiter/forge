@@ -270,7 +270,7 @@ def reader_manifest(root, state, host_bin):
         if app in ('ember', 'frost'):
             text += 'restore_session=false\ninitial_width=1200\ninitial_height=850\n'
         else:
-            text += 'startup_commands=""\njsh_update_check="never"\n'
+            text += 'jsh_update_check="never"\n'
         if app == 'frost':
             text += 'inspector_width=520.0\n'
         config.write_text(text)

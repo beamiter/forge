@@ -565,6 +565,43 @@ fn retained_observations(
         "retained_observation_or_stale_gate_changed",
     )
 }
+fn empty_conversations(reply: WorkspaceReply) -> Result<(), String> {
+    match reply {
+        WorkspaceReply::CatalogPage {
+            rows,
+            next_before,
+            total,
+        } if rows.is_empty() && next_before.is_none() && total == 0 => Ok(()),
+        WorkspaceReply::CatalogPage {
+            rows,
+            next_before,
+            total,
+        } => {
+            // Keep the hard empty-catalog gate. Only retain shape facts from
+            // the already-requested first row, never text, IDs, paths or store
+            // contents. This diagnoses a future failure without exempting it.
+            let shape = rows.first().map(|row| {
+                json!({
+                    "kind": row.kind,
+                    "runtime": row.runtime,
+                    "title_is_default": row.title == "New chat",
+                    "provider_is_api": row.provider == "API",
+                    "cwd_empty": row.cwd.is_empty(),
+                    "preview_empty": row.preview.is_empty(),
+                    "tags_count": row.tags.len(),
+                    "archived": row.archived,
+                    "pinned": row.pinned
+                })
+            });
+            Err(format!(
+                "conversation_catalog_not_empty: {}",
+                json!({"total": total, "returned_rows": rows.len(),
+                    "next_before_present": next_before.is_some(), "first_row_shape": shape})
+            ))
+        }
+        _ => Err("unexpected_conversation_catalog_reply".into()),
+    }
+}
 fn no_runtime(host: &Host) -> Result<(), String> {
     match request(
         WorkspaceCommand::NativeCatalog {
@@ -579,20 +616,13 @@ fn no_runtime(host: &Host) -> Result<(), String> {
         } if entries.is_empty() && next_after.is_none() => (),
         _ => return Err("native_runtime_catalog_not_empty".into()),
     }
-    match request(
+    empty_conversations(request(
         WorkspaceCommand::CatalogPage {
             before: None,
             limit: 1,
         },
         host,
-    )? {
-        WorkspaceReply::CatalogPage {
-            rows,
-            next_before,
-            total,
-        } if rows.is_empty() && next_before.is_none() && total == 0 => Ok(()),
-        _ => Err("conversation_catalog_not_empty".into()),
-    }
+    )?)
 }
 fn seed(root: &Path, host: Host, out: &Path) -> Result<(), String> {
     require(!out.exists(), "seed_receipt_already_exists")?;
@@ -697,6 +727,27 @@ fn check(root: &Path, host: &Host, receipt: &Path, out: &Path) -> Result<(), Str
         &json!({"schema":1,"status":"passed","scope":"host_state_check_only_not_native_UI","core":CORE,"host":host,"mission":saved.mission,"report":report,"full_plan_unchanged":true,"native_catalog_empty":true,"conversation_catalog_empty":true,"provider_execution":"skipped_by_user","hosted_task_validation":"not_run","five_repository_delivery":"not_completed"}),
     )
 }
+fn record_check_failure(out: &Path, error: String) -> Result<(), String> {
+    // Preserve the rejected invariant instead of leaving the final gate with
+    // only a missing-file error. This is a failure record, never a substitute
+    // for a successful state check, and cannot overwrite an earlier receipt.
+    let failure = json!({
+        "schema": 1,
+        "status": "failed",
+        "scope": "host_state_check_only_not_native_UI",
+        "core": CORE,
+        "error": error,
+        "provider_execution": "skipped_by_user",
+        "hosted_task_validation": "not_run",
+        "five_repository_delivery": "not_completed"
+    });
+    if let Err(write_error) = write_json(out, &failure) {
+        return Err(format!(
+            "{error}; failure_receipt_not_written: {write_error}"
+        ));
+    }
+    Err(error)
+}
 fn run() -> Result<(), String> {
     let args: Vec<_> = std::env::args().collect();
     require(args.len() == 7 || args.len() == 8, "usage: seed ROOT STATE PID HOST_BIN RECEIPT | check ROOT STATE PID HOST_BIN RECEIPT OUTPUT")?;
@@ -709,7 +760,8 @@ fn run() -> Result<(), String> {
             &host,
             Path::new(&args[6]),
             Path::new(&args[7]),
-        ),
+        )
+        .or_else(|error| record_check_failure(Path::new(&args[7]), error)),
         _ => Err("unsupported_operation".into()),
     }
 }
@@ -722,6 +774,83 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn even_an_empty_api_placeholder_is_rejected_with_redacted_shape_only() {
+        let row = WorkspaceRow {
+            id: ConversationId("must-not-archive-this-id".into()),
+            kind: ConversationKind::Api,
+            title: "New chat".into(),
+            provider: "API".into(),
+            cwd: String::new(),
+            preview: String::new(),
+            updated_at_ms: 0,
+            archived: false,
+            pinned: false,
+            tags: vec![],
+            runtime: RuntimeState::Idle,
+            facts: WorkspaceFacts::default(),
+        };
+        let error = empty_conversations(WorkspaceReply::CatalogPage {
+            rows: vec![row],
+            next_before: None,
+            total: 1,
+        })
+        .unwrap_err();
+        let detail: Value = serde_json::from_str(
+            error
+                .strip_prefix("conversation_catalog_not_empty: ")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(detail["total"], 1);
+        assert_eq!(detail["first_row_shape"]["kind"], "Api");
+        assert_eq!(detail["first_row_shape"]["title_is_default"], true);
+        assert!(!error.contains("must-not-archive-this-id"));
+    }
+    #[test]
+    fn empty_catalog_requires_zero_total_and_no_cursor() {
+        for (total, next_before) in [(0, None), (1, None), (0, Some(1))] {
+            let result = empty_conversations(WorkspaceReply::CatalogPage {
+                rows: vec![],
+                next_before,
+                total,
+            });
+            assert_eq!(result.is_ok(), total == 0 && next_before.is_none());
+        }
+    }
+    #[test]
+    fn failed_check_records_original_reason_without_claiming_success_or_overwriting() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "native-check-failure-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("failure.json");
+        let original = "conversation_catalog_not_empty";
+        assert_eq!(
+            record_check_failure(&path, original.into()).unwrap_err(),
+            original
+        );
+        let bytes = fs::read(&path).unwrap();
+        let receipt: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(receipt["status"], "failed");
+        assert_eq!(receipt["error"], original);
+        assert_eq!(receipt["scope"], "host_state_check_only_not_native_UI");
+        assert_eq!(receipt["hosted_task_validation"], "not_run");
+        assert_eq!(receipt["five_repository_delivery"], "not_completed");
+        assert!(receipt.get("full_plan_unchanged").is_none());
+        assert!(receipt.get("conversation_catalog_empty").is_none());
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        let second = record_check_failure(&path, "another_failure".into()).unwrap_err();
+        assert!(second.starts_with("another_failure; failure_receipt_not_written:"));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
     fn repos() -> Vec<Repo> {
         FOUR_TERMINAL_REPOSITORIES
             .iter()

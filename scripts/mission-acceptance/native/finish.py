@@ -5,7 +5,9 @@ Never calls legacy collect.finish or manufactures host-acceptance-result.json:
 its four protocol-client contract is deliberately distinct from four native UIs.
 """
 import json
+import os
 from pathlib import Path
+import stat
 import sys
 import subprocess
 
@@ -49,7 +51,10 @@ def validate_results(seed, reader, state):
               'Missing seeded Mission identity')
     p.require(isinstance(host, dict) and set(host) == {'pid', 'start_ticks', 'executable', 'state_dir'},
               'Missing production host identity')
-    p.require(state.get('schema') == 1 and state.get('status') == 'passed', 'Host-state check did not pass')
+    detail = state.get('error')
+    reason = detail[:2048] if isinstance(detail, str) else 'no valid successful receipt'
+    p.require(state.get('schema') == 1 and state.get('status') == 'passed',
+              'Host-state check did not pass: ' + reason)
     p.require(state.get('scope') == 'host_state_check_only_not_native_UI', 'Wrong host result scope')
     p.require(state.get('core') == seed.get('core') == p.collector.CORE, 'Host core identity mismatch')
     p.require(state.get('host') == host and state.get('mission') == mission, 'Production host or full plan changed')
@@ -82,6 +87,44 @@ def validate_results(seed, reader, state):
     p.require(reader.get('provider_execution') == 'skipped_by_user' and reader.get('full_delivery') == 'not_claimed',
               'Native reader scope exceeds approval')
     return mission, host
+
+
+def failure_details(evidence):
+    """Bounded diagnostic context only; never grants acceptance authority."""
+    def read(name):
+        try:
+            path = evidence / name
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(descriptor, 'rb') as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    return None
+                data = stream.read(1024 * 1024 + 1)
+            if len(data) > 1024 * 1024:
+                return None
+            value = json.loads(data)
+            return value if isinstance(value, dict) else None
+        except (OSError, ValueError):
+            return None
+
+    details = {'scope': 'diagnostic_only_not_verification', 'application_errors': {}}
+    reader = read('native-reader/result.json')
+    applications = reader.get('applications') if reader else None
+    if isinstance(applications, dict):
+        for app in p.APPS:
+            result = applications.get(app)
+            error = result.get('error') if isinstance(result, dict) else None
+            if isinstance(error, str):
+                details['application_errors'][app] = error[:2048]
+    state = read('native-state-check.json')
+    error = state.get('error') if state else None
+    details['host_state_error'] = error[:2048] if isinstance(error, str) else 'no bounded error receipt'
+    codes = read('native-exit-codes.json')
+    if codes and codes.get('scope') == 'process_exit_codes_only_not_verification':
+        for key in ('reader_exit_code', 'state_check_exit_code'):
+            value = codes.get(key)
+            if type(value) is int and 0 <= value <= 255:
+                details[key] = value
+    return details
 
 
 def finish(root, expected, artifacts):
@@ -140,7 +183,8 @@ def main():
     except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError) as error:
         p.write(output, {'schema': 1, 'contract': 'four-native-shared-mission-readers-v1',
                          'status': 'failed', 'error': str(error), 'provider_execution': 'skipped_by_user',
-                         'hosted_task_validation': 'not_run', 'five_repository_delivery': 'not_completed'})
+                         'hosted_task_validation': 'not_run', 'five_repository_delivery': 'not_completed',
+                         'runtime_diagnostics': failure_details(root / 'evidence')})
         raise
 
 

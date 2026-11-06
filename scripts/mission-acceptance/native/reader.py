@@ -44,6 +44,32 @@ def require(test, message):
         raise RuntimeError(message)
 
 
+class WindowNotReady(RuntimeError):
+    """A transient window/tool observation, never a process or host guard error."""
+
+
+def decimal_id(raw, label):
+    value = raw.strip()
+    require(re.fullmatch(r'[1-9][0-9]*', value) is not None, 'Invalid ' + label + ': ' + repr(raw[:200]))
+    return int(value)
+
+
+def window_geometry(raw, wid):
+    # Parse xdotool --shell output as data, never eval it. Also bind the
+    # returned geometry to the requested window instead of trusting coordinates.
+    fields = {}
+    for line in raw.splitlines():
+        match = re.fullmatch(r'(WINDOW|X|Y|WIDTH|HEIGHT|SCREEN)=(-?[0-9]+)', line)
+        require(match is not None, 'Invalid xdotool geometry line: ' + repr(line[:200]))
+        key, value = match.groups()
+        require(key not in fields, 'Duplicate xdotool geometry field: ' + key)
+        fields[key] = int(value)
+    require(set(fields) == {'WINDOW','X','Y','WIDTH','HEIGHT','SCREEN'}, 'Incomplete xdotool geometry')
+    require(fields['WINDOW'] == int(wid), 'Geometry belongs to a different window')
+    require(fields['WIDTH'] > 0 and fields['HEIGHT'] > 0 and fields['SCREEN'] >= 0, 'Invalid window dimensions/screen')
+    return [fields[k] for k in ('X', 'Y', 'WIDTH', 'HEIGHT')]
+
+
 def sha256(path):
     with open(path, 'rb') as f:
         return hashlib.file_digest(f, 'sha256').hexdigest()
@@ -89,7 +115,10 @@ def safe_config(app, path):
     exact = dict(ai_enabled=False, eva_companion_enabled=False, agent_workspace_enabled=True,
                  shell='/bin/bash', terminal_mode='block')
     if app in ('anvil', 'forge'):
-        exact.update(startup_commands='', jsh_update_check='never')
+        # Both published loaders map an absent startup_commands to None.
+        # Forge rejects an empty string and then ignores the whole config,
+        # including AI/Eva disabling. No startup_commands key is permitted.
+        exact.update(jsh_update_check='never')
     else:
         exact.update(restore_session=False, initial_width=1200, initial_height=850)
         if app == 'frost':
@@ -425,8 +454,11 @@ class Reader:
         self.host, self.out = host, out
         self.sequence = 0
         self.process = None
+        self.process_identity = None
         self.window = None
         self.window_rect = None
+        self.window_probe = {}
+        self.last_command = None
         self.mission_open = False
         self.deadline = time.monotonic() + 300
         self.inputs = []
@@ -443,25 +475,52 @@ class Reader:
         require(time.monotonic() < self.deadline, 'Per-app 300-second budget exhausted')
         if self.process:
             require(self.process.poll() is None, 'Native application exited unexpectedly')
+            require(self.process_identity is not None, 'Owned app identity is not bound')
+            require(self.process_identity['executable'] == self.spec['binary'], 'Wrong app executable')
+            require(self.process_identity['state_dir'] == self.env['JTERM_WORKSPACE_STATE_DIR'], 'Wrong shared state')
             require(proc_identity(self.process.pid) == self.process_identity, 'Owned app process identity changed')
 
     def run(self, command, timeout=15):
         self.checkpoint()
-        result = subprocess.run(command, env=self.env, text=True, capture_output=True, timeout=timeout)
-        require(result.returncode == 0, 'Command failed: %s: %s' % (command[0], result.stderr[:400]))
+        self.last_command = dict(argv=command, status='started')
+        try:
+            result = subprocess.run(command, env=self.env, text=True, capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            self.last_command.update(status='timed_out', timeout=timeout)
+            raise RuntimeError('Command timed out after %s seconds: %s' % (timeout, ' '.join(command))) from error
+        self.last_command = dict(argv=command, returncode=result.returncode,
+                                 stdout=result.stdout[:4096], stderr=result.stderr[:4096])
         self.checkpoint()
+        if result.returncode != 0:
+            raise WindowNotReady('Command failed (exit %d): %s: %s' %
+                                 (result.returncode, ' '.join(command), result.stderr[:400]))
         return result.stdout
 
     def windows(self):
-        raw = self.run(['xdotool', 'search', '--onlyvisible', '--pid', str(self.process.pid), '--name', '.*'])
+        self.window_probe = {'pid': self.process.pid, 'candidates': []}
+        # xdotool defaults to OR. Without --all, --name .* also selects the
+        # unnamed root/Openbox windows; getwindowpid then fails on the root
+        # before we ever reach our app. Keep the independent PID read below.
+        raw = self.run(['xdotool', 'search', '--all', '--onlyvisible', '--pid', str(self.process.pid), '--name', '.*'])
+        self.window_probe['search_stdout'] = raw
         found = []
+        seen = set()
         for wid in raw.split():
-            if int(self.run(['xdotool', 'getwindowpid', wid]).strip()) == self.process.pid:
-                name = self.run(['xdotool', 'getwindowname', wid]).strip()
-                geom = dict(line.split('=', 1) for line in self.run(['xdotool', 'getwindowgeometry', '--shell', wid]).splitlines() if '=' in line)
-                rect = [int(geom[k]) for k in ('X', 'Y', 'WIDTH', 'HEIGHT')]
-                if rect[2] >= 300 and rect[3] >= 200:
-                    found.append((wid, name, rect))
+            xid = decimal_id(wid, 'search window ID')
+            require(xid not in seen, 'Duplicate search window ID')
+            seen.add(xid)
+            candidate = {'window': wid}
+            self.window_probe['candidates'].append(candidate)
+            candidate['pid'] = decimal_id(self.run(['xdotool', 'getwindowpid', wid]), 'window PID')
+            require(candidate['pid'] == self.process.pid, 'Search returned a window with a foreign PID')
+            name = self.run(['xdotool', 'getwindowname', wid]).strip()
+            candidate['name'] = name
+            raw_geom = self.run(['xdotool', 'getwindowgeometry', '--shell', wid])
+            candidate['geometry_stdout'] = raw_geom
+            rect = window_geometry(raw_geom, wid)
+            candidate['rect'] = rect
+            if rect[2] >= 300 and rect[3] >= 200:
+                found.append((wid, name, rect))
         return found
 
     def bind_window(self):
@@ -470,10 +529,30 @@ class Reader:
             found = [w for w in found if w[1] == FRAME['anvil']]
         elif self.app == 'anvil':
             found = [w for w in found if w[1] != FRAME['anvil']]
-        require(len(found) == 1, 'Missing or ambiguous owned native window')
-        self.window, _, self.window_rect = found[0]
-        require(int(self.run(['xdotool', 'getactivewindow']).strip()) == int(self.window),
-                'Owned target window is not the active visible window')
+        if len(found) != 1:
+            raise WindowNotReady('Missing or ambiguous owned native window: %d candidates' % len(found))
+        window, _, rect = found[0]
+        active = decimal_id(self.run(['xdotool', 'getactivewindow']), 'active window ID')
+        self.window_probe['active_window'] = active
+        if active != int(window):
+            raise WindowNotReady('Owned target window %s is not the active visible window %s' % (window, active))
+        self.window, self.window_rect = window, rect
+
+    def startup_failure(self, cycle, attempts, error):
+        report = dict(status='failed', error=str(error), attempts=attempts,
+                      process_identity=self.process_identity, window_probe=self.window_probe,
+                      last_command=self.last_command, launch_log='launch-%d.log' % cycle,
+                      scope='startup diagnostics only; not Mission coverage')
+        # The private desktop screenshot can explain missing/ambiguous windows.
+        # It never supplies UI coverage or bypasses host/process guards.
+        png = self.out / ('startup-%d-failed.png' % cycle)
+        try:
+            self.run(['import', '-window', 'root', str(png)], timeout=5)
+            require(png.is_file() and png.stat().st_size > 0, 'Startup screenshot was not produced')
+            report['screenshot'] = png.name
+        except Exception as capture_error:
+            report['screenshot_error'] = str(capture_error)
+        (self.out / ('startup-%d.json' % cycle)).write_text(json.dumps(report, indent=2)+'\n')
 
     def launch(self, cycle):
         self.host.check()
@@ -483,18 +562,30 @@ class Reader:
         self.log = (self.out / ('launch-%d.log' % cycle)).open('w')
         self.process = subprocess.Popen(argv, env=self.env, cwd=self.env['HOME'], stdout=self.log,
                                         stderr=subprocess.STDOUT, start_new_session=True)
-        for _ in range(100):
+        self.process_identity = None
+        self.window, self.window_rect = None, None
+        self.window_probe, self.last_command = {}, None
+        attempts = []
+        try:
             require(self.process.poll() is None, 'App exited during startup')
-            try:
-                self.process_identity = proc_identity(self.process.pid)
-                require(self.process_identity['executable'] == self.spec['binary'], 'Wrong app executable')
-                require(self.process_identity['state_dir'] == self.env['JTERM_WORKSPACE_STATE_DIR'], 'Wrong shared state')
-                self.bind_window()
-                break
-            except (RuntimeError, FileNotFoundError):
-                time.sleep(.2)
-        else:
-            raise RuntimeError('No owned app window within startup bound')
+            # Capture birth/executable/state once. Retrying a window probe must
+            # never replace the reference identity after exec or PID reuse.
+            self.process_identity = proc_identity(self.process.pid)
+            require(self.process_identity['executable'] == self.spec['binary'], 'Wrong app executable')
+            require(self.process_identity['state_dir'] == self.env['JTERM_WORKSPACE_STATE_DIR'], 'Wrong shared state')
+            for attempt in range(100):
+                self.checkpoint()
+                try:
+                    self.bind_window()
+                    break
+                except WindowNotReady as error:
+                    attempts.append(dict(attempt=attempt+1, error=str(error)))
+                    time.sleep(.2)
+            else:
+                raise RuntimeError('No owned app window within startup bound; last failure: ' + attempts[-1]['error'])
+        except Exception as error:
+            self.startup_failure(cycle, attempts, error)
+            raise
         self.coverage['stages']['launch_%d' % cycle] = dict(pid=self.process.pid, identity=self.process_identity)
         time.sleep(.5)
 

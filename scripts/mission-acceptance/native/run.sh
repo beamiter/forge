@@ -129,6 +129,16 @@ python3 "$here/reader.py" --manifest "$evidence/native-reader-input.json" \
   --state-dir "$state" --host-pid "$host" --output "$evidence/native-reader" \
   > "$evidence/native-reader.log" 2>&1 || reader_status=$?
 kill -0 "$host"
+state_status=0
 timeout 180 "$helper" check "$root" "$state" "$host" "$host_bin" "$evidence/native-seed.json" \
-  "$evidence/native-state-check.json" > "$evidence/native-state-check.log" 2>&1
-exit "$reader_status"
+  "$evidence/native-state-check.json" > "$evidence/native-state-check.log" 2>&1 || state_status=$?
+# Preserve both independent failures; neither successful step replaces the other.
+python3 - "$evidence/native-exit-codes.json" "$reader_status" "$state_status" <<'PY_EXITS'
+import json
+import sys
+with open(sys.argv[1], 'x', encoding='utf-8') as output:
+    json.dump({'schema': 1, 'scope': 'process_exit_codes_only_not_verification',
+               'reader_exit_code': int(sys.argv[2]), 'state_check_exit_code': int(sys.argv[3])}, output)
+PY_EXITS
+if ((reader_status != 0)); then exit "$reader_status"; fi
+exit "$state_status"
