@@ -509,7 +509,7 @@ class NativeStartupTests(unittest.TestCase):
             self.window_ids=[]
             with self.assertRaises(reader.WindowNotReady):self.r.bind_window()
             self.window_ids=['4194307','4194308'];self.window_pids['4194308']=21
-            with self.assertRaisesRegex(reader.WindowNotReady,'2 candidates'):self.r.bind_window()
+            with self.assertRaisesRegex(RuntimeError,'2 candidates'):self.r.bind_window()
             self.window_ids=['4194307'];self.active='543'
             with self.assertRaisesRegex(reader.WindowNotReady,'not the active'):self.r.bind_window()
             self.active='4194307'

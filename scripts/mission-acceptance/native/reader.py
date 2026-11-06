@@ -20,7 +20,7 @@ import threading
 import time
 import tomllib
 
-from observer import inside, observe_atspi, ocr_rows, phrases, state
+from observer import ObservationNotReady, inside, observe_atspi, ocr_rows, phrases, state
 
 APPS = ('anvil', 'forge', 'ember', 'frost')
 REPOS = ('jterm_core', *APPS)
@@ -37,6 +37,9 @@ REASONS = ('Validation failed', 'Validation blocked', 'Validation needs rechecki
 FRAME = {'anvil': 'Missions · delivery plans', 'ember': 'Missions · delivery evidence'}
 ENV_KEYS = {'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME',
             'XDG_RUNTIME_DIR', 'DISPLAY', 'DBUS_SESSION_BUS_ADDRESS'}
+OBSERVATION_ATTEMPTS = 20
+OBSERVATION_SECONDS = 15
+OBSERVATION_INTERVAL = .2
 
 
 def require(test, message):
@@ -44,7 +47,7 @@ def require(test, message):
         raise RuntimeError(message)
 
 
-class WindowNotReady(RuntimeError):
+class WindowNotReady(ObservationNotReady):
     """A transient window/tool observation, never a process or host guard error."""
 
 
@@ -192,7 +195,8 @@ def allowed_control(app, label, plan, purpose):
     if purpose == 'open':
         patterns = {'anvil': r'Missions · (delivery plans|\d+ need review)',
                     'forge': r'Mission workbench · linked delivery',
-                    'ember': r'Missions · \d+ need you', 'frost': r'Missions(?: · \d+ need review)?'}
+                    'ember': r'Missions · \d+ need you',
+                    'frost': r'Missions(?: · (?:0|[1-9][0-9]*) need review)?'}
         return re.fullmatch(patterns[app], label) is not None
     if purpose == 'menu':
         return app == 'forge' and label == '＋ New'
@@ -205,6 +209,108 @@ def allowed_control(app, label, plan, purpose):
     if purpose == 'close_mission':
         return (app == 'frost' and label == 'Back') or (app == 'ember' and label == 'Close')
     return False
+
+
+def frost_sidebar_open_targets(rows, window):
+    """Recognize the painted sidebar entry, not arbitrary matching OCR text.
+
+    The captured public sidebar has Agent Workspace above All / Running /
+    Needs you and Missions. Bind that unique title to the owned image's upper
+    left sidebar, then require its observed layout, high-confidence lines and
+    compact word boxes. Only the small middle-dot glyph may read as '-' in
+    these two badges. This does not normalize AT-SPI, Mission data or other
+    controls. All target coordinates come from the actual Missions words.
+    """
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(tuple(row[k] for k in ('page_num','block_num','par_num','line_num')), []).append(row)
+
+    def line(words, separator=None):
+        if any(not 80 <= w['conf'] <= 100 or w['width'] <= 0 or w['height'] <= 0 for w in words):
+            return None
+        letters = [w for i,w in enumerate(words) if i != separator]
+        height = max(w['height'] for w in letters)
+        bottom = max(w['top'] + w['height'] for w in letters)
+        # OCR's scale conversion rounds each box independently, so allow one
+        # pixel of quantization as well as the proportional baseline bound.
+        if any(w['height'] < height*.6 or bottom-w['top']-w['height'] > height/3+1 for w in letters):
+            return None
+        if any(not 0 < b['left']-a['left']-a['width'] <= height
+               for a,b in zip(words, words[1:])):
+            return None
+        if separator is not None:
+            dot = words[separator]
+            # A full-width hyphen, baseline period or tall punctuation is not
+            # evidence of the tiny, midline dot visible in the native badge.
+            if (max(dot['width'], dot['height']) > height*.4
+                    or not .5 <= dot['width']/dot['height'] <= 2
+                    or not bottom-height*.8 <= dot['top']+dot['height']/2 <= bottom-height*.2):
+                return None
+        x = min(w['left'] for w in words); y = min(w['top'] for w in words)
+        return [x, y, max(w['left']+w['width'] for w in words)-x,
+                max(w['top']+w['height'] for w in words)-y]
+
+    heading_words = [words for words in grouped.values()
+                     if [w['text'] for w in words[-2:]] == ['Agent', 'Workspace']]
+    if len(heading_words) != 1:
+        return []
+    words = heading_words[0]
+    heading = line(words[-2:])
+    if heading is None or len(words) not in (2, 3):
+        return []
+    if len(words) == 3:
+        # The captured collapse triangle is OCR'd as a lone yen glyph. It is
+        # decorative, not a low-confidence word silently removed from a label.
+        icon = words[0]
+        if (icon['text'] not in ('¥', '▼', '▾') or not 0 < icon['width'] <= heading[3]
+                or not inside([icon['left'], icon['top'], icon['width'], icon['height']],
+                              [heading[0]-heading[3]*2, heading[1], heading[3]*2, heading[3]])):
+            return []
+    # This is only an exclusion bound, never a coordinate input fallback.
+    # Relative word layout alone would also recognize a copy in body prose.
+    if not inside(heading, [0, 0, window[2]/3, window[3]/4]):
+        return []
+    all_tabs, running_tabs, needs_tabs, missions = [], [], [], []
+    for words in grouped.values():
+        label = ' '.join(w['text'] for w in words)
+        if label in ('All', 'Running'):
+            rect = line(words)
+            if rect:
+                (all_tabs if label == 'All' else running_tabs).append(rect)
+        elif re.fullmatch(r'Needs you [·-] (?:0|[1-9][0-9]*)', label):
+            rect = line(words, 2)
+            if rect:
+                needs_tabs.append(rect)
+        elif re.fullmatch(r'Missions [·-] (?:0|[1-9][0-9]*) need review', label):
+            rect = line(words, 1)
+            if rect:
+                missions.append((label, rect, words))
+    if any(len(anchors) != 1 for anchors in (all_tabs, running_tabs, needs_tabs)):
+        return []
+    left, middle, right = all_tabs[0], running_tabs[0], needs_tabs[0]
+    height = max(r[3] for r in (left, middle, right))
+    if (not 0 <= heading[0]-left[0] <= heading[3]*1.5
+            or not heading[3]*8 <= left[1]-heading[1]-heading[3] <= heading[3]*16
+            or any(not inside(r, [0, 0, window[2]/3, window[3]]) for r in (left,middle,right))
+            or max(r[1] for r in (left, middle, right))-min(r[1] for r in (left, middle, right)) > height/2
+            or any(not 0 < b[0]-a[0]-a[2] <= height*2 for a,b in ((left,middle),(middle,right)))):
+        return []
+    bottom = max(r[1]+r[3] for r in (left, middle, right))
+    result = []
+    for label, rect, words in missions:
+        x,y,w,h = rect
+        if (abs(x-left[0]) > height/4 or x+w > right[0]+right[2]
+                or not height <= y-bottom <= height*3 or not height*.6 <= h <= height*1.4):
+            continue
+        # Extra words, including low-confidence words in a separate OCR block,
+        # must not turn adjacent prose into a supposed standalone control.
+        own = {id(word) for word in words}
+        if any(id(row) not in own and row['top'] < y+h and row['top']+row['height'] > y
+               and row['left'] < right[0]+right[2] and row['left']+row['width'] > left[0] for row in rows):
+            continue
+        result.append(dict(label=label.replace(' - ', ' · ', 1), observed_label=label,
+                           rect=rect, node=None))
+    return result
 
 
 def expected_fields(plan):
@@ -461,6 +567,8 @@ class Reader:
         self.last_command = None
         self.mission_open = False
         self.deadline = time.monotonic() + 300
+        self.observation_deadline = None
+        self.observation_probe = {}
         self.inputs = []
         self.coverage = {'fields': {}, 'identity_bindings': [], 'candidate_bindings': {}, 'core_pin_bindings': {},
                          'supplementary_values': {}, 'stages': {}, 'reasons': [],
@@ -473,6 +581,8 @@ class Reader:
     def checkpoint(self):
         self.host.check()
         require(time.monotonic() < self.deadline, 'Per-app 300-second budget exhausted')
+        if self.observation_deadline is not None:
+            require(time.monotonic() < self.observation_deadline, 'Observation readiness deadline exhausted')
         if self.process:
             require(self.process.poll() is None, 'Native application exited unexpectedly')
             require(self.process_identity is not None, 'Owned app identity is not bound')
@@ -482,6 +592,9 @@ class Reader:
 
     def run(self, command, timeout=15):
         self.checkpoint()
+        deadline = min(self.deadline, self.observation_deadline or self.deadline)
+        timeout = min(timeout, deadline - time.monotonic())
+        require(timeout > 0, 'Command deadline exhausted')
         self.last_command = dict(argv=command, status='started')
         try:
             result = subprocess.run(command, env=self.env, text=True, capture_output=True, timeout=timeout)
@@ -492,8 +605,14 @@ class Reader:
                                  stdout=result.stdout[:4096], stderr=result.stderr[:4096])
         self.checkpoint()
         if result.returncode != 0:
-            raise WindowNotReady('Command failed (exit %d): %s: %s' %
-                                 (result.returncode, ' '.join(command), result.stderr[:400]))
+            # Only xdotool's documented no-match result is a window absence.
+            # PID lookup, capture, D-Bus and other genuine tool failures remain
+            # hard failures and cannot be retried as readiness.
+            if (command[:2] == ['xdotool', 'search'] and result.returncode == 1
+                    and not result.stdout.strip() and not result.stderr.strip()):
+                raise WindowNotReady('Owned native window is not visible yet')
+            raise RuntimeError('Command failed (exit %d): %s: %s' %
+                               (result.returncode, ' '.join(command), result.stderr[:400]))
         return result.stdout
 
     def windows(self):
@@ -529,8 +648,9 @@ class Reader:
             found = [w for w in found if w[1] == FRAME['anvil']]
         elif self.app == 'anvil':
             found = [w for w in found if w[1] != FRAME['anvil']]
-        if len(found) != 1:
-            raise WindowNotReady('Missing or ambiguous owned native window: %d candidates' % len(found))
+        require(len(found) <= 1, 'Ambiguous owned native window: %d candidates' % len(found))
+        if not found:
+            raise WindowNotReady('Missing owned native window: 0 candidates')
         window, _, rect = found[0]
         active = decimal_id(self.run(['xdotool', 'getactivewindow']), 'active window ID')
         self.window_probe['active_window'] = active
@@ -580,25 +700,65 @@ class Reader:
                     break
                 except WindowNotReady as error:
                     attempts.append(dict(attempt=attempt+1, error=str(error)))
-                    time.sleep(.2)
+                    self.checkpoint()
+                    time.sleep(min(.2, max(0, self.deadline - time.monotonic())))
             else:
                 raise RuntimeError('No owned app window within startup bound; last failure: ' + attempts[-1]['error'])
         except Exception as error:
             self.startup_failure(cycle, attempts, error)
             raise
         self.coverage['stages']['launch_%d' % cycle] = dict(pid=self.process.pid, identity=self.process_identity)
-        time.sleep(.5)
+        # Mapping/activation is not first paint or accessibility registration.
+        # The first observe() waits on those actual signals, not a fixed sleep.
 
     def observe(self, label, control=False):
+        deadline = min(self.deadline, time.monotonic() + OBSERVATION_SECONDS)
+        attempts = []
+        report = self.out / ('readiness-%03d-%s.json' %
+            (self.sequence + 1, re.sub('[^a-zA-Z0-9_-]', '-', label)))
+        self.observation_deadline = deadline
+        try:
+            for attempt in range(OBSERVATION_ATTEMPTS):
+                self.checkpoint()
+                self.observation_probe = {}
+                try:
+                    return self.observe_once(label, control=control)
+                except ObservationNotReady as error:
+                    # Security/process/host errors are never caught here, even
+                    # if a transient observation happened immediately before.
+                    self.checkpoint()
+                    attempts.append(dict(attempt=attempt+1, error=str(error), **self.observation_probe))
+                    report.write_text(json.dumps(dict(attempts=attempts,
+                        scope='discarded readiness attempts only; not Mission coverage'), indent=2)+'\n')
+                    if (attempt + 1 == OBSERVATION_ATTEMPTS
+                            or time.monotonic() + OBSERVATION_INTERVAL >= deadline):
+                        raise RuntimeError('Observation readiness bound exhausted; last failure: ' + str(error)) from error
+                    time.sleep(OBSERVATION_INTERVAL)
+        finally:
+            self.observation_deadline = None
+
+    def observe_once(self, label, control=False):
         self.bind_window()
         self.sequence += 1
         stem = '%03d-%s' % (self.sequence, re.sub('[^a-zA-Z0-9_-]', '-', label))
         png = self.out / (stem + '.png')
+        window, window_rect = self.window, self.window_rect[:]
         x, y, w, h = self.window_rect
+        captured_at_ns = time.time_ns()
+        self.observation_probe = dict(evidence=stem, screenshot=png.name, captured_at_ns=captured_at_ns)
         self.run(['import', '-window', 'root', '-crop', '%dx%d+%d+%d' % (w, h, x, y), str(png)])
+        require(png.is_file() and png.stat().st_size > 0, 'Observation screenshot was not produced')
+        # A mapped, black/flat window can precede first paint. A nonuniform
+        # image is only readiness, never proof of a control or Mission field.
+        image = self.run(['identify', '-format', '%w %h %k', str(png)]).strip()
+        require(re.fullmatch(r'[1-9][0-9]* [1-9][0-9]* [1-9][0-9]*', image) is not None,
+                'Invalid observation screenshot metadata')
+        width, height, colors = map(int, image.split())
+        require((width, height) == (w, h), 'Observation screenshot dimensions differ from owned window')
         if self.app != 'frost':
             observation = observe_atspi(self.process.pid, self.window_rect,
-                FRAME['ember'] if self.app=='ember' and self.mission_open else None)
+                FRAME['ember'] if self.app=='ember' and self.mission_open else None,
+                deadline=self.observation_deadline)
             self.checkpoint()
             if self.app in ('anvil', 'ember') and self.mission_open:
                 frames = [n for n in observation['nodes'] if n['role'] == 23 and n['name'] == FRAME[self.app]]
@@ -633,8 +793,14 @@ class Reader:
         if self.app != 'frost':
             spatial = sorted(observation['scoped_nodes'], key=lambda n: (n.get('rect',[0,0])[1], n.get('rect',[0,0])[0]))
             observation['visible_text'] = '\n'.join(dict.fromkeys(n.get('visible_text','') for n in spatial if n.get('visible_text')))
+        self.bind_window()
+        if self.window != window or self.window_rect != window_rect:
+            raise ObservationNotReady('Owned window changed during observation')
+        if colors == 1:
+            raise ObservationNotReady('Owned native window has not painted a nonuniform frame')
+        self.checkpoint()
         observation.update(evidence=stem, screenshot=png.name, window=self.window, window_rect=self.window_rect,
-                           captured_at_ns=time.time_ns(), pid=self.process.pid)
+                           captured_at_ns=captured_at_ns, pid=self.process.pid)
         (self.out / (stem + '.json')).write_text(json.dumps(observation, indent=2) + '\n')
         return observation
 
@@ -650,13 +816,9 @@ class Reader:
         if purpose in ('refresh', 'inspect'):
             labels = [(REFRESH if purpose == 'refresh' else INSPECT)[self.app]]
         elif purpose == 'open':
-            # Exact whole observed line must identify the entry; no expected
-            # numeric badge or synthetic position is substituted.
-            grouped = {}
-            for row in rows:
-                grouped.setdefault(tuple(row[k] for k in ('page_num','block_num','par_num','line_num')), []).append(row)
-            labels = [' '.join(w['text'] for w in group) for group in grouped.values()]
-            labels = [s for s in labels if allowed_control(self.app, s, self.plan, purpose)]
+            return [dict(target, rect=[target['rect'][0]+self.window_rect[0],
+                                      target['rect'][1]+self.window_rect[1], *target['rect'][2:]])
+                    for target in frost_sidebar_open_targets(rows, self.window_rect)]
         elif purpose == 'select':
             return [dict(label=self.plan['title'],
                          rect=[r[0]+self.window_rect[0],r[1]+self.window_rect[1],*r[2:]],node=None)

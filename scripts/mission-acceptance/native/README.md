@@ -67,10 +67,19 @@ inspection may restore current source observations, never validation completion.
 
 ## Status and result scope
 
-This new experiment is **not yet run**. Pure helper/observer tests do not count as
-native acceptance. The frozen Frost `4ce406b` UI did not display Mission ID;
-a future exact-ID visual check must block until that display exists and its new
-commit is independently verified. Do not silently weaken the identity check.
+The latest executed round, [42228324473, attempt 1](https://github.com/beamiter/forge/actions/runs/42228324473),
+**failed native acceptance**. Its five production builds and 21 prerequisite
+checks passed. The final independent host check passed with the full saved plan
+unchanged and both native/conversation catalogs empty. No complete native
+Mission inspection, refresh or reopen sequence passed.
+
+The first Anvil/Forge captures were still blank before accessibility registration;
+Ember reached the selected Mission before its accessibility tree changed during
+observation; Frost's visible Missions entry had a middle dot read as a hyphen by
+OCR. These are retained failures, not passes inferred from source or screenshots.
+Pure observer regression tests do not replace another exact-head native run.
+Frost now displays the stable Mission ID, but its exact identity/revision and
+repository-bound fields must still be observed in every required stage.
 
 Results must distinguish:
 
@@ -86,3 +95,21 @@ Results must distinguish:
 Only the specific native checks actually executed may be marked passed. Preserve
 failed or unexecuted phases and their reasons; never fill missing observations
 with assertions from source code or an earlier CI run.
+
+## Observation readiness
+
+X11 window mapping is not proof of a painted frame or an accessible tree.
+Each observation has at most 20 attempts within 15 seconds, also bounded by the
+unchanged 300-second per-app deadline. An unregistered accessibility root, a
+validated temporary tree update or a still-flat first frame discards that whole
+attempt. A retry captures a new screenshot and rechecks the host, process,
+window and public tree. It never reuses a discarded attempt's image for a later tree.
+Ambiguous roots/windows, foreign or cyclic edges, changed ownership, malformed
+data and tool/protocol failures remain hard errors.
+
+Frost's small middle dot may be read as a hyphen only in the public Missions
+sidebar badge and its neighboring Needs-you badge anchor. This is a
+control-specific OCR rule, not a correction of Mission
+IDs, candidate hashes, core pins or other text. The whole high-confidence line,
+sidebar context, actual word boxes and two matching observations must identify
+one control before pointer input is allowed.

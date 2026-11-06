@@ -15,6 +15,10 @@ TEXT = 'org.a11y.atspi.Text'
 ROOT = '/org/a11y/atspi/accessible/root'
 
 
+class ObservationNotReady(RuntimeError):
+    """A proven temporary absence/update, never an ownership or protocol error."""
+
+
 def inside(rect, outer):
     return (len(rect) == len(outer) == 4 and rect[2] > 0 and rect[3] > 0
             and outer[2] > 0 and outer[3] > 0 and rect[0] >= outer[0]
@@ -100,34 +104,44 @@ def node_observation_bounds(node, nodes, window, mission_scope=None):
     return window
 
 
-def observe_atspi(pid, window, mission_title=None):
+def observe_atspi(pid, window, mission_title=None, *, deadline=None):
     import dbus
-    deadline = time.monotonic() + 25
+    deadline = min(deadline, time.monotonic() + 25) if deadline is not None else time.monotonic() + 25
     def check():
-        if time.monotonic() > deadline:
+        if time.monotonic() >= deadline:
             raise RuntimeError('AT-SPI observation deadline exhausted')
+    def remaining():
+        budget = deadline - time.monotonic()
+        if budget <= 0:
+            raise RuntimeError('AT-SPI observation deadline exhausted')
+        return min(2, budget)
     def iface(bus, owner, path, interface):
         check()
-        return dbus.Interface(bus.get_object(owner, path), interface)
+        # Do not let implicit introspection introduce an unbounded D-Bus call.
+        return dbus.Interface(bus.get_object(owner, path, introspect=False), interface)
     session = dbus.SessionBus()
-    address = iface(session, 'org.a11y.Bus', '/org/a11y/bus', 'org.a11y.Bus').GetAddress(timeout=2)
+    address = iface(session, 'org.a11y.Bus', '/org/a11y/bus', 'org.a11y.Bus').GetAddress(timeout=remaining())
     bus = dbus.bus.BusConnection(str(address))
     broker = iface(bus, 'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus')
     registry = iface(bus, 'org.a11y.atspi.Registry', ROOT, ACCESSIBLE)
-    roots = []
-    children = registry.GetChildren(timeout=2)
-    if len(children) > 32:
-        raise RuntimeError('Private desktop has too many applications')
-    for addr in children:
-        owner = str(broker.GetNameOwner(str(addr[0]), timeout=2))
-        if int(broker.GetConnectionUnixProcessID(owner, timeout=2)) == pid:
-            roots.append((owner, str(addr[1])))
-    if len(roots) != 1:
-        raise RuntimeError('No unique PID-owned accessibility root')
-    owner, root = roots[0]
+    def owned_root():
+        roots = []
+        children = registry.GetChildren(timeout=remaining())
+        if len(children) > 32:
+            raise RuntimeError('Private desktop has too many applications')
+        for addr in children:
+            owner = str(broker.GetNameOwner(str(addr[0]), timeout=remaining()))
+            if int(broker.GetConnectionUnixProcessID(owner, timeout=remaining())) == pid:
+                roots.append((owner, str(addr[1])))
+        if not roots:
+            raise ObservationNotReady('PID-owned accessibility root is not registered yet')
+        if len(roots) != 1:
+            raise RuntimeError('Ambiguous PID-owned accessibility roots')
+        return roots[0]
+    owner, root = owned_root()
     nodes, seen, queue = [], set(), [(root, None)]
     def children_of(path):
-        found = iface(bus, owner, path, ACCESSIBLE).GetChildren(timeout=2)
+        found = iface(bus, owner, path, ACCESSIBLE).GetChildren(timeout=remaining())
         if any(str(a[0]) != owner or not re.fullmatch(r'/[A-Za-z0-9_/]+', str(a[1])) for a in found):
             raise RuntimeError('Foreign accessibility edge')
         return [str(a[1]) for a in found]
@@ -141,18 +155,18 @@ def observe_atspi(pid, window, mission_title=None):
         seen.add(path)
         obj = iface(bus, owner, path, ACCESSIBLE)
         props = iface(bus, owner, path, 'org.freedesktop.DBus.Properties')
-        interfaces = list(map(str, obj.GetInterfaces(timeout=2)))
+        interfaces = list(map(str, obj.GetInterfaces(timeout=remaining())))
         n = dict(path=path, parent=parent, owner=owner, pid=pid,
-                 name=str(props.Get(ACCESSIBLE, 'Name', timeout=2)),
-                 role=int(obj.GetRole(timeout=2)), states=list(map(int, obj.GetState(timeout=2))),
+                 name=str(props.Get(ACCESSIBLE, 'Name', timeout=remaining())),
+                 role=int(obj.GetRole(timeout=remaining())), states=list(map(int, obj.GetState(timeout=remaining()))),
                  interfaces=interfaces, children=children_of(path))
         if COMPONENT in interfaces:
-            n['rect'] = list(map(int, iface(bus, owner, path, COMPONENT).GetExtents(0, timeout=2)))
+            n['rect'] = list(map(int, iface(bus, owner, path, COMPONENT).GetExtents(0, timeout=remaining())))
         if TEXT in interfaces:
-            count = int(props.Get(TEXT, 'CharacterCount', timeout=2))
+            count = int(props.Get(TEXT, 'CharacterCount', timeout=remaining()))
             if not 0 <= count <= 131072:
                 raise RuntimeError('Text bound exceeded')
-            n['text'] = str(iface(bus, owner, path, TEXT).GetText(0, count, timeout=2))
+            n['text'] = str(iface(bus, owner, path, TEXT).GetText(0, count, timeout=remaining()))
         nodes.append(n)
         queue.extend((p, path) for p in n['children'])
     tree = dict(pid=pid, owner=owner, root=root, nodes=nodes)
@@ -176,7 +190,7 @@ def observe_atspi(pid, window, mission_title=None):
             for line in text.splitlines(keepends=True):
                 end = offset + len(line.rstrip('\r\n'))
                 if end > offset:
-                    rect = iface(bus, owner, n['path'], TEXT).GetRangeExtents(offset, end, 0, timeout=2)
+                    rect = iface(bus, owner, n['path'], TEXT).GetRangeExtents(offset, end, 0, timeout=remaining())
                     if inside(list(map(int, rect)), clip):
                         lines.append(line.rstrip('\r\n'))
                 offset += len(line)
@@ -185,19 +199,45 @@ def observe_atspi(pid, window, mission_title=None):
             n['visible_text'] = n['name']
         if n['visible_text']:
             texts.append(n['visible_text'])
-    # Reject a traversal spanning any structural update; never repair its tree.
+    # Re-read the complete structure, including new edges, before classifying
+    # a change as temporary. Foreign edges, duplicates/cycles and D-Bus errors
+    # are hard failures even when another part of the tree changed first.
+    latest, seen, queue = [], set(), [(root, None)]
+    while queue:
+        check()
+        if len(seen) > 2048:
+            raise RuntimeError('Accessibility node budget exhausted')
+        path, parent = queue.pop(0)
+        if path in seen:
+            raise RuntimeError('Duplicate accessibility node')
+        seen.add(path)
+        n = dict(path=path, parent=parent, owner=owner, pid=pid, children=children_of(path))
+        latest.append(n)
+        queue.extend((p, path) for p in n['children'])
+    latest_by_path = validate_tree(dict(pid=pid, owner=owner, root=root, nodes=latest))
+    changes = []
+    if (set(latest_by_path) != set(by_path)
+            or any(n['children'] != by_path[n['path']]['children'] for n in latest if n['path'] in by_path)):
+        changes.append('tree')
     for n in nodes:
-        if children_of(n['path']) != n['children']:
-            raise RuntimeError('Accessibility tree changed during observation')
         props = iface(bus, owner, n['path'], 'org.freedesktop.DBus.Properties')
-        if str(props.Get(ACCESSIBLE, 'Name', timeout=2)) != n['name']:
-            raise RuntimeError('Accessibility name changed during observation')
+        if str(props.Get(ACCESSIBLE, 'Name', timeout=remaining())) != n['name']:
+            changes.append('name')
         if 'text' in n:
-            count = int(props.Get(TEXT, 'CharacterCount', timeout=2))
-            if count != len(n['text']) or str(iface(bus,owner,n['path'],TEXT).GetText(0,count,timeout=2)) != n['text']:
-                raise RuntimeError('Accessibility text changed during observation')
-    if int(broker.GetConnectionUnixProcessID(owner, timeout=2)) != pid:
+            count = int(props.Get(TEXT, 'CharacterCount', timeout=remaining()))
+            if not 0 <= count <= 131072:
+                raise RuntimeError('Text bound exceeded')
+            if count != len(n['text']) or str(iface(bus,owner,n['path'],TEXT).GetText(0,count,timeout=remaining())) != n['text']:
+                changes.append('text')
+    if int(broker.GetConnectionUnixProcessID(owner, timeout=remaining())) != pid:
         raise RuntimeError('Accessibility PID changed')
+    if owned_root() != (owner, root):
+        raise RuntimeError('Accessibility root or owner changed')
+    check()
+    if changes:
+        # Never pair this updated tree with the earlier screenshot. The caller
+        # must discard this attempt and capture/recheck a whole new frame.
+        raise ObservationNotReady('Accessibility %s changed during observation' % '/'.join(dict.fromkeys(changes)))
     tree['visible_text'] = '\n'.join(texts)
     return tree
 
