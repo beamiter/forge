@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import tarfile
 import tempfile
 import tomllib
@@ -19,6 +20,37 @@ HERE = Path(__file__).resolve().parent
 WORKFLOW = HERE.parents[2] / '.github/workflows/four-native-mission.yml'
 ENV = {'GITHUB_REPOSITORY': 'beamiter/forge', 'GITHUB_SHA': '3' * 40,
        'GITHUB_REF': 'refs/heads/master', 'GITHUB_RUN_ID': '123', 'GITHUB_RUN_ATTEMPT': '1'}
+
+
+class CleanupTrapTests(unittest.TestCase):
+    def cleanup_script(self):
+        source = (HERE / 'run.sh').read_text()
+        start = source.index('cleanup() {\n')
+        end = source.index('trap cleanup EXIT\n', start) + len('trap cleanup EXIT\n')
+        return source[start:end]
+
+    def test_exit_trap_uses_only_recorded_positive_child_pids(self):
+        # These shell functions record calls only. They do not signal processes.
+        script = '''set -Eeuo pipefail
+kill() { printf 'kill:%s\\n' "$*"; return 1; }
+wait() { printf 'wait:%s\\n' "$*"; return 1; }
+host=321; wm=0; display=654
+''' + self.cleanup_script() + 'exit 7\n'
+        result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(result.stdout.splitlines(), ['kill:321', 'wait:321', 'kill:654', 'wait:654'])
+        self.assertEqual(result.stderr, '')
+
+    def test_exit_trap_before_startup_never_signals_process_group(self):
+        script = '''set -Eeuo pipefail
+kill() { printf 'unexpected kill:%s\\n' "$*"; return 1; }
+wait() { printf 'unexpected wait:%s\\n' "$*"; return 1; }
+host=0; wm=0; display=0
+''' + self.cleanup_script() + 'exit 9\n'
+        result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 9)
+        self.assertEqual(result.stdout, '')
+        self.assertEqual(result.stderr, '')
 
 
 def candidates():

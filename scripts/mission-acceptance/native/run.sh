@@ -33,6 +33,8 @@ export XDG_STATE_HOME="$HOME/.local/state" XDG_CACHE_HOME="$HOME/.cache"
 evidence="$root/evidence"
 state=$JTERM_WORKSPACE_STATE_DIR
 host=0; display=0; wm=0
+# Invoked indirectly by the EXIT trap, including failures before host startup.
+# shellcheck disable=SC2317
 cleanup() {
   # No broad pkill: terminate only the exact children this shell launched.
   for pid in "$host" "$wm" "$display"; do
