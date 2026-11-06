@@ -54,13 +54,22 @@ host=0; wm=0; display=0
 
 
 class GtkDependencyAcquisitionTests(unittest.TestCase):
+    workflow_file = 'ci.yml'
+    step_name = 'Install GTK display test dependencies'
+    expected_install = [
+        'install', '--no-install-recommends', '-y', 'pkg-config', 'libgtk-4-dev',
+        'libadwaita-1-dev', 'libvte-2.91-gtk4-dev', 'vim', 'ripgrep', 'libpcre2-dev',
+        'xvfb', 'xdotool', 'xauth', 'libxtst6', 'python3', 'gdb', 'dbus-x11',
+        'sway', 'wtype', 'grim', 'fonts-dejavu-core', 'fonts-liberation',
+        'fonts-noto-cjk', 'fonts-noto-color-emoji']
+
     def step(self):
-        workflow = (HERE.parents[2] / '.github/workflows/ci.yml').read_text()
-        start = workflow.index('      - name: Install GTK display test dependencies\n')
+        workflow = (HERE.parents[2] / '.github/workflows' / self.workflow_file).read_text()
+        start = workflow.index('      - name: ' + self.step_name + '\n')
         end = workflow.index('\n      - name:', start + 1)
         return workflow[start:end]
 
-    def run_step(self, failure):
+    def run_step(self, failure, fail_at='update'):
         step = self.step()
         self.assertIn('        timeout-minutes: 6\n', step)
         self.assertIn('        shell: bash\n', step)
@@ -79,17 +88,21 @@ if not args or args[0] != 'apt-get':
     raise SystemExit(91)
 source = next(a.split('=', 1)[1] for a in args if a.startswith('Dir::Etc::sourcelist='))
 with open(os.environ['APT_LOG'], 'a') as stream:
-    stream.write(json.dumps({'args': args, 'source': source, 'text': pathlib.Path(source).read_text()}) + '\\n')
-raise SystemExit(int(os.environ['APT_FAILURE']))
+    stream.write(json.dumps({'args': args, 'source': source, 'text': pathlib.Path(source).read_text(),
+                            'mode': pathlib.Path(source).stat().st_mode & 0o777}) + '\\n')
+raise SystemExit(int(os.environ['APT_FAILURE']) if os.environ['APT_FAIL_AT'] in args else 0)
 ''')
             fake.chmod(0o755)
             env = {**os.environ, 'PATH': str(root) + os.pathsep + os.environ['PATH'],
-                   'TMPDIR': directory, 'APT_LOG': str(log), 'APT_FAILURE': str(failure)}
+                   'TMPDIR': directory, 'APT_LOG': str(log), 'APT_FAILURE': str(failure),
+                   'APT_FAIL_AT': fail_at}
             result = subprocess.run(['bash', '-c', script], env=env, capture_output=True,
                                     text=True, timeout=5)
             calls = [json.loads(line) for line in log.read_text().splitlines()]
             self.assertEqual(result.returncode, failure, result.stderr)
             for call in calls:
+                self.assertEqual(Path(call['source']).parent, root)
+                self.assertEqual(call['mode'], 0o644)
                 self.assertFalse(Path(call['source']).exists(), 'Temporary apt source was not cleaned')
             return calls
 
@@ -104,21 +117,72 @@ raise SystemExit(int(os.environ['APT_FAILURE']))
         ]
         for call in calls:
             self.assertEqual(call['text'].splitlines(), sources)
-            for option in ('Dir::Etc::sourceparts=-', 'Acquire::Retries=2',
-                           'Acquire::http::Timeout=30', 'Acquire::https::Timeout=30'):
-                self.assertIn(option, call['args'])
-        args = calls[1]['args']
-        self.assertEqual(args[args.index('install'):], [
-            'install', '--no-install-recommends', '-y', 'pkg-config', 'libgtk-4-dev',
-            'libadwaita-1-dev', 'libvte-2.91-gtk4-dev', 'vim', 'ripgrep', 'libpcre2-dev',
-            'xvfb', 'xdotool', 'xauth', 'libxtst6', 'python3', 'gdb', 'dbus-x11',
-            'sway', 'wtype', 'grim', 'fonts-dejavu-core', 'fonts-liberation',
-            'fonts-noto-cjk', 'fonts-noto-color-emoji'])
+            self.assertEqual(call['source'], calls[0]['source'])
+        options = ['apt-get', '-o', 'Dir::Etc::sourcelist=' + calls[0]['source'],
+                   '-o', 'Dir::Etc::sourceparts=-', '-o', 'Acquire::Retries=2',
+                   '-o', 'Acquire::http::Timeout=30', '-o', 'Acquire::https::Timeout=30']
+        self.assertEqual(calls[0]['args'], options + ['update'])
+        self.assertEqual(calls[1]['args'], options + self.expected_install)
 
     def test_failed_update_stops_before_install_and_cleans_source(self):
         calls = self.run_step(42)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]['args'][-1], 'update')
+
+    def test_failed_install_preserves_failure_and_cleans_source(self):
+        calls = self.run_step(43, fail_at='install')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]['args'][-1], 'update')
+        self.assertIn('install', calls[1]['args'])
+
+
+class LayoutDependencyAcquisitionTests(GtkDependencyAcquisitionTests):
+    # Run the same production-shell failure injections for both workflows.
+    workflow_file = 'ui-layout.yml'
+    step_name = 'Install GTK, VTE, and isolated display'
+    expected_install = [
+        'install', '--no-install-recommends', '--yes', 'pkg-config', 'libgtk-4-dev',
+        'libadwaita-1-dev', 'libvte-2.91-gtk4-dev', 'libpcre2-dev', 'dbus-x11',
+        'xauth', 'xvfb', 'fonts-dejavu-core', 'fonts-noto-cjk']
+
+    def test_layout_job_and_required_test_gates_are_preserved(self):
+        workflow = (HERE.parents[2] / '.github/workflows' / self.workflow_file).read_text()
+        self.assertIn('permissions:\n  contents: read\n', workflow)
+        self.assertIn('concurrency:\n  group: ui-layout-${{ github.ref }}\n  cancel-in-progress: true\n', workflow)
+        self.assertIn('    runs-on: ubuntu-24.04\n    timeout-minutes: 30\n', workflow)
+        self.assertNotIn('continue-on-error:', workflow)
+        self.assertNotIn('        if:', workflow)
+        self.assertIn('      - name: Compile application tests\n'
+                      '        run: cargo test --locked --lib --all-features --no-run\n', workflow)
+        required = workflow.split('          tests=(\n', 1)[1].split('          )\n', 1)[0]
+        self.assertEqual(required.split(), [
+            'pty::tests::live_display_fixture_reaps_its_idle_child_on_drop',
+            'block_view::chat::tests::composer_keeps_three_input_rows_and_clearance_within_the_pane',
+            'block_view::chat::tests::real_editor_minimum_uses_native_cell_height_and_bounded_canvas_budget',
+            'block_view::chat::tests::bounded_editor_reveals_caret_without_changing_native_ring_or_history',
+            'block_view::developer_block::tests::block_input_rows_keep_three_lines_plus_clearance_and_follow_native_content',
+            'block_view::chat_layout_tests::chat_bubbles_keep_alignment_through_resize_and_font_changes',
+            'ui::reference_conversation::tests::user_capsules_follow_reading_edge_and_wrap_in_narrow_windows',
+            'block_view::chat::tests::chat_moves_only_the_native_clip_and_keeps_history_anchor',
+            'block_view::tests::multiline_native_caret_fits_editor_and_footer',
+            'block_view::tests::chat_docking_keeps_pty_rows_and_native_hit_geometry_stable'])
+        tail = workflow.split('          )\n', 1)[1]
+        self.assertEqual(tail, '''          listed_tests="$(cargo test --locked --lib --all-features -- --list --include-ignored)"
+          failed=0
+          for test_name in "${tests[@]}"; do
+            if ! grep -Fxq "${test_name}: test" <<< "$listed_tests"; then
+              printf 'Required layout test not found: %s\\n' "$test_name" >&2
+              failed=1
+              continue
+            fi
+            if ! dbus-run-session -- xvfb-run --auto-servernum \\
+              cargo test --locked --lib --all-features "$test_name" \\
+              -- --exact --include-ignored --test-threads=1; then
+              failed=1
+            fi
+          done
+          exit "$failed"
+''')
 
 
 class RuntimeFailureDiagnosticsTests(unittest.TestCase):
