@@ -4,6 +4,10 @@ All notable user-visible and operational changes are recorded here.
 
 ## Unreleased
 
+- Dependency queue rendering now indexes known task identities once per update
+  instead of repeatedly scanning the catalog, reducing UI-thread work for large
+  workspaces without changing which tasks can be selected as dependencies.
+
 ### Highlights
 
 - Mission Needs-you now shows concrete shared reasons and exact candidate,
