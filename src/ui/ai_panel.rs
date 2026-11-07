@@ -1065,7 +1065,13 @@ impl AiPanel {
                     }
                     let payload = self.pending_new_context.borrow_mut().remove(&request);
                     if let Some(payload) = payload {
-                        self.send_with_context(payload.user_text, payload.context, false, false);
+                        self.send_with_context_for_chat(
+                            chat_id,
+                            payload.user_text,
+                            payload.context,
+                            false,
+                            false,
+                        );
                     }
                     if !background_handoff {
                         self.render_active_chat();
@@ -1150,7 +1156,11 @@ impl AiPanel {
                 }
                 super::workspace_chats::Event::Rejected { request, message } => {
                     self.pending_shared.borrow_mut().remove(&request);
+                    self.show_error_status(&message);
+                }
+                super::workspace_chats::Event::CreateRejected { request, message } => {
                     self.pending_new_drafts.borrow_mut().remove(&request);
+                    self.pending_new_context.borrow_mut().remove(&request);
                     self.show_error_status(&message);
                 }
                 super::workspace_chats::Event::Deleted(id) => {
@@ -2013,11 +2023,29 @@ impl AiPanel {
         restore_pending_as_draft: bool,
         clear_composer_on_start: bool,
     ) -> bool {
+        let chat_id = self.store.borrow().active_id();
+        self.send_with_context_for_chat(
+            chat_id,
+            user_text,
+            context,
+            restore_pending_as_draft,
+            clear_composer_on_start,
+        )
+    }
+
+    fn send_with_context_for_chat(
+        &self,
+        chat_id: u64,
+        user_text: String,
+        context: Option<BlockContext>,
+        restore_pending_as_draft: bool,
+        clear_composer_on_start: bool,
+    ) -> bool {
         if !self.config.borrow().ai_enabled {
             self.show_error_status("Enable AI in Settings before sending a message.");
             return false;
         }
-        if user_text.trim().is_empty() || self.store.borrow().is_active_busy() {
+        if user_text.trim().is_empty() {
             return false;
         }
         let user_text = if self.config.borrow().ai_redact_secrets {
@@ -2025,11 +2053,12 @@ impl AiPanel {
         } else {
             user_text
         };
-        let local = self.store.borrow().active_id();
-        let result =
-            self.shared
-                .borrow_mut()
-                .prepare(local, user_text.clone(), clear_composer_on_start);
+        let result = self.shared.borrow_mut().prepare_for_chat(
+            &self.store.borrow(),
+            chat_id,
+            user_text.clone(),
+            clear_composer_on_start,
+        );
         match result {
             Ok(request) => {
                 self.pending_shared.borrow_mut().insert(
