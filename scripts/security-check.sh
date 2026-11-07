@@ -64,11 +64,48 @@ check_dependency_policy() {
         --duplicates
 }
 
+audit_lockfile() {
+    local lockfile="$1"
+    local audit_output
+    local audit_status=0
+
+    # cargo-audit 0.22.2 reports registry lookup failures without failing its
+    # exit status or JSON report. JSON also hides index update/open warnings,
+    # so keep terminal diagnostics visible and uncolored for this guard.
+    # .cargo/audit.toml must retain quiet = false; the regression checks it.
+    audit_output="$(cargo audit --format terminal --color never \
+        --deny warnings --file "${lockfile}" 2>&1)" || audit_status=$?
+    printf '%s\n' "${audit_output}"
+
+    # Preserve all upstream failures, including vulnerabilities and denied
+    # informational/yanked warnings, before checking its fail-open cases.
+    if ((audit_status != 0)); then
+        return "${audit_status}"
+    fi
+
+    local diagnostic_status=0
+    grep -Eq "^[[:space:]]*(error: couldn't check if the package is yanked:|warning: couldn't (update|open) crates[.]io index:)" \
+        <<<"${audit_output}" || diagnostic_status=$?
+    case "${diagnostic_status}" in
+        0)
+            printf 'Error: incomplete yanked-crate check for %s.\n' "${lockfile}" >&2
+            return 1
+            ;;
+        1) return 0 ;;
+        *)
+            printf 'Error: could not validate audit diagnostics for %s (grep exited %s).\n' \
+                "${lockfile}" "${diagnostic_status}" >&2
+            return "${diagnostic_status}"
+            ;;
+    esac
+}
+
 check_rustsec() {
     require_command cargo-audit "cargo install cargo-audit --version 0.22.2 --locked"
-    cargo audit --deny warnings --file Cargo.lock
-    cargo audit --no-fetch --deny warnings \
-        --file prototypes/ascii-organism/Cargo.lock
+    audit_lockfile Cargo.lock
+    # --no-fetch also disables sparse-index downloads. The prototype has
+    # dependencies absent from the root graph, so it needs its own fetch.
+    audit_lockfile prototypes/ascii-organism/Cargo.lock
 }
 
 check_shell_scripts() {
