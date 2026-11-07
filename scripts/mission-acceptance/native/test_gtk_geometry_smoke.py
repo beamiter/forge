@@ -10,11 +10,13 @@ tesseract. No installs, display/bus startup, product/host/provider or input.
 JTERM_GTK_GEOMETRY_SMOKE_OUT receives only JSON/PNG. Default discovery skips;
 explicit opt-in with missing dependencies fails and leaves a failure receipt.
 """
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -26,6 +28,112 @@ import observer
 VISIBLE=('GEOMETRY FIXTURE VISIBLE','ENTRY GEOMETRY VISIBLE','TEXTVIEW GEOMETRY VISIBLE')
 HIDDEN='HIDDEN_SENTINEL_73963'
 WRAPPED='WRAPPED GEOMETRY MUST KEEP EACH PHYSICAL LINE SEPARATE WITHOUT JOINING THE LOGICAL SENTENCE'
+
+
+@contextmanager
+def fixture_temporary_directory():
+    """Temporary cleanup is secondary to an existing fixture failure too."""
+    temporary=tempfile.TemporaryDirectory(prefix='gtk-geometry-smoke-')
+    primary=None
+    try:
+        yield temporary.name
+    except BaseException as error:
+        primary=error
+        raise
+    finally:
+        try:temporary.cleanup()
+        except Exception as error:
+            if primary is not None:
+                primary.add_note('Fixture temporary cleanup failed: '+str(error))
+            else:
+                raise
+
+
+def fixture_environment(source):
+    """Pass only this inherited private X11 session's existing authority.
+
+    Never read/copy an authorization cookie, discover a personal .Xauthority,
+    disable X access control, or broaden the caller's environment allowlist.
+    xvfb-run creates its private authority directory beneath TMPDIR.
+    """
+    for key in ('XAUTHORITY','TMPDIR'):
+        if not isinstance(source.get(key),str) or not source[key]:
+            raise RuntimeError('Fixture requires inherited private xvfb-run '+key)
+    env={k:v for k,v in source.items() if k in ('PATH','HOME','DISPLAY','DBUS_SESSION_BUS_ADDRESS',
+        'XDG_RUNTIME_DIR','XDG_CONFIG_HOME','XDG_DATA_HOME','XDG_STATE_HOME','XDG_CACHE_HOME',
+        'XDG_DATA_DIRS','TMPDIR','LANG','LC_ALL','GSK_RENDERER','LIBGL_ALWAYS_SOFTWARE')}
+    authority=Path(source['XAUTHORITY']);temporary=Path(source['TMPDIR'])
+    if (not authority.is_absolute() or not temporary.is_absolute()
+            or authority.resolve(strict=True)!=authority or temporary.resolve(strict=True)!=temporary
+            or authority==temporary or not authority.is_relative_to(temporary)):
+        raise RuntimeError('Fixture XAUTHORITY is outside the canonical private temporary session')
+    info=temporary.stat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode & 0o077:
+        raise RuntimeError('Fixture TMPDIR must be an owned private directory')
+    info=authority.stat()
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid()
+            or info.st_mode & 0o022):
+        raise RuntimeError('Fixture XAUTHORITY must be an owned, non-writable-by-others regular file')
+    # A private parent protects a cookie even when the file was created
+    # with a less restrictive umask. Validate all intermediate ancestors.
+    parent=authority.parent
+    if parent==temporary or parent.stat().st_mode & 0o077:
+        raise RuntimeError('Fixture XAUTHORITY needs its private xvfb-run directory')
+    while parent!=temporary:
+        info=parent.stat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode & 0o022:
+            raise RuntimeError('Fixture XAUTHORITY has an unsafe temporary ancestor')
+        parent=parent.parent
+    env['XAUTHORITY']=str(authority)
+    env.update(NO_AT_BRIDGE='0',GTK_A11Y='atspi',GDK_BACKEND='x11')
+    return env
+
+
+def fixture_exit_receipt(process):
+    """Keep natural exit separate from the signal used for owned cleanup."""
+    before=process.poll()
+    terminated=before is None
+    killed=False
+    if terminated:
+        process.terminate()
+        try:process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            killed=True;process.kill();process.wait(timeout=5)
+    return dict(fixture_exit_code_before_cleanup=before,fixture_exit_code=process.poll(),
+                fixture_terminated_for_cleanup=terminated,fixture_killed_for_cleanup=killed)
+
+
+def fixture_stderr_receipt(stream):
+    """Read only a bounded tail from this fixture's already-open stderr FD."""
+    limit=8192
+    stream.flush();stream.seek(0,os.SEEK_END);size=stream.tell()
+    stream.seek(max(0,size-limit));raw=stream.read(limit)
+    return dict(fixture_stderr_tail=raw.decode('utf-8',errors='replace'),
+                fixture_stderr_total_bytes=size,fixture_stderr_truncated=size>limit)
+
+
+def finalize_fixture_report(report,process,stream,path,active_error=None):
+    """Preserve the primary failure even when cleanup or receipt I/O fails."""
+    errors=[]
+    def attempt(key,operation):
+        try:
+            operation()
+        except Exception as error:
+            errors.append(error)
+            report.update(status='failed',**{key:str(error)})
+    if process is not None:
+        attempt('fixture_cleanup_error',lambda:report.update(fixture_exit_receipt(process)))
+    if stream is not None:
+        attempt('fixture_stderr_error',lambda:report.update(fixture_stderr_receipt(stream)))
+        attempt('fixture_stderr_close_error',stream.close)
+    attempt('fixture_receipt_write_error',lambda:path.write_text(json.dumps(report,indent=2)+'\n'))
+    if errors:
+        if active_error is not None:
+            # If the receipt itself is unwritable, the original traceback can
+            # still retain bounded secondary diagnostics without replacing it.
+            active_error.add_note('Fixture finalization errors: '+'; '.join(str(error) for error in errors))
+        else:
+            raise errors[0]
 
 
 def fixture():
@@ -87,7 +195,7 @@ class GtkGeometrySmoke(unittest.TestCase):
 
     def test_real_gtk14_capability_and_same_frame_geometry(self):
         self.process=None
-        with tempfile.TemporaryDirectory(prefix='gtk-geometry-smoke-') as temporary:
+        with fixture_temporary_directory() as temporary:
             private=Path(temporary)
             out=Path(os.environ.get('JTERM_GTK_GEOMETRY_SMOKE_OUT',str(private/'evidence')))
             ocr_private=private/'ocr';ocr_private.mkdir(mode=0o700)
@@ -114,17 +222,15 @@ class GtkGeometrySmoke(unittest.TestCase):
                 if report['gtk'][:2]!=[4,14]:raise RuntimeError('This regression specifically requires GTK4.14.x')
                 report['tesseract']=self.command(['tesseract','--version'],deadline).splitlines()[0]
                 report['imagemagick']=self.command(['convert','-version'],deadline).splitlines()[0]
-                env={k:v for k,v in os.environ.items() if k in ('PATH','HOME','DISPLAY','DBUS_SESSION_BUS_ADDRESS',
-                    'XDG_RUNTIME_DIR','XDG_CONFIG_HOME','XDG_DATA_HOME','XDG_STATE_HOME','XDG_CACHE_HOME',
-                    'XDG_DATA_DIRS','TMPDIR','LANG','LC_ALL','GSK_RENDERER','LIBGL_ALWAYS_SOFTWARE')}
-                env.update(NO_AT_BRIDGE='0',GTK_A11Y='atspi',GDK_BACKEND='x11')
-                log=open(private/'fixture.log','w')
+                env=fixture_environment(os.environ)
+                log=open(private/'fixture.stderr','w+b')
                 self.process=subprocess.Popen([sys.executable,'-B',str(Path(__file__).resolve()),'--fixture'],
-                                              env=env,stdout=log,stderr=log)
+                                              env=env,stdout=subprocess.DEVNULL,stderr=log)
                 report['fixture_pid']=self.process.pid
                 window=None
                 for _ in range(80):
-                    if self.process.poll() is not None:raise RuntimeError('GTK fixture failed before map')
+                    if self.process.poll() is not None:
+                        raise RuntimeError('GTK fixture failed before map (exit %s)'%self.process.returncode)
                     remaining=deadline-time.monotonic()
                     if remaining<=0:raise RuntimeError('GTK smoke mapping deadline exhausted')
                     result=subprocess.run(['xdotool','search','--onlyvisible','--pid',str(self.process.pid)],
@@ -207,12 +313,7 @@ class GtkGeometrySmoke(unittest.TestCase):
                               diagnostics=getattr(error,'atspi_diagnostics',[]))
                 raise
             finally:
-                if self.process is not None:
-                    self.process.terminate()
-                    try:self.process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:self.process.kill();self.process.wait(timeout=5)
-                if log is not None:log.close()
-                (out/'result.json').write_text(json.dumps(report,indent=2)+'\n')
+                finalize_fixture_report(report,self.process,log,out/'result.json',sys.exc_info()[1])
 
 
 if __name__=='__main__':
