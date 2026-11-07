@@ -129,7 +129,7 @@ class FrostPublicPixelReplayTests(unittest.TestCase):
             return subprocess.run(command, capture_output=True, text=True, timeout=15, check=True).stdout
         cls.reader.run = run
         cls.observation = cls.reader.frost_readout(cls.frame, 'replay', captured())
-        cls.observation.update(evidence='replay',window='42',window_rect=[200,175,1200,850])
+        cls.observation.update(evidence='replay',window='42',window_rect=[200,175,1200,850],pid=123)
 
     @classmethod
     def tearDownClass(cls):
@@ -162,7 +162,7 @@ class FrostPublicPixelReplayTests(unittest.TestCase):
         r.run = run
         o = r.frost_readout(flat, 'flat-precision', [], regions=False)
         self.assertEqual(o['frost_components'], [dict(rect=[0,0,1203,853], fill=1.0)])
-        self.assertEqual(len(measured), 1)
+        self.assertEqual(len(measured), 3)
         command, raw = measured[0]
         self.assertEqual(command[command.index('-precision')+1], '16')
         self.assertIn(' 1026159 gray(255)', raw)
@@ -305,13 +305,16 @@ class FrostPublicPixelReplayTests(unittest.TestCase):
         self.assertEqual(r.run.call_args[0][0][1:4], ['mousemove','1383','333'])
 
     def test_scroll_missing_duplicate_changed_or_foreign_window_never_sends_input(self):
-        for mutation in ('missing','duplicate','changed','window'):
+        for mutation in ('missing','duplicate','changed','window','pid','track','scope'):
             a = copy.deepcopy(self.observation); b = copy.deepcopy(a)
-            thumb = next(c for c in b['frost_components'] if c['rect']==[1178,103,10,111])
-            if mutation=='missing': b['frost_components'].remove(thumb)
-            if mutation=='duplicate': b['frost_components'].append(copy.deepcopy(thumb))
+            thumb = next(c for c in b['frost_scroll_components'] if c['rect']==[1178,103,10,111])
+            if mutation=='missing': b['frost_scroll_components'].remove(thumb)
+            if mutation=='duplicate': b['frost_scroll_components'].append(copy.deepcopy(thumb))
             if mutation=='changed': thumb['rect'][1] += 1
             if mutation=='window': b['window_rect'][0] += 1
+            if mutation=='pid': b['pid'] += 1
+            if mutation=='track': thumb['track'][1] += 1
+            if mutation=='scope': b['frost_panel_scope'][1] += 1
             r = make_reader(); r.run = Mock()
             with patch.object(r,'observe',side_effect=[a,b]), patch.object(r,'bind_window'), \
                     self.assertRaises(RuntimeError):

@@ -248,11 +248,33 @@ class FailClosedInspectionTests(unittest.TestCase):
                 r.scroll=lambda amount:None
                 r.observe=lambda *args,**kw:dict(rows=[],scoped_nodes=[],evidence='observed-absent')
                 if app=='frost': r.freeze_after_refresh()
+                elif app=='ember':
+                    from test_reader_navigation import EmberSimulation
+                    sim=EmberSimulation(); original=sim.observe
+                    def absent(*args,**kw):
+                        o=original();o['scoped_nodes']=[n for n in o['scoped_nodes'] if n['path']!='/freeze'];return o
+                    sim.r.observe=absent
+                    with self.assertRaisesRegex(RuntimeError,'No unique navigation control'):sim.r.freeze_after_refresh()
+                    sim.r.click.assert_not_called()
                 else:
                     with self.assertRaisesRegex(RuntimeError,'not observed'): r.freeze_after_refresh()
 
     def test_enabled_or_ambiguous_freeze_cannot_pass(self):
         for app in ('anvil','forge','ember'):
+            if app=='ember':
+                from test_reader_navigation import EmberSimulation
+                for duplicate in (False,True):
+                    sim=EmberSimulation(1440); original=sim.observe
+                    def enabled(*args,**kw):
+                        o=original();n=next(n for n in o['scoped_nodes'] if n['path']=='/freeze')
+                        n['states'][0]|=(1<<8)|(1<<24)
+                        if duplicate:o['scoped_nodes'].append(dict(n,path='/other-freeze'))
+                        return o
+                    sim.r.observe=enabled
+                    message='No unique navigation control' if duplicate else 'did not visibly disable'
+                    with self.assertRaisesRegex(RuntimeError,message):sim.r.freeze_after_refresh()
+                    sim.r.click.assert_not_called()
+                continue
             with tempfile.TemporaryDirectory() as td:
                 r=reader.Reader(app,{}, {},plan(),None,Path(td));r.scroll=lambda amount:None
                 label={'anvil':'Freeze inspected commits','forge':'Freeze inspected clean commits as candidates','ember':'Freeze observed candidates'}[app]
@@ -331,8 +353,9 @@ class FailClosedInspectionTests(unittest.TestCase):
 
     def test_notice_free_status_requires_actual_source_defined_status(self):
         p=plan()
-        self.assertTrue(reader.clean_inspection_status('anvil',dict(visible_text='1 Mission(s) need review. Only inspected, version-bound receipts count as passed.'),p))
-        self.assertTrue(reader.clean_inspection_status('forge',dict(visible_text='1 saved Missions · 1 need you'),p))
+        from test_status_scope import status_fixture
+        self.assertTrue(reader.clean_inspection_status('anvil',status_fixture('anvil'),p))
+        self.assertTrue(reader.clean_inspection_status('forge',status_fixture('forge'),p))
         self.assertFalse(reader.clean_inspection_status('forge',dict(visible_text='Mission request: failed'),p))
         refresh=node('/refresh',name='Refresh saved Missions',visible=True,rect=[0,10,100,20],visible_text='Refresh saved Missions')
         catalog=node('/catalog',name=p['title']+' · Needs attention',visible=True,rect=[0,60,100,20],visible_text=p['title'])

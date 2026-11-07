@@ -6,6 +6,7 @@ but never enters visible_text or supplies an input target.
 """
 import csv
 import io
+import math
 import re
 import time
 
@@ -13,6 +14,20 @@ ACCESSIBLE = 'org.a11y.atspi.Accessible'
 COMPONENT = 'org.a11y.atspi.Component'
 TEXT = 'org.a11y.atspi.Text'
 ROOT = '/org/a11y/atspi/accessible/root'
+NOT_SUPPORTED = 'org.freedesktop.DBus.Error.NotSupported'
+# This is an allowlist, not an interface denylist. No mutation API can be
+# reached through the observer's proxy, including on future fallback paths.
+READ_SIGNATURES = {
+    ('org.a11y.Bus', 'GetAddress'): '',
+    ('org.freedesktop.DBus', 'GetNameOwner'): 's',
+    ('org.freedesktop.DBus', 'GetConnectionUnixProcessID'): 's',
+    ('org.freedesktop.DBus.Properties', 'Get'): 'ss',
+    (ACCESSIBLE, 'GetChildren'): '', (ACCESSIBLE, 'GetInterfaces'): '',
+    (ACCESSIBLE, 'GetRole'): '', (ACCESSIBLE, 'GetState'): '',
+    (COMPONENT, 'GetExtents'): 'u', (TEXT, 'GetText'): 'ii',
+    (TEXT, 'GetRangeExtents'): 'iiu',
+}
+
 
 
 class ObservationNotReady(RuntimeError):
@@ -88,12 +103,26 @@ def mission_content_scope(tree, title, window):
     bar=bars[0];x,y,w,h=frame['rect'];top=bar['rect'][1]+bar['rect'][3]
     if not y<top<y+h-8:
         raise RuntimeError('Invalid Mission content viewport')
-    return dict(frame=frame['path'],titlebar=bar['path'],content_rect=[x,top,w,y+h-8-top])
+    header_rect = [x,y,w,top-y]
+    header_close = None
+    if title == 'Missions · delivery evidence':
+        # Ember/egui exposes Close as a sibling of the title bar, not its
+        # descendant. Only this exact direct child can use the header strip.
+        closes = [n for n in nodes.values() if n['parent']==frame['path']
+                  and n['role']==43 and n['name']=='Close window']
+        if len(closes)>1:
+            raise RuntimeError('Ambiguous Mission header Close window')
+        if closes and visible(closes[0],nodes,header_rect):
+            header_close = closes[0]['path']
+    return dict(frame=frame['path'],titlebar=bar['path'],header_rect=header_rect,
+                header_close=header_close,content_rect=[x,top,w,y+h-8-top])
 
 
 def node_observation_bounds(node, nodes, window, mission_scope=None):
     if mission_scope is None:
         return window
+    if node['path'] == mission_scope.get('header_close'):
+        return mission_scope['header_rect']
     current=node
     while current is not None:
         if current['path']==mission_scope['titlebar']:
@@ -104,8 +133,115 @@ def node_observation_bounds(node, nodes, window, mission_scope=None):
     return window
 
 
-def observe_atspi(pid, window, mission_title=None, *, deadline=None):
+
+def text_geometry_unknown_in_scope(tree, scope, node_paths=None):
+    """Unknown text is not an empty/notice-free result.
+
+    Callers must use the actual Mission/status viewport and, when available,
+    its descendant paths. An unrelated terminal elsewhere is not a notice.
+    Entries retain node identity and clipping provenance for that decision.
+    """
+    return [entry for entry in tree.get('unknown_text', [])
+            if (node_paths is None or entry['path'] in node_paths)
+            and all(v > 0 for v in intersect(entry['clip'], scope)[2:])]
+
+
+def verify_ocr_text_geometry(text, clip, proof, frame_id):
+    """Validate actual same-frame SCREEN-coordinate OCR, never invent boxes.
+
+    The callback is given only a node path/clip, not the expected text. Its
+    trusted caller must bind it to the captured screenshot identified by
+    frame_id. Every supplied word must be high-confidence and wholly inside
+    the clip with a pixel of margin. Only exact, unique, complete logical
+    lines count; only line-local whitespace is normalized. No substring,
+    punctuation repair, cross-line joining or expected-text injection.
+    Unobserved lines remain explicitly unknown, never implied invisible.
+    """
+    if not isinstance(frame_id, str) or not frame_id:
+        raise RuntimeError('OCR text geometry requires a captured frame identity')
+    if not isinstance(proof, dict) or proof.get('frame_id') != frame_id:
+        raise RuntimeError('OCR text geometry belongs to a different frame')
+    rows = proof.get('rows')
+    if not isinstance(rows, list) or len(rows) > 8192:
+        raise RuntimeError('Invalid or excessive OCR text geometry rows')
+    expected = [(i, ' '.join(line.split())) for i, line in enumerate(text.splitlines()) if line.strip()]
+    empty = dict(status='unavailable', visible_text='', lines=[],
+                 unproven_lines=[i for i, _ in expected], reason='No exact complete OCR lines')
+    if not rows or clip[2] <= 2 or clip[3] <= 2:
+        return empty
+    inner = [clip[0]+1, clip[1]+1, clip[2]-2, clip[3]-2]
+    grouped = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise RuntimeError('Invalid OCR text geometry row')
+        word, confidence = row.get('text'), row.get('conf')
+        if (not isinstance(word, str) or not word or any(c.isspace() for c in word)
+                or type(confidence) not in (int, float) or not math.isfinite(confidence)
+                or not 80 <= confidence <= 100):
+            return dict(empty, reason='OCR word is missing, malformed or low-confidence')
+        rect = [row.get(k) for k in ('left', 'top', 'width', 'height')]
+        if any(type(v) is not int for v in rect) or not inside(rect, inner):
+            return dict(empty, reason='OCR word is clipped or has invalid geometry')
+        key = tuple(row.get(k) for k in ('page_num', 'block_num', 'par_num', 'line_num'))
+        if any(not re.fullmatch(r'[1-9][0-9]*', str(v)) for v in key):
+            raise RuntimeError('Invalid OCR line identity')
+        grouped.setdefault(tuple(map(str, key)), []).append((word, rect, confidence))
+    lines = []
+    for words in grouped.values():
+        words.sort(key=lambda w: w[1][0])
+        # A single OCR line must actually be one unambiguous horizontal line.
+        top = max(r[1] for _, r, _ in words)
+        bottom = min(r[1]+r[3] for _, r, _ in words)
+        if top >= bottom or any(a[1][0]+a[1][2] >= b[1][0] for a, b in zip(words, words[1:])):
+            return dict(empty, reason='OCR line has overlapping or disjoint word boxes')
+        observed = ' '.join(word for word, _, _ in words)
+        matches = [i for i, line in expected if line == observed]
+        if len(matches) != 1:
+            return dict(empty, reason='OCR line is not an exact unique complete text line')
+        x = min(r[0] for _, r, _ in words); y = min(r[1] for _, r, _ in words)
+        rect = [x, y, max(r[0]+r[2] for _, r, _ in words)-x,
+                max(r[1]+r[3] for _, r, _ in words)-y]
+        lines.append(dict(index=matches[0], text=observed, rect=rect,
+                          words=[dict(text=w, rect=r, conf=c) for w, r, c in words]))
+    lines.sort(key=lambda line: (line['rect'][1], line['rect'][0]))
+    indices = [line['index'] for line in lines]
+    if (len(set(indices)) != len(indices) or indices != sorted(indices)
+            or any(a['rect'][1]+a['rect'][3] > b['rect'][1] for a, b in zip(lines, lines[1:]))):
+        return dict(empty, reason='OCR logical line order or geometry is ambiguous')
+    missing = [i for i, _ in expected if i not in indices]
+    return dict(status='ocr_partial' if missing else 'ocr_verified',
+                visible_text='\n'.join(line['text'] for line in lines), lines=lines,
+                unproven_lines=missing, frame_id=frame_id)
+
+
+def observe_atspi(pid, window, mission_title=None, *, deadline=None,
+                  text_geometry=None, frame_id=None, diagnostics=None):
     import dbus
+    diagnostics = [] if diagnostics is None else diagnostics
+    node_context = {}
+    def failure(error, owner, path, interface, method, args):
+        get_name = getattr(error, 'get_dbus_name', None)
+        get_message = getattr(error, 'get_dbus_message', None)
+        entry = dict(pid=pid, owner=owner, path=path, interface=interface,
+                     method=method, expected_signature=READ_SIGNATURES.get((interface, method)),
+                     arguments=[dict(value=int(a) if isinstance(a, int) else str(a),
+                                     type=type(a).__name__) for a in args],
+                     error_type=type(error).__name__, error_name=get_name() if callable(get_name) else None,
+                     error_message=get_message() if callable(get_message) else str(error),
+                     node=dict(node_context.get(path, {})))
+        diagnostics.append(entry)
+        # Keep the original exception class/identity, so no caller can confuse
+        # a security, ownership or transport failure with readiness.
+        try:
+            error.atspi_diagnostics = diagnostics
+        except (AttributeError, TypeError):
+            pass
+    def connect(factory, method, *args):
+        try:
+            return factory(*args)
+        except Exception as error:
+            failure(error, None, None, 'connection', method, args)
+            raise
     deadline = min(deadline, time.monotonic() + 25) if deadline is not None else time.monotonic() + 25
     def check():
         if time.monotonic() >= deadline:
@@ -118,14 +254,33 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None):
     def iface(bus, owner, path, interface):
         check()
         # Do not let implicit introspection introduce an unbounded D-Bus call.
-        return dbus.Interface(bus.get_object(owner, path, introspect=False), interface)
+        try:
+            endpoint = dbus.Interface(bus.get_object(owner, path, introspect=False), interface)
+        except Exception as error:
+            failure(error, owner, path, interface, 'Interface', ())
+            raise
+        class ReadOnlyInterface:
+            def __getattr__(self, method):
+                if (interface, method) not in READ_SIGNATURES:
+                    raise RuntimeError('Forbidden AT-SPI observation method: ' + interface + '.' + method)
+                def read(*args, timeout):
+                    if interface == 'org.freedesktop.DBus.Properties' and args not in (
+                            (ACCESSIBLE, 'Name'), (TEXT, 'CharacterCount')):
+                        raise RuntimeError('Forbidden AT-SPI observation property')
+                    try:
+                        return getattr(endpoint, method)(*args, timeout=timeout)
+                    except Exception as error:
+                        failure(error, owner, path, interface, method, args)
+                        raise
+                return read
+        return ReadOnlyInterface()
     # With introspection disabled, Python ints default to signed D-Bus 'i'.
     # AT-SPI Component.GetExtents takes 'u'; Text.GetText takes 'ii' and
     # Text.GetRangeExtents takes 'iiu'. SCREEN is coordinate type 0.
     screen = dbus.UInt32(0)
-    session = dbus.SessionBus()
+    session = connect(dbus.SessionBus, 'SessionBus')
     address = iface(session, 'org.a11y.Bus', '/org/a11y/bus', 'org.a11y.Bus').GetAddress(timeout=remaining())
-    bus = dbus.bus.BusConnection(str(address))
+    bus = connect(dbus.bus.BusConnection, 'BusConnection', str(address))
     broker = iface(bus, 'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus')
     registry = iface(bus, 'org.a11y.atspi.Registry', ROOT, ACCESSIBLE)
     def owned_root():
@@ -160,10 +315,14 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None):
         obj = iface(bus, owner, path, ACCESSIBLE)
         props = iface(bus, owner, path, 'org.freedesktop.DBus.Properties')
         interfaces = list(map(str, obj.GetInterfaces(timeout=remaining())))
-        n = dict(path=path, parent=parent, owner=owner, pid=pid,
-                 name=str(props.Get(ACCESSIBLE, 'Name', timeout=remaining())),
-                 role=int(obj.GetRole(timeout=remaining())), states=list(map(int, obj.GetState(timeout=remaining()))),
-                 interfaces=interfaces, children=children_of(path))
+        node_context[path] = dict(path=path, parent=parent, interfaces=interfaces)
+        n = dict(path=path, parent=parent, owner=owner, pid=pid, interfaces=interfaces)
+        n['name'] = str(props.Get(ACCESSIBLE, 'Name', timeout=remaining()))
+        node_context[path]['name'] = n['name']
+        n['role'] = int(obj.GetRole(timeout=remaining()))
+        node_context[path]['role'] = n['role']
+        n['states'] = list(map(int, obj.GetState(timeout=remaining())))
+        n['children'] = children_of(path)
         if COMPONENT in interfaces:
             n['rect'] = list(map(int, iface(bus, owner, path, COMPONENT).GetExtents(screen, timeout=remaining())))
         if TEXT in interfaces:
@@ -178,7 +337,11 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None):
     mission_scope = mission_content_scope(tree,mission_title,window) if mission_title else None
     if mission_scope:
         tree['mission_content_rect'] = mission_scope['content_rect']
+        tree['mission_header_rect'] = mission_scope['header_rect']
+        tree['mission_header_close'] = mission_scope['header_close']
     texts = []
+    tree['unknown_text'] = []
+    unsupported_seen = False
     for n in nodes:
         check()
         bounds = node_observation_bounds(n,by_path,window,mission_scope)
@@ -188,14 +351,51 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None):
             continue
         if 'text' in n and 'rect' in n:
             clip = intersect(clip_for(n, by_path, bounds), n['rect'])
+            # No pixels in this owned viewport means there is no text geometry
+            # to query or unknown notice to infer. Do not probe offscreen text.
+            if clip[2] <= 0 or clip[3] <= 0:
+                n['text_geometry_status'] = 'outside_clip'
+                continue
             text = n['text']; offset = 0; lines = []
             # Only entire logical lines proven inside the actual clip count.
             # A partially clipped line is not guessed, repaired, or synthesized.
             for line in text.splitlines(keepends=True):
                 end = offset + len(line.rstrip('\r\n'))
                 if end > offset:
-                    rect = iface(bus, owner, n['path'], TEXT).GetRangeExtents(
-                        dbus.Int32(offset), dbus.Int32(end), screen, timeout=remaining())
+                    range_text = iface(bus, owner, n['path'], TEXT)
+                    try:
+                        rect = range_text.GetRangeExtents(
+                            dbus.Int32(offset), dbus.Int32(end), screen, timeout=remaining())
+                    except Exception as error:
+                        dbus_error = getattr(dbus, 'DBusException', ())
+                        if not (isinstance(error, dbus_error) and error.get_dbus_name() == NOT_SUPPORTED
+                                and TEXT in n['interfaces']):
+                            raise
+                        unsupported_seen = True
+                        unsupported = diagnostics[-1]
+                        # Only this exact optional geometry operation may be
+                        # unavailable. No name/widget rectangle becomes text
+                        # proof, and unsupported is never a readiness retry.
+                        geometry = dict(status='unavailable', visible_text='', lines=[],
+                            unproven_lines=[i for i, value in enumerate(text.splitlines()) if value],
+                            reason='Text.GetRangeExtents is not supported')
+                        if clip[2] <= 0 or clip[3] <= 0:
+                            geometry = dict(geometry, status='outside_clip', unproven_lines=[])
+                        elif text_geometry is not None:
+                            check()
+                            proof = text_geometry(n['path'], clip[:], deadline=deadline)
+                            check()
+                            geometry = verify_ocr_text_geometry(text, clip, proof, frame_id)
+                        n['text_geometry'] = dict(geometry, clip=clip[:],
+                            unsupported=unsupported)
+                        n['text_geometry_status'] = ('unknown' if geometry['unproven_lines']
+                                                     else geometry['status'])
+                        lines = geometry['visible_text'].splitlines()
+                        if geometry['unproven_lines']:
+                            tree['unknown_text'].append(dict(path=n['path'], owner=owner,
+                                pid=pid, role=n['role'], clip=clip[:], rect=n['rect'][:],
+                                status=geometry['status'], unproven_lines=geometry['unproven_lines']))
+                        break
                     if inside(list(map(int, rect)), clip):
                         lines.append(line.rstrip('\r\n'))
                 offset += len(line)
@@ -228,6 +428,17 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None):
         props = iface(bus, owner, n['path'], 'org.freedesktop.DBus.Properties')
         if str(props.Get(ACCESSIBLE, 'Name', timeout=remaining())) != n['name']:
             changes.append('name')
+        if unsupported_seen:
+            # OCR boxes belong to the captured clip. Verify node geometry and
+            # all clipping ancestors, not just text, before accepting them.
+            obj = iface(bus, owner, n['path'], ACCESSIBLE)
+            if (list(map(str, obj.GetInterfaces(timeout=remaining()))) != n['interfaces']
+                    or int(obj.GetRole(timeout=remaining())) != n['role']
+                    or list(map(int, obj.GetState(timeout=remaining()))) != n['states']):
+                changes.append('node properties')
+            if 'rect' in n and list(map(int, iface(bus, owner, n['path'], COMPONENT).GetExtents(
+                    screen, timeout=remaining()))) != n['rect']:
+                changes.append('geometry')
         if 'text' in n:
             count = int(props.Get(TEXT, 'CharacterCount', timeout=remaining()))
             if not 0 <= count <= 131072:
@@ -245,6 +456,7 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None):
         # must discard this attempt and capture/recheck a whole new frame.
         raise ObservationNotReady('Accessibility %s changed during observation' % '/'.join(dict.fromkeys(changes)))
     tree['visible_text'] = '\n'.join(texts)
+    tree['atspi_diagnostics'] = diagnostics
     return tree
 
 

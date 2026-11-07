@@ -67,24 +67,34 @@ inspection may restore current source observations, never validation completion.
 
 ## Status and result scope
 
-The latest executed round, [42245525353, attempt 1](https://github.com/beamiter/forge/actions/runs/42245525353),
+The latest executed round, [42312173963, attempt 1](https://github.com/beamiter/forge/actions/runs/42312173963),
 **failed native acceptance**. Its five production builds and 21 prerequisite
-checks passed. The final independent host check passed with the full saved plan
-unchanged and both native/conversation catalogs empty. No complete native
-Mission inspection, refresh or reopen sequence passed.
+checks passed. The final independent host check passed with the whole saved plan
+unchanged, both native/conversation catalogs empty, no Tasks, and every required
+validation still `not_run`. The recorded frontend binaries matched the same-run
+production build artifacts. No complete native inspection/refresh/reopen sequence
+passed.
 
-Anvil, Forge and Ember reached rendered windows, but the read-only AT-SPI
-observer sent a signed coordinate argument where the protocol requires unsigned.
-They stopped before any Mission input. Frost opened and selected the saved
-Mission, but OCR did not bind its exact ID or find Refresh, and the scroll samples
-did not move. Inspect therefore remained unexecuted. These are retained failures,
-not passes inferred from source or screenshots. The preceding
-[42228324473 round](https://github.com/beamiter/forge/actions/runs/42228324473) also
-remains failed; its blank-frame, changing-tree and Missions-entry observations
-must not be combined with this round to claim a completed sequence.
-Pure observer regression tests do not replace another exact-head native run.
-Frost now displays the stable Mission ID, but its exact identity/revision and
-repository-bound fields must still be observed in every required stage.
+Anvil and Forge opened real windows, but the observer stopped with an AT-SPI
+`NotSupported` error before Mission input. GTK 4.14 does not implement general
+Text.GetRangeExtents for these widgets. The old diagnostic did not identify the
+failing node, so this is a verified compatibility defect, not proof of that
+particular exception's call site. Ember selected the existing Mission and read
+its exact identity/revision, five repository candidates and four core pins.
+Its fixed-distance rewind then left Inspect above the viewport and searched in
+the wrong direction. Inspect, refresh, close and reopen were not executed.
+Frost opened the plan and really scrolled, but a single adjacent pixel merged
+with its scrollbar thumb and made the strict shape check reject it. Its ID crop
+also failed the unchanged OCR confidence threshold. Identity and subsequent
+inspection phases were not accepted.
+
+The earlier [42245525353](https://github.com/beamiter/forge/actions/runs/42245525353)
+and [42228324473](https://github.com/beamiter/forge/actions/runs/42228324473) rounds
+remain failed. Their observations must not be combined with later rounds to
+claim a completed sequence. Offline pixel replay and pure observer regression
+tests do not replace another exact-head native run. Frost displays its stable
+Mission ID, but the ID/revision and repository-bound fields must still be
+observed in every required stage.
 
 Results must distinguish:
 
@@ -107,7 +117,23 @@ AT-SPI requests keep introspection disabled and use explicit protocol types:
 unsigned SCREEN coordinates for Component.GetExtents and Text.GetRangeExtents,
 signed text offsets for Text.GetText and Text.GetRangeExtents. Signature tests
 use a typed mock when dbus-python is unavailable locally; they are not a real
-D-Bus or native-application pass. Protocol errors remain hard failures.
+D-Bus or native-application pass. Protocol errors remain hard failures, with one
+explicit capability fallback: only the actual Text.GetRangeExtents call's exact
+D-Bus NotSupported error can use same-frame OCR. Other calls, proxy construction
+and other errors cannot enter that fallback. Read-only call diagnostics retain
+the owner, node path, method, typed arguments and error name.
+
+Fallback OCR never receives expected field text. It uses one fixed grayscale
+300% PSM 11 capture per frame and keeps actual word boxes. Every contributing
+word must have confidence at least 80 and its complete box must lie inside the
+node's observed clip. Complete logical lines must match the node's public text,
+allowing only leading/trailing and repeated horizontal whitespace normalization.
+It never repairs characters or joins values across frames. Partial or missing
+proof remains `unknown_text`, not an empty successful observation. Automatic
+visual wrapping of a logical line is not reconstructed; it can still leave
+status or candidate text unknown and fail the native contract. Tree, owner,
+text, geometry and state checks still apply. Required status evidence must come
+from its own Mission control, not another body or terminal string.
 
 X11 window mapping is not proof of a painted frame or an accessible tree.
 Each observation has at most 20 attempts within 15 seconds, also bounded by the
@@ -137,9 +163,43 @@ Refresh and Back require the complete observed toolbar, and Inspect remains
 bound to its environment-to-attention band. These pointer targets need two equal
 current observations and the existing ownership/deadline checks.
 
+Frost's measured ID crop uses a fixed grayscale 300% PSM 6 pass, without expected
+ID guidance. The confidence-80 and conflicting-ID rejection rules stay unchanged.
+The blue scrollbar mask is separate from the grayscale button mask. It must
+prove a unique high-fill thumb and its observed longer track inside the Mission
+scope, with stable geometry in two frames; an adjacent non-blue pixel cannot
+silently relax the shape threshold.
+
 Frost wheel input uses the center of a unique observed Mission scrollbar thumb,
 not the window's outside gutter. Two current captures must agree on the thumb
 and owned window. Cached panel bounds are bound to process birth and window and
 are cleared on close, relaunch or a discarded observation. Real-pixel replay
 proves recognition and coordinate placement only; actual scrolling and the
 complete inspection/refresh/reopen sequence require a later native experiment.
+
+
+Ember navigation uses bounded direction and measured progress instead of a fixed
+rewind distance. A clipped control can inform scroll direction but cannot become
+a pointer target. Input still requires two matching visible, enabled, sensitive
+observations in the owned Mission scope. Its `Close window` header button must
+be the unique direct child of the validated nested Mission frame and lie wholly
+inside that frame's header strip; unrelated controls are not made visible.
+
+## Ordinary observer compatibility gate
+
+The ordinary CI job `Native observer compatibility` runs pure contracts normally
+and with Python optimization, then a standalone GTK 4.14 fixture in private
+X11/D-Bus and XDG directories. The fixture exercises Label, read-only Entry,
+TextView, clipped hidden text and a narrow automatically wrapped label, using
+the delivered Reader OCR callback. It
+records real NotSupported capability diagnostics, checks visible text geometry,
+rejects the clipped sentinel, and retains the wrapped logical line as unknown.
+It does not launch any terminal application,
+production host, provider or real Task and sends no input to the fixture.
+
+The real GTK test is opt-in with `JTERM_GTK_GEOMETRY_SMOKE=1`; ordinary local
+discovery reports it as skipped. Explicit opt-in with missing dependencies or
+the wrong GTK version fails. CI preserves only fixture JSON/PNG/version evidence,
+not private homes or host state. A pass would cover this isolated compatibility
+fixture only, never the four-application Mission contract. Local tests on a
+machine without GTK are not a real GTK pass.

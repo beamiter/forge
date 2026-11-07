@@ -40,6 +40,10 @@ ENV_KEYS = {'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_C
 OBSERVATION_ATTEMPTS = 20
 OBSERVATION_SECONDS = 15
 OBSERVATION_INTERVAL = .2
+# One declared segmentation, independent of expected Mission values.
+IDENTITY_OCR_SCALE = 3
+FROST_THUMB_MASK = '(b>=128/255)*(b-r>=80/255)*(b-g>=50/255)*(g-r>=25/255)'
+FROST_RAIL_MASK = '(b>=60/255)*(b-r>=40/255)*(b-g>=25/255)*(g-r>=10/255)'
 
 
 def require(test, message):
@@ -207,7 +211,7 @@ def allowed_control(app, label, plan, purpose):
     if purpose == 'expand':
         return app == 'ember' and label in {'beamiter/' + n for n in REPOS}
     if purpose == 'close_mission':
-        return (app == 'frost' and label == 'Back') or (app == 'ember' and label == 'Close')
+        return (app == 'frost' and label == 'Back') or (app == 'ember' and label == 'Close window')
     return False
 
 
@@ -515,6 +519,109 @@ def observation_notice_text(observation):
     return observation['visible_text'] + '\n' + frost_lines(observation.get('frost_source_rows', []))
 
 
+GTK_STATUS_SUMMARY = {
+    'anvil': r'(?:0|[1-9][0-9]*) Mission\(s\) need review\. Only inspected, version-bound receipts count as passed\.',
+    'forge': r'(?:0|[1-9][0-9]*) saved Missions · (?:0|[1-9][0-9]*) need you',
+}
+
+
+def gtk_status_node(app, observation):
+    """Bind the status widget through the frozen production widget structure.
+
+    GTK layout changes fail closed. Names locate source-defined anchors only;
+    they never supply status visibility or replace a missing Text observation.
+    """
+    if app not in GTK_STATUS_SUMMARY:
+        return None
+    nodes = observation.get('nodes', observation.get('scoped_nodes', []))
+    by_path = {n['path']: n for n in nodes}
+    if len(by_path) != len(nodes): return None
+    scoped = {n['path'] for n in observation.get('scoped_nodes', [])}
+    refresh = [n for n in nodes if n['path'] in scoped and n['role']==43 and n['name']==REFRESH[app]]
+    if len(refresh)!=1: return None
+    root = by_path.get(refresh[0]['parent'])
+    if root is None: return None
+    paths = root.get('children',[])
+    if len(set(paths)) != len(paths) or any(p not in by_path for p in paths): return None
+    children = [by_path[p] for p in paths]
+    owned = lambda n: n.get('pid') == observation.get('pid') and n.get('owner') == observation.get('owner')
+    if not observation.get('pid') or not observation.get('owner') or not owned(root): return None
+    if any(not owned(n) or n['parent']!=root['path'] for n in children): return None
+    current=root; seen=set(); frame_seen=False
+    while current is not None and current['path'] not in seen:
+        if not owned(current): return None
+        seen.add(current['path'])
+        if current['role']==23 and (app!='anvil' or current['name']==FRAME['anvil']):
+            if not inside(current.get('rect',[]),observation.get('window_rect',[])): return None
+            frame_seen=True
+        if current['path']==observation.get('root'): break
+        current=by_path.get(current['parent'])
+    if not frame_seen or current is None or current['path']!=observation.get('root'): return None
+    def anchor(index,text):
+        return children[index]['role']==29 and children[index]['name']==text
+    if app=='forge':
+        if (len(children)<7 or children[2]['path']!=refresh[0]['path']
+                or not anchor(0,'Missions · linked repository delivery')
+                or not anchor(1,"A Mission links existing tasks and exact repository candidates. Save edits only the plan. Inspection is read only. Start, validation, review and integration stay in each task's existing controls.")
+                or children[4]['name']!='New Mission' or children[6]['role']!=29
+                or not re.fullmatch(r'Needs you · (?:select a Mission|unsaved plan; evidence actions are unavailable|(?:0|[1-9][0-9]*) current reasons)',children[6]['name'])):
+            return None
+        status=children[5]
+    else:
+        if (len(children)<14 or children[1]['path']!=refresh[0]['path']
+                or not anchor(0,'One goal, exact repositories and linked task runs. Inspection reads Git and saved evidence; it does not start work or publish code.')
+                or not anchor(3,'Needs-you reasons for saved plans · read-only')
+                or not anchor(5,'Title, acceptance goal and required environment')
+                or not anchor(9,'Repository = exact absolute worktree path, one per line')):
+            return None
+        # FlowBox may expose an intermediate FlowBoxChild; follow only actual
+        # same-owner edges to the unique source-defined Inspect action.
+        descendants=[]; pending=[children[11]['path']]; visited=set()
+        while pending:
+            path=pending.pop()
+            if path in visited or path not in by_path: return None
+            visited.add(path); n=by_path[path]
+            if not owned(n): return None
+            descendants.append(n); pending.extend(n.get('children',[]))
+        if len([n for n in descendants if n['role']==43 and n['name']==INSPECT['anvil']])!=1:
+            return None
+        status=children[12]
+    return status if status['role']==29 and status['path'] in scoped else None
+
+
+def status_text_unknown(observation, status):
+    return (status is None or status.get('text_geometry_status')=='unknown'
+            or bool(status.get('text_geometry',{}).get('unproven_lines'))
+            or any(u['path']==status['path'] for u in observation.get('unknown_text',[])))
+
+
+def unknown_notices(app, observation, plan):
+    """Unknown header text is not proof of absence; body clipping is separate."""
+    if app in GTK_STATUS_SUMMARY:
+        return status_text_unknown(observation,gtk_status_node(app,observation))
+    nodes = observation.get('scoped_nodes', [])
+    paths = {n['path'] for n in nodes}
+    unknown = [u for u in observation.get('unknown_text', []) if u['path'] in paths]
+    if not unknown:
+        return False
+    refresh = [n for n in nodes if n.get('rect') and n['role'] in (43,62)
+               and n['name'] == REFRESH[app]]
+    catalog = [n for n in nodes if n.get('rect') and n['role'] in (43,62)
+               and allowed_control(app,n['name'],plan,'select')]
+    if len(refresh) != 1 or len(catalog) != 1:
+        return True
+    bounds = observation.get('mission_content_rect',observation.get('window_rect'))
+    if not bounds:
+        return True
+    top = refresh[0]['rect'][1]+refresh[0]['rect'][3] if app == 'ember' else bounds[1]
+    bottom = catalog[0]['rect'][1]
+    if bottom < top:
+        return True
+    x,_,w,_ = bounds
+    return any(u.get('clip') and u['clip'][0] < x+w and u['clip'][0]+u['clip'][2] > x
+               and u['clip'][1] < bottom and u['clip'][1]+u['clip'][3] > top for u in unknown)
+
+
 def inspection_obstacles(text):
     return [message for message in (*INSPECTION_BUSY, *INSPECTION_INVALID) if message in text]
 
@@ -581,12 +688,14 @@ def frost_catalog_bounds(rows, plan):
 def clean_inspection_status(app, observation, plan):
     """Require a visible, source-defined notice-free status/header region."""
     text = observation_notice_text(observation)
-    if inspection_obstacles(text):
+    if inspection_obstacles(text) or unknown_notices(app,observation,plan):
         return False
-    if app == 'anvil':
-        return bool(re.search(r'\b\d+ Mission\(s\) need review\. Only inspected, version-bound receipts count as passed\.', text))
-    if app == 'forge':
-        return bool(re.search(r'\b\d+ saved Missions · \d+ need you\b', text))
+    if app in GTK_STATUS_SUMMARY:
+        status=gtk_status_node(app,observation)
+        if status_text_unknown(observation,status) or not status.get('visible'):
+            return False
+        value=status.get('visible_text','')
+        return (value==status.get('text') and re.fullmatch(GTK_STATUS_SUMMARY[app],value) is not None)
     if app == 'ember':
         nodes = observation.get('scoped_nodes', [])
         refresh = [n for n in nodes if n.get('visible') and n['role'] in (43,62)
@@ -865,7 +974,8 @@ class Reader:
         if self.app != 'frost':
             observation = observe_atspi(self.process.pid, self.window_rect,
                 FRAME['ember'] if self.app=='ember' and self.mission_open else None,
-                deadline=self.observation_deadline)
+                deadline=self.observation_deadline, frame_id=stem,
+                text_geometry=self.clip_text_geometry(png, stem, window_rect))
             self.checkpoint()
             if self.app in ('anvil', 'ember') and self.mission_open:
                 frames = [n for n in observation['nodes'] if n['role'] == 23 and n['name'] == FRAME[self.app]]
@@ -907,6 +1017,29 @@ class Reader:
         (self.out / (stem + '.json')).write_text(json.dumps(observation, indent=2) + '\n')
         return observation
 
+    def clip_text_geometry(self, png, stem, window_rect):
+        """One sparse OCR pass of this frame, never supplied expected text."""
+        frame_rows = None
+        def read(node_path, clip, *, deadline):
+            nonlocal frame_rows
+            require(inside(clip, window_rect), 'AT-SPI OCR crop escaped captured window')
+            require(time.monotonic() < deadline, 'AT-SPI OCR deadline exhausted')
+            path = self.out / (stem + '.atspi-ocr.png')
+            if frame_rows is None:
+                self.run(['convert', str(png), '+repage', '-colorspace', 'Gray',
+                          '-resize', '300%', str(path)])
+                raw = self.run(['tesseract', str(path), 'stdout', '--psm', '11', 'tsv'])
+                path.with_suffix('.tsv').write_text(raw)
+                frame_rows = ocr_rows(raw, scale=3)
+                for word in frame_rows:
+                    word['left'] += window_rect[0]; word['top'] += window_rect[1]
+            x,y,w,h = clip
+            # Keep edge-straddling words unchanged so the observer rejects them.
+            rows = [dict(r) for r in frame_rows if r['left'] < x+w and r['left']+r['width'] > x
+                    and r['top'] < y+h and r['top']+r['height'] > y]
+            return dict(frame_id=stem,rows=rows,image=path.name)
+        return read
+
     def frost_readout(self, png, stem, rows, regions=True):
         # All alternate views are deterministic crops of this same owned frame.
         # Clear ImageMagick's virtual X11 page offset before any local crop.
@@ -929,6 +1062,37 @@ class Reader:
             '-define', 'connected-components:verbose=true', '-connected-components', '8', 'null:'])
         components = frost_components(components, self.window_rect)
         observation['frost_components'] = components
+        # Luminance joins anti-aliased white text to the blue thumb. Separate
+        # chroma from brightness before connectivity; never lower the fill gate.
+        # Save the exact mask as evidence. Coordinates still come only from
+        # measured components, within the current owned Mission scope.
+        mask = self.out / (stem + '.thumb-mask.png')
+        self.run(['convert', str(png), '+repage', '-colorspace', 'sRGB',
+                  '-fx', FROST_THUMB_MASK, '-colorspace', 'Gray', str(mask)])
+        thumb_raw = self.run(['convert', '-precision', '16', str(mask),
+            '-define', 'connected-components:verbose=true', '-connected-components', '8', 'null:'])
+        observation['frost_scroll_components'] = frost_components(thumb_raw, self.window_rect)
+        observation['frost_scroll_mask'] = mask.name
+        # A blue body stroke is not a scrollbar. Measure the real longer rail
+        # in the candidate's own observed columns, without guessed track bounds.
+        for index,candidate in enumerate(observation['frost_scroll_components']):
+            sx,sy,sw,sh = candidate['rect']
+            if not (scope and inside(candidate['rect'],scope) and sx > self.window_rect[2]*.9
+                    and 4 <= sw <= 16 and sh > sw*3 and candidate['fill'] >= .95):
+                continue
+            rail_path = self.out / ('%s.rail-%03d.png' % (stem,index))
+            self.run(['convert', str(png), '+repage', '-crop', '%dx%d+%d+0' %
+                (sw,self.window_rect[3],sx), '+repage', '-colorspace', 'sRGB',
+                '-fx', FROST_RAIL_MASK, '-colorspace', 'Gray', str(rail_path)])
+            rail_raw = self.run(['convert', '-precision', '16', str(rail_path),
+                '-define', 'connected-components:verbose=true', '-connected-components', '8', 'null:'])
+            rails = frost_components(rail_raw,[0,0,sw,self.window_rect[3]])
+            rails = [dict(rect=[r['rect'][0]+sx,*r['rect'][1:]],fill=r['fill']) for r in rails]
+            rails = [r for r in rails if r['fill'] >= .95 and r['rect'][2] == sw
+                     and r['rect'][3] > sh and inside(candidate['rect'],r['rect']) and inside(r['rect'],scope)]
+            if len(rails) == 1:
+                candidate['track'] = rails[0]['rect']
+                candidate['track_image'] = rail_path.name
         buttons = [c['rect'] for c in components if regions and scope and inside(c['rect'], scope)
                    and 16 <= c['rect'][3] <= 60 and c['rect'][2] >= c['rect'][3]*1.5
                    and c['fill'] >= .7]
@@ -946,13 +1110,14 @@ class Reader:
                        (crop[2],crop[3],crop[0],crop[1]), '+repage', '-colorspace', 'Gray']
             if button:
                 command += ['-threshold', '22%']
-            command += ['-resize', '200%']
+            scale = 2 if button else IDENTITY_OCR_SCALE
+            command += ['-resize', str(scale*100)+'%']
             if border:
                 command += ['-bordercolor', 'white', '-border', str(border*2)]
             self.run(command+[str(path)])
             raw = self.run(['tesseract', str(path), 'stdout', '--psm', '7' if button else '6', 'tsv'])
             (self.out / (stem+'.'+suffix+'.tsv')).write_text(raw)
-            found = ocr_rows(raw)
+            found = ocr_rows(raw, scale=scale)
             for word in found:
                 word['left'] += crop[0]-border; word['top'] += crop[1]-border
                 word['block_num'] = suffix+':'+word['block_num']
@@ -960,7 +1125,7 @@ class Reader:
             # can be silently omitted to manufacture a complete control.
             valid = all(inside([r[k] for k in ('left','top','width','height')], crop) for r in found)
             return dict(rect=rect, rows=found, text=frost_lines(found, complete=True) if valid else '',
-                        image=path.name, psm=7 if button else 6, unclipped=valid)
+                        image=path.name, psm=7 if button else 6, scale=scale, unclipped=valid)
 
         for index, rect in enumerate(sorted(buttons, key=lambda r:(r[1],r[0]))):
             view = crop_view(rect, 'button-%02d' % index, button=True)
@@ -995,6 +1160,9 @@ class Reader:
                 if (n['role'] in (43, 62) and n.get('visible') and state(n, 8) and state(n, 24)
                         and allowed_control(self.app, n['name'], self.plan, purpose)):
                     result.append(dict(label=n['name'], rect=n['rect'], node=n['path']))
+            if self.app == 'ember' and purpose == 'close_mission':
+                close = observation.get('mission_header_close')
+                result = [t for t in result if close is not None and t['node'] == close]
             return result
         rows = observation['rows']
         if purpose in ('refresh', 'close_mission'):
@@ -1038,8 +1206,14 @@ class Reader:
         self.run(['xdotool', 'mousemove', str(entry['x']), str(entry['y']), 'click', '1'])
         time.sleep(.3)
 
-    def scroll(self, amount):
+    def scroll(self, amount, observation=None):
         self.bind_window()
+        if observation is not None:
+            require(observation.get('pid') == self.process.pid and observation.get('window') == self.window
+                    and observation.get('window_rect') == self.window_rect,
+                    'Owned window changed before navigation input')
+            require(observation.get('mission_content_rect') == self.scroll_rect
+                    and inside(self.scroll_rect,self.window_rect), 'Navigation viewport changed before wheel')
         x,y,w,h = getattr(self, 'scroll_rect', self.window_rect)
         # Public wheel over the observed viewport's gutter avoids editing and
         # avoids nested multiline Goal/JSON text inputs consuming the wheel.
@@ -1053,15 +1227,18 @@ class Reader:
             for label in ('scroll-target', 'scroll-target-settled'):
                 obs = self.observe(label, control=True)
                 scope = obs.get('frost_panel_scope')
-                thumbs = [c['rect'] for c in obs.get('frost_components', []) if scope
+                thumbs = [c for c in obs.get('frost_scroll_components', []) if scope
                     and inside(c['rect'], scope) and c['rect'][0] > self.window_rect[2]*.9
-                    and 4 <= c['rect'][2] <= 16 and c['rect'][3] > c['rect'][2]*3 and c['fill'] >= .95]
+                    and 4 <= c['rect'][2] <= 16 and c['rect'][3] > c['rect'][2]*3 and c['fill'] >= .95
+                    and c.get('track') and inside(c['rect'],c['track']) and inside(c['track'],scope)]
                 require(len(thumbs) == 1, 'No unique observed Mission scrollbar')
-                choices.append((thumbs[0], obs['window'], tuple(obs['window_rect'])))
+                require(obs.get('pid') == self.process.pid, 'Mission scrollbar belongs to another PID')
+                choices.append((thumbs[0]['rect'],thumbs[0]['track'],tuple(scope),
+                                obs['window'],tuple(obs['window_rect']),obs['pid']))
                 evidence.append(obs['evidence'])
             require(choices[0] == choices[1], 'Mission scrollbar changed before wheel input')
             self.bind_window()
-            require((self.window, tuple(self.window_rect)) == choices[0][1:],
+            require((self.window, tuple(self.window_rect), self.process.pid) == choices[0][3:],
                     'Owned window changed before scrollbar input')
             sx,sy,sw,sh = choices[0][0]
             point = [self.window_rect[0]+sx+sw//2, self.window_rect[1]+sy+sh//2]
@@ -1072,7 +1249,111 @@ class Reader:
                   '--delay', '40', '5' if amount > 0 else '4'])
         time.sleep(.2)
 
+    def ember_navigation(self, observation, purpose, label=None):
+        """Offscreen geometry chooses wheel direction only, never visibility."""
+        require(self.app == 'ember' and self.mission_open, 'Navigation needs the owned Ember Mission')
+        require(observation.get('pid') == self.process.pid and observation.get('window') == self.window
+                and observation.get('window_rect') == self.window_rect, 'Navigation ownership changed')
+        nodes = observation['scoped_nodes']; by_path = {n['path']: n for n in nodes}
+        frames = [n for n in nodes if n['role'] == 23 and n['name'] == FRAME['ember']]
+        require(len(frames) == 1, 'No unique navigation Mission frame')
+        frame = frames[0]; viewport = observation.get('mission_content_rect')
+        require(viewport and inside(viewport,frame['rect']) and inside(frame['rect'],self.window_rect),
+                'Navigation viewport escaped owned Mission')
+        def descendant(n):
+            seen = set()
+            while n is not None and n['path'] not in seen:
+                if n['path'] == frame['path']: return True
+                seen.add(n['path']); n = by_path.get(n['parent'])
+            return False
+        def matches(n):
+            if purpose == 'freeze':
+                return n['name'] == 'Freeze observed candidates'
+            return allowed_control('ember',n['name'],self.plan,purpose) and (label is None or n['name'] == label)
+        choices = [n for n in nodes if n['role'] in (43,62) and matches(n)]
+        require(len(choices) == 1, 'No unique navigation control: '+purpose)
+        n = choices[0]
+        require(n.get('pid') == self.process.pid == frame.get('pid') and n.get('owner') == frame.get('owner')
+                and descendant(n), 'Navigation control escaped owned Mission ancestry')
+        require(purpose == 'freeze' or (state(n,8) and state(n,24)), 'Navigation control is disabled')
+        rect = n.get('rect',[])
+        require(len(rect) == 4 and all(type(v) is int for v in rect) and min(rect[2:]) > 0,
+                'Invalid navigation control rectangle')
+        if purpose == 'close_mission':
+            require(n['parent'] == frame['path'] and n['path'] == observation.get('mission_header_close'),
+                    'Close control is not the Mission title-bar button')
+            viewport = observation.get('mission_header_rect')
+            require(viewport and inside(viewport,frame['rect']), 'No owned Mission header strip')
+        x,y,w,h = rect; vx,vy,vw,vh = viewport
+        require(vx <= x and x+w <= vx+vw and h <= vh, 'Navigation control cannot fit viewport')
+        direction = -1 if y < vy else 1 if y+h > vy+vh else 0
+        distance = max(vy-y,y+h-vy-vh,0)
+        binding = (self.process.pid,frame['owner'],frame['path'],n['path'],n['name'],
+                   self.window,tuple(self.window_rect),tuple(viewport))
+        return n,direction,distance,binding
+
+    def locate_ember(self, purpose, label=None):
+        previous = None
+        for index in range(24):
+            obs = self.observe('locate-%s-%02d' % (purpose,index), control=True)
+            n,direction,distance,binding = self.ember_navigation(obs,purpose,label)
+            if previous is not None:
+                old_binding,old_distance,old_y,old_direction = previous
+                require(binding == old_binding, 'Navigation binding changed')
+                require(distance < old_distance and (n['rect'][1]-old_y)*old_direction < 0,
+                        'Navigation made no progress toward control')
+            if direction == 0:
+                require(n.get('visible'), 'Contained navigation control is not visible')
+                return obs,n
+            previous = (binding,distance,n['rect'][1],direction)
+            self.scroll(direction*4, observation=obs)
+        raise RuntimeError('Navigation 24-step budget exhausted: '+purpose)
+
+    def ember_header(self):
+        """Prove the header and upward saturation, within one 24-step budget."""
+        previous = None
+        for index in range(24):
+            obs = self.observe('header-%02d' % index, control=True)
+            n,direction,distance,binding = self.ember_navigation(obs,'refresh')
+            if previous is not None:
+                old_binding,old_y,old_distance,old_direction = previous
+                require(binding == old_binding, 'Header navigation binding changed')
+                delta = n['rect'][1]-old_y
+                if delta == 0:
+                    require(direction == 0 and n.get('visible') and
+                            bound_identity(obs['visible_text'],self.plan),
+                            'Header stopped before identity and Refresh were visible')
+                    return obs
+                require(delta*old_direction < 0 and (old_distance == 0 or distance < old_distance),
+                        'Header navigation made no progress')
+            if direction == 0:
+                require(n.get('visible'), 'Contained header control is not visible')
+            wheel = direction if direction else -1
+            previous = (binding,n['rect'][1],distance,wheel)
+            self.scroll(wheel*4, observation=obs)
+        raise RuntimeError('Header navigation 24-step budget exhausted')
+
+    def rewind(self):
+        if self.app == 'ember' and self.mission_open:
+            return self.ember_header()
+        self.scroll(-30)
+
     def press(self, purpose, attempts=10, label=None):
+        if self.app == 'ember' and self.mission_open and purpose not in ('open','menu','select'):
+            first,_ = self.locate_ember(purpose,label)
+            choices = self.targets(first,purpose)
+            if label is not None: choices = [t for t in choices if t['label'] == label]
+            second = self.observe(purpose+'-settled',control=True)
+            again = self.targets(second,purpose)
+            if label is not None: again = [t for t in again if t['label'] == label]
+            require(len(choices) == 1 and again == choices and
+                    all(first.get(k) == second.get(k) for k in ('pid','window','window_rect')),
+                    'No unique settled public control: '+purpose)
+            require(not any(s in observation_notice_text(second) for s in INSPECTION_BUSY)
+                    and (purpose not in ('inspect','refresh') or not any(unknown_notices(self.app,o,self.plan) for o in (first,second))),
+                    'Mission notice is busy or unknown')
+            self.click(choices[0],purpose,second['evidence'])
+            return
         for _ in range(attempts):
             first = self.observe(purpose, control=True)
             choices = self.targets(first, purpose)
@@ -1084,7 +1365,8 @@ class Reader:
                 again = self.targets(second, purpose)
                 if label is not None:
                     again = [t for t in again if t['label'] == label]
-                if again == choices and not any(s in observation_notice_text(second) for s in ('Reading the host', 'Waiting for the host')):
+                if (again == choices and not any(s in observation_notice_text(second) for s in INSPECTION_BUSY)
+                        and (purpose not in ('inspect','refresh') or not any(unknown_notices(self.app,o,self.plan) for o in (first,second)))):
                     self.click(choices[0], purpose, second['evidence'])
                     return
             if purpose in ('select', 'refresh', 'open', 'menu'):
@@ -1108,7 +1390,7 @@ class Reader:
                 self.coverage['inspection_errors'].append(dict(problem=problem,evidence=observation['evidence']))
             if clean_inspection_status(self.app, observation, self.plan):
                 self.coverage['inspection_status'].append(dict(stage=stage,evidence=observation['evidence']))
-            for entry in inspection_validation(text, self.plan):
+            for entry in ([] if unknown_notices(self.app,observation,self.plan) else inspection_validation(text, self.plan)):
                 self.coverage['inspection_validation'].setdefault(entry['repository'],[]).append(
                     dict(entry,stage=stage,evidence=observation['evidence']))
         identity_texts = ([v['text'] for v in observation.get('identity_views', [])]
@@ -1144,7 +1426,8 @@ class Reader:
                 self.coverage['reasons'].append(dict(text=line, stage=stage,evidence=observation['evidence']))
 
     def scan(self, stage):
-        self.scroll(-24)
+        if self.app == 'ember': self.ember_header()
+        else: self.scroll(-24)
         seen = set()
         for index in range(24):
             obs = self.observe(stage+'-%02d' % index)
@@ -1157,7 +1440,7 @@ class Reader:
         self.coverage['stages'][stage] = 'scan_complete' if stage == 'inspected' else True
 
     def close_mission(self):
-        self.scroll(-30)
+        if self.app != 'ember': self.rewind()
         if self.app == 'anvil':
             self.key_close()
             self.mission_open = False
@@ -1213,11 +1496,11 @@ class Reader:
                      else len(self.targets(first, 'inspect')) == 1)
             if ready:
                 require(not fatal, 'Inspection rejected: ' + '; '.join(fatal))
-            if ready and not obstacles:
+            if ready and not obstacles and not unknown_notices(self.app,first,self.plan):
                 second = self.observe('inspect-completion-%02d-settled' % attempt, control=True)
                 ready_again = (clean_inspection_status(self.app, second, self.plan) if self.app == 'frost'
                                else self.targets(second,'inspect') == self.targets(first,'inspect'))
-                if ready_again and not inspection_obstacles(observation_notice_text(second)):
+                if ready_again and not inspection_obstacles(observation_notice_text(second)) and not unknown_notices(self.app,second,self.plan):
                     self.coverage['stages']['inspection_ready'] = dict(status='settled',
                         evidence=[first['evidence'],second['evidence']],
                         basis='notice_free_header' if self.app=='frost' else 'enabled_sensitive_inspect_control')
@@ -1228,6 +1511,17 @@ class Reader:
     def freeze_after_refresh(self):
         labels = {'anvil':'Freeze inspected commits','forge':'Freeze inspected clean commits as candidates',
                   'ember':'Freeze observed candidates','frost':'Use observed commits'}
+        if self.app == 'ember':
+            obs,n = self.locate_ember('freeze')
+            second = self.observe('freeze-settled',control=True)
+            again,_,_,binding = self.ember_navigation(second,'freeze')
+            require(n == again and all(obs.get(k) == second.get(k) for k in ('pid','window','window_rect')),
+                    'Freeze control changed before readback')
+            disabled = not state(n,8) and not state(n,24)
+            self.coverage['stages']['freeze_after_refresh'] = dict(
+                status='disabled' if disabled else 'unexpected_enabled', evidence=second['evidence'])
+            require(disabled, 'Refresh did not visibly disable adoption')
+            return
         self.scroll(-30)
         for index in range(16):
             obs = self.observe('refresh-freeze-state-%02d' % index, control=True)
@@ -1253,16 +1547,16 @@ class Reader:
         self.open()
         if self.app == 'ember':
             for name in REPOS:
-                self.scroll(-30)
+                self.rewind()
                 self.press('expand', label='beamiter/' + name)
         self.scan('initial')
         # No inspection can be attributed to the exact plan until its visible
         # identity and revision have been established in this app.
         if any(e['stage']=='initial' for e in self.coverage['identity_bindings']):
-            self.scroll(-30); self.press('inspect'); self.wait_inspection_settled(); self.scan('inspected')
+            self.rewind(); self.press('inspect'); self.wait_inspection_settled(); self.scan('inspected')
         else:
             self.coverage['stages']['inspected'] = 'not_run_identity_not_visible'
-        self.scroll(-30); self.press('refresh'); self.scan('refreshed'); self.freeze_after_refresh()
+        self.rewind(); self.press('refresh'); self.scan('refreshed'); self.freeze_after_refresh()
         if self.close_mission():
             self.open(); self.scan('mission_reopened')
         self.close_app()
@@ -1270,7 +1564,7 @@ class Reader:
         self.launch(2); self.open()
         if self.app == 'ember':
             for name in REPOS:
-                self.scroll(-30)
+                self.rewind()
                 self.press('expand', label='beamiter/' + name)
         self.scan('app_reopened'); self.close_app()
         self.coverage['stages']['normal_close_2'] = True
@@ -1290,6 +1584,13 @@ class Reader:
             self.log.close()
         (self.out / 'inputs.json').write_text(json.dumps(self.inputs, indent=2)+'\n')
         (self.out / 'coverage.json').write_text(json.dumps(self.coverage, indent=2)+'\n')
+
+
+def record_failure(target, error):
+    target['error'] = str(error)
+    diagnostics = getattr(error,'atspi_diagnostics',None)
+    if diagnostics is not None:
+        target['atspi_diagnostics'] = diagnostics
 
 
 def main(argv=None):
@@ -1350,7 +1651,7 @@ def main(argv=None):
             try:
                 reader.execute(); entry['status'] = 'passed'
             except Exception as error:
-                entry['error'] = str(error)
+                record_failure(entry,error)
             finally:
                 reader.cleanup()
                 entry['coverage'] = reader.coverage
@@ -1360,13 +1661,13 @@ def main(argv=None):
         if all(r['status'] == 'passed' for r in result['applications'].values()):
             result['status'] = 'passed'
     except Exception as error:
-        result['error'] = str(error)
+        record_failure(result,error)
     finally:
         if host:
             try:
                 host.close(); result['host_guard_samples'] = host.samples
             except Exception as error:
-                result['error'] = str(error); result['status'] = 'failed'
+                record_failure(result,error); result['status'] = 'failed'
         (out / 'result.json').write_text(json.dumps(result, indent=2)+'\n')
     return 0 if result['status'] == 'passed' else 1
 

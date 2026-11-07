@@ -21,6 +21,54 @@ env:
   CARGO_DENY_VERSION: "0.20.2"
 
 jobs:
+  native-observer-compatibility:
+    name: Native observer compatibility
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install signed official native observation dependencies
+        timeout-minutes: 6
+        run: timeout 350 bash scripts/mission-acceptance/native/build.sh packages runtime
+      - name: Check native observer pure and synthetic-pixel contracts
+        run: |
+          set -Eeuo pipefail
+          command -v convert tesseract
+          python3 -B -m unittest discover -s scripts/mission-acceptance/native -p 'test_*.py'
+          PYTHONOPTIMIZE=1 python3 -B -m unittest discover -s scripts/mission-acceptance/native -p 'test_*.py'
+      - name: Verify real GTK text geometry without applications or providers
+        timeout-minutes: 3
+        run: |
+          set -Eeuo pipefail
+          private=$(mktemp -d "$RUNNER_TEMP/observer-private.XXXXXXXX")
+          mkdir -m 0700 "$private"/{home,config,data,state,cache,runtime,tmp}
+          evidence="$RUNNER_TEMP/native-observer-compatibility"
+          mkdir -m 0700 "$evidence"
+          env -i PATH=/usr/bin:/bin USER="$(id -un)" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+            HOME="$private/home" TMPDIR="$private/tmp" \
+            XDG_CONFIG_HOME="$private/config" XDG_DATA_HOME="$private/data" \
+            XDG_STATE_HOME="$private/state" XDG_CACHE_HOME="$private/cache" \
+            XDG_RUNTIME_DIR="$private/runtime" \
+            GDK_BACKEND=x11 GSK_RENDERER=cairo LIBGL_ALWAYS_SOFTWARE=1 GTK_A11Y=atspi NO_AT_BRIDGE=0 \
+            JTERM_GTK_GEOMETRY_SMOKE=1 JTERM_GTK_GEOMETRY_SMOKE_OUT="$evidence" \
+            dbus-run-session -- xvfb-run --auto-servernum \
+              --server-args='-screen 0 1400x1000x24 -nolisten tcp' \
+              /usr/bin/python3 -B -m unittest discover \
+                -s scripts/mission-acceptance/native -p 'test_gtk_geometry_smoke.py'
+      - name: Preserve only observer fixture evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: native-observer-compatibility
+          path: ${{ runner.temp }}/native-observer-compatibility/
+          if-no-files-found: warn
+          retention-days: 7
+
   privacy:
     name: Tracked-text privacy guard
     runs-on: ubuntu-24.04

@@ -22,6 +22,56 @@ ENV = {'GITHUB_REPOSITORY': 'beamiter/forge', 'GITHUB_SHA': '3' * 40,
        'GITHUB_REF': 'refs/heads/master', 'GITHUB_RUN_ID': '123', 'GITHUB_RUN_ATTEMPT': '1'}
 
 
+class ObserverCompatibilityJobTests(unittest.TestCase):
+    def job(self):
+        source = (HERE.parents[2] / '.github/workflows/ci.yml').read_text()
+        start = source.index('  native-observer-compatibility:\n')
+        match = re.search(r'\n  [a-z][a-z0-9-]*:\n', source[start + 1:])
+        self.assertIsNotNone(match)
+        return source[start:start + 1 + match.start()]
+
+    def test_only_read_permission_and_pinned_no_credential_checkout(self):
+        job = self.job()
+        self.assertIn('    permissions:\n      contents: read\n', job)
+        self.assertIn('persist-credentials: false', job)
+        for action in re.findall(r'uses: ([^\s]+)', job):
+            self.assertRegex(action, r'^[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+@[0-9a-f]{40}$')
+        for forbidden in ('write', 'secrets.', 'workflow_dispatch', 'git push', 'create_commit'):
+            self.assertNotIn(forbidden, job)
+
+    def test_image_tools_exist_before_normal_and_optimized_contracts(self):
+        job = self.job()
+        install = job.index('timeout 350 bash scripts/mission-acceptance/native/build.sh packages runtime')
+        tools = job.index('command -v convert tesseract')
+        normal = job.index('python3 -B -m unittest discover')
+        optimized = job.index('PYTHONOPTIMIZE=1 python3 -B -m unittest discover')
+        self.assertLess(install, tools)
+        self.assertLess(tools, normal)
+        self.assertLess(normal, optimized)
+        self.assertIn('timeout-minutes: 6', job)
+
+    def test_opt_in_fixture_uses_private_bus_display_and_clean_environment(self):
+        job = self.job()
+        for required in ('env -i PATH=/usr/bin:/bin', 'HOME="$private/home"',
+                         'XDG_CONFIG_HOME="$private/config"', 'XDG_DATA_HOME="$private/data"',
+                         'XDG_STATE_HOME="$private/state"', 'XDG_CACHE_HOME="$private/cache"',
+                         'XDG_RUNTIME_DIR="$private/runtime"', 'JTERM_GTK_GEOMETRY_SMOKE=1',
+                         'dbus-run-session -- xvfb-run --auto-servernum', '-nolisten tcp',
+                         "-p 'test_gtk_geometry_smoke.py'"):
+            self.assertIn(required, job)
+        for forbidden in ('run.sh', 'jterm-sessiond', 'mission-native-state', 'DISPLAY=$',
+                          'DBUS_SESSION_BUS_ADDRESS=$'):
+            self.assertNotIn(forbidden, job)
+
+    def test_artifact_is_only_the_fixture_evidence_directory(self):
+        job = self.job()
+        paths = re.findall(r'^          path: (.+)$', job, re.MULTILINE)
+        self.assertEqual(paths, ['${{ runner.temp }}/native-observer-compatibility/'])
+        self.assertIn('JTERM_GTK_GEOMETRY_SMOKE_OUT="$evidence"', job)
+        self.assertIn('if: ${{ always() }}', job)
+        self.assertIn('retention-days: 7', job)
+
+
 class CleanupTrapTests(unittest.TestCase):
     def cleanup_script(self):
         source = (HERE / 'run.sh').read_text()
