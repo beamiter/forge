@@ -4,6 +4,12 @@ All notable user-visible and operational changes are recorded here.
 
 ## Unreleased
 
+- Rejected oversized context pastes now restore the visible field or material
+  to the retained draft, so Save and Preview match the text on screen.
+
+- Context save confirmations now distinguish the saved version from newer
+  unsaved edits typed while the save was pending.
+
 - Late new-chat replies preserve newer navigation, and deferred block-context
   messages target the exact created chat even when multiple creations finish
   together. Creation failures no longer clear unrelated pending submissions.

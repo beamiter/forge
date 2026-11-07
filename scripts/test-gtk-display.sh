@@ -52,6 +52,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    ui::workspace_context_ui::tests::rejected_context_paste_restores_field_and_material_buffers
     ui::workspace_missions::tests::mission_editor_preserves_newer_drafts_stable_rows_and_releases_callbacks
     ui::workspace_visibility::tests::collapse_retains_conversation_widgets_and_gives_terminals_the_space
     ui::reference_shell::navigation_drawer::tests::rehost_keeps_the_exact_navigation_widgets_draft_selection_and_scroll

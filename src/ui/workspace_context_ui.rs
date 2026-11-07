@@ -141,12 +141,27 @@ impl ContextSurface {
             let guard = rendering.clone();
             buffer.connect_changed(move |buffer| {
                 if !guard.get() {
-                    state.borrow_mut().set_field(
+                    let accepted = state.borrow_mut().set_field(
                         field,
                         buffer
                             .text(&buffer.start_iter(), &buffer.end_iter(), false)
                             .into(),
                     );
+                    if !accepted {
+                        let retained = state
+                            .borrow()
+                            .draft()
+                            .map(|draft| match field {
+                                ContextField::Goal => draft.goal.clone(),
+                                ContextField::Completed => draft.completed.clone(),
+                                ContextField::Remaining => draft.remaining.clone(),
+                                ContextField::Constraints => draft.constraints.clone(),
+                            })
+                            .unwrap_or_default();
+                        guard.set(true);
+                        set_buffer(buffer, &retained);
+                        guard.set(false);
+                    }
                 }
             });
             fields.push(buffer);
@@ -500,12 +515,25 @@ impl ContextSurface {
         let key = id.to_owned();
         buffer.connect_changed(move |buffer| {
             if !guard.get() {
-                state.borrow_mut().set_material(
+                let accepted = state.borrow_mut().set_material(
                     &key,
                     buffer
                         .text(&buffer.start_iter(), &buffer.end_iter(), false)
                         .into(),
                 );
+                if !accepted {
+                    let retained = state
+                        .borrow()
+                        .draft()
+                        .and_then(|draft| {
+                            draft.materials.iter().find(|material| material.id == key)
+                        })
+                        .map(|material| material.text.clone())
+                        .unwrap_or_default();
+                    guard.set(true);
+                    set_buffer(buffer, &retained);
+                    guard.set(false);
+                }
             }
         });
         root.append(&view);
@@ -542,5 +570,62 @@ fn target_provider(selected: u32) -> &'static str {
         2 => "kimi",
         3 => "api",
         _ => "codex",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jterm_core::agent_workspace::ConversationId;
+
+    #[test]
+    #[ignore = "requires an isolated GTK display and one test per process"]
+    fn rejected_context_paste_restores_field_and_material_buffers() {
+        gtk::init().expect("isolated GTK display is required");
+        for dirty in [false, true] {
+            let surface = ContextSurface::new(Rc::new(|_| {}));
+            let mut context = WorkspaceContext::empty(ConversationId("paste-fixture".into()));
+            context.goal = "Retained goal".into();
+            context.materials.push(WorkspaceMaterial {
+                id: "note".into(),
+                label: "Note".into(),
+                kind: jterm_core::agent_workspace::MaterialKind::Note,
+                text: "Retained excerpt".into(),
+                source: None,
+                truncated: false,
+            });
+            *surface.editor.borrow_mut() = ContextEditor::with_saved_context_for_test(context);
+            if dirty {
+                surface
+                    .editor
+                    .borrow_mut()
+                    .set_field(ContextField::Remaining, "Unsaved work".into());
+            }
+            surface.render();
+            let before = surface.editor.borrow().draft().cloned().unwrap();
+            let huge = "x".repeat(256 * 1024 + 1);
+            let goal = &surface.fields[0];
+            goal.insert(&mut goal.end_iter(), &huge);
+            assert_eq!(
+                goal.text(&goal.start_iter(), &goal.end_iter(), false)
+                    .as_str(),
+                "Retained goal"
+            );
+            let note = surface.material_widgets.borrow()["note"].buffer.clone();
+            note.insert(&mut note.end_iter(), &huge);
+            assert_eq!(
+                note.text(&note.start_iter(), &note.end_iter(), false)
+                    .as_str(),
+                "Retained excerpt"
+            );
+            assert_eq!(surface.editor.borrow().draft(), Some(&before));
+            assert_eq!(surface.editor.borrow().dirty(), dirty);
+            assert!(
+                !surface.rendering.get(),
+                "rollback must release the render guard"
+            );
+            surface.render();
+            assert_eq!(surface.editor.borrow().draft(), Some(&before));
+        }
     }
 }
