@@ -145,4 +145,122 @@ class EmberNavigationTests(unittest.TestCase):
             self.assertEqual(reader.unknown_notices('ember',changed,sim.r.plan),expected)
 
 
+    def test_reopened_catalog_selection_uses_existing_bounded_navigation(self):
+        sim=EmberSimulation(1460) # Captured catalog top -1182 after Mission surface reopen.
+        sim.r.press('select')
+        self.assertTrue(sim.wheels and all(w == -4 for w in sim.wheels))
+        sim.r.click.assert_called_once()
+        target=sim.r.click.call_args.args[0]
+        self.assertEqual(target['node'],'/catalog')
+        self.assertTrue(reader.inside(target['rect'],sim.r.scroll_rect))
+
+    def test_initial_visible_catalog_selection_does_not_scroll(self):
+        sim=EmberSimulation()
+        sim.r.press('select')
+        self.assertEqual(sim.wheels,[])
+        self.assertEqual(sim.r.click.call_args.args[0]['node'],'/catalog')
+
+    def test_reopened_catalog_rejects_foreign_missing_ambiguous_or_disabled(self):
+        for mutation in ('duplicate','foreign_pid','foreign_owner','ancestry','disabled','missing','width'):
+            sim=EmberSimulation(1460); original=sim.observe
+            def observe(*a,**kw):
+                o=original();n=next(n for n in o['scoped_nodes'] if n['path']=='/catalog')
+                if mutation=='duplicate':o['scoped_nodes'].append(dict(n,path='/duplicate'))
+                if mutation=='foreign_pid':n['pid']=99
+                if mutation=='foreign_owner':n['owner']=':1.99'
+                if mutation=='ancestry':n['parent']='/other'
+                if mutation=='disabled':n['states'][0]&=~(1<<8)
+                if mutation=='missing':o['scoped_nodes'].remove(n)
+                if mutation=='width':n['rect'][0]=0
+                return o
+            sim.r.observe=observe
+            with self.subTest(mutation=mutation),self.assertRaises(RuntimeError):sim.r.press('select')
+            self.assertEqual(sim.wheels,[]);sim.r.click.assert_not_called()
+
+    def test_reopened_catalog_no_scroll_progress_rejects_before_click(self):
+        sim=EmberSimulation(1460)
+        sim.r.scroll=lambda amount,observation=None:sim.wheels.append(amount)
+        with self.assertRaisesRegex(RuntimeError,'no progress'):sim.r.press('select')
+        self.assertEqual(sim.wheels,[-4]);sim.r.click.assert_not_called()
+
+    def test_visible_catalog_must_settle_before_click(self):
+        sim=EmberSimulation();original=sim.observe
+        def observe(*a,**kw):
+            o=original()
+            if sim.sequence>1:next(n for n in o['scoped_nodes'] if n['path']=='/catalog')['rect'][0]+=1
+            return o
+        sim.r.observe=observe
+        with self.assertRaisesRegex(RuntimeError,'settled'):sim.r.press('select')
+        sim.r.click.assert_not_called()
+
+
+    def test_select_waits_for_initial_catalog_but_does_not_input_while_absent(self):
+        sim=EmberSimulation();original=sim.observe
+        def observe(*a,**kw):
+            o=original()
+            if sim.sequence<=2:o['scoped_nodes']=[n for n in o['scoped_nodes'] if n['path']!='/catalog']
+            return o
+        sim.r.observe=observe
+        with patch('reader.time.sleep') as pause:sim.r.press('select')
+        self.assertEqual(pause.call_count,2);self.assertEqual(sim.wheels,[])
+        sim.r.click.assert_called_once()
+
+    def test_select_catalog_wait_has_ten_frame_bound_and_zero_input(self):
+        sim=EmberSimulation();original=sim.observe
+        def observe(*a,**kw):
+            o=original();o['scoped_nodes']=[n for n in o['scoped_nodes'] if n['path']!='/catalog'];return o
+        sim.r.observe=observe
+        with patch('reader.time.sleep'),self.assertRaisesRegex(RuntimeError,'catalog did not become ready'):
+            sim.r.press('select')
+        self.assertEqual(sim.sequence,10);self.assertEqual(sim.wheels,[])
+        sim.r.click.assert_not_called()
+
+    def test_select_catalog_disappearing_after_wheel_is_not_readiness(self):
+        sim=EmberSimulation(1460);original=sim.observe
+        def observe(*a,**kw):
+            o=original()
+            if sim.wheels:o['scoped_nodes']=[n for n in o['scoped_nodes'] if n['path']!='/catalog']
+            return o
+        sim.r.observe=observe
+        with patch('reader.time.sleep') as pause,self.assertRaisesRegex(RuntimeError,'No unique navigation control'):
+            sim.r.press('select')
+        pause.assert_not_called();self.assertEqual(sim.wheels,[-4])
+        sim.r.click.assert_not_called()
+
+
+    def test_wait_cannot_hide_illegal_first_matching_catalog(self):
+        for mutation in ('disabled','foreign_pid','foreign_owner','duplicate'):
+            sim=EmberSimulation();original=sim.observe
+            def observe(*a,**kw):
+                o=original();n=next(n for n in o['scoped_nodes'] if n['path']=='/catalog')
+                if sim.sequence==1:o['scoped_nodes'].remove(n)
+                elif sim.sequence==2:
+                    if mutation=='disabled':n['states'][0]&=~(1<<8)
+                    if mutation=='foreign_pid':n['pid']=99
+                    if mutation=='foreign_owner':n['owner']=':1.99'
+                    if mutation=='duplicate':o['scoped_nodes'].append(dict(n,path='/duplicate'))
+                return o
+            sim.r.observe=observe
+            with patch('reader.time.sleep'),self.subTest(mutation=mutation),self.assertRaises(RuntimeError):
+                sim.r.press('select')
+            self.assertEqual(sim.sequence,2);self.assertEqual(sim.wheels,[])
+            sim.r.click.assert_not_called()
+
+    def test_missing_catalog_still_requires_owned_frame_and_viewport(self):
+        for mutation in ('frame','viewport','pid','window'):
+            sim=EmberSimulation();original=sim.observe
+            def observe(*a,**kw):
+                o=original();o['scoped_nodes']=[n for n in o['scoped_nodes'] if n['path']!='/catalog']
+                if mutation=='frame':o['scoped_nodes']=[n for n in o['scoped_nodes'] if n['path']!='/frame']
+                if mutation=='viewport':o['mission_content_rect']=[0,0,500,500]
+                if mutation=='pid':o['pid']=99
+                if mutation=='window':o['window']='99'
+                return o
+            sim.r.observe=observe
+            with patch('reader.time.sleep') as pause,self.subTest(mutation=mutation),self.assertRaises(RuntimeError):
+                sim.r.press('select')
+            pause.assert_not_called();self.assertEqual(sim.sequence,1)
+            self.assertEqual(sim.wheels,[]);sim.r.click.assert_not_called()
+
+
 if __name__=='__main__':unittest.main()

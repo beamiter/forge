@@ -3730,19 +3730,30 @@ mod popup_theme_tests {
         let mut widgets = vec![mission.root.clone().upcast::<gtk::Widget>()];
         let mut index = 0;
         while index < widgets.len() {
-            let mut child = widgets[index].first_child();
+            let widget = widgets[index].clone();
+            if let Some(expander) = widget.downcast_ref::<gtk::Expander>() {
+                expander.set_expanded(true);
+                // A collapsed Expander keeps its configured content outside
+                // the widget tree. Include it before the next layout frame,
+                // then require its actual controls to map before painting.
+                if let Some(content) = expander.child() {
+                    if !widgets.contains(&content) {
+                        widgets.push(content);
+                    }
+                }
+            }
+            let mut child = widget.first_child();
             while let Some(widget) = child {
                 child = widget.next_sibling();
-                widgets.push(widget);
+                if !widgets.contains(&widget) {
+                    widgets.push(widget);
+                }
             }
             index += 1;
         }
         let mut views = Vec::new();
         let mut entries = Vec::new();
         for widget in &widgets {
-            if let Some(expander) = widget.downcast_ref::<gtk::Expander>() {
-                expander.set_expanded(true);
-            }
             if let Some(view) = widget.downcast_ref::<gtk::TextView>() {
                 view.buffer().set_text("Readable Mission plan and evidence");
                 views.push(view.clone());
@@ -3774,6 +3785,7 @@ mod popup_theme_tests {
                 );
             }
             for entry in &entries {
+                assert!(entry.is_mapped());
                 let text = entry
                     .first_child()
                     .expect("entry child")

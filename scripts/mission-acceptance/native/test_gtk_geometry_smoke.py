@@ -418,6 +418,11 @@ class GtkGeometrySmoke(unittest.TestCase):
         if rect[2]<=0 or rect[3]<=0:raise RuntimeError('Empty fixture window')
         if self.command(['xdotool','getwindowpid',str(window)],deadline).strip()!=str(self.process.pid):
             raise RuntimeError('Foreign fixture window')
+        from x11_geometry import client_geometry
+        root_raw=self.command(['xwininfo','-int','-root','-stats'],deadline)
+        client_raw=self.command(['xwininfo','-int','-id',str(window),'-stats','-children'],deadline)
+        rect,proof=client_geometry(client_raw,root_raw,window,rect)
+        self.x11_geometry_receipts.append(proof)
         return rect
 
     def binding(self,window,rect,deadline):
@@ -442,8 +447,78 @@ class GtkGeometrySmoke(unittest.TestCase):
     def test_real_gtk14_control_sensitivity(self):
         self.run_smoke(controls_only=True)
 
+
+    def test_real_reparented_x11_client_origin_and_border(self):
+        """Create only two fixture X windows, not an application or provider."""
+        import ctypes
+        from reader import window_geometry
+        from x11_geometry import client_geometry
+        if not re.fullmatch(r':\d+(?:\.\d+)?',os.environ.get('DISPLAY','')):
+            raise RuntimeError('X11 client fixture needs existing local display')
+        out=Path(os.environ['JTERM_GTK_GEOMETRY_SMOKE_OUT'])
+        if not out.is_absolute() or out.resolve()!=out or out.stat().st_uid!=os.getuid():
+            raise RuntimeError('X11 fixture evidence is not owned/canonical')
+        lib=ctypes.CDLL('libX11.so.6')
+        display_t=ctypes.c_void_p;window_t=ctypes.c_ulong;integer=ctypes.c_int;unsigned=ctypes.c_uint
+        signatures={
+            'XOpenDisplay':([ctypes.c_char_p],display_t),
+            'XDefaultRootWindow':([display_t],window_t),
+            'XInternAtom':([display_t,ctypes.c_char_p,integer],window_t),
+            'XGetSelectionOwner':([display_t,window_t],window_t),
+            'XCreateSimpleWindow':([display_t,window_t,integer,integer,unsigned,unsigned,unsigned,window_t,window_t],window_t),
+            'XTranslateCoordinates':([display_t,window_t,window_t,integer,integer,ctypes.POINTER(integer),ctypes.POINTER(integer),ctypes.POINTER(window_t)],integer),
+            'XMapWindow':([display_t,window_t],integer),
+            'XSync':([display_t,integer],integer),
+            'XDestroyWindow':([display_t,window_t],integer),
+            'XCloseDisplay':([display_t],integer),
+        }
+        for name,(args,result) in signatures.items():
+            function=getattr(lib,name);function.argtypes=args;function.restype=result
+        display=lib.XOpenDisplay(None)
+        if not display:raise RuntimeError('Cannot open private X11 display')
+        parent=0
+        receipt=dict(schema=1,status='failed',scope='two synthetic X11 windows only',provider_execution='not_started')
+        try:
+            # Ordinary compatibility CI uses a fresh Xvfb without a WM. Do
+            # not misdiagnose a future WM placement policy as a coordinate bug.
+            manager=lib.XInternAtom(display,b'WM_S0',0)
+            self.assertEqual(lib.XGetSelectionOwner(display,manager),0,'Fixture requires its private no-WM Xvfb')
+            receipt['window_manager']='absent'
+            root=lib.XDefaultRootWindow(display)
+            parent=lib.XCreateSimpleWindow(display,root,100,120,600,600,2,0,0)
+            child=lib.XCreateSimpleWindow(display,parent,17,23,320,240,1,0,0)
+            if not parent or not child:raise RuntimeError('X11 fixture creation failed')
+            lib.XMapWindow(display,parent);lib.XMapWindow(display,child);lib.XSync(display,0)
+            def command(args):
+                return subprocess.run(args,check=True,text=True,capture_output=True,timeout=10).stdout
+            legacy=command(['xdotool','getwindowgeometry','--shell',str(child)])
+            root_raw=command(['xwininfo','-int','-root','-stats'])
+            client_raw=command(['xwininfo','-int','-id',str(child),'-stats','-children'])
+            rect,proof=client_geometry(client_raw,root_raw,child,window_geometry(legacy,child))
+            # Parent root x/y + parent border + child x/y + child border.
+            # This is deliberately not the old xdotool reparented x/y result.
+            self.assertEqual(rect,[120,146,320,240])
+            dx,dy,under=integer(),integer(),window_t()
+            translated=lib.XTranslateCoordinates(display,child,root,0,0,ctypes.byref(dx),ctypes.byref(dy),ctypes.byref(under))
+            self.assertEqual(translated,1)
+            self.assertEqual(rect[:2],[dx.value,dy.value])
+            receipt['direct_client_zero_translation']=[dx.value,dy.value]
+            self.assertEqual(proof['client']['relative_x'],17)
+            self.assertEqual(proof['client']['relative_y'],23)
+            self.assertEqual(proof['client']['border'],1)
+            self.assertEqual(proof['client']['parent'],parent)
+            self.assertEqual(proof['client']['root'],root)
+            receipt.update(status='passed',client_rect=rect,geometry=proof)
+        except Exception as error:
+            receipt.update(error_type=type(error).__name__,error=str(error));raise
+        finally:
+            if parent:lib.XDestroyWindow(display,parent)
+            lib.XSync(display,0);lib.XCloseDisplay(display)
+            (out/'x11-client-geometry.json').write_text(json.dumps(receipt,indent=2)+'\n')
+
     def run_smoke(self, controls_only=False):
         self.process=None
+        self.x11_geometry_receipts=[]
         with fixture_temporary_directory() as temporary:
             private=Path(temporary)
             out=Path(os.environ.get('JTERM_GTK_GEOMETRY_SMOKE_OUT',str(private/'evidence')))
@@ -457,7 +532,7 @@ class GtkGeometrySmoke(unittest.TestCase):
                         component_trace=dict(events=[],errors=[],omitted=0))
             deadline=time.monotonic()+60;log=None
             try:
-                for tool in ('xdotool','import','convert','tesseract'):
+                for tool in ('xdotool','xwininfo','import','convert','tesseract'):
                     if shutil.which(tool) is None:raise RuntimeError('Opt-in GTK smoke missing existing tool: '+tool)
                 if not re.fullmatch(r':\d+(?:\.\d+)?',os.environ.get('DISPLAY','')):
                     raise RuntimeError('Opt-in GTK smoke needs existing local X11')
@@ -643,6 +718,7 @@ class GtkGeometrySmoke(unittest.TestCase):
                               diagnostics=getattr(error,'atspi_diagnostics',[]))
                 raise
             finally:
+                report['x11_geometry_receipts']=self.x11_geometry_receipts
                 finalize_fixture_report(report,self.process,log,out/'result.json',sys.exc_info()[1])
 
 

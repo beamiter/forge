@@ -277,3 +277,57 @@ the wrong GTK version fails. CI preserves only fixture JSON/PNG/version evidence
 not private homes or host state. A pass would cover this isolated compatibility
 fixture only, never the four-application Mission contract. Local tests on a
 machine without GTK are not a real GTK pass.
+
+
+## Native run 42383439132: observed failure, not acceptance
+
+The exact Forge `4965b2cca714596ff4606bc347e247192c7eb616` attempt passed
+preflight and all five production builds. The four-reader runtime failed; it
+did not establish four-application acceptance or real Task/provider delivery.
+Artifact `13579410747` is 70,404,217 bytes, SHA-256
+`a7df71d7c525bbd3f9bcf87fac1a24c0097c9e860698becce2b4ca7d52493b3b`.
+Its independent host check passed: the complete saved plan stayed unchanged and
+both conversation catalogs remained empty.
+
+Anvil and Forge opened their Mission surfaces but did not select the saved row.
+Ember proved identity, all five candidates and four common core pins, Inspect,
+Refresh and the disabled post-refresh freeze control. It closed and reopened
+the Mission surface, then could not reselect the offscreen saved row. Whole-app
+restart was not reached. Frost selected the plan, but its exact ID/hash OCR was
+below confidence 80, so it correctly did not Inspect. Its fixed rewind stopped
+midway down the content, leaving Refresh offscreen. These partial observations
+are not a passed contract.
+
+The navigation corrections do not weaken these evidence requirements:
+- Ember saved-row selection uses the existing owned, bounded navigation path.
+  A genuinely absent initial catalog may wait up to ten frames within the same
+  24-step budget. Disabled, foreign, duplicate or disappearing-after-scroll
+  matches still fail; pointer input still needs two equal visible observations.
+- Frost rewinds by at most 24 batches of four upward wheel events. Each batch
+  uses the current unique measured thumb/track, stable in two frames and bound
+  to the preceding observation. The distance from the track top must strictly
+  shrink; success requires exact top equality and a second matching frame.
+  Horizontal geometry and track stay fixed. The observed one-pixel raster
+  rounding of thumb height is bounded across the whole seek, not accumulated.
+  This is navigation only, never identity, candidate, pin or validation proof.
+- X11 client coordinates come from strict `xwininfo` output, not guessed
+  decoration offsets. The measured border is added to its absolute outer
+  origin. Window/root identity, map state, dimensions, complete root containment
+  and the before/after binding are checked. Existing xdotool PID, active-window
+  and dimension checks remain; its legacy X/Y are retained only diagnostically.
+  Only local screen 0 is accepted, matching the isolated input/capture server.
+  Pointer input rechecks the complete second-frame window/title/root/client
+  binding; a small move that leaves the old point inside the window still fails.
+  This avoids the old xdotool reparented-window offset calculation.
+
+The ordinary compatibility fixture additionally creates two synthetic X11
+windows with nonzero parent/child offsets and borders. It checks the measured
+client origin and saves a separate receipt. It is not a terminal application,
+host or provider, and does not upgrade the failed native result.
+
+The GTK mixed content-origin/border-size issue and Frost low-confidence
+identifier/hash pixels remain separate from the navigation corrections.
+No clipping tolerance, confidence reduction, punctuation repair, expected-value
+OCR dictionary, cross-frame text joining or fabricated validation is introduced.
+A later native experiment still needs separately reviewed frozen heads and all
+22 current prerequisite checks.
