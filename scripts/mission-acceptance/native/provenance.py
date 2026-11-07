@@ -22,7 +22,7 @@ BINARIES = {name: (name,) for name in APPS}
 BINARIES['jterm_core'] = ('jterm-sessiond', 'mission-native-state')
 # Additional path-filtered security workflows. Manual dispatch is accepted ONLY
 # for these fixed native additions; legacy collect.WORKFLOWS/event rules remain
-# untouched. These bring the native before/after requirement from 19 to 21.
+# untouched. These bring the native before/after requirement from 20 to 22.
 EXTRA_SECURITY_WORKFLOWS = {'forge': 'security-audit.yml', 'frost': 'security.yml'}
 NATIVE_REQUIRED_WORKFLOW_COUNT = sum(map(len, collector.WORKFLOWS.values())) + len(EXTRA_SECURITY_WORKFLOWS)
 
@@ -89,7 +89,7 @@ def select_security_run(item, response):
 
 
 def security_receipts(candidates):
-    require(NATIVE_REQUIRED_WORKFLOW_COUNT == 21, 'Native workflow requirements changed; review all gates')
+    require(NATIVE_REQUIRED_WORKFLOW_COUNT == 22, 'Native workflow requirements changed; review all gates')
     by_name = {item['name']: item for item in candidates['repositories']}
     result = []
     for name in EXTRA_SECURITY_WORKFLOWS:

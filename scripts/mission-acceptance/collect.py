@@ -12,19 +12,19 @@ import sys
 import urllib.request
 
 NAMES = ("jterm_core", "anvil", "forge", "ember", "frost")
-CORE = "4ffa774138ee89dc2916ce21786c45e411196ca4"
+CORE = "e8bd7a2b3edd48d7a0f8f0304fa3d8c864dab40e"
 WORKFLOWS = {
-    "jterm_core": ("ci.yml", "vim9-pixel-input.yml"),
+    "jterm_core": ("ci.yml", "vim9-pixel-input.yml", "security.yml"),
     "anvil": ("ci.yml", "security.yml", "link-recovery.yml", "vim9-pixel-viewport.yml", "ui-layout.yml"),
     "forge": ("ci.yml", "flatpak.yml", "vim9-pixel-viewport.yml", "ui-layout.yml"),
     "ember": ("ci.yml", "security.yml", "ui-layout.yml"),
     "frost": ("ci.yml", "native-desktop.yml", "native-provider-acceptance.yml", "vim9-rewrite.yml", "ui-layout.yml"),
 }
-# These two workflows have push paths filters. A manual run of the exact master
+# These three fixed workflows have push paths filters. A manual run of the exact master
 # is required when unrelated changes produce no push run. No other workflow may
 # substitute a manual run. Anvil link recovery remains source/build-only with
 # native recovery lanes explicitly SKIPPED. Forge Flatpak retains its full job.
-MANUAL_WORKFLOWS = frozenset({("anvil", "link-recovery.yml"), ("forge", "flatpak.yml")})
+MANUAL_WORKFLOWS = frozenset({("jterm_core", "security.yml"), ("anvil", "link-recovery.yml"), ("forge", "flatpak.yml")})
 MISSION_FILES = {"anvil": "src/workspace_mission_ui.rs", "forge": "src/ui/workspace_missions.rs", "ember": "src/workspace_missions.rs", "frost": "src/workspace_mission.rs"}
 HERE = Path(__file__).resolve().parent
 

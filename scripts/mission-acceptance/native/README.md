@@ -30,6 +30,11 @@ must pin the compiled core. Publication of new acceptance code changes Forge's
 HEAD, so a new freeze and exact-head prerequisite CI are needed before dispatch.
 An old accepted snapshot cannot approve new workflow code.
 
+The current prerequisite contract requires 22 exact-head workflows: the base
+20 now include core `security.yml`, plus the existing Forge/Frost security gates.
+The historical rounds below used 21 and are not relabelled. Core Security accepts
+only exact-master push or explicit dispatch; all other event restrictions remain.
+
 All clients receive one short canonical private `JTERM_WORKSPACE_STATE_DIR`.
 An independently built production `jterm-sessiond --jterm-session-host` owns it.
 Record and monitor PID, Linux process birth tick, executable and private socket. The helper also

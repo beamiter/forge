@@ -26,7 +26,7 @@ from observer import ObservationNotReady, inside, observe_atspi, ocr_rows, phras
 
 APPS = ('anvil', 'forge', 'ember', 'frost')
 REPOS = ('jterm_core', *APPS)
-CORE = '4ffa774138ee89dc2916ce21786c45e411196ca4'
+CORE = 'e8bd7a2b3edd48d7a0f8f0304fa3d8c864dab40e'
 REFRESH = {'anvil': 'Refresh saved Missions', 'forge': 'Refresh saved Missions and expire old evidence',
            'ember': 'Refresh saved Missions', 'frost': 'Refresh'}
 INSPECT = {'anvil': 'Inspect saved candidates', 'forge': 'Inspect saved repository candidates',

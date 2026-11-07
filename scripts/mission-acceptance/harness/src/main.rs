@@ -522,7 +522,7 @@ fn flow(root: &Path, input: &Value) -> Result<Value, String> {
     check_no_validation(&dirty_report)?;
     save(root, "07-negative-dirty.json", &dirty_report)?;
     fs::remove_file(dirty).map_err(|e| e.to_string())?;
-    const CORE: &str = "4ffa774138ee89dc2916ce21786c45e411196ca4";
+    const CORE: &str = "e8bd7a2b3edd48d7a0f8f0304fa3d8c864dab40e";
     const OLD_CORE: &str = "f8566bb9cb6e9cca3258c8050c6dc4e9b96da8ff";
     for name in ["Cargo.toml", "Cargo.lock"] {
         let path = negative.join(name);

@@ -11,7 +11,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const CORE: &str = "4ffa774138ee89dc2916ce21786c45e411196ca4";
+const CORE: &str = "e8bd7a2b3edd48d7a0f8f0304fa3d8c864dab40e";
 const LIMIT: u64 = 1024 * 1024;
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
