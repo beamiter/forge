@@ -849,7 +849,11 @@ impl AiPanel {
     }
 
     pub(crate) fn connect_close_requested(&self, callback: impl Fn() + 'static) {
-        self.close_btn.connect_clicked(move |_| callback());
+        let shared = self.shared.clone();
+        self.close_btn.connect_clicked(move |_| {
+            shared.borrow_mut().retire_navigation();
+            callback();
+        });
     }
 
     pub(crate) fn set_persistence_callback(&self, callback: impl Fn() + 'static) {
@@ -857,6 +861,7 @@ impl AiPanel {
     }
 
     pub(crate) fn restore_persisted_conversation(&self) {
+        self.shared.borrow_mut().retire_navigation();
         let Some(snapshot) = crate::state::get_ai_conversation_snapshot() else {
             return;
         };
@@ -880,6 +885,10 @@ impl AiPanel {
             drop(request);
             let _ = store.cancel_request(token, "Response continues in the session host.".into());
         }
+    }
+
+    pub(crate) fn retire_pending_navigation(&self) {
+        self.shared.borrow_mut().retire_navigation();
     }
 
     pub(crate) fn focus_input(&self) {
@@ -944,6 +953,7 @@ impl AiPanel {
     }
 
     fn toggle_chat_library(&self) {
+        self.shared.borrow_mut().retire_navigation();
         if self.content_stack.visible_child_name().as_deref() == Some(CHAT_LIBRARY_PAGE) {
             self.show_chat_page();
         } else {
@@ -952,6 +962,7 @@ impl AiPanel {
     }
 
     fn show_chat_library(&self) {
+        self.shared.borrow_mut().retire_navigation();
         self.handoff_navigation_epoch
             .set(self.handoff_navigation_epoch.get().wrapping_add(1));
         self.refresh_chat_library();
@@ -1072,6 +1083,10 @@ impl AiPanel {
                         self.show_error_status("The new conversation already has a draft. The handoff remains in its source context; no text was overwritten.");
                     }
                 }
+                super::workspace_chats::Event::Refreshed => {
+                    self.render_active_chat();
+                    self.publish_persisted_conversation();
+                }
                 super::workspace_chats::Event::Opened(id) => {
                     let job = self.shared.borrow().hosted_job(id);
                     if let Some(job) = job {
@@ -1188,6 +1203,7 @@ impl AiPanel {
     }
 
     pub(crate) fn select_chat(&self, id: u64) {
+        self.shared.borrow_mut().retire_navigation();
         self.handoff_navigation_epoch
             .set(self.handoff_navigation_epoch.get().wrapping_add(1));
         let selected = self.store.borrow_mut().select_chat(id);
@@ -1202,6 +1218,7 @@ impl AiPanel {
         let result = self.store.borrow_mut().toggle_archive_active();
         match result {
             Ok(_) => {
+                self.shared.borrow_mut().retire_navigation();
                 self.render_active_chat();
                 self.publish_persisted_conversation();
                 self.show_chat_page();
@@ -1272,6 +1289,7 @@ impl AiPanel {
                 p.show_info_status("Stopping the background response. Delete this chat after cleanup finishes.");
                 return;
             }
+            p.shared.borrow_mut().retire_navigation();
             match p.shared.borrow_mut().delete(deleted_id) {
                 Ok(true) => { p.show_info_status("Deleting the shared conversation…"); return; }
                 Ok(false) => {},

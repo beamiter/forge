@@ -4,6 +4,9 @@ All notable user-visible and operational changes are recorded here.
 
 ## Unreleased
 
+- Delayed chat open and reload replies now refresh cached data without
+  overriding a newer conversation selection or reopening a retired view.
+
 - Imported API conversations can retry binding after a full command queue
   instead of remaining indefinitely marked as syncing.
 
