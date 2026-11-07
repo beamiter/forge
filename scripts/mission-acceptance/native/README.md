@@ -113,9 +113,40 @@ with assertions from source code or an earlier CI run.
 
 ## Observation readiness
 
+The separate ordinary-CI GTK compatibility fixture at
+[4c3e4e7 / run 42319455807](https://github.com/beamiter/forge/actions/runs/42319455807)
+started and painted a real GTK 4.14.5 window, but failed its first visible-label
+assertion. All observed Component SCREEN origins were `(0, 0)`, so the strict
+OCR clips did not contain the displayed controls. This is a failed standalone
+observer test, not a passed frontend or formal native round. The same screenshot
+also showed that `max-width-chars` alone did not make the wrapping fixture
+narrow; its later width assertion was not reached.
+
+[GTK 4.14.5's Component implementation](https://github.com/GNOME/gtk/blob/4.14.5/gtk/a11y/gtkatspicomponent.c#L106-L153)
+returns zero SCREEN origins, while WINDOW coordinates accumulate actual
+accessible-parent bounds. When every Component SCREEN origin is zero, the
+observer requires the reader's freshly observed X11 client XID, PID, title and
+rectangle. A unique direct top-level frame must match both the observed title
+and client dimensions in the same PID-owned accessibility tree. Only that
+frame's subtree is translated from WINDOW coordinates using the captured client
+origin. Other clients retain raw diagnostic geometry but cannot supply visible
+text or input targets. Ambiguous matches, missing bindings, dimension conflicts
+and unsupported nested native dialog/window boundaries fail closed. Nested
+in-client FRAME containers retain their clipping boundaries.
+
+Raw SCREEN and WINDOW extents, the chosen anchor and the converted rectangles
+are recorded. Both raw coordinate sets, the complete tree, node properties,
+text, owner and PID are rechecked; the reader separately rechecks XID, title,
+PID and client geometry after observation. No decoration offset, scaling or
+expected text is used to invent a position. Implementations with nonzero SCREEN
+origins keep the existing SCREEN path. Local mock regressions do not prove this
+compatibility path works in real GTK; the ordinary fixture and subsequent
+formal round must independently pass.
+
 AT-SPI requests keep introspection disabled and use explicit protocol types:
-unsigned SCREEN coordinates for Component.GetExtents and Text.GetRangeExtents,
-signed text offsets for Text.GetText and Text.GetRangeExtents. Signature tests
+unsigned SCREEN or bound WINDOW coordinates for Component.GetExtents and
+Text.GetRangeExtents, signed text offsets for Text.GetText and
+Text.GetRangeExtents. Signature tests
 use a typed mock when dbus-python is unavailable locally; they are not a real
 D-Bus or native-application pass. Protocol errors remain hard failures, with one
 explicit capability fallback: only the actual Text.GetRangeExtents call's exact

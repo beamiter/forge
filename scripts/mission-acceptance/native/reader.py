@@ -864,12 +864,12 @@ class Reader:
         require(len(found) <= 1, 'Ambiguous owned native window: %d candidates' % len(found))
         if not found:
             raise WindowNotReady('Missing owned native window: 0 candidates')
-        window, _, rect = found[0]
+        window, title, rect = found[0]
         active = decimal_id(self.run(['xdotool', 'getactivewindow']), 'active window ID')
         self.window_probe['active_window'] = active
         if active != int(window):
             raise WindowNotReady('Owned target window %s is not the active visible window %s' % (window, active))
-        self.window, self.window_rect = window, rect
+        self.window, self.window_title, self.window_rect = window, title, rect
 
     def startup_failure(self, cycle, attempts, error):
         report = dict(status='failed', error=str(error), attempts=attempts,
@@ -958,7 +958,7 @@ class Reader:
         self.sequence += 1
         stem = '%03d-%s' % (self.sequence, re.sub('[^a-zA-Z0-9_-]', '-', label))
         png = self.out / (stem + '.png')
-        window, window_rect = self.window, self.window_rect[:]
+        window, window_title, window_rect = self.window, self.window_title, self.window_rect[:]
         x, y, w, h = self.window_rect
         captured_at_ns = time.time_ns()
         self.observation_probe = dict(evidence=stem, screenshot=png.name, captured_at_ns=captured_at_ns)
@@ -975,6 +975,8 @@ class Reader:
             observation = observe_atspi(self.process.pid, self.window_rect,
                 FRAME['ember'] if self.app=='ember' and self.mission_open else None,
                 deadline=self.observation_deadline, frame_id=stem,
+                window_binding=dict(window=int(window), pid=self.process.pid,
+                                    title=window_title, rect=window_rect[:]),
                 text_geometry=self.clip_text_geometry(png, stem, window_rect))
             self.checkpoint()
             if self.app in ('anvil', 'ember') and self.mission_open:
@@ -1007,7 +1009,7 @@ class Reader:
             spatial = sorted(observation['scoped_nodes'], key=lambda n: (n.get('rect',[0,0])[1], n.get('rect',[0,0])[0]))
             observation['visible_text'] = '\n'.join(dict.fromkeys(n.get('visible_text','') for n in spatial if n.get('visible_text')))
         self.bind_window()
-        if self.window != window or self.window_rect != window_rect:
+        if self.window != window or self.window_title != window_title or self.window_rect != window_rect:
             raise ObservationNotReady('Owned window changed during observation')
         if colors == 1:
             raise ObservationNotReady('Owned native window has not painted a nonuniform frame')

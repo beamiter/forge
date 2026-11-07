@@ -71,6 +71,53 @@ def validate_tree(tree):
     return nodes
 
 
+def window_coordinate_anchor(tree, window, binding):
+    """Bind zero-SCREEN origins to the caller's observed native client window.
+
+    GTK 4.14.5 returns (0, 0) for SCREEN, not a screen position. WINDOW
+    adds accessible-parent bounds; PARENT is only the immediate parent.
+    https://github.com/GNOME/gtk/blob/4.14.5/gtk/a11y/gtkatspicomponent.c#L106-L153
+    No toolkit-name/path inference, guessed decoration offset or scale is used.
+    The caller reads XID/PID/title/client rectangle before capturing and again
+    after observation. Only a unique title AND size match can select a client
+    in the same PID-owned tree; other native clients never supply evidence.
+    """
+    nodes = validate_tree(tree)
+    components = [n for n in tree['nodes'] if 'rect' in n]
+    if not components or any(n['rect'][:2] != [0, 0] for n in components):
+        return None
+    if (not isinstance(binding, dict) or set(binding) != {'window', 'pid', 'title', 'rect'}
+            or type(binding['window']) is not int or binding['window'] <= 0
+            or type(binding['pid']) is not int or binding['pid'] != tree['pid']
+            or not isinstance(binding['title'], str) or not binding['title']
+            or len(binding['title']) > 4096 or '\x00' in binding['title']
+            or binding['rect'] != window or len(window) != 4
+            or any(type(v) is not int for v in window) or window[2] <= 0 or window[3] <= 0):
+        raise RuntimeError('Zero SCREEN coordinates require an observed native client binding')
+    root = nodes[tree['root']]
+    frames = [nodes[path] for path in root['children']]
+    if (root['role'] != 75 or COMPONENT in root['interfaces'] or not frames
+            or any(n['role'] != 23 or 'rect' not in n for n in frames)):
+        raise RuntimeError('Zero SCREEN coordinates need unambiguous top-level frame ancestry')
+    matches = [n for n in frames if n['name'] == binding['title']
+               and n['rect'] == [0, 0, *window[2:]] and state(n, 25) and state(n, 30)]
+    if len(matches) != 1:
+        raise RuntimeError('Missing or ambiguous native client title and size match')
+    anchor = matches[0]['path']
+    selected = set(); pending = [anchor]
+    while pending:
+        path = pending.pop(); selected.add(path)
+        if nodes[path]['role'] in (16, 69):
+            raise RuntimeError('Unsupported nested native dialog/window coordinate boundary')
+        pending.extend(nodes[path]['children'])
+    return anchor, selected
+
+
+def project_window_rect(rect, window):
+    """Translate actual WINDOW coordinates, without scaling or enlarging clips."""
+    return [window[0] + rect[0], window[1] + rect[1], rect[2], rect[3]]
+
+
 def clip_for(node, nodes, window):
     clip = window
     while node is not None:
@@ -215,7 +262,7 @@ def verify_ocr_text_geometry(text, clip, proof, frame_id):
 
 
 def observe_atspi(pid, window, mission_title=None, *, deadline=None,
-                  text_geometry=None, frame_id=None, diagnostics=None):
+                  text_geometry=None, frame_id=None, diagnostics=None, window_binding=None):
     import dbus
     diagnostics = [] if diagnostics is None else diagnostics
     node_context = {}
@@ -278,6 +325,8 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None,
     # AT-SPI Component.GetExtents takes 'u'; Text.GetText takes 'ii' and
     # Text.GetRangeExtents takes 'iiu'. SCREEN is coordinate type 0.
     screen = dbus.UInt32(0)
+    window_coordinates = dbus.UInt32(1)
+    coordinates = screen
     session = connect(dbus.SessionBus, 'SessionBus')
     address = iface(session, 'org.a11y.Bus', '/org/a11y/bus', 'org.a11y.Bus').GetAddress(timeout=remaining())
     bus = connect(dbus.bus.BusConnection, 'BusConnection', str(address))
@@ -298,6 +347,18 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None,
             raise RuntimeError('Ambiguous PID-owned accessibility roots')
         return roots[0]
     owner, root = owned_root()
+    def checked_rect(raw, method):
+        # The wire result is (iiii), not arbitrary numeric/coercible values.
+        # Exact types also reject dbus.Boolean/UInt32, both int subclasses.
+        if (not isinstance(raw, (tuple, list)) or len(raw) != 4
+                or any(type(v) not in (int, dbus.Int32)
+                       or not -(1 << 31) <= v < (1 << 31) for v in raw)
+                or raw[2] < 0 or raw[3] < 0):
+            raise RuntimeError('Malformed AT-SPI ' + method + ' extents')
+        return list(map(int, raw))
+    def component_rect(path, coordinate_type):
+        raw = iface(bus, owner, path, COMPONENT).GetExtents(coordinate_type, timeout=remaining())
+        return checked_rect(raw, 'Component')
     nodes, seen, queue = [], set(), [(root, None)]
     def children_of(path):
         found = iface(bus, owner, path, ACCESSIBLE).GetChildren(timeout=remaining())
@@ -324,7 +385,7 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None,
         n['states'] = list(map(int, obj.GetState(timeout=remaining())))
         n['children'] = children_of(path)
         if COMPONENT in interfaces:
-            n['rect'] = list(map(int, iface(bus, owner, path, COMPONENT).GetExtents(screen, timeout=remaining())))
+            n['rect'] = component_rect(path, screen)
         if TEXT in interfaces:
             count = int(props.Get(TEXT, 'CharacterCount', timeout=remaining()))
             if not 0 <= count <= 131072:
@@ -334,6 +395,28 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None,
         queue.extend((p, path) for p in n['children'])
     tree = dict(pid=pid, owner=owner, root=root, nodes=nodes)
     by_path = validate_tree(tree)
+    selection = window_coordinate_anchor(tree, window, window_binding)
+    anchor = selection[0] if selection is not None else None
+    if selection is not None:
+        coordinates = window_coordinates
+        for n in nodes:
+            n['coordinate_selected'] = n['path'] in selection[1]
+            if 'rect' not in n:
+                continue
+            raw = component_rect(n['path'], coordinates)
+            if raw[2:] != n['rect'][2:]:
+                raise RuntimeError('SCREEN and WINDOW component dimensions differ')
+            if n['path'] == anchor and raw != [0, 0, *window[2:]]:
+                raise RuntimeError('WINDOW frame origin or size does not match captured native client')
+            n['component_extents'] = dict(screen=n['rect'][:], window=raw[:])
+            if n['coordinate_selected']:
+                n['rect'] = project_window_rect(raw, window)
+            else:
+                # Raw rectangles from another native client have a different
+                # origin. Retain them for diagnostics, never as screen evidence.
+                del n['rect']
+        tree['coordinate_geometry'] = dict(mode='window_to_screen', anchor=anchor,
+            captured_window=window[:], offset=window[:2], binding=dict(window_binding))
     mission_scope = mission_content_scope(tree,mission_title,window) if mission_title else None
     if mission_scope:
         tree['mission_content_rect'] = mission_scope['content_rect']
@@ -347,7 +430,7 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None,
         bounds = node_observation_bounds(n,by_path,window,mission_scope)
         n['visible'] = visible(n, by_path, bounds)
         n['visible_text'] = ''
-        if not state(n, 25) or not state(n, 30):
+        if n.get('coordinate_selected') is False or not state(n, 25) or not state(n, 30):
             continue
         if 'text' in n and 'rect' in n:
             clip = intersect(clip_for(n, by_path, bounds), n['rect'])
@@ -365,7 +448,7 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None,
                     range_text = iface(bus, owner, n['path'], TEXT)
                     try:
                         rect = range_text.GetRangeExtents(
-                            dbus.Int32(offset), dbus.Int32(end), screen, timeout=remaining())
+                            dbus.Int32(offset), dbus.Int32(end), coordinates, timeout=remaining())
                     except Exception as error:
                         dbus_error = getattr(dbus, 'DBusException', ())
                         if not (isinstance(error, dbus_error) and error.get_dbus_name() == NOT_SUPPORTED
@@ -396,7 +479,10 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None,
                                 pid=pid, role=n['role'], clip=clip[:], rect=n['rect'][:],
                                 status=geometry['status'], unproven_lines=geometry['unproven_lines']))
                         break
-                    if inside(list(map(int, rect)), clip):
+                    rect = checked_rect(rect, 'Text range')
+                    if anchor is not None:
+                        rect = project_window_rect(rect, window)
+                    if inside(rect, clip):
                         lines.append(line.rstrip('\r\n'))
                 offset += len(line)
             n['visible_text'] = '\n'.join(lines)
@@ -428,7 +514,7 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None,
         props = iface(bus, owner, n['path'], 'org.freedesktop.DBus.Properties')
         if str(props.Get(ACCESSIBLE, 'Name', timeout=remaining())) != n['name']:
             changes.append('name')
-        if unsupported_seen:
+        if unsupported_seen or anchor is not None:
             # OCR boxes belong to the captured clip. Verify node geometry and
             # all clipping ancestors, not just text, before accepting them.
             obj = iface(bus, owner, n['path'], ACCESSIBLE)
@@ -436,9 +522,13 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None,
                     or int(obj.GetRole(timeout=remaining())) != n['role']
                     or list(map(int, obj.GetState(timeout=remaining()))) != n['states']):
                 changes.append('node properties')
-            if 'rect' in n and list(map(int, iface(bus, owner, n['path'], COMPONENT).GetExtents(
-                    screen, timeout=remaining()))) != n['rect']:
-                changes.append('geometry')
+            if 'rect' in n or 'component_extents' in n:
+                original = n.get('component_extents')
+                expected = original['screen'] if original else n['rect']
+                if component_rect(n['path'], screen) != expected:
+                    changes.append('geometry')
+                if original is not None and component_rect(n['path'], window_coordinates) != original['window']:
+                    changes.append('WINDOW geometry')
         if 'text' in n:
             count = int(props.Get(TEXT, 'CharacterCount', timeout=remaining()))
             if not 0 <= count <= 131072:

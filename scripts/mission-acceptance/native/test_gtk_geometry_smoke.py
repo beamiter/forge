@@ -157,13 +157,18 @@ def fixture():
     clipped.set_propagate_natural_height(False);clipped.set_vexpand(False)
     clipped.set_child(Gtk.Label(label='CLIPPED FIRST LINE\nSECOND LINE\nTHIRD LINE\nFOURTH LINE\n'+HIDDEN,
                                 xalign=0,yalign=0));box.append(clipped)
-    # Equal minimum/natural character widths and START alignment prevent the
-    # label from filling the wide box. This is one logical line, WordChar-
-    # wrapped by real GTK layout into several physical painted lines.
+    # max-width-chars is a natural-size hint, not an allocation limit:
+    # GTK 4.14.5 gtklabel.c get_width_for_height recalculates the width for a
+    # given height. A homogeneous two-child row allocates a real half width
+    # (gtkboxlayout.c gtk_box_layout_allocate), including height-for-width.
+    # This remains one logical line with several physical painted lines.
+    wrapped_row=Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,homogeneous=True)
+    box.append(wrapped_row)
     wrapped=Gtk.Label(label=WRAPPED,xalign=0)
     wrapped.set_wrap(True);wrapped.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
     wrapped.set_width_chars(18);wrapped.set_max_width_chars(18)
-    wrapped.set_halign(Gtk.Align.START);wrapped.set_hexpand(False);box.append(wrapped)
+    wrapped.set_halign(Gtk.Align.FILL);wrapped.set_hexpand(False)
+    wrapped_row.append(wrapped);wrapped_row.append(Gtk.Box())
     loop=GLib.MainLoop();window.connect('close-request',lambda *args:loop.quit())
     window.present();loop.run()
 
@@ -192,6 +197,11 @@ class GtkGeometrySmoke(unittest.TestCase):
         if self.command(['xdotool','getwindowpid',str(window)],deadline).strip()!=str(self.process.pid):
             raise RuntimeError('Foreign fixture window')
         return rect
+
+    def binding(self,window,rect,deadline):
+        title=self.command(['xdotool','getwindowname',str(window)],deadline).strip()
+        if not title:raise RuntimeError('Fixture native window title is empty')
+        return dict(window=window,pid=self.process.pid,title=title,rect=rect[:])
 
     def test_real_gtk14_capability_and_same_frame_geometry(self):
         self.process=None
@@ -245,7 +255,9 @@ class GtkGeometrySmoke(unittest.TestCase):
                 initial=None
                 for _ in range(20):
                     try:
-                        initial=observer.observe_atspi(self.process.pid,self.geometry(window,deadline),deadline=deadline)
+                        rect=self.geometry(window,deadline)
+                        initial=observer.observe_atspi(self.process.pid,rect,deadline=deadline,
+                            window_binding=self.binding(window,rect,deadline))
                         break
                     except observer.ObservationNotReady:time.sleep(.1)
                 self.assertIsNotNone(initial,'GTK accessibility did not settle')
@@ -257,6 +269,7 @@ class GtkGeometrySmoke(unittest.TestCase):
                 observed=None
                 for attempt in range(10):
                     rect=self.geometry(window,deadline);frame_id='gtk-smoke-%d'%attempt;png=out/(frame_id+'.png')
+                    binding=self.binding(window,rect,deadline)
                     x,y,w,h=rect
                     self.command(['import','-window','root','-crop','%dx%d%+d%+d'%(w,h,x,y),str(png)],deadline)
                     # Exercise the delivered reader callback, not a separate
@@ -276,12 +289,19 @@ class GtkGeometrySmoke(unittest.TestCase):
                         return proof
                     try:
                         observed=observer.observe_atspi(self.process.pid,rect,deadline=deadline,
-                            text_geometry=geometry_from_pixels,frame_id=frame_id)
+                            text_geometry=geometry_from_pixels,frame_id=frame_id,window_binding=binding)
                     except observer.ObservationNotReady:time.sleep(.1);continue
-                    if self.geometry(window,deadline)!=rect:observed=None;continue
+                    if (self.geometry(window,deadline)!=rect
+                            or self.binding(window,rect,deadline)!=binding):observed=None;continue
                     break
                 self.assertIsNotNone(observed,'GTK screenshot/tree never settled')
                 (out/'with-fallback.json').write_text(json.dumps(observed,indent=2)+'\n')
+                self.assertEqual(observed.get('coordinate_geometry',{}).get('mode'),'window_to_screen')
+                for node in observed['nodes']:
+                    if 'rect' not in node:continue
+                    raw=node['component_extents']
+                    self.assertEqual(raw['screen'][:2],[0,0])
+                    self.assertEqual(node['rect'],observer.project_window_rect(raw['window'],rect))
                 for text in VISIBLE:self.assertIn(text,observed['visible_text'])
                 self.assertNotIn(HIDDEN,observed['visible_text'])
                 self.assertTrue(any(n.get('text_geometry',{}).get('status')=='ocr_verified' for n in observed['nodes']))
