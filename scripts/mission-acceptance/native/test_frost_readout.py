@@ -31,6 +31,7 @@ def captured(name='controls'):
 def make_reader(out=Path('/unused')):
     p = plan(); p.update(id=MISSION, title='Shared native Mission', revision=1)
     r = reader.Reader('frost', {}, {}, p, None, out)
+    r.checkpoint = Mock()  # Offline pixels have no live host/process to guard.
     r.window = '42'; r.window_rect = [200, 175, 1200, 850]
     r.process = SimpleNamespace(pid=123); r.mission_open = True
     r.process_identity = dict(pid=123, start_ticks='456', executable='/owned/frost', state_dir='/owned/state')
@@ -162,7 +163,7 @@ class FrostPublicPixelReplayTests(unittest.TestCase):
         r.run = run
         o = r.frost_readout(flat, 'flat-precision', [], regions=False)
         self.assertEqual(o['frost_components'], [dict(rect=[0,0,1203,853], fill=1.0)])
-        self.assertEqual(len(measured), 3)
+        self.assertEqual(len(measured), 4)  # RGB16 extraction and mask PNG encode are bounded separately.
         command, raw = measured[0]
         self.assertEqual(command[command.index('-precision')+1], '16')
         self.assertIn(' 1026159 gray(255)', raw)

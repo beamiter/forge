@@ -67,34 +67,45 @@ inspection may restore current source observations, never validation completion.
 
 ## Status and result scope
 
-The latest executed round, [42312173963, attempt 1](https://github.com/beamiter/forge/actions/runs/42312173963),
-**failed native acceptance**. Its five production builds and 21 prerequisite
-checks passed. The final independent host check passed with the whole saved plan
-unchanged, both native/conversation catalogs empty, no Tasks, and every required
-validation still `not_run`. The recorded frontend binaries matched the same-run
-production build artifacts. No complete native inspection/refresh/reopen sequence
-passed.
+The latest executed round, [42348116404, attempt 1](https://github.com/beamiter/forge/actions/runs/42348116404),
+**failed native acceptance** on exact Forge `e4c1228`. Its five production builds
+and 21 prerequisite checks passed. The final independent host check passed with
+the whole saved plan unchanged, both native/conversation catalogs empty, no
+Tasks, and every required validation still `not_run`. Source, installed binary,
+process and shared-host identities were checked against the same-run artifacts.
+The [final artifact](https://github.com/beamiter/forge/actions/runs/42348116404/artifacts/13564932113)
+contains 740 members; its ZIP SHA256 is
+`555c1c2e339d63e3b2393a43bdfd0a02efecaf3f9edc41b8730dbcdbdd4df55c`.
 
-Anvil and Forge opened real windows, but the observer stopped with an AT-SPI
-`NotSupported` error before Mission input. GTK 4.14 does not implement general
-Text.GetRangeExtents for these widgets. The old diagnostic did not identify the
-failing node, so this is a verified compatibility defect, not proof of that
-particular exception's call site. Ember selected the existing Mission and read
-its exact identity/revision, five repository candidates and four core pins.
-Its fixed-distance rewind then left Inspect above the viewport and searched in
-the wrong direction. Inspect, refresh, close and reopen were not executed.
-Frost opened the plan and really scrolled, but a single adjacent pixel merged
-with its scrollbar thumb and made the strict shape check reject it. Its ID crop
-also failed the unchanged OCR confidence threshold. Identity and subsequent
-inspection phases were not accepted.
+- Anvil and Forge opened real windows but found no unique eligible settled open
+  control. Neither received any input or opened the Mission surface. The captured
+  GTK controls were sensitive and visible without the ENABLED state bit; this
+  is distinct from the earlier SCREEN-coordinate and Text capability failures.
+- Ember opened and selected the existing Mission, expanded all five repositories
+  and completed one explicit Inspect. Both initial and inspected scans bound the
+  exact ID/revision, five candidate SHAs and four core pins. The inspected scan
+  also retained missing-validation evidence for all five repositories. During
+  the subsequent upward scroll toward Refresh, a Text range-extents response
+  was rejected as malformed. That failed frame did not record the raw response,
+  so its exact geometry cause remains unconfirmed.
+- Frost opened and selected the existing Mission but did not complete its initial
+  scan or establish an identity binding. Repeated full-frame observation consumed
+  almost the entire 300-second application budget, and the final scrollbar-mask
+  command timed out with 2.795 seconds remaining. This is not an OCR-confidence
+  pass or a completed inspection.
 
-The earlier [42245525353](https://github.com/beamiter/forge/actions/runs/42245525353)
-and [42228324473](https://github.com/beamiter/forge/actions/runs/42228324473) rounds
-remain failed. Their observations must not be combined with later rounds to
-claim a completed sequence. Offline pixel replay and pure observer regression
-tests do not replace another exact-head native run. Frost displays its stable
-Mission ID, but the ID/revision and repository-bound fields must still be
-observed in every required stage.
+No frontend clicked Refresh, completed normal close or reopened in this round.
+The separate real GTK observer fixture passed in ordinary e4c CI; that result
+cannot replace any missing application-level checks above.
+
+The earlier [42312173963](https://github.com/beamiter/forge/actions/runs/42312173963),
+[42245525353](https://github.com/beamiter/forge/actions/runs/42245525353),
+[42228324473](https://github.com/beamiter/forge/actions/runs/42228324473) and the
+first formal round remain failed. Their observations must not be combined with
+later rounds to claim a completed sequence. Offline pixel replay and pure
+observer regression tests do not replace another exact-head native run. Frost
+displays its stable Mission ID, but the ID/revision and repository-bound fields
+must still be observed in every required stage.
 
 Results must distinguish:
 
@@ -110,6 +121,33 @@ Results must distinguish:
 Only the specific native checks actually executed may be marked passed. Preserve
 failed or unexecuted phases and their reasons; never fill missing observations
 with assertions from source code or an earlier CI run.
+
+## Current observer corrections and verification limits
+
+The GTK control path uses the pinned frontends' actual public state semantics:
+Anvil and Forge require SENSITIVE and non-defunct state through their complete
+owned widget ancestry. Only the validated application root is exempt. Ember
+continues to require both ENABLED and SENSITIVE. Exact allowed labels, supported
+button roles, full visibility, stable repeated observations and owned-window
+bindings remain mandatory. This does not make an absent ENABLED bit proof that
+Freeze is disabled. The real GTK control fixture runs in a separate window so
+it cannot alter the existing wrapped-text and OCR geometry fixture.
+
+AccessKit's exact signed-i32 Text range sentinel `(-1,-1,-1,-1)` denotes
+unavailable bounds, not a visible or invisible rectangle. Such a range supplies
+no visible-text or field proof and does not enter the NotSupported-only OCR
+fallback. Other malformed replies still fail with bounded raw-reply diagnostics.
+This compatibility correction is based on the pinned AccessKit implementation;
+the old failed frame did not retain its reply, so it is not a reproduced cause
+or proof that a later native round will pass.
+
+Frost's full-frame scrollbar mask retains the original sRGB Q16 floating-point
+comparisons and connected-component geometry. The optimized RGB16 walk keeps
+host/deadline checks, rejects malformed extraction and unexpected transparency,
+and does not increase the 300-second application budget or observation budget.
+Offline comparisons against the actual failed-round frames establish pixel and
+component equivalence, not native interaction coverage. OCR, scrolling and the
+rest of the application sequence still need a complete exact-head run.
 
 ## Observation readiness
 

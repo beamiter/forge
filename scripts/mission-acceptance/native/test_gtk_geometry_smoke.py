@@ -325,7 +325,7 @@ def configure_fixture_text(entry,view,wrapped,center):
     wrapped.set_xalign(0.5);wrapped.set_justify(center)
 
 
-def fixture(ready_path):
+def fixture(ready_path, controls_only=False):
     ready_path=fixture_ready_location(ready_path)
     import gi
     gi.require_version('Gtk','4.0')
@@ -338,28 +338,38 @@ def fixture(ready_path):
     window=Gtk.Window(title='Read-only AT-SPI geometry fixture');window.set_default_size(640,650)
     box=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=20)
     for side in ('top','bottom','start','end'):getattr(box,'set_margin_'+side)(24)
-    window.set_child(box);box.append(Gtk.Label(label=VISIBLE[0],xalign=0))
-    entry=Gtk.Entry();entry.set_text(VISIBLE[1]);entry.set_editable(False);box.append(entry)
-    view=Gtk.TextView();view.set_editable(False);view.set_cursor_visible(False)
-    view.get_buffer().set_text(VISIBLE[2]);view.set_size_request(-1,50);box.append(view)
-    clipped=Gtk.ScrolledWindow();clipped.set_policy(Gtk.PolicyType.NEVER,Gtk.PolicyType.ALWAYS)
-    clipped.set_min_content_height(50);clipped.set_max_content_height(50)
-    clipped.set_propagate_natural_height(False);clipped.set_vexpand(False)
-    clipped.set_child(Gtk.Label(label='CLIPPED FIRST LINE\nSECOND LINE\nTHIRD LINE\nFOURTH LINE\n'+HIDDEN,
-                                xalign=0,yalign=0));box.append(clipped)
-    # max-width-chars is a natural-size hint, not an allocation limit:
-    # GTK 4.14.5 gtklabel.c get_width_for_height recalculates the width for a
-    # given height. A homogeneous two-child row allocates a real half width
-    # (gtkboxlayout.c gtk_box_layout_allocate), including height-for-width.
-    # This remains one logical line with several physical painted lines.
-    wrapped_row=Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,homogeneous=True)
-    box.append(wrapped_row)
-    wrapped=Gtk.Label(label=WRAPPED,xalign=0)
-    wrapped.set_wrap(True);wrapped.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
-    wrapped.set_width_chars(18);wrapped.set_max_width_chars(18)
-    wrapped.set_halign(Gtk.Align.FILL);wrapped.set_hexpand(False)
-    wrapped_row.append(wrapped);wrapped_row.append(Gtk.Box())
-    configure_fixture_text(entry,view,wrapped,Gtk.Justification.CENTER)
+    window.set_child(box)
+    if controls_only:
+        # GTK 4.14 does not emit ENABLED. Exercise both explicit and inherited
+        # insensitivity through the real public tree, without sending input.
+        controls=Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,spacing=12)
+        live=Gtk.Button(label='LIVE CONTROL');controls.append(live)
+        disabled=Gtk.Button(label='DISABLED');disabled.set_sensitive(False);controls.append(disabled)
+        inherited=Gtk.Box();inherited.set_sensitive(False)
+        inherited.append(Gtk.Button(label='INHERITED'));controls.append(inherited);box.append(controls)
+    else:
+        box.append(Gtk.Label(label=VISIBLE[0],xalign=0))
+        entry=Gtk.Entry();entry.set_text(VISIBLE[1]);entry.set_editable(False);box.append(entry)
+        view=Gtk.TextView();view.set_editable(False);view.set_cursor_visible(False)
+        view.get_buffer().set_text(VISIBLE[2]);view.set_size_request(-1,50);box.append(view)
+        clipped=Gtk.ScrolledWindow();clipped.set_policy(Gtk.PolicyType.NEVER,Gtk.PolicyType.ALWAYS)
+        clipped.set_min_content_height(50);clipped.set_max_content_height(50)
+        clipped.set_propagate_natural_height(False);clipped.set_vexpand(False)
+        clipped.set_child(Gtk.Label(label='CLIPPED FIRST LINE\nSECOND LINE\nTHIRD LINE\nFOURTH LINE\n'+HIDDEN,
+                                    xalign=0,yalign=0));box.append(clipped)
+        # max-width-chars is a natural-size hint, not an allocation limit:
+        # GTK 4.14.5 gtklabel.c get_width_for_height recalculates the width for a
+        # given height. A homogeneous two-child row allocates a real half width
+        # (gtkboxlayout.c gtk_box_layout_allocate), including height-for-width.
+        # This remains one logical line with several physical painted lines.
+        wrapped_row=Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,homogeneous=True)
+        box.append(wrapped_row)
+        wrapped=Gtk.Label(label=WRAPPED,xalign=0)
+        wrapped.set_wrap(True);wrapped.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        wrapped.set_width_chars(18);wrapped.set_max_width_chars(18)
+        wrapped.set_halign(Gtk.Align.FILL);wrapped.set_hexpand(False)
+        wrapped_row.append(wrapped);wrapped_row.append(Gtk.Box())
+        configure_fixture_text(entry,view,wrapped,Gtk.Justification.CENTER)
     loop=GLib.MainLoop();window.connect('close-request',lambda *args:loop.quit())
     window.present()
     clock=window.get_frame_clock()
@@ -427,10 +437,17 @@ class GtkGeometrySmoke(unittest.TestCase):
         return words
 
     def test_real_gtk14_capability_and_same_frame_geometry(self):
+        self.run_smoke()
+
+    def test_real_gtk14_control_sensitivity(self):
+        self.run_smoke(controls_only=True)
+
+    def run_smoke(self, controls_only=False):
         self.process=None
         with fixture_temporary_directory() as temporary:
             private=Path(temporary)
             out=Path(os.environ.get('JTERM_GTK_GEOMETRY_SMOKE_OUT',str(private/'evidence')))
+            if controls_only:out=out/'controls'
             ocr_private=private/'ocr';ocr_private.mkdir(mode=0o700)
             if not out.is_absolute():raise RuntimeError('Smoke evidence path must be absolute')
             out.mkdir(mode=0o700,parents=True,exist_ok=True)
@@ -461,7 +478,8 @@ class GtkGeometrySmoke(unittest.TestCase):
                 ready=private/'fixture-ready.json'
                 self.assertFalse(ready.exists())
                 report['phase']='fixture_launch'
-                self.process=subprocess.Popen([sys.executable,'-B',str(Path(__file__).resolve()),'--fixture',str(ready)],
+                self.process=subprocess.Popen([sys.executable,'-B',str(Path(__file__).resolve()),
+                    '--controls-fixture' if controls_only else '--fixture',str(ready)],
                                               env=env,stdout=subprocess.DEVNULL,stderr=log)
                 report['fixture_pid']=self.process.pid
                 report['phase']='window_mapping'
@@ -499,6 +517,25 @@ class GtkGeometrySmoke(unittest.TestCase):
                     except observer.ObservationNotReady:time.sleep(.1)
                 self.assertIsNotNone(initial,'GTK accessibility did not settle')
                 report['phase']='initial_assertions'
+                if controls_only:
+                    # A separate launch keeps the wrapped-text/OCR fixture's
+                    # geometry, allocations and assertions exactly unchanged.
+                    self.assertEqual(self.geometry(window,deadline),rect)
+                    self.assertEqual(self.binding(window,rect,deadline),binding)
+                    from reader import gtk_control_sensitive
+                    report['control_states']=[]
+                    for name,sensitive in (('LIVE CONTROL',True),('DISABLED',False),('INHERITED',False)):
+                        controls=[n for n in initial['nodes'] if n['role']==43 and n['name']==name]
+                        self.assertEqual(len(controls),1,'Fixture needs one actual button: '+name)
+                        control=controls[0]
+                        self.assertTrue(control['visible'],'Fixture control must be wholly visible')
+                        self.assertFalse(observer.state(control,8),'GTK4.14 does not export ENABLED')
+                        self.assertEqual(gtk_control_sensitive(control,initial),sensitive)
+                        report['control_states'].append(dict(name=name,states=control['states'],
+                            sensitive_ancestry=gtk_control_sensitive(control,initial),rect=control['rect']))
+                    (out/'controls.json').write_text(json.dumps(initial,indent=2)+'\n')
+                    report['status']='passed'
+                    return
                 (out/'without-fallback.json').write_text(json.dumps(initial,indent=2)+'\n')
                 unsupported=[d for d in initial['atspi_diagnostics'] if d['error_name']==observer.NOT_SUPPORTED]
                 self.assertTrue(unsupported,'Fixture must exercise actual GTK4.14 NotSupported')
@@ -610,5 +647,6 @@ class GtkGeometrySmoke(unittest.TestCase):
 
 
 if __name__=='__main__':
-    if len(sys.argv)==3 and sys.argv[1]=='--fixture':fixture(Path(sys.argv[2]))
+    if len(sys.argv)==3 and sys.argv[1] in ('--fixture','--controls-fixture'):
+        fixture(Path(sys.argv[2]),controls_only=sys.argv[1]=='--controls-fixture')
     else:unittest.main()

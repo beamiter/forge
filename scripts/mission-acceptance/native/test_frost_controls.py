@@ -52,12 +52,15 @@ class FrostOpenControlTests(unittest.TestCase):
 
     def test_atspi_stays_exact_and_requires_real_button_role(self):
         self.reader.app = 'anvil'
-        n = node('/mission', visible=True, name='Missions - 0 need review')
-        self.assertEqual(self.reader.targets(dict(scoped_nodes=[n]), 'open'), [])
+        n = node('/mission', '/app', visible=True, name='Missions - 0 need review')
+        root = node('/app', children=['/mission'], role=75, states=[0,0])
+        observed = dict(pid=n['pid'], owner=n['owner'], root='/app',
+                        nodes=[root,n], scoped_nodes=[n])
+        self.assertEqual(self.reader.targets(observed, 'open'), [])
         n['name'] = 'Missions · 0 need review'
-        self.assertEqual(len(self.reader.targets(dict(scoped_nodes=[n]), 'open')), 1)
+        self.assertEqual(len(self.reader.targets(observed, 'open')), 1)
         n['role'] = 29
-        self.assertEqual(self.reader.targets(dict(scoped_nodes=[n]), 'open'), [])
+        self.assertEqual(self.reader.targets(observed, 'open'), [])
 
     def test_low_nonfinite_and_out_of_range_confidence_on_any_word_rejects(self):
         for index in range(len(self.rows)):

@@ -8,6 +8,7 @@ import csv
 import io
 import math
 import re
+import reprlib
 import time
 
 ACCESSIBLE = 'org.a11y.atspi.Accessible'
@@ -347,18 +348,29 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None,
             raise RuntimeError('Ambiguous PID-owned accessibility roots')
         return roots[0]
     owner, root = owned_root()
-    def checked_rect(raw, method):
+    def checked_rect(raw, method, path, interface, member, args, clip=None):
         # The wire result is (iiii), not arbitrary numeric/coercible values.
         # Exact types also reject dbus.Boolean/UInt32, both int subclasses.
-        if (not isinstance(raw, (tuple, list)) or len(raw) != 4
-                or any(type(v) not in (int, dbus.Int32)
-                       or not -(1 << 31) <= v < (1 << 31) for v in raw)
-                or raw[2] < 0 or raw[3] < 0):
-            raise RuntimeError('Malformed AT-SPI ' + method + ' extents')
+        typed = (isinstance(raw, (tuple, list)) and len(raw) == 4
+                 and all(type(v) in (int, dbus.Int32)
+                         and -(1 << 31) <= v < (1 << 31) for v in raw))
+        # AccessKit's range_extents returns Rect::INVALID for absent bounds
+        # (or invalid offsets). This exact signed-i32 sentinel is unavailable,
+        # never invisible or a rectangle. Component and all other negatives
+        # still fail. Offsets/text and final tree stability are checked below.
+        # Ember 3c8b4c6 vendor/accesskit_atspi_common/src/{node,rect,util}.rs.
+        if typed and method == 'Text range' and list(raw) == [-1, -1, -1, -1]:
+            return None
+        if not typed or raw[2] < 0 or raw[3] < 0:
+            error = RuntimeError('Malformed AT-SPI ' + method + ' extents')
+            failure(error, owner, path, interface, member, args)
+            diagnostics[-1].update(frame_id=frame_id, clip=clip,
+                reply_type=type(raw).__name__, reply_repr=reprlib.repr(raw)[:2048])
+            raise error
         return list(map(int, raw))
     def component_rect(path, coordinate_type):
         raw = iface(bus, owner, path, COMPONENT).GetExtents(coordinate_type, timeout=remaining())
-        return checked_rect(raw, 'Component')
+        return checked_rect(raw, 'Component', path, COMPONENT, 'GetExtents', (coordinate_type,))
     nodes, seen, queue = [], set(), [(root, None)]
     def children_of(path):
         found = iface(bus, owner, path, ACCESSIBLE).GetChildren(timeout=remaining())
@@ -391,6 +403,8 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None,
             if not 0 <= count <= 131072:
                 raise RuntimeError('Text bound exceeded')
             n['text'] = str(iface(bus, owner, path, TEXT).GetText(dbus.Int32(0), dbus.Int32(count), timeout=remaining()))
+            if len(n['text']) != count:
+                raise RuntimeError('AT-SPI text length differs from CharacterCount')
         nodes.append(n)
         queue.extend((p, path) for p in n['children'])
     tree = dict(pid=pid, owner=owner, root=root, nodes=nodes)
@@ -424,7 +438,7 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None,
         tree['mission_header_close'] = mission_scope['header_close']
     texts = []
     tree['unknown_text'] = []
-    unsupported_seen = False
+    geometry_recheck = False
     for n in nodes:
         check()
         bounds = node_observation_bounds(n,by_path,window,mission_scope)
@@ -439,10 +453,10 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None,
             if clip[2] <= 0 or clip[3] <= 0:
                 n['text_geometry_status'] = 'outside_clip'
                 continue
-            text = n['text']; offset = 0; lines = []
+            text = n['text']; offset = 0; lines = []; unavailable_ranges = []
             # Only entire logical lines proven inside the actual clip count.
             # A partially clipped line is not guessed, repaired, or synthesized.
-            for line in text.splitlines(keepends=True):
+            for index, line in enumerate(text.splitlines(keepends=True)):
                 end = offset + len(line.rstrip('\r\n'))
                 if end > offset:
                     range_text = iface(bus, owner, n['path'], TEXT)
@@ -454,7 +468,14 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None,
                         if not (isinstance(error, dbus_error) and error.get_dbus_name() == NOT_SUPPORTED
                                 and TEXT in n['interfaces']):
                             raise
-                        unsupported_seen = True
+                        if unavailable_ranges:
+                            # A later capability failure cannot erase a prior
+                            # sentinel or short-circuit remaining range checks
+                            # into success. Preserve both replies and fail.
+                            diagnostics[-1].update(frame_id=frame_id, clip=clip[:],
+                                unavailable_ranges=unavailable_ranges)
+                            raise
+                        geometry_recheck = True
                         unsupported = diagnostics[-1]
                         # Only this exact optional geometry operation may be
                         # unavailable. No name/widget rectangle becomes text
@@ -479,12 +500,28 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None,
                                 pid=pid, role=n['role'], clip=clip[:], rect=n['rect'][:],
                                 status=geometry['status'], unproven_lines=geometry['unproven_lines']))
                         break
-                    rect = checked_rect(rect, 'Text range')
-                    if anchor is not None:
+                    rect = checked_rect(rect, 'Text range', n['path'], TEXT, 'GetRangeExtents',
+                                        (dbus.Int32(offset), dbus.Int32(end), coordinates), clip[:])
+                    if rect is None:
+                        # Do not use OCR, the widget/name rectangle, or another
+                        # line to repair a returned unavailable range. Continue
+                        # checking later ranges so malformed replies stay hard.
+                        geometry_recheck = True
+                        unavailable_ranges.append(dict(index=index, start=offset, end=end,
+                            coordinates=int(coordinates), reply=[-1, -1, -1, -1]))
+                    elif anchor is not None:
                         rect = project_window_rect(rect, window)
-                    if inside(rect, clip):
+                    if rect is not None and inside(rect, clip):
                         lines.append(line.rstrip('\r\n'))
                 offset += len(line)
+            if unavailable_ranges and 'text_geometry' not in n:
+                missing = [entry['index'] for entry in unavailable_ranges]
+                n['text_geometry_status'] = 'unknown'
+                n['text_geometry'] = dict(status='range_unavailable', clip=clip[:],
+                    unproven_lines=missing, unavailable_ranges=unavailable_ranges)
+                tree['unknown_text'].append(dict(path=n['path'], owner=owner,
+                    pid=pid, role=n['role'], clip=clip[:], rect=n['rect'][:],
+                    status='range_unavailable', unproven_lines=missing))
             n['visible_text'] = '\n'.join(lines)
         elif n['visible']:
             n['visible_text'] = n['name']
@@ -514,9 +551,9 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None,
         props = iface(bus, owner, n['path'], 'org.freedesktop.DBus.Properties')
         if str(props.Get(ACCESSIBLE, 'Name', timeout=remaining())) != n['name']:
             changes.append('name')
-        if unsupported_seen or anchor is not None:
-            # OCR boxes belong to the captured clip. Verify node geometry and
-            # all clipping ancestors, not just text, before accepting them.
+        if geometry_recheck or anchor is not None:
+            # OCR boxes and unknown ranges belong to the captured clip. Verify
+            # node geometry and all clipping ancestors, not just the text.
             obj = iface(bus, owner, n['path'], ACCESSIBLE)
             if (list(map(str, obj.GetInterfaces(timeout=remaining()))) != n['interfaces']
                     or int(obj.GetRole(timeout=remaining())) != n['role']

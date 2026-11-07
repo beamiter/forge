@@ -9,6 +9,7 @@ are read-only observers. Missing, ambiguous, clipped, low-confidence or stale
 visible evidence fails closed. No database is opened and no host RPC is sent.
 """
 import argparse
+from array import array
 import hashlib
 import json
 import os
@@ -16,11 +17,12 @@ from pathlib import Path
 import re
 import signal
 import subprocess
+import sys
 import threading
 import time
 import tomllib
 
-from observer import ObservationNotReady, inside, observe_atspi, ocr_rows, phrases, state
+from observer import ObservationNotReady, inside, observe_atspi, ocr_rows, phrases, state, validate_tree
 
 APPS = ('anvil', 'forge', 'ember', 'frost')
 REPOS = ('jterm_core', *APPS)
@@ -44,6 +46,46 @@ OBSERVATION_INTERVAL = .2
 IDENTITY_OCR_SCALE = 3
 FROST_THUMB_MASK = '(b>=128/255)*(b-r>=80/255)*(b-g>=50/255)*(g-r>=25/255)'
 FROST_RAIL_MASK = '(b>=60/255)*(b-r>=40/255)*(b-g>=25/255)*(g-r>=10/255)'
+# Preserve ImageMagick Q16 FX's normalized floating-point comparisons exactly,
+# including boundary-rounding behavior. Integer subtraction is NOT equivalent.
+FROST_MASK_MAX_PIXELS = 4096 * 4096
+FROST_MASK_CHUNK_PIXELS = 65536
+
+
+def frost_thumb_pixels(rgb, width, height, checkpoint):
+    """Exact full-frame Q16 mask, without ImageMagick 6's per-channel FX walk.
+
+    The input is little-endian, interleaved RGB16 from the captured frame after
+    the same sRGB conversion as FROST_THUMB_MASK. No resizing, quantization to
+    RGB8, crop, expected content, or connectivity approximation is permitted.
+    Normalize by the Q16 QuantumScale before subtracting, just as FX does:
+    integer comparisons differ at some antialiased threshold boundary colors.
+    """
+    checkpoint()
+    require(type(width) is int and type(height) is int and width > 0 and height > 0
+            and width * height <= FROST_MASK_MAX_PIXELS, 'Frost mask dimensions exceed bound')
+    pixels = width * height
+    require(len(rgb) == pixels * 6, 'Frost mask RGB16 byte count differs from captured window')
+    samples = array('H')
+    require(samples.itemsize == 2, 'Frost mask requires 16-bit unsigned samples')
+    samples.frombytes(rgb)
+    if sys.byteorder != 'little':
+        samples.byteswap()
+    require(sys.float_info.radix == 2 and sys.float_info.mant_dig == 53
+            and sys.float_info.max_exp == 1024, 'Frost mask requires IEEE-754 binary64')
+    quantum_scale = 1 / 65535
+    normalized = tuple(value * quantum_scale for value in range(65536))
+    mask = bytearray(pixels)
+    for start in range(0, pixels, FROST_MASK_CHUNK_PIXELS):
+        checkpoint()
+        for i in range(start, min(start + FROST_MASK_CHUNK_PIXELS, pixels)):
+            r = normalized[samples[3*i]]
+            g = normalized[samples[3*i+1]]
+            b = normalized[samples[3*i+2]]
+            if b >= 128/255 and b-r >= 80/255 and b-g >= 50/255 and g-r >= 25/255:
+                mask[i] = 255
+    checkpoint()
+    return bytes(mask)
 
 
 def require(test, message):
@@ -213,6 +255,28 @@ def allowed_control(app, label, plan, purpose):
     if purpose == 'close_mission':
         return (app == 'frost' and label == 'Back') or (app == 'ember' and label == 'Close window')
     return False
+
+
+def gtk_control_sensitive(node, observation):
+    """GTK 4.14 exports SENSITIVE, not ENABLED, for interactive widgets.
+
+    collect_states maps the widget's explicit DISABLED property to SENSITIVE:
+    https://github.com/GNOME/gtk/blob/4.14.5/gtk/a11y/gtkatspicontext.c
+    Inherited insensitivity can live on an ancestor instead of the button.
+    Require the complete owned ancestry, stopping only at the application
+    root (which is not a widget and has no SENSITIVE state). This is action
+    eligibility, not proof of inspection completion or disabled adoption.
+    """
+    nodes = validate_tree(observation)
+    root = nodes[observation['root']]
+    require(root['role'] == 75 and root['parent'] is None,
+            'GTK control needs an owned application root')
+    require(nodes.get(node['path']) == node, 'GTK control is not in the observed tree')
+    while node['path'] != root['path']:
+        if not state(node, 24) or state(node, 6):  # SENSITIVE, not DEFUNCT
+            return False
+        node = nodes[node['parent']]
+    return True
 
 
 def frost_sidebar_open_targets(rows, window):
@@ -1042,6 +1106,33 @@ class Reader:
             return dict(frame_id=stem,rows=rows,image=path.name)
         return read
 
+    def frost_thumb_mask(self, png, mask):
+        # Each external step retains run()'s original observation/app deadline.
+        # The bounded Python pixel walk checks those same deadlines every chunk.
+        # Raw intermediates are temporary, never additional observation evidence.
+        width, height = self.window_rect[2:]
+        require(width > 0 and height > 0 and width * height <= FROST_MASK_MAX_PIXELS,
+                'Frost mask dimensions exceed bound')
+        rgb = mask.with_suffix('.rgb16')
+        pgm = mask.with_suffix('.pgm')
+        try:
+            metadata = self.run(['convert', str(png), '+repage', '-colorspace', 'sRGB',
+                      '-depth', '16', '-endian', 'LSB', '-write', 'RGB:' + str(rgb),
+                      '-format', '%w %h %[opaque]\n', 'info:'])
+            # Bind both axes, not only byte count: an equal-area wrong shape
+            # must never be reshaped into invented component coordinates. This
+            # exact one-line receipt also rejects multiple frames and alpha.
+            require(metadata.strip().lower() == '%d %d true' % (width, height),
+                    'Frost mask frame dimensions or opacity differ from captured window')
+            require(rgb.stat().st_size == width * height * 6,
+                    'Frost mask RGB16 byte count differs from captured window')
+            pixels = frost_thumb_pixels(rgb.read_bytes(), width, height, self.checkpoint)
+            pgm.write_bytes(('P5\n%d %d\n255\n' % (width, height)).encode('ascii') + pixels)
+            self.run(['convert', str(pgm), str(mask)])
+        finally:
+            rgb.unlink(missing_ok=True)
+            pgm.unlink(missing_ok=True)
+
     def frost_readout(self, png, stem, rows, regions=True):
         # All alternate views are deterministic crops of this same owned frame.
         # Clear ImageMagick's virtual X11 page offset before any local crop.
@@ -1069,8 +1160,7 @@ class Reader:
         # Save the exact mask as evidence. Coordinates still come only from
         # measured components, within the current owned Mission scope.
         mask = self.out / (stem + '.thumb-mask.png')
-        self.run(['convert', str(png), '+repage', '-colorspace', 'sRGB',
-                  '-fx', FROST_THUMB_MASK, '-colorspace', 'Gray', str(mask)])
+        self.frost_thumb_mask(png, mask)
         thumb_raw = self.run(['convert', '-precision', '16', str(mask),
             '-define', 'connected-components:verbose=true', '-connected-components', '8', 'null:'])
         observation['frost_scroll_components'] = frost_components(thumb_raw, self.window_rect)
@@ -1159,8 +1249,10 @@ class Reader:
         if self.app != 'frost':
             result = []
             for n in observation['scoped_nodes']:
-                if (n['role'] in (43, 62) and n.get('visible') and state(n, 8) and state(n, 24)
-                        and allowed_control(self.app, n['name'], self.plan, purpose)):
+                if (n['role'] in (43, 62) and n.get('visible')
+                        and allowed_control(self.app, n['name'], self.plan, purpose)
+                        and (gtk_control_sensitive(n, observation) if self.app in ('anvil','forge')
+                             else state(n, 8) and state(n, 24))):
                     result.append(dict(label=n['name'], rect=n['rect'], node=n['path']))
             if self.app == 'ember' and purpose == 'close_mission':
                 close = observation.get('mission_header_close')
@@ -1505,7 +1597,9 @@ class Reader:
                 if ready_again and not inspection_obstacles(observation_notice_text(second)) and not unknown_notices(self.app,second,self.plan):
                     self.coverage['stages']['inspection_ready'] = dict(status='settled',
                         evidence=[first['evidence'],second['evidence']],
-                        basis='notice_free_header' if self.app=='frost' else 'enabled_sensitive_inspect_control')
+                        basis=('notice_free_header' if self.app=='frost' else
+                               'sensitive_ancestry_inspect_control' if self.app in ('anvil','forge') else
+                               'enabled_sensitive_inspect_control'))
                     return
             time.sleep(.2)
         raise RuntimeError('Inspect completion did not become visibly settled')
