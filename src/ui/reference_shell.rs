@@ -3712,6 +3712,81 @@ mod popup_theme_tests {
             parsing_errors.borrow()
         );
         preferences.force_close();
+        settle();
+
+        // Missions are a central page, not a dialog. They still need the same
+        // explicit workspace palette: otherwise the shell's light foreground
+        // falls through onto the light canvas and native TextView backgrounds.
+        host.add_css_class("forge-window");
+        host.add_css_class("reference-shell");
+        host.set_default_size(960, 1400);
+        let central = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        central.add_css_class("reference-central");
+        let mission = crate::ui::workspace_missions::MissionSurface::new(std::rc::Rc::new(|_| {
+            panic!("palette inspection must not navigate or control a task")
+        }));
+        central.append(&mission.root);
+        host.set_content(Some(&central));
+        let mut widgets = vec![mission.root.clone().upcast::<gtk::Widget>()];
+        let mut index = 0;
+        while index < widgets.len() {
+            let mut child = widgets[index].first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                widgets.push(widget);
+            }
+            index += 1;
+        }
+        let mut views = Vec::new();
+        let mut entries = Vec::new();
+        for widget in &widgets {
+            if let Some(expander) = widget.downcast_ref::<gtk::Expander>() {
+                expander.set_expanded(true);
+            }
+            if let Some(view) = widget.downcast_ref::<gtk::TextView>() {
+                view.buffer().set_text("Readable Mission plan and evidence");
+                views.push(view.clone());
+            }
+            if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
+                entry.set_text("Readable Mission input");
+                entries.push(entry.clone());
+            }
+        }
+        assert_eq!(views.len(), 2, "inspect both plan and evidence TextViews");
+        assert_eq!(entries.len(), 3, "inspect every new-Mission input");
+        for scheme in [adw::ColorScheme::ForceLight, adw::ColorScheme::ForceDark] {
+            style.set_color_scheme(scheme);
+            settle();
+            assert_color(mission.root.color(), [0xd4, 0xe2, 0xf8]);
+            assert!(matching_pixels(&mission.root, [0x10, 0x19, 0x27]) > 100);
+            let heading = mission.root.first_child().expect("Mission heading");
+            assert!(
+                crate::config::contrast_ratio(&heading.color(), &color([0x10, 0x19, 0x27])) >= 4.5,
+                "Mission headings must contrast with their painted page in {scheme:?}"
+            );
+            for view in &views {
+                assert!(view.is_mapped());
+                assert_color(view.color(), [0xd4, 0xe2, 0xf8]);
+                assert!(matching_pixels(view, [0x10, 0x1c, 0x2e]) > 100);
+                assert!(
+                    crate::config::contrast_ratio(&view.color(), &color([0x10, 0x1c, 0x2e])) >= 4.5,
+                    "Mission text must contrast with its painted TextView in {scheme:?}"
+                );
+            }
+            for entry in &entries {
+                let text = entry
+                    .first_child()
+                    .expect("entry child")
+                    .downcast::<gtk::Text>()
+                    .expect("native entry text");
+                assert_color(text.color(), [0xd4, 0xe2, 0xf8]);
+                assert!(matching_pixels(entry, [0x16, 0x24, 0x3a]) > 100);
+                assert!(
+                    crate::config::contrast_ratio(&text.color(), &color([0x16, 0x24, 0x3a])) >= 4.5,
+                    "Mission inputs must contrast with their painted fields in {scheme:?}"
+                );
+            }
+        }
         host.close();
         gtk::style_context_remove_provider_for_display(&display, &provider);
     }
