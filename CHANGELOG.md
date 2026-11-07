@@ -4,6 +4,9 @@ All notable user-visible and operational changes are recorded here.
 
 ## Unreleased
 
+- Imported API conversations can retry binding after a full command queue
+  instead of remaining indefinitely marked as syncing.
+
 - Catalog refresh now indexes incoming identities across pages instead of
   rescanning prior rows, avoiding quadratic UI-thread work in large workspaces
   while preserving row order and duplicate-update behavior.
