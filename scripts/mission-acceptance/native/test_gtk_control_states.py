@@ -114,7 +114,8 @@ class GtkControlStatesTests(unittest.TestCase):
             with patch('reader.time.sleep'):
                 if change=='none':
                     r.press('open',attempts=1)
-                    r.click.assert_called_once_with(r.targets(second,'open')[0],'open','second')
+                    r.click.assert_called_once_with(r.targets(second,'open')[0],'open','second',changed)
+                    self.assertIs(r.click.call_args.args[3],changed)
                 else:
                     with self.assertRaisesRegex(RuntimeError,'No unique settled public control'):
                         r.press('open',attempts=1)

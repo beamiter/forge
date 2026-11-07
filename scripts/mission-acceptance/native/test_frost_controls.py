@@ -174,11 +174,14 @@ class FrostOpenControlTests(unittest.TestCase):
             click.assert_not_called()
 
     def test_press_still_requires_two_equal_observations(self):
-        with patch.object(self.reader, 'observe', side_effect=[self.observation(evidence='first'),
-                self.observation(evidence='settled')]) as observe, patch.object(self.reader, 'click') as click:
+        first = self.observation(evidence='first')
+        settled = self.observation(evidence='settled')
+        with patch.object(self.reader, 'observe', side_effect=[first, settled]) as observe, \
+                patch.object(self.reader, 'click') as click:
             self.reader.press('open', attempts=1)
         self.assertEqual(observe.call_count, 2)
-        click.assert_called_once_with(self.targets()[0], 'open', 'settled')
+        click.assert_called_once_with(self.targets()[0], 'open', 'settled', settled)
+        self.assertIs(click.call_args.args[3], settled)
         for change in ('count', 'geometry', 'observed_glyph'):
             changed = copy.deepcopy(self.rows)
             if change == 'count':

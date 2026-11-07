@@ -240,6 +240,30 @@ class ReaderReadinessTests(unittest.TestCase):
         code = 0; out = ''; err = ''
         if self.fail_command and command[0] == self.fail_command:
             code = 1; err = 'genuine tool failure'
+        elif command[0] == 'xwininfo':
+            if command == ['xwininfo', '-int', '-root', '-stats']:
+                wid, rect = '1', [0, 0, 1600, 1200]
+                children = False
+            elif len(command) == 6 and command[:3] == ['xwininfo', '-int', '-id'] and command[4:] == ['-stats', '-children']:
+                wid, rect = command[3], self.rect
+                children = True
+            else:
+                raise AssertionError('Unexpected xwininfo command: ' + repr(command))
+            lines = [
+                'xwininfo: Window id: %s "fixture"' % wid,
+                '  Absolute upper-left X:  %d' % rect[0],
+                '  Absolute upper-left Y:  %d' % rect[1],
+                '  Relative upper-left X:  0',
+                '  Relative upper-left Y:  0',
+                '  Width: %d' % rect[2],
+                '  Height: %d' % rect[3],
+                '  Border width: 0',
+                '  Class: InputOutput',
+                '  Map State: IsViewable',
+            ]
+            if children:
+                lines += ['  Root window id: 1 "root"', '  Parent window id: 1 "root"']
+            out = '\n'.join(lines) + '\n'
         elif command[0] == 'import':
             path = Path(command[-1]); self.captures.append(path)
             path.write_text('fresh frame %d' % len(self.captures))
@@ -423,7 +447,7 @@ class ReaderReadinessTests(unittest.TestCase):
         self.assertEqual(captures[1][-2], '640x480+10+0')
 
     def test_genuine_tool_failures_and_bad_image_metadata_are_hard(self):
-        for command in ('xdotool', 'import', 'identify'):
+        for command in ('xdotool', 'xwininfo', 'import', 'identify'):
             self.fail_command = command
             with self.subTest(command=command), self.assertRaisesRegex(RuntimeError, 'genuine tool failure'):
                 self.observe()
@@ -434,6 +458,37 @@ class ReaderReadinessTests(unittest.TestCase):
                 self.observe()
         self.assertEqual(self.atspi.call_count, 0)
         self.assertEqual(self.clock.sleeps, [])
+
+    def test_xwininfo_geometry_errors_fail_before_capture_without_retry(self):
+        original = self.tool
+        def invalid(command, **kwargs):
+            result = original(command, **kwargs)
+            if command[0] == 'xwininfo' and '-id' in command:
+                result.stdout = result.stdout.replace('  Root window id: 1 ', '  Root window id: 99 ')
+            return result
+        with patch('reader.subprocess.run', side_effect=invalid):
+            with self.assertRaisesRegex(RuntimeError, 'another captured root') as caught:
+                self.observe()
+        self.assertNotIsInstance(caught.exception, observer.ObservationNotReady)
+        self.assertEqual(self.captures, [])
+        self.assertEqual(self.clock.sleeps, [])
+        self.assertEqual(self.r.inputs, [])
+
+    def test_xwininfo_receipt_change_discards_frame_even_with_unchanged_client_rect(self):
+        original = self.tool
+        def reparented(command, **kwargs):
+            result = original(command, **kwargs)
+            if command[0] == 'xwininfo' and '-id' in command and self.bind_reads >= 2:
+                result.stdout = result.stdout.replace('  Parent window id: 1 ', '  Parent window id: 2 ')
+            return result
+        with patch('reader.subprocess.run', side_effect=reparented):
+            result = self.observe()
+        self.assertEqual(result['evidence'], '002-open')
+        self.assertEqual(result['window_rect'], [0, 0, 640, 480])
+        self.assertEqual(result['x11_geometry']['client']['parent'], 2)
+        self.assertFalse((self.out / '001-open.json').exists())
+        self.assertEqual(len(self.captures), 2)
+        self.assertEqual(self.r.inputs, [])
 
     def test_startup_uses_first_observation_readiness_not_fixed_paint_sleep(self):
         with patch('reader.sha256', return_value='a'*64), patch('reader.safe_config'), \
