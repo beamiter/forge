@@ -2440,7 +2440,7 @@ mod tests {
     #[ignore = "requires a GTK display"]
     fn composer_limit_preserves_insert_iter_and_utf8_draft() {
         gtk4::init().expect("GTK display");
-        let panel = AiPanel::build(Rc::new(RefCell::new(Config::default())));
+        let panel = AiPanel::build(Rc::new(RefCell::new(Config::safe_defaults())));
         let prefix = "x".repeat(MAX_LIVE_MESSAGE_BYTES - 4);
         panel.input_buffer.set_text(&prefix);
         let mut iter = panel.input_buffer.end_iter();
