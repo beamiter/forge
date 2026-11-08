@@ -137,31 +137,17 @@ impl ContextSurface {
             body.append(&heading);
             let (view, buffer) = editor_view(true);
             view.update_property(&[gtk::accessible::Property::Label(title)]);
+            limit_inserted_text(&buffer, &editor, &rendering, None);
             let state = editor.clone();
             let guard = rendering.clone();
             buffer.connect_changed(move |buffer| {
                 if !guard.get() {
-                    let accepted = state.borrow_mut().set_field(
+                    state.borrow_mut().set_field(
                         field,
                         buffer
                             .text(&buffer.start_iter(), &buffer.end_iter(), false)
                             .into(),
                     );
-                    if !accepted {
-                        let retained = state
-                            .borrow()
-                            .draft()
-                            .map(|draft| match field {
-                                ContextField::Goal => draft.goal.clone(),
-                                ContextField::Completed => draft.completed.clone(),
-                                ContextField::Remaining => draft.remaining.clone(),
-                                ContextField::Constraints => draft.constraints.clone(),
-                            })
-                            .unwrap_or_default();
-                        guard.set(true);
-                        set_buffer(buffer, &retained);
-                        guard.set(false);
-                    }
                 }
             });
             fields.push(buffer);
@@ -510,30 +496,18 @@ impl ContextSurface {
         source.add_css_class("dim-label");
         root.append(&source);
         let (view, buffer) = editor_view(true);
+        limit_inserted_text(&buffer, &self.editor, &self.rendering, Some(id.to_owned()));
         let state = self.editor.clone();
         let guard = self.rendering.clone();
         let key = id.to_owned();
         buffer.connect_changed(move |buffer| {
             if !guard.get() {
-                let accepted = state.borrow_mut().set_material(
+                state.borrow_mut().set_material(
                     &key,
                     buffer
                         .text(&buffer.start_iter(), &buffer.end_iter(), false)
                         .into(),
                 );
-                if !accepted {
-                    let retained = state
-                        .borrow()
-                        .draft()
-                        .and_then(|draft| {
-                            draft.materials.iter().find(|material| material.id == key)
-                        })
-                        .map(|material| material.text.clone())
-                        .unwrap_or_default();
-                    guard.set(true);
-                    set_buffer(buffer, &retained);
-                    guard.set(false);
-                }
             }
         });
         root.append(&view);
@@ -552,6 +526,36 @@ impl ContextSurface {
             buffer,
         }
     }
+}
+
+// Reject before GTK's default insert handler owns a live TextIter. Rewriting
+// the buffer from `changed` invalidates that iterator before insert returns.
+fn limit_inserted_text(
+    buffer: &gtk::TextBuffer,
+    editor: &Rc<RefCell<ContextEditor>>,
+    rendering: &Rc<Cell<bool>>,
+    material: Option<String>,
+) {
+    let editor = editor.clone();
+    let rendering = rendering.clone();
+    buffer.connect_insert_text(move |buffer, _, text| {
+        if rendering.get() {
+            return;
+        }
+        let mut editor = editor.borrow_mut();
+        let editable = editor.draft().is_some_and(|draft| {
+            material
+                .as_ref()
+                .is_none_or(|id| draft.materials.iter().any(|item| &item.id == id))
+        });
+        let bytes = buffer
+            .text(&buffer.start_iter(), &buffer.end_iter(), false)
+            .len()
+            .saturating_add(text.len());
+        if !editable || !editor.accept_text_size(bytes, material.is_some()) {
+            buffer.stop_signal_emission_by_name("insert-text");
+        }
+    });
 }
 
 fn set_buffer(buffer: &gtk::TextBuffer, text: &str) {
@@ -605,14 +609,18 @@ mod tests {
             let before = surface.editor.borrow().draft().cloned().unwrap();
             let huge = "x".repeat(256 * 1024 + 1);
             let goal = &surface.fields[0];
-            goal.insert(&mut goal.end_iter(), &huge);
+            let mut goal_end = goal.end_iter();
+            goal.insert(&mut goal_end, &huge);
+            assert_eq!(goal_end.offset(), "Retained goal".chars().count() as i32);
             assert_eq!(
                 goal.text(&goal.start_iter(), &goal.end_iter(), false)
                     .as_str(),
                 "Retained goal"
             );
             let note = surface.material_widgets.borrow()["note"].buffer.clone();
-            note.insert(&mut note.end_iter(), &huge);
+            let mut note_end = note.end_iter();
+            note.insert(&mut note_end, &huge);
+            assert_eq!(note_end.offset(), "Retained excerpt".chars().count() as i32);
             assert_eq!(
                 note.text(&note.start_iter(), &note.end_iter(), false)
                     .as_str(),
@@ -626,6 +634,37 @@ mod tests {
             );
             surface.render();
             assert_eq!(surface.editor.borrow().draft(), Some(&before));
+            // Valid input after a rejection still works; size is UTF-8 bytes,
+            // not TextIter's character offset.
+            goal.insert(&mut goal_end, "界");
+            assert_eq!(
+                surface.editor.borrow().draft().unwrap().goal,
+                "Retained goal界"
+            );
+            let boundary = "é".repeat(128 * 1024);
+            goal.set_text(&boundary);
+            assert_eq!(
+                surface.editor.borrow().draft().unwrap().goal.len(),
+                256 * 1024
+            );
+            let mut end = goal.end_iter();
+            goal.insert(&mut end, "é");
+            assert_eq!(end.offset(), 128 * 1024);
+            assert_eq!(
+                goal.text(&goal.start_iter(), &goal.end_iter(), false)
+                    .as_str(),
+                boundary
+            );
+            goal.delete(&mut goal.start_iter(), &mut goal.end_iter());
+            goal.insert(&mut goal.end_iter(), "Recovered");
+            note.insert(&mut note_end, "✓");
+            let editor = surface.editor.borrow();
+            assert_eq!(editor.draft().unwrap().goal, "Recovered");
+            assert_eq!(
+                editor.draft().unwrap().materials[0].text,
+                "Retained excerpt✓"
+            );
+            assert!(editor.dirty());
         }
     }
 }

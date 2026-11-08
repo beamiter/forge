@@ -17,6 +17,7 @@ import time
 RUNNER = Path(__file__).with_name("test-gtk-display.sh")
 DIAGNOSTIC = "ui::organism::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers"
 CHAT = "block_view::blocks::tests::chat_pair_keeps_native_surfaces_and_gap_is_not_accumulated"
+CONTEXT = "ui::workspace_context_ui::tests::rejected_context_paste_restores_field_and_material_buffers"
 A11Y = {DIAGNOSTIC, "ui::tasks_panel::tests::approval_details_are_paged_read_only_and_stale_controls_cannot_decide"}
 IME = {"block_view::tests::native_ime_commit_cancel_and_independent_ptys",
        "block_view::tests::native_ime_send_button_preserves_composition"}
@@ -29,7 +30,7 @@ tests = json.loads(Path(e["CONTRACT_TESTS"]).read_text())
 with open(e["CONTRACT_LOG"], "a") as f:
     f.write(json.dumps({"command": name, "args": args, "pid": os.getpid(),
         "env": {k: v for k, v in e.items() if k.startswith("XDG_") or k in
-            ["GTK_A11Y", "GTK_IM_MODULE", "RUST_TEST_THREADS", "GDK_BACKEND",
+            ["G_DEBUG", "GTK_A11Y", "GTK_IM_MODULE", "RUST_TEST_THREADS", "GDK_BACKEND",
              "GSK_RENDERER", "LIBGL_ALWAYS_SOFTWARE", "NO_AT_BRIDGE"]}}) + "\n")
 if name == "dbus-run-session":
     assert args[0].startswith("--config-file=") and args[1] == "--", args
@@ -102,7 +103,7 @@ def main():
         env = dict(os.environ)
         for key in ("BASH_ENV", "FORGE_NATIVE_CRASH_DIAGNOSTICS", "GTK_PAINT_DIAGNOSTICS_DIR"):
             env.pop(key, None)
-        env.update(PATH=str(bindir), TMPDIR=str(root), GTK_IM_MODULE="inherited",
+        env.update(PATH=str(bindir), TMPDIR=str(root), GTK_IM_MODULE="inherited", G_DEBUG="gc-friendly",
                    CONTRACT_TESTS=str(inventory), GTK_PAINT_DIAGNOSTICS_DIR=str(root / "diagnostics"))
         cases = [
             ("success", {}, 0),
@@ -162,7 +163,8 @@ def main():
                 assert sum(r["args"][2] == "120s" for r in deadlines) == len(tests), mode
                 assert sum(r["args"][2] == "240s" for r in deadlines) == (mode == "diagnostic"), mode
                 for call, test in zip(calls, tests):
-                    for key, value in {"GTK_A11Y": "test" if test in A11Y else "none",
+                    for key, value in {"G_DEBUG": "gc-friendly,fatal-warnings" if test == CONTEXT else "gc-friendly",
+                                       "GTK_A11Y": "test" if test in A11Y else "none",
                                        "GTK_IM_MODULE": "simple" if test in IME else "inherited",
                                        "RUST_TEST_THREADS": "1", "GDK_BACKEND": "x11",
                                        "GSK_RENDERER": "cairo", "LIBGL_ALWAYS_SOFTWARE": "1",
@@ -187,3 +189,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
