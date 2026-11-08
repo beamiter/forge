@@ -19,7 +19,7 @@ DIAGNOSTIC = "ui::organism::tests::live_settings_reuse_body_preserve_focus_and_s
 CHAT = "block_view::blocks::tests::chat_pair_keeps_native_surfaces_and_gap_is_not_accumulated"
 CONTEXT = "ui::workspace_context_ui::tests::rejected_context_paste_restores_field_and_material_buffers"
 A11Y = {DIAGNOSTIC, "ui::tasks_panel::tests::approval_details_are_paged_read_only_and_stale_controls_cannot_decide"}
-IME = {"block_view::tests::native_ime_commit_cancel_and_independent_ptys",
+IME = {CONTEXT, "block_view::tests::native_ime_commit_cancel_and_independent_ptys",
        "block_view::tests::native_ime_send_button_preserves_composition"}
 FAKE_CHILD = r'''
 import json, os, sys, time

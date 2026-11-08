@@ -307,6 +307,9 @@ for test_name in "${tests[@]}"; do
     fi
     fixture_g_debug="${G_DEBUG-}"
     if [[ "$test_name" == ui::workspace_context_ui::tests::rejected_context_paste_restores_field_and_material_buffers ]]; then
+        # Do not inject the inherited empty IM name: GTK warns before the
+        # iterator regression starts, and this case intentionally makes warnings fatal.
+        fixture_im_module=simple
         fixture_g_debug="${fixture_g_debug:+${fixture_g_debug},}fatal-warnings"
     fi
     # A wedged fixture must fail explicitly and leave the remaining cases runnable.
