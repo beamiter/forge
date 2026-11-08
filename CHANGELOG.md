@@ -4,6 +4,10 @@ All notable user-visible and operational changes are recorded here.
 
 ## Unreleased
 
+- Preserve the order of selected diffs, logs and evidence while context loads.
+  Pending selections are bounded and retained when saved materials fill capacity;
+  overflow is reported explicitly, and changing conversations cancels old selections.
+
 - Reject oversized context insertions before GTK mutates the buffer, keeping
   caller iterators valid; enforce fatal GTK warnings in the focused regression.
 
@@ -844,4 +848,3 @@ All notable user-visible and operational changes are recorded here.
 ### Security
 
 - Persisted commands, output, working directories, and session metadata are restricted to `0700` directories and `0600` files on Unix.
-
