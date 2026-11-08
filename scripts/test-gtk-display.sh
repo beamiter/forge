@@ -52,6 +52,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    ui::workspace_context_ui::tests::pending_context_additions_preserve_order_capacity_and_cancellation
     ui::workspace_context_ui::tests::rejected_context_paste_restores_field_and_material_buffers
     ui::workspace_missions::tests::mission_editor_preserves_newer_drafts_stable_rows_and_releases_callbacks
     ui::workspace_visibility::tests::collapse_retains_conversation_widgets_and_gives_terminals_the_space
@@ -306,7 +307,7 @@ for test_name in "${tests[@]}"; do
         fixture_im_module=simple
     fi
     fixture_g_debug="${G_DEBUG-}"
-    if [[ "$test_name" == ui::workspace_context_ui::tests::rejected_context_paste_restores_field_and_material_buffers ]]; then
+    if [[ "$test_name" == ui::workspace_context_ui::tests::rejected_context_paste_restores_field_and_material_buffers || "$test_name" == ui::workspace_context_ui::tests::pending_context_additions_preserve_order_capacity_and_cancellation ]]; then
         # Do not inject the inherited empty IM name: GTK warns before the
         # iterator regression starts, and this case intentionally makes warnings fatal.
         fixture_im_module=simple
@@ -344,4 +345,3 @@ if (( ${#failed_cases[@]} > 0 )); then
     # A diagnostic replay or a later passing case must never turn the run green.
     exit "${failed_statuses[0]}"
 fi
-
