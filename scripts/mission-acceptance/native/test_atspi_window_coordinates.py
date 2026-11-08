@@ -128,6 +128,88 @@ class WindowCoordinateTests(unittest.TestCase):
         with self.assertRaisesRegex(observer.ObservationNotReady, 'geometry'):
             bus.observe(text_geometry=lambda *a, **kw:bus.proof(), frame_id='frame-1')
 
+    def test_observed_scrollbar_width_race_discards_the_entire_observation(self):
+        # Replay the CI receipt: SCREEN width 7, then WINDOW width 6.
+        # Only a second SCREEN read proves a temporal change, not a tolerated
+        # cross-coordinate discrepancy. No text geometry may be accepted.
+        bus = WindowGeometryBus(); callback = Mock()
+        bus.screen['/button'] = [0, 0, 7, 50]
+        bus.local['/button'] = [611, 192, 6, 50]
+        bus.latest_screen['/button'] = [0, 0, 6, 50]
+        with self.assertRaisesRegex(observer.ObservationNotReady, 'between SCREEN and WINDOW'):
+            bus.observe(text_geometry=callback, frame_id='discarded')
+        callback.assert_not_called()
+        self.assertEqual([(p, c) for p, c, _ in bus.coordinate_calls if p == '/button'],
+                         [('/button', 0), ('/button', 1), ('/button', 0), ('/button', 1)])
+
+    def test_changed_window_coordinates_also_require_a_fresh_observation(self):
+        bus = WindowGeometryBus(); callback = Mock()
+        bus.local['/button'] = [24, 24, 179, 70]
+        bus.latest_local['/button'] = [24, 24, 180, 70]
+        with self.assertRaises(observer.ObservationNotReady):
+            bus.observe(text_geometry=callback, frame_id='discarded')
+        callback.assert_not_called()
+        # A new, internally consistent capture is independently validated.
+        stable = WindowGeometryBus()
+        tree = stable.observe(text_geometry=lambda *a, **kw:dict(stable.proof(), frame_id='fresh'), frame_id='fresh')
+        self.assertIn(stable.text, tree['visible_text'])
+        self.assertEqual(observer.validate_tree(tree)['/button']['text_geometry']['frame_id'], 'fresh')
+
+    def test_stable_dimension_disagreement_is_still_a_hard_failure(self):
+        bus = WindowGeometryBus(); callback = Mock()
+        bus.local['/button'][2] -= 1
+        with self.assertRaisesRegex(RuntimeError, 'dimensions differ') as caught:
+            bus.observe(text_geometry=callback, frame_id='discarded')
+        self.assertNotIsInstance(caught.exception, observer.ObservationNotReady)
+        callback.assert_not_called()
+        self.assertEqual(len([p for p, _, _ in bus.coordinate_calls if p == '/button']), 4)
+
+    def test_mismatch_recheck_does_not_convert_protocol_or_access_errors(self):
+        for failure in ('malformed', 'denied'):
+            bus = WindowGeometryBus(); callback = Mock()
+            bus.local['/button'][2] -= 1
+            if failure == 'malformed':bus.latest_screen['/button'] = [0, 0, -1, 70]
+            else:
+                bus.latest_screen['/button'] = [0, 0, 179, 70]
+                bus.late_error = DBusError('org.freedesktop.DBus.Error.AccessDenied')
+            with self.subTest(failure=failure), self.assertRaises(RuntimeError) as caught:
+                bus.observe(text_geometry=callback, frame_id='discarded')
+            self.assertNotIsInstance(caught.exception, observer.ObservationNotReady)
+            if failure == 'denied':self.assertIs(caught.exception, bus.late_error)
+            callback.assert_not_called()
+
+    def test_mismatch_recheck_keeps_the_original_deadline(self):
+        bus = WindowGeometryBus(); bus.local['/button'][2] -= 1
+        now = [100.0]
+        window_reads = [0]
+        def expire_on_window(interface, method, args):
+            if method == 'GetExtents' and int(args[0]) == 1:
+                window_reads[0] += 1
+                if window_reads[0] == 3:now[0] = 101.0
+        bus.wire_error = expire_on_window
+        with patch.object(observer.time, 'monotonic', side_effect=lambda:now[0]):
+            with self.assertRaisesRegex(RuntimeError, 'deadline') as caught:
+                bus.observe(deadline=100.5)
+        self.assertNotIsInstance(caught.exception, observer.ObservationNotReady)
+        self.assertEqual([(p, c) for p, c, _ in bus.coordinate_calls if p == '/button'],
+                         [('/button', 0), ('/button', 1)])
+
+    def test_deadline_expiring_between_rechecks_is_not_readiness(self):
+        bus = WindowGeometryBus(); bus.local['/button'][2] -= 1
+        bus.latest_screen['/button'] = [0, 0, 179, 70]
+        now = [100.0]; screen_reads = [0]
+        def expire_on_screen_recheck(interface, method, args):
+            if method == 'GetExtents' and int(args[0]) == 0:
+                screen_reads[0] += 1
+                if screen_reads[0] == 4:now[0] = 101.0
+        bus.wire_error = expire_on_screen_recheck
+        with patch.object(observer.time, 'monotonic', side_effect=lambda:now[0]):
+            with self.assertRaisesRegex(RuntimeError, 'deadline') as caught:
+                bus.observe(deadline=100.5)
+        self.assertNotIsInstance(caught.exception, observer.ObservationNotReady)
+        self.assertEqual([(p, c) for p, c, _ in bus.coordinate_calls if p == '/button'],
+                         [('/button', 0), ('/button', 1), ('/button', 0)])
+
     def test_nonzero_screen_path_is_unchanged_and_never_queries_window(self):
         bus = SignatureBus(); tree = bus.observe()
         self.assertNotIn('coordinate_geometry', tree)
@@ -300,6 +382,33 @@ class WindowCoordinateTests(unittest.TestCase):
 
 class ReaderWindowBindingTests(unittest.TestCase):
     setUp = readiness.ReaderReadinessTests.setUp
+
+    def width_race(self, *args, **kwargs):
+        bus = WindowGeometryBus()
+        bus.screen['/button'] = [0, 0, 7, 50]
+        bus.local['/button'] = [611, 192, 6, 50]
+        bus.latest_screen['/button'] = [0, 0, 6, 50]
+        return bus.observe(deadline=kwargs['deadline'])
+
+    def test_proven_width_race_recaptures_without_publishing_old_evidence(self):
+        def first_races(*args, **kwargs):
+            if self.atspi.call_count == 1:return self.width_race(*args, **kwargs)
+            return copy.deepcopy(self.tree)
+        self.atspi.side_effect = first_races
+        result = self.r.observe('width-race', control=True)
+        self.assertEqual(len(self.captures), 2)
+        self.assertEqual(result['evidence'], '002-width-race')
+        self.assertFalse((self.out / '001-width-race.json').exists())
+        self.assertEqual(self.r.inputs, [])
+
+    def test_repeated_proven_width_race_exhausts_existing_attempt_bound(self):
+        self.atspi.side_effect = self.width_race
+        with self.assertRaisesRegex(RuntimeError, 'bound exhausted'):
+            self.r.observe('width-race', control=True)
+        self.assertEqual(self.atspi.call_count, reader.OBSERVATION_ATTEMPTS)
+        self.assertEqual(len(self.captures), reader.OBSERVATION_ATTEMPTS)
+        self.assertEqual(self.r.coverage['fields'], {})
+        self.assertEqual(self.r.inputs, [])
 
     def tool(self, command, **kwargs):
         result = readiness.ReaderReadinessTests.tool(self, command, **kwargs)

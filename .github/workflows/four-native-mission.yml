@@ -53,7 +53,7 @@ jobs:
           python3 scripts/mission-acceptance/native/provenance.py security-before "$root" "$EXPECTED_SET"
       - name: Preserve preflight evidence
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: native-preflight-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/native-preflight-${{ github.run_id }}-${{ github.run_attempt }}/evidence/
@@ -111,7 +111,7 @@ jobs:
           bash scripts/mission-acceptance/native/build.sh build "$ACCEPTANCE_ROOT" "$COMPONENT" "$EXPECTED_SET" \
             2>&1 | tee "$ACCEPTANCE_ROOT/evidence/native-build.log"
       - name: Preserve only successful exact build artifacts for this run and attempt
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: native-build-${{ matrix.component }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/native-build-${{ github.run_id }}-${{ github.run_attempt }}/build-artifact/
@@ -120,7 +120,7 @@ jobs:
           retention-days: 7
       - name: Preserve build receipts and diagnostics even on failure
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: native-compile-evidence-${{ matrix.component }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/native-build-${{ github.run_id }}-${{ github.run_attempt }}/evidence/
@@ -147,7 +147,7 @@ jobs:
           python3 scripts/mission-acceptance/native/provenance.py security-before "$root" "$EXPECTED_SET"
       # No token, external repository or run-id: download-artifact is restricted
       # to this workflow run. Exact names exclude build-evidence artifacts.
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           pattern: native-build-*-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/native-artifacts
@@ -167,7 +167,7 @@ jobs:
           python3 scripts/mission-acceptance/native/finish.py "$ACCEPTANCE_ROOT" "$EXPECTED_SET" "$RUNNER_TEMP/native-artifacts"
       - name: Preserve scoped screenshots, observations and receipts only, never HOME or host state
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: four-native-mission-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/four-native-mission-${{ github.run_id }}-${{ github.run_attempt }}/evidence/
