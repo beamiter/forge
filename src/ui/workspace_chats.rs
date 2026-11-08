@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 pub(crate) enum Event {
     Opened(u64),
+    /// Cached data changed without an activation request.
+    Refreshed,
     Created {
         request: u64,
         chat_id: u64,
@@ -20,6 +22,11 @@ pub(crate) enum Event {
         receipt: SubmissionReceipt,
     },
     Rejected {
+        request: u64,
+        message: String,
+    },
+    /// Client creation request IDs and submission IDs are separate namespaces.
+    CreateRejected {
         request: u64,
         message: String,
     },
@@ -44,7 +51,9 @@ enum Pending {
     Import(Vec<u64>),
     Bind(u64),
     Fresh(u64),
-    Open,
+    Open {
+        activate: bool,
+    },
     Create {
         activate: bool,
     },
@@ -138,6 +147,38 @@ impl SharedChats {
         let id = self.client.send(command)?;
         self.pending.insert(id, pending);
         Ok(())
+    }
+
+    fn bind_imported(&mut self, local: u64, id: ConversationId) -> Result<(), String> {
+        if let Err(error) = self.send(Command::LoadChat { id }, Pending::Bind(local)) {
+            // No request was queued. Retaining this marker would exclude the
+            // local chat from every subsequent import pass after backpressure.
+            self.importing.remove(&local);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Bind deferred context submission to its creation receipt, never to the
+    /// selection that happens to be visible when the receipt is processed.
+    pub fn prepare_for_chat(
+        &mut self,
+        store: &ChatStore,
+        local: u64,
+        text: String,
+        exact_draft: bool,
+    ) -> Result<u64, String> {
+        let target = store
+            .summaries()
+            .into_iter()
+            .find(|row| row.id == local)
+            .ok_or("The target conversation is no longer available.")?;
+        if target.busy || target.archived {
+            return Err(
+                "The target conversation is busy or archived; the message was not sent.".into(),
+            );
+        }
+        self.prepare(local, text, exact_draft)
     }
 
     pub fn prepare(&mut self, local: u64, text: String, exact_draft: bool) -> Result<u64, String> {
@@ -308,7 +349,23 @@ impl SharedChats {
         }
     }
 
+    /// A newer explicit navigation permanently retires older read activations.
+    /// Their data may still refresh the cache, but cannot take selection back.
+    pub fn retire_navigation(&mut self) {
+        for pending in self.pending.values_mut() {
+            match pending {
+                Pending::Open { activate }
+                | Pending::Create { activate }
+                | Pending::Reload { open: activate, .. } => {
+                    *activate = false;
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub fn open(&mut self, id: ConversationId) -> Result<Option<u64>, String> {
+        self.retire_navigation();
         if let Some(local) = self.local_id(&id) {
             if self.known.get(&local).is_some_and(|known| known.writing)
                 || self.receipts.keys().any(|token| token.chat_id == local)
@@ -329,7 +386,7 @@ impl SharedChats {
             }
             return Ok(None);
         }
-        self.send(Command::LoadChat { id }, Pending::Open)?;
+        self.send(Command::LoadChat { id }, Pending::Open { activate: true })?;
         Ok(None)
     }
 
@@ -342,6 +399,7 @@ impl SharedChats {
         self.create_with_activation(false)
     }
     fn create_with_activation(&mut self, activate: bool) -> Result<u64, String> {
+        self.retire_navigation();
         let request = self.client.send(Command::CreateChat {
             title: "New chat".into(),
         })?;
@@ -371,6 +429,7 @@ impl SharedChats {
     }
 
     pub fn reload(&mut self, local: u64) -> Result<(), String> {
+        self.retire_navigation();
         let known = self
             .known
             .get(&local)
@@ -607,8 +666,8 @@ impl SharedChats {
                                 }
                             }
                         }
-                        Pending::Create { activate: false } => {
-                            events.push(Event::Rejected {
+                        Pending::Create { .. } => {
+                            events.push(Event::CreateRejected {
                                 request: request_id,
                                 message: message.clone(),
                             });
@@ -640,10 +699,7 @@ impl SharedChats {
                 }
                 (Pending::Import(_), Reply::Imported { mappings }) => {
                     for mapping in mappings {
-                        if let Err(error) = self.send(
-                            Command::LoadChat { id: mapping.id },
-                            Pending::Bind(mapping.legacy_id),
-                        ) {
+                        if let Err(error) = self.bind_imported(mapping.legacy_id, mapping.id) {
                             events.push(Event::Error(error));
                         }
                     }
@@ -669,20 +725,18 @@ impl SharedChats {
                             }
                         }
                         Err(error) => {
-                            if !activate {
-                                events.push(Event::Rejected {
-                                    request: request_id,
-                                    message: error.clone(),
-                                });
-                            }
+                            events.push(Event::CreateRejected {
+                                request: request_id,
+                                message: error.clone(),
+                            });
                             events.push(Event::Error(error));
                         }
                     }
                 }
-                (Pending::Open, Reply::Chat { chat }) => {
-                    match self.accept_chat(store, chat, None, true, redact) {
+                (Pending::Open { activate }, Reply::Chat { chat }) => {
+                    match self.accept_chat(store, chat, None, activate, redact) {
                         Ok(Some(local)) => events.push(Event::Opened(local)),
-                        Ok(None) => {}
+                        Ok(None) => events.push(Event::Refreshed),
                         Err(error) => events.push(Event::Error(error)),
                     }
                 }
@@ -780,7 +834,11 @@ impl SharedChats {
                             if !open {
                                 store.select_chat(active);
                             }
-                            events.push(Event::Opened(store.active_id()));
+                            if open {
+                                events.push(Event::Opened(store.active_id()));
+                            } else {
+                                events.push(Event::Refreshed);
+                            }
                         }
                         Err(error) => events.push(Event::Error(error)),
                     }
@@ -1101,6 +1159,247 @@ fn reconcile_draft(local: &str, remote: &str, baseline: &str) -> DraftResolution
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    fn navigation_chat(id: u64, title: &str) -> StoredChat {
+        let snapshot = ChatSnapshot::from_completed_history(id, title, false, &[], None, "");
+        StoredChat {
+            row: WorkspaceRow {
+                id: ConversationId(format!("navigation-{id}")),
+                kind: ConversationKind::Api,
+                title: title.into(),
+                provider: "API".into(),
+                cwd: String::new(),
+                preview: String::new(),
+                updated_at_ms: 0,
+                archived: false,
+                pinned: false,
+                tags: Vec::new(),
+                runtime: jterm_core::agent_workspace::RuntimeState::Idle,
+                facts: Default::default(),
+            },
+            revision: 1,
+            draft_revision: 0,
+            epoch: 0,
+            snapshot_json: ConversationSnapshot::from_chats(id, vec![snapshot])
+                .unwrap()
+                .to_json()
+                .unwrap(),
+            has_older: false,
+            read_position: None,
+            api_job: None,
+            background_api_supported: true,
+        }
+    }
+
+    #[test]
+    fn retired_read_refreshes_cache_without_overriding_newer_selection() {
+        let mut bridge = SharedChats::new("navigation-fixture".into());
+        let mut store = ChatStore::default();
+        let current = store.active_id();
+        store.set_active_draft("Keep my current draft".into());
+        let incoming = jterm_core::agent_workspace::SHARED_CHAT_ID_BASE + 1;
+        bridge.pending.insert(1, Pending::Open { activate: true });
+        bridge.pending.insert(
+            2,
+            Pending::Reload {
+                local: incoming,
+                open: true,
+                keep_local: true,
+            },
+        );
+        bridge.retire_navigation();
+        // Even returning to the original view cannot re-arm an old request.
+        bridge.retire_navigation();
+        let Pending::Open { activate } = bridge.pending.remove(&1).unwrap() else {
+            panic!("open");
+        };
+        assert!(!activate);
+        let result = bridge
+            .accept_chat(
+                &mut store,
+                navigation_chat(incoming, "Read completed"),
+                None,
+                activate,
+                false,
+            )
+            .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(store.active_id(), current);
+        assert_eq!(store.active_draft(), "Keep my current draft");
+        assert!(
+            bridge.known.contains_key(&incoming),
+            "background data must still load"
+        );
+        assert!(matches!(
+            bridge.pending.get(&2),
+            Some(Pending::Reload { open: false, .. })
+        ));
+    }
+
+    #[test]
+    fn a_newer_read_keeps_its_activation_after_older_reads_are_retired() {
+        let mut bridge = SharedChats::new("navigation-fixture".into());
+        let mut store = ChatStore::default();
+        bridge.pending.insert(1, Pending::Open { activate: true });
+        bridge.retire_navigation();
+        bridge.pending.insert(2, Pending::Open { activate: true });
+        let Pending::Open { activate: old } = bridge.pending.remove(&1).unwrap() else {
+            panic!("old open");
+        };
+        assert!(!old);
+        let Pending::Open { activate } = bridge.pending.remove(&2).unwrap() else {
+            panic!("new open");
+        };
+        let incoming = jterm_core::agent_workspace::SHARED_CHAT_ID_BASE + 2;
+        let result = bridge
+            .accept_chat(
+                &mut store,
+                navigation_chat(incoming, "Latest choice"),
+                None,
+                activate,
+                false,
+            )
+            .unwrap();
+        assert_eq!(result, Some(incoming));
+        assert_eq!(store.active_id(), incoming);
+    }
+
+    #[test]
+    fn retired_creation_keeps_new_selection_and_receipt_bound_context_target() {
+        let mut bridge = SharedChats::new("creation-fixture".into());
+        let mut store = ChatStore::default();
+        let visible = store.active_id();
+        store.set_active_draft("Keep visible draft".into());
+        bridge.pending.insert(1, Pending::Create { activate: true });
+        bridge.retire_navigation();
+        let Pending::Create { activate } = bridge.pending.remove(&1).unwrap() else {
+            panic!("create");
+        };
+        assert!(!activate);
+        let created = jterm_core::agent_workspace::SHARED_CHAT_ID_BASE + 1;
+        bridge
+            .accept_chat(
+                &mut store,
+                navigation_chat(created, "New background chat"),
+                None,
+                activate,
+                false,
+            )
+            .unwrap();
+        assert_eq!(store.active_id(), visible);
+        assert_eq!(store.active_draft(), "Keep visible draft");
+        // An unrelated busy foreground conversation must not block this target.
+        store
+            .begin_turn("Foreground response".into(), None, "Thinking".into(), true)
+            .unwrap();
+        let request = bridge
+            .prepare_for_chat(&store, created, "Exact context".into(), false)
+            .unwrap();
+        assert_eq!(bridge.submissions[&created].request, request);
+        assert_eq!(bridge.submissions[&created].text, "Exact context");
+        assert!(!bridge.submissions.contains_key(&visible));
+        assert_eq!(store.active_id(), visible);
+    }
+
+    #[test]
+    fn batched_creations_prepare_each_context_for_its_own_chat() {
+        let mut bridge = SharedChats::new("creation-fixture".into());
+        let mut store = ChatStore::default();
+        let first = jterm_core::agent_workspace::SHARED_CHAT_ID_BASE + 1;
+        let second = first + 1;
+        // poll applies both receipts before the UI handles either Created event.
+        bridge
+            .accept_chat(
+                &mut store,
+                navigation_chat(first, "First"),
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        bridge
+            .accept_chat(
+                &mut store,
+                navigation_chat(second, "Second"),
+                None,
+                true,
+                false,
+            )
+            .unwrap();
+        bridge
+            .prepare_for_chat(&store, first, "First context".into(), false)
+            .unwrap();
+        bridge
+            .prepare_for_chat(&store, second, "Second context".into(), false)
+            .unwrap();
+        assert_eq!(bridge.submissions[&first].text, "First context");
+        assert_eq!(bridge.submissions[&second].text, "Second context");
+        assert_eq!(store.active_id(), second);
+        assert!(bridge
+            .prepare_for_chat(&store, second + 1, "Missing".into(), false)
+            .is_err());
+        bridge.submissions.clear();
+        store
+            .begin_turn("Busy target".into(), None, "Thinking".into(), true)
+            .unwrap();
+        assert!(bridge
+            .prepare_for_chat(&store, second, "Do not send".into(), false)
+            .is_err());
+        assert!(bridge.submissions.is_empty());
+        assert!(store.select_chat(first));
+        store.toggle_archive_active().unwrap();
+        assert!(bridge
+            .prepare_for_chat(&store, first, "Archived target".into(), false)
+            .is_err());
+        assert!(bridge.submissions.is_empty());
+    }
+
+    #[test]
+    fn rejected_import_binding_releases_only_its_retry_marker() {
+        let mut bridge = SharedChats::new("import-retry-fixture".into());
+        // LoadChat is rejected synchronously by a read-only client, exercising
+        // send's error path without starting an SSH process or a host.
+        let config = jterm_core::agent_workspace::WorkspaceSshHost::new(
+            "fixture",
+            "/bin/jterm-sessiond",
+            "fixture",
+        )
+        .unwrap();
+        bridge.client = WorkspaceClient::with_ssh_host(config).unwrap();
+        bridge.importing.extend([1, 2]);
+        assert!(bridge
+            .bind_imported(1, ConversationId("imported-chat".into()))
+            .is_err());
+        assert!(
+            !bridge.importing.contains(&1),
+            "failed enqueue must be retryable"
+        );
+        assert!(
+            bridge.importing.contains(&2),
+            "other pending imports stay protected"
+        );
+        assert!(bridge.pending.is_empty());
+        // The retry's accepted enqueue must retain its marker until the reply.
+        // This endpoint cannot launch a host; no provider or SSH is involved.
+        let path = std::env::temp_dir().join(format!(
+            "jterm-bind-retry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        bridge.client = WorkspaceClient::for_state_dir(path);
+        bridge.importing.insert(1);
+        bridge
+            .bind_imported(1, ConversationId("imported-chat".into()))
+            .unwrap();
+        assert!(bridge.importing.contains(&1));
+        assert!(bridge
+            .pending
+            .values()
+            .any(|pending| matches!(pending, Pending::Bind(1))));
+    }
 
     #[test]
     fn settlement_draft_reconciliation_does_not_bless_a_peer_overwrite() {

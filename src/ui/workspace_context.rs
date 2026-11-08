@@ -58,6 +58,46 @@ impl Default for ContextEditor {
 }
 
 impl ContextEditor {
+    #[cfg(test)]
+    pub(crate) fn with_saved_context_for_test(context: WorkspaceContext) -> Self {
+        let id = context.conversation.clone();
+        let mut editor = Self {
+            selected: Some(id.clone()),
+            ..Default::default()
+        };
+        editor.entries.insert(
+            id,
+            Entry {
+                value: context,
+                generation: 0,
+                dirty: false,
+                remote: None,
+            },
+        );
+        editor
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_pending_context_for_test(id: ConversationId) -> Self {
+        let mut editor = Self {
+            selected: Some(id.clone()),
+            ..Default::default()
+        };
+        editor.stage_context_read_for_test(id);
+        editor
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stage_context_read_for_test(&mut self, id: ConversationId) {
+        self.pending
+            .insert(u64::MAX - self.pending.len() as u64, Pending::Read(id));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_context_for_test(&mut self, context: WorkspaceContext) {
+        self.receive(u64::MAX, Ok(WorkspaceReply::Context { context }));
+    }
+
     pub(crate) fn selected(&self) -> Option<&ConversationId> {
         self.selected.as_ref()
     }
@@ -121,26 +161,39 @@ impl ContextEditor {
             Err(error) => self.notice = Some(error),
         }
     }
-    fn edit(&mut self, change: impl FnOnce(&mut WorkspaceContext)) {
+    fn edit(&mut self, change: impl FnOnce(&mut WorkspaceContext)) -> bool {
         let Some(id) = &self.selected else {
-            return;
+            return false;
         };
         let Some(entry) = self.entries.get_mut(id) else {
-            return;
+            return false;
         };
         change(&mut entry.value);
         entry.generation = entry.generation.wrapping_add(1);
         entry.dirty = true;
         self.packet = None;
         self.notice = entry.value.validate().err();
+        true
     }
-    pub(crate) fn set_field(&mut self, field: ContextField, text: String) {
+    pub(crate) fn accept_text_size(&mut self, bytes: usize, material: bool) -> bool {
+        if bytes <= 256 * 1024 {
+            return true;
+        }
+        self.notice = Some(
+            if material {
+                "That material is too large; the previous excerpt was kept."
+            } else {
+                "That paste is too large; the previous context draft was kept."
+            }
+            .into(),
+        );
+        false
+    }
+    pub(crate) fn set_field(&mut self, field: ContextField, text: String) -> bool {
         // Preserve ordinary over-budget edits for review; refuse only an
         // implausibly large paste instead of truncating its meaning.
-        if text.len() > 256 * 1024 {
-            self.notice =
-                Some("That paste is too large; the previous context draft was kept.".into());
-            return;
+        if !self.accept_text_size(text.len(), false) {
+            return false;
         }
         self.edit(|draft| {
             *match field {
@@ -149,15 +202,14 @@ impl ContextEditor {
                 ContextField::Remaining => &mut draft.remaining,
                 ContextField::Constraints => &mut draft.constraints,
             } = text
-        });
+        })
     }
     pub(crate) fn remove_material(&mut self, id: &str) {
         self.edit(|draft| draft.materials.retain(|material| material.id != id));
     }
-    pub(crate) fn set_material(&mut self, id: &str, text: String) {
-        if text.len() > 256 * 1024 {
-            self.notice = Some("That material is too large; the previous excerpt was kept.".into());
-            return;
+    pub(crate) fn set_material(&mut self, id: &str, text: String) -> bool {
+        if !self.accept_text_size(text.len(), true) {
+            return false;
         }
         self.edit(|draft| {
             if let Some(material) = draft
@@ -168,7 +220,7 @@ impl ContextEditor {
                 material.text = text;
                 material.truncated = true;
             }
-        });
+        })
     }
     pub(crate) fn add_note(&mut self) {
         self.edit(|draft| {
@@ -363,7 +415,11 @@ impl ContextEditor {
                         entry.remote = None;
                     }
                     if self.selected.as_ref() == Some(&id) {
-                        self.notice = Some("Materials saved. They are not sent to a model until you create and submit a new handoff draft.".into());
+                        self.notice = Some(if self.dirty() {
+                            "The earlier version was saved. Your newer local edits are still unsaved; review and Save again.".into()
+                        } else {
+                            "Materials saved. They are not sent to a model until you create and submit a new handoff draft.".into()
+                        });
                     }
                 }
                 Err(error) if self.selected.as_ref() == Some(&id) => {
@@ -436,6 +492,30 @@ mod tests {
         (editor, id)
     }
     #[test]
+    fn rejected_pastes_report_failure_without_changing_retained_drafts() {
+        let (mut editor, _) = editor();
+        assert!(editor.set_field(ContextField::Goal, "Retained goal".into()));
+        editor.add_material(WorkspaceMaterial {
+            id: "note".into(),
+            label: "Note".into(),
+            kind: MaterialKind::Note,
+            text: "Retained note".into(),
+            source: None,
+            truncated: false,
+        });
+        let before = editor.draft().cloned();
+        let huge = "x".repeat(256 * 1024 + 1);
+        assert!(!editor.set_field(ContextField::Goal, huge.clone()));
+        assert!(!editor.set_material("note", huge));
+        assert_eq!(editor.draft(), before.as_ref());
+        assert!(editor.dirty());
+        // Ordinary over-budget text remains editable rather than disappearing.
+        assert!(editor.set_field(ContextField::Goal, "x".repeat(70 * 1024)));
+        assert_eq!(editor.draft().unwrap().goal.len(), 70 * 1024);
+        assert!(editor.draft().unwrap().validate().is_err());
+    }
+
+    #[test]
     fn save_ack_preserves_edits_typed_while_saving() {
         let (mut editor, id) = editor();
         editor.set_field(ContextField::Goal, "submitted".into());
@@ -448,6 +528,28 @@ mod tests {
         assert_eq!(editor.draft().unwrap().goal, "newer unsaved goal");
         assert_eq!(editor.draft().unwrap().revision, 1);
         assert!(editor.dirty());
+        assert!(editor
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("newer local edits are still unsaved"));
+    }
+    #[test]
+    fn save_ack_without_new_edits_reports_saved_materials() {
+        let (mut editor, id) = editor();
+        editor.set_field(ContextField::Goal, "submitted".into());
+        let generation = editor.entries[&id].generation;
+        let mut saved = editor.draft().unwrap().clone();
+        saved.revision = 1;
+        editor.pending.insert(1, Pending::Save { id, generation });
+        editor.receive(1, Ok(WorkspaceReply::Context { context: saved }));
+        assert!(!editor.dirty());
+        assert_eq!(editor.draft().unwrap().goal, "submitted");
+        assert!(editor
+            .notice
+            .as_deref()
+            .unwrap()
+            .starts_with("Materials saved."));
     }
     #[test]
     fn remote_revision_requires_an_explicit_draft_choice() {

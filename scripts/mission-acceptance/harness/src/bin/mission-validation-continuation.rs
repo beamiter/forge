@@ -10,7 +10,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const CORE: &str = "4ffa774138ee89dc2916ce21786c45e411196ca4";
+const CORE: &str = "e8bd7a2b3edd48d7a0f8f0304fa3d8c864dab40e";
 const INPUT_BYTES: usize = 65536;
 const TASK_LIMIT: usize = 16;
 const TOTAL_SECONDS: u64 = 180;

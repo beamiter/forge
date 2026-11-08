@@ -52,6 +52,8 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    ui::workspace_context_ui::tests::pending_context_additions_preserve_order_capacity_and_cancellation
+    ui::workspace_context_ui::tests::rejected_context_paste_restores_field_and_material_buffers
     ui::workspace_missions::tests::mission_editor_preserves_newer_drafts_stable_rows_and_releases_callbacks
     ui::workspace_visibility::tests::collapse_retains_conversation_widgets_and_gives_terminals_the_space
     ui::reference_shell::navigation_drawer::tests::rehost_keeps_the_exact_navigation_widgets_draft_selection_and_scroll
@@ -304,8 +306,15 @@ for test_name in "${tests[@]}"; do
     if [[ "$test_name" == block_view::tests::native_ime_commit_cancel_and_independent_ptys || "$test_name" == block_view::tests::native_ime_send_button_preserves_composition ]]; then
         fixture_im_module=simple
     fi
+    fixture_g_debug="${G_DEBUG-}"
+    if [[ "$test_name" == ui::workspace_context_ui::tests::rejected_context_paste_restores_field_and_material_buffers || "$test_name" == ui::workspace_context_ui::tests::pending_context_additions_preserve_order_capacity_and_cancellation ]]; then
+        # Do not inject the inherited empty IM name: GTK warns before the
+        # iterator regression starts, and this case intentionally makes warnings fatal.
+        fixture_im_module=simple
+        fixture_g_debug="${fixture_g_debug:+${fixture_g_debug},}fatal-warnings"
+    fi
     # A wedged fixture must fail explicitly and leave the remaining cases runnable.
-    if GTK_IM_MODULE="$fixture_im_module" GTK_A11Y="$a11y_backend" \
+    if G_DEBUG="$fixture_g_debug" GTK_IM_MODULE="$fixture_im_module" GTK_A11Y="$a11y_backend" \
         timeout --signal=TERM --kill-after=10s 120s \
         dbus-run-session "${dbus_run_args[@]}" -- \
         xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \

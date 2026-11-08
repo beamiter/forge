@@ -97,7 +97,7 @@ class Contract(unittest.TestCase):
         self.manifest["repositories"].reverse()
         self.assertEqual(collector.validate_manifest(self.manifest,self.digest),self.digest)
     def test_exact_successful_runs_are_selected(self):
-        self.assertEqual(len(collector.select_runs(self.item,self.runs())),2)
+        self.assertEqual(len(collector.select_runs(self.item,self.runs())),3)
     def test_missing_workflow_does_not_pass(self):
         data=self.runs();data["workflow_runs"].pop()
         with self.assertRaises(ValueError):collector.select_runs(self.item,data)
@@ -124,7 +124,7 @@ class Contract(unittest.TestCase):
         selected=collector.select_runs(self.item,data)
         self.assertEqual(len(selected),5)
         self.assertTrue(any(all(r[k]==v for k,v in link.items()) for r in selected))
-        self.assertEqual(collector.MANUAL_WORKFLOWS,{("anvil","link-recovery.yml"),("forge","flatpak.yml")})
+        self.assertEqual(collector.MANUAL_WORKFLOWS,{("jterm_core","security.yml"),("anvil","link-recovery.yml"),("forge","flatpak.yml")})
     def test_forge_flatpak_allows_only_successful_exact_master_manual_run(self):
         self.item=next(r for r in self.manifest["repositories"] if r["name"]=="forge")
         data=self.runs();flatpak=next(r for r in data["workflow_runs"] if r["path"].endswith("/flatpak.yml"))
@@ -222,6 +222,56 @@ class Contract(unittest.TestCase):
         self.assertIn('rustup run 1.86.0 clippy-driver --version',workflow)
 
 
+class CoreSecurityGateTests(unittest.TestCase):
+    def setUp(self):
+        self.manifest=json.loads((HERE/"frozen-candidates.json").read_text())
+        self.manifest["frozen"]=True
+        self.item=next(r for r in self.manifest["repositories"] if r["name"]=="jterm_core")
+        self.digest=collector.digest_set(self.manifest)
+    def runs(self):
+        return {"total_count":3,"workflow_runs":[{"id":i+1,"run_attempt":1,"path":".github/workflows/"+path,"head_sha":self.item["revision"],"event":"push","head_branch":"master","status":"completed","conclusion":"success"} for i,path in enumerate(collector.WORKFLOWS["jterm_core"])]}
+    def security(self,data):
+        return next(r for r in data["workflow_runs"] if r["path"]==".github/workflows/security.yml")
+    def test_core_security_is_a_required_base_gate(self):
+        self.assertEqual(sum(map(len,collector.WORKFLOWS.values())),20)
+        self.assertEqual(collector.WORKFLOWS["jterm_core"],("ci.yml","vim9-pixel-input.yml","security.yml"))
+        for event in ("push","workflow_dispatch"):
+            data=self.runs();self.security(data)["event"]=event
+            self.assertEqual(len(collector.select_runs(self.item,data)),3)
+    def test_missing_wrong_identity_or_event_security_fails(self):
+        data=self.runs();data["workflow_runs"].remove(self.security(data))
+        with self.assertRaises(ValueError):collector.select_runs(self.item,data)
+        for key,value in (("head_sha","0"*40),("head_branch","other"),("path",".github/workflows/other.yml"),("event","pull_request"),("event","schedule"),("event","workflow_run")):
+            for event in ("push","workflow_dispatch"):
+                data=self.runs();self.security(data).update(event=event);self.security(data)[key]=value
+                with self.subTest(key=key,value=value,event=event),self.assertRaises(ValueError):collector.select_runs(self.item,data)
+    def test_latest_security_failure_and_rerun_cannot_fall_back(self):
+        for status,conclusion in (("queued",None),("in_progress",None),("completed","failure"),("completed","cancelled"),("completed","skipped")):
+            for newer in ({"id":100},{"id":3,"run_attempt":2}):
+                for old_event,new_event in (("push","workflow_dispatch"),("workflow_dispatch","push")):
+                    data=self.runs();old=self.security(data);old["event"]=old_event
+                    new=copy.deepcopy(old);new.update(**newer,event=new_event,status=status,conclusion=conclusion);data["workflow_runs"].append(new)
+                    with self.subTest(status=status,newer=newer,events=(old_event,new_event)),self.assertRaises(ValueError):collector.select_runs(self.item,data)
+    def fake_fetch_with_failed_security(self,full_name,suffix):
+        self.assertEqual(full_name,"beamiter/jterm_core")
+        if suffix=="git/ref/heads/master":
+            return {"ref":"refs/heads/master","object":{"type":"commit","sha":self.item["revision"]}}
+        self.assertEqual(suffix,f"actions/runs?head_sha={self.item['revision']}&per_page=100")
+        data=self.runs();self.security(data)["conclusion"]="failure";return data
+    def test_failed_core_security_stops_prepare_before_checkout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/"input.json";path.write_text(json.dumps(self.manifest));output=Path(temp)/"run"
+            with mock.patch.dict(collector.os.environ,{"GITHUB_ACTIONS":"false"}),mock.patch.object(collector,"fetch",side_effect=self.fake_fetch_with_failed_security),mock.patch.object(collector.subprocess,"run") as execute:
+                with self.assertRaisesRegex(ValueError,"security.yml"):collector.prepare(output,path,self.digest)
+                execute.assert_not_called();self.assertFalse(output.exists())
+    def test_failed_core_security_stops_finish_before_credit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);(root/"frozen-candidates.json").write_text(json.dumps(self.manifest))
+            with mock.patch.object(collector,"source_preflight"),mock.patch.object(collector,"fetch",side_effect=self.fake_fetch_with_failed_security):
+                with self.assertRaisesRegex(ValueError,"security.yml"):collector.finish(root,self.digest)
+            self.assertFalse((root/"evidence/final-receipt.json").exists())
+
+
 class RecoveredIntegrationContract(unittest.TestCase):
     def test_all_compiled_core_sources_and_lock_agree(self):
         import tomllib
@@ -231,8 +281,12 @@ class RecoveredIntegrationContract(unittest.TestCase):
         entries=[p for p in lock["package"] if p["name"]=="jterm_core"]
         self.assertEqual(len(entries),1)
         self.assertEqual(entries[0]["source"],f"git+https://github.com/beamiter/jterm_core.git?rev={collector.CORE}#{collector.CORE}")
-        for name in ("main.rs","bin/mission-validation-continuation.rs"):
+        for name in ("main.rs","bin/mission-validation-continuation.rs","bin/mission-native-state.rs"):
             self.assertIn(f'const CORE: &str = "{collector.CORE}";', (HERE/"harness/src"/name).read_text())
+    def test_native_reader_core_agrees_without_executing_it(self):
+        tree=ast.parse((HERE/"native/reader.py").read_text())
+        constants=[ast.literal_eval(node.value) for node in tree.body if isinstance(node,ast.Assign) and any(isinstance(t,ast.Name) and t.id=="CORE" for t in node.targets)]
+        self.assertEqual(constants,[collector.CORE])
     def test_both_examples_are_unfrozen_and_runtime_identity_blank(self):
         candidate=json.loads((HERE/"frozen-candidates.json").read_text())
         validation=json.loads((HERE/"validation-input.example.json").read_text())

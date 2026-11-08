@@ -9,6 +9,7 @@ are read-only observers. Missing, ambiguous, clipped, low-confidence or stale
 visible evidence fails closed. No database is opened and no host RPC is sent.
 """
 import argparse
+from array import array
 import hashlib
 import json
 import os
@@ -16,15 +17,17 @@ from pathlib import Path
 import re
 import signal
 import subprocess
+import sys
 import threading
 import time
 import tomllib
 
-from observer import ObservationNotReady, inside, observe_atspi, ocr_rows, phrases, state
+from observer import ObservationNotReady, inside, observe_atspi, ocr_rows, phrases, state, validate_tree
+from x11_geometry import client_geometry
 
 APPS = ('anvil', 'forge', 'ember', 'frost')
 REPOS = ('jterm_core', *APPS)
-CORE = '4ffa774138ee89dc2916ce21786c45e411196ca4'
+CORE = 'e8bd7a2b3edd48d7a0f8f0304fa3d8c864dab40e'
 REFRESH = {'anvil': 'Refresh saved Missions', 'forge': 'Refresh saved Missions and expire old evidence',
            'ember': 'Refresh saved Missions', 'frost': 'Refresh'}
 INSPECT = {'anvil': 'Inspect saved candidates', 'forge': 'Inspect saved repository candidates',
@@ -44,6 +47,46 @@ OBSERVATION_INTERVAL = .2
 IDENTITY_OCR_SCALE = 3
 FROST_THUMB_MASK = '(b>=128/255)*(b-r>=80/255)*(b-g>=50/255)*(g-r>=25/255)'
 FROST_RAIL_MASK = '(b>=60/255)*(b-r>=40/255)*(b-g>=25/255)*(g-r>=10/255)'
+# Preserve ImageMagick Q16 FX's normalized floating-point comparisons exactly,
+# including boundary-rounding behavior. Integer subtraction is NOT equivalent.
+FROST_MASK_MAX_PIXELS = 4096 * 4096
+FROST_MASK_CHUNK_PIXELS = 65536
+
+
+def frost_thumb_pixels(rgb, width, height, checkpoint):
+    """Exact full-frame Q16 mask, without ImageMagick 6's per-channel FX walk.
+
+    The input is little-endian, interleaved RGB16 from the captured frame after
+    the same sRGB conversion as FROST_THUMB_MASK. No resizing, quantization to
+    RGB8, crop, expected content, or connectivity approximation is permitted.
+    Normalize by the Q16 QuantumScale before subtracting, just as FX does:
+    integer comparisons differ at some antialiased threshold boundary colors.
+    """
+    checkpoint()
+    require(type(width) is int and type(height) is int and width > 0 and height > 0
+            and width * height <= FROST_MASK_MAX_PIXELS, 'Frost mask dimensions exceed bound')
+    pixels = width * height
+    require(len(rgb) == pixels * 6, 'Frost mask RGB16 byte count differs from captured window')
+    samples = array('H')
+    require(samples.itemsize == 2, 'Frost mask requires 16-bit unsigned samples')
+    samples.frombytes(rgb)
+    if sys.byteorder != 'little':
+        samples.byteswap()
+    require(sys.float_info.radix == 2 and sys.float_info.mant_dig == 53
+            and sys.float_info.max_exp == 1024, 'Frost mask requires IEEE-754 binary64')
+    quantum_scale = 1 / 65535
+    normalized = tuple(value * quantum_scale for value in range(65536))
+    mask = bytearray(pixels)
+    for start in range(0, pixels, FROST_MASK_CHUNK_PIXELS):
+        checkpoint()
+        for i in range(start, min(start + FROST_MASK_CHUNK_PIXELS, pixels)):
+            r = normalized[samples[3*i]]
+            g = normalized[samples[3*i+1]]
+            b = normalized[samples[3*i+2]]
+            if b >= 128/255 and b-r >= 80/255 and b-g >= 50/255 and g-r >= 25/255:
+                mask[i] = 255
+    checkpoint()
+    return bytes(mask)
 
 
 def require(test, message):
@@ -73,7 +116,7 @@ def window_geometry(raw, wid):
         fields[key] = int(value)
     require(set(fields) == {'WINDOW','X','Y','WIDTH','HEIGHT','SCREEN'}, 'Incomplete xdotool geometry')
     require(fields['WINDOW'] == int(wid), 'Geometry belongs to a different window')
-    require(fields['WIDTH'] > 0 and fields['HEIGHT'] > 0 and fields['SCREEN'] >= 0, 'Invalid window dimensions/screen')
+    require(fields['WIDTH'] > 0 and fields['HEIGHT'] > 0 and fields['SCREEN'] == 0, 'Invalid window dimensions/screen; isolated inputs require screen 0')
     return [fields[k] for k in ('X', 'Y', 'WIDTH', 'HEIGHT')]
 
 
@@ -181,7 +224,7 @@ class HostGuard:
 def safe_environment(manifest, state_dir):
     source = manifest['environment']
     require(set(source) == ENV_KEYS, 'Unexpected or missing environment keys')
-    require(re.fullmatch(r':\d+(?:\.\d+)?', source['DISPLAY']) is not None, 'Only local X11 display permitted')
+    require(re.fullmatch(r':\d+(?:\.0)?', source['DISPLAY']) is not None, 'Only local X11 screen 0 permitted')
     require(source['DBUS_SESSION_BUS_ADDRESS'].startswith('unix:'), 'Only private Unix D-Bus permitted')
     for key in ENV_KEYS - {'DISPLAY', 'DBUS_SESSION_BUS_ADDRESS'}:
         private_path(source[key], directory=True)
@@ -213,6 +256,28 @@ def allowed_control(app, label, plan, purpose):
     if purpose == 'close_mission':
         return (app == 'frost' and label == 'Back') or (app == 'ember' and label == 'Close window')
     return False
+
+
+def gtk_control_sensitive(node, observation):
+    """GTK 4.14 exports SENSITIVE, not ENABLED, for interactive widgets.
+
+    collect_states maps the widget's explicit DISABLED property to SENSITIVE:
+    https://github.com/GNOME/gtk/blob/4.14.5/gtk/a11y/gtkatspicontext.c
+    Inherited insensitivity can live on an ancestor instead of the button.
+    Require the complete owned ancestry, stopping only at the application
+    root (which is not a widget and has no SENSITIVE state). This is action
+    eligibility, not proof of inspection completion or disabled adoption.
+    """
+    nodes = validate_tree(observation)
+    root = nodes[observation['root']]
+    require(root['role'] == 75 and root['parent'] is None,
+            'GTK control needs an owned application root')
+    require(nodes.get(node['path']) == node, 'GTK control is not in the observed tree')
+    while node['path'] != root['path']:
+        if not state(node, 24) or state(node, 6):  # SENSITIVE, not DEFUNCT
+            return False
+        node = nodes[node['parent']]
+    return True
 
 
 def frost_sidebar_open_targets(rows, window):
@@ -849,7 +914,14 @@ class Reader:
             candidate['name'] = name
             raw_geom = self.run(['xdotool', 'getwindowgeometry', '--shell', wid])
             candidate['geometry_stdout'] = raw_geom
-            rect = window_geometry(raw_geom, wid)
+            legacy_rect = window_geometry(raw_geom, wid)
+            # xdotool 3.20160805 can double-count a reparenting WM offset.
+            # Independent X11 absolute+measured-border coordinates bind both
+            # root screenshots and AT-SPI WINDOW projection to the real client.
+            root_info = self.run(['xwininfo', '-int', '-root', '-stats'])
+            client_info = self.run(['xwininfo', '-int', '-id', wid, '-stats', '-children'])
+            rect, geometry = client_geometry(client_info, root_info, wid, legacy_rect)
+            candidate['x11_geometry'] = geometry
             candidate['rect'] = rect
             if rect[2] >= 300 and rect[3] >= 200:
                 found.append((wid, name, rect))
@@ -864,12 +936,12 @@ class Reader:
         require(len(found) <= 1, 'Ambiguous owned native window: %d candidates' % len(found))
         if not found:
             raise WindowNotReady('Missing owned native window: 0 candidates')
-        window, _, rect = found[0]
+        window, title, rect = found[0]
         active = decimal_id(self.run(['xdotool', 'getactivewindow']), 'active window ID')
         self.window_probe['active_window'] = active
         if active != int(window):
             raise WindowNotReady('Owned target window %s is not the active visible window %s' % (window, active))
-        self.window, self.window_rect = window, rect
+        self.window, self.window_title, self.window_rect = window, title, rect
 
     def startup_failure(self, cycle, attempts, error):
         report = dict(status='failed', error=str(error), attempts=attempts,
@@ -958,7 +1030,10 @@ class Reader:
         self.sequence += 1
         stem = '%03d-%s' % (self.sequence, re.sub('[^a-zA-Z0-9_-]', '-', label))
         png = self.out / (stem + '.png')
-        window, window_rect = self.window, self.window_rect[:]
+        window, window_title, window_rect = self.window, self.window_title, self.window_rect[:]
+        geometry = [c['x11_geometry'] for c in self.window_probe['candidates']
+            if c.get('window') == window and 'x11_geometry' in c]
+        require(len(geometry) == 1, 'Missing initial X11 client geometry receipt')
         x, y, w, h = self.window_rect
         captured_at_ns = time.time_ns()
         self.observation_probe = dict(evidence=stem, screenshot=png.name, captured_at_ns=captured_at_ns)
@@ -975,6 +1050,8 @@ class Reader:
             observation = observe_atspi(self.process.pid, self.window_rect,
                 FRAME['ember'] if self.app=='ember' and self.mission_open else None,
                 deadline=self.observation_deadline, frame_id=stem,
+                window_binding=dict(window=int(window), pid=self.process.pid,
+                                    title=window_title, rect=window_rect[:]),
                 text_geometry=self.clip_text_geometry(png, stem, window_rect))
             self.checkpoint()
             if self.app in ('anvil', 'ember') and self.mission_open:
@@ -1007,12 +1084,18 @@ class Reader:
             spatial = sorted(observation['scoped_nodes'], key=lambda n: (n.get('rect',[0,0])[1], n.get('rect',[0,0])[0]))
             observation['visible_text'] = '\n'.join(dict.fromkeys(n.get('visible_text','') for n in spatial if n.get('visible_text')))
         self.bind_window()
-        if self.window != window or self.window_rect != window_rect:
+        if self.window != window or self.window_title != window_title or self.window_rect != window_rect:
             raise ObservationNotReady('Owned window changed during observation')
         if colors == 1:
             raise ObservationNotReady('Owned native window has not painted a nonuniform frame')
         self.checkpoint()
-        observation.update(evidence=stem, screenshot=png.name, window=self.window, window_rect=self.window_rect,
+        final_geometry = [c['x11_geometry'] for c in self.window_probe['candidates']
+            if c.get('window') == self.window and 'x11_geometry' in c]
+        require(len(final_geometry) == 1, 'Missing final X11 client geometry receipt')
+        if final_geometry != geometry:
+            raise ObservationNotReady('Owned X11 client binding changed during observation')
+        observation['x11_geometry'] = geometry[0]
+        observation.update(evidence=stem, screenshot=png.name, window=self.window, window_title=self.window_title, window_rect=self.window_rect,
                            captured_at_ns=captured_at_ns, pid=self.process.pid)
         (self.out / (stem + '.json')).write_text(json.dumps(observation, indent=2) + '\n')
         return observation
@@ -1039,6 +1122,33 @@ class Reader:
                     and r['top'] < y+h and r['top']+r['height'] > y]
             return dict(frame_id=stem,rows=rows,image=path.name)
         return read
+
+    def frost_thumb_mask(self, png, mask):
+        # Each external step retains run()'s original observation/app deadline.
+        # The bounded Python pixel walk checks those same deadlines every chunk.
+        # Raw intermediates are temporary, never additional observation evidence.
+        width, height = self.window_rect[2:]
+        require(width > 0 and height > 0 and width * height <= FROST_MASK_MAX_PIXELS,
+                'Frost mask dimensions exceed bound')
+        rgb = mask.with_suffix('.rgb16')
+        pgm = mask.with_suffix('.pgm')
+        try:
+            metadata = self.run(['convert', str(png), '+repage', '-colorspace', 'sRGB',
+                      '-depth', '16', '-endian', 'LSB', '-write', 'RGB:' + str(rgb),
+                      '-format', '%w %h %[opaque]\n', 'info:'])
+            # Bind both axes, not only byte count: an equal-area wrong shape
+            # must never be reshaped into invented component coordinates. This
+            # exact one-line receipt also rejects multiple frames and alpha.
+            require(metadata.strip().lower() == '%d %d true' % (width, height),
+                    'Frost mask frame dimensions or opacity differ from captured window')
+            require(rgb.stat().st_size == width * height * 6,
+                    'Frost mask RGB16 byte count differs from captured window')
+            pixels = frost_thumb_pixels(rgb.read_bytes(), width, height, self.checkpoint)
+            pgm.write_bytes(('P5\n%d %d\n255\n' % (width, height)).encode('ascii') + pixels)
+            self.run(['convert', str(pgm), str(mask)])
+        finally:
+            rgb.unlink(missing_ok=True)
+            pgm.unlink(missing_ok=True)
 
     def frost_readout(self, png, stem, rows, regions=True):
         # All alternate views are deterministic crops of this same owned frame.
@@ -1067,8 +1177,7 @@ class Reader:
         # Save the exact mask as evidence. Coordinates still come only from
         # measured components, within the current owned Mission scope.
         mask = self.out / (stem + '.thumb-mask.png')
-        self.run(['convert', str(png), '+repage', '-colorspace', 'sRGB',
-                  '-fx', FROST_THUMB_MASK, '-colorspace', 'Gray', str(mask)])
+        self.frost_thumb_mask(png, mask)
         thumb_raw = self.run(['convert', '-precision', '16', str(mask),
             '-define', 'connected-components:verbose=true', '-connected-components', '8', 'null:'])
         observation['frost_scroll_components'] = frost_components(thumb_raw, self.window_rect)
@@ -1157,8 +1266,10 @@ class Reader:
         if self.app != 'frost':
             result = []
             for n in observation['scoped_nodes']:
-                if (n['role'] in (43, 62) and n.get('visible') and state(n, 8) and state(n, 24)
-                        and allowed_control(self.app, n['name'], self.plan, purpose)):
+                if (n['role'] in (43, 62) and n.get('visible')
+                        and allowed_control(self.app, n['name'], self.plan, purpose)
+                        and (gtk_control_sensitive(n, observation) if self.app in ('anvil','forge')
+                             else state(n, 8) and state(n, 24))):
                     result.append(dict(label=n['name'], rect=n['rect'], node=n['path']))
             if self.app == 'ember' and purpose == 'close_mission':
                 close = observation.get('mission_header_close')
@@ -1195,10 +1306,21 @@ class Reader:
                 result.append(dict(label=label, rect=rect, node=None))
         return result
 
-    def click(self, target, purpose, evidence):
+    def click(self, target, purpose, evidence, observation=None):
         self.bind_window()
         require(allowed_control(self.app, target['label'], self.plan, purpose), 'Forbidden semantic input')
         require(inside(target['rect'], self.window_rect), 'Target lies outside owned window')
+        keys = ('pid','window','window_title','window_rect','x11_geometry')
+        require(isinstance(observation,dict) and observation.get('evidence') == evidence
+                and all(key in observation for key in keys),
+                'Pointer input needs its complete current observation binding')
+        geometry = [c['x11_geometry'] for c in self.window_probe['candidates']
+            if c.get('window') == self.window and 'x11_geometry' in c]
+        require(len(geometry) == 1, 'Pointer input is missing X11 client geometry')
+        current = dict(pid=self.process.pid,window=self.window,window_title=self.window_title,
+                       window_rect=self.window_rect,x11_geometry=geometry[0])
+        require({key:observation[key] for key in keys} == current,
+                'Owned native binding changed before pointer input')
         x,y,w,h = target['rect']
         entry = dict(kind='pointer', purpose=purpose, target=target, evidence=evidence,
                      window=self.window, pid=self.process.pid, x=x+w//2, y=y+h//2)
@@ -1206,7 +1328,7 @@ class Reader:
         self.run(['xdotool', 'mousemove', str(entry['x']), str(entry['y']), 'click', '1'])
         time.sleep(.3)
 
-    def scroll(self, amount, observation=None):
+    def scroll(self, amount, observation=None, frost_state=None):
         self.bind_window()
         if observation is not None:
             require(observation.get('pid') == self.process.pid and observation.get('window') == self.window
@@ -1220,25 +1342,17 @@ class Reader:
         point = [x+w-12, y+h//2]
         evidence = []
         if self.app == 'frost':
-            # The old window gutter landed at the scrollbar's exclusive right
-            # edge and never scrolled. Wheel only over a currently observed,
-            # unique Mission scrollbar thumb, never a guessed content point.
             choices = []
             for label in ('scroll-target', 'scroll-target-settled'):
                 obs = self.observe(label, control=True)
-                scope = obs.get('frost_panel_scope')
-                thumbs = [c for c in obs.get('frost_scroll_components', []) if scope
-                    and inside(c['rect'], scope) and c['rect'][0] > self.window_rect[2]*.9
-                    and 4 <= c['rect'][2] <= 16 and c['rect'][3] > c['rect'][2]*3 and c['fill'] >= .95
-                    and c.get('track') and inside(c['rect'],c['track']) and inside(c['track'],scope)]
-                require(len(thumbs) == 1, 'No unique observed Mission scrollbar')
-                require(obs.get('pid') == self.process.pid, 'Mission scrollbar belongs to another PID')
-                choices.append((thumbs[0]['rect'],thumbs[0]['track'],tuple(scope),
-                                obs['window'],tuple(obs['window_rect']),obs['pid']))
+                choices.append(self.frost_scroll_state(obs))
                 evidence.append(obs['evidence'])
             require(choices[0] == choices[1], 'Mission scrollbar changed before wheel input')
+            require(frost_state is None or choices[0] == frost_state,
+                    'Frost rewind observation changed before wheel input')
             self.bind_window()
-            require((self.window, tuple(self.window_rect), self.process.pid) == choices[0][3:],
+            require((self.process.pid, self.window, tuple(self.window_rect)) == choices[0][1][:3]
+                    and tuple(sorted((self.process_identity or {}).items())) == choices[0][1][5],
                     'Owned window changed before scrollbar input')
             sx,sy,sw,sh = choices[0][0]
             point = [self.window_rect[0]+sx+sw//2, self.window_rect[1]+sy+sh//2]
@@ -1249,7 +1363,7 @@ class Reader:
                   '--delay', '40', '5' if amount > 0 else '4'])
         time.sleep(.2)
 
-    def ember_navigation(self, observation, purpose, label=None):
+    def ember_navigation(self, observation, purpose, label=None, *, allow_missing=False):
         """Offscreen geometry chooses wheel direction only, never visibility."""
         require(self.app == 'ember' and self.mission_open, 'Navigation needs the owned Ember Mission')
         require(observation.get('pid') == self.process.pid and observation.get('window') == self.window
@@ -1271,6 +1385,8 @@ class Reader:
                 return n['name'] == 'Freeze observed candidates'
             return allowed_control('ember',n['name'],self.plan,purpose) and (label is None or n['name'] == label)
         choices = [n for n in nodes if n['role'] in (43,62) and matches(n)]
+        if not choices and allow_missing:
+            return None
         require(len(choices) == 1, 'No unique navigation control: '+purpose)
         n = choices[0]
         require(n.get('pid') == self.process.pid == frame.get('pid') and n.get('owner') == frame.get('owner')
@@ -1296,7 +1412,16 @@ class Reader:
         previous = None
         for index in range(24):
             obs = self.observe('locate-%s-%02d' % (purpose,index), control=True)
-            n,direction,distance,binding = self.ember_navigation(obs,purpose,label)
+            # Preserve only the old ten-frame initial catalog wait. The owned
+            # frame/viewport is validated before a missing match can be ready;
+            # waiting consumes this same 24-step budget and never sends input.
+            navigation = self.ember_navigation(obs,purpose,label,
+                allow_missing=(purpose == 'select' and previous is None))
+            if navigation is None:
+                require(index < 9, 'Saved Mission catalog did not become ready')
+                time.sleep(.2)
+                continue
+            n,direction,distance,binding = navigation
             if previous is not None:
                 old_binding,old_distance,old_y,old_direction = previous
                 require(binding == old_binding, 'Navigation binding changed')
@@ -1333,13 +1458,66 @@ class Reader:
             self.scroll(wheel*4, observation=obs)
         raise RuntimeError('Header navigation 24-step budget exhausted')
 
+
+    def frost_scroll_state(self, observation):
+        """Measured scrollbar only; no OCR value or inferred scroll endpoint."""
+        require(self.app == 'frost' and self.mission_open, 'Navigation needs the owned Frost Mission')
+        require(observation.get('pid') == self.process.pid
+                and observation.get('window') == self.window
+                and observation.get('window_rect') == self.window_rect,
+                'Frost navigation ownership changed')
+        scope = observation.get('frost_panel_scope')
+        require(scope and inside(scope, [0, 0, *self.window_rect[2:]]),
+                'No contained Frost Mission scope')
+        thumbs = [c for c in observation.get('frost_scroll_components', [])
+                  if inside(c['rect'], scope) and c['rect'][0] > self.window_rect[2]*.9
+                  and 4 <= c['rect'][2] <= 16 and c['rect'][3] > c['rect'][2]*3
+                  and c['fill'] >= .95 and c.get('track')
+                  and inside(c['rect'], c['track']) and inside(c['track'], scope)]
+        require(len(thumbs) == 1, 'No unique observed Mission scrollbar')
+        thumb, track = tuple(thumbs[0]['rect']), tuple(thumbs[0]['track'])
+        binding = (self.process.pid, self.window, tuple(self.window_rect),
+                   tuple(scope), track, tuple(sorted((self.process_identity or {}).items())),
+                   (thumb[0],thumb[2]))
+        return thumb, binding
+
+    def frost_rewind(self):
+        """At most 24 upward wheel batches; top is exact and twice observed."""
+        binding = None
+        previous_distance = None
+        heights = []
+        for step in range(25):
+            first = self.observe('rewind-top-%02d' % step, control=True)
+            current = self.frost_scroll_state(first)
+            thumb, current_binding = current
+            if binding is None:
+                binding = current_binding
+            require(current_binding == binding, 'Frost rewind binding or track changed')
+            heights.append(thumb[3])
+            require(max(heights) - min(heights) <= 1,
+                    'Frost scrollbar height changed beyond one-pixel raster rounding')
+            distance = thumb[1] - binding[4][1]
+            require(distance >= 0, 'Frost scrollbar escaped track top')
+            if previous_distance is not None:
+                require(distance < previous_distance, 'Frost rewind made no upward progress')
+            if distance == 0:
+                second = self.observe('rewind-top-%02d-settled' % step, control=True)
+                require(self.frost_scroll_state(second) == current,
+                        'Frost top was not stable in two frames')
+                return second
+            require(step < 24, 'Frost rewind 24-wheel-batch budget exhausted')
+            previous_distance = distance
+            self.scroll(-4, frost_state=current)
+
     def rewind(self):
+        if self.app == 'frost' and self.mission_open:
+            return self.frost_rewind()
         if self.app == 'ember' and self.mission_open:
             return self.ember_header()
         self.scroll(-30)
 
     def press(self, purpose, attempts=10, label=None):
-        if self.app == 'ember' and self.mission_open and purpose not in ('open','menu','select'):
+        if self.app == 'ember' and self.mission_open and purpose not in ('open','menu'):
             first,_ = self.locate_ember(purpose,label)
             choices = self.targets(first,purpose)
             if label is not None: choices = [t for t in choices if t['label'] == label]
@@ -1347,12 +1525,12 @@ class Reader:
             again = self.targets(second,purpose)
             if label is not None: again = [t for t in again if t['label'] == label]
             require(len(choices) == 1 and again == choices and
-                    all(first.get(k) == second.get(k) for k in ('pid','window','window_rect')),
+                    all(first.get(k) == second.get(k) for k in ('pid','window','window_title','window_rect','x11_geometry')),
                     'No unique settled public control: '+purpose)
             require(not any(s in observation_notice_text(second) for s in INSPECTION_BUSY)
                     and (purpose not in ('inspect','refresh') or not any(unknown_notices(self.app,o,self.plan) for o in (first,second))),
                     'Mission notice is busy or unknown')
-            self.click(choices[0],purpose,second['evidence'])
+            self.click(choices[0],purpose,second['evidence'],second)
             return
         for _ in range(attempts):
             first = self.observe(purpose, control=True)
@@ -1365,9 +1543,11 @@ class Reader:
                 again = self.targets(second, purpose)
                 if label is not None:
                     again = [t for t in again if t['label'] == label]
-                if (again == choices and not any(s in observation_notice_text(second) for s in INSPECTION_BUSY)
+                if (again == choices
+                        and all(first.get(k) == second.get(k) for k in ('pid','window','window_title','window_rect','x11_geometry'))
+                        and not any(s in observation_notice_text(second) for s in INSPECTION_BUSY)
                         and (purpose not in ('inspect','refresh') or not any(unknown_notices(self.app,o,self.plan) for o in (first,second)))):
-                    self.click(choices[0], purpose, second['evidence'])
+                    self.click(choices[0], purpose, second['evidence'], second)
                     return
             if purpose in ('select', 'refresh', 'open', 'menu'):
                 time.sleep(.2)
@@ -1427,6 +1607,7 @@ class Reader:
 
     def scan(self, stage):
         if self.app == 'ember': self.ember_header()
+        elif self.app == 'frost': self.frost_rewind()
         else: self.scroll(-24)
         seen = set()
         for index in range(24):
@@ -1487,7 +1668,7 @@ class Reader:
     def wait_inspection_settled(self):
         """Observe completion without sending a second Inspect action."""
         if self.app == 'frost':
-            self.scroll(-30)
+            self.rewind()
         for attempt in range(20):
             first = self.observe('inspect-completion-%02d' % attempt, control=True)
             obstacles = inspection_obstacles(observation_notice_text(first))
@@ -1503,7 +1684,9 @@ class Reader:
                 if ready_again and not inspection_obstacles(observation_notice_text(second)) and not unknown_notices(self.app,second,self.plan):
                     self.coverage['stages']['inspection_ready'] = dict(status='settled',
                         evidence=[first['evidence'],second['evidence']],
-                        basis='notice_free_header' if self.app=='frost' else 'enabled_sensitive_inspect_control')
+                        basis=('notice_free_header' if self.app=='frost' else
+                               'sensitive_ancestry_inspect_control' if self.app in ('anvil','forge') else
+                               'enabled_sensitive_inspect_control'))
                     return
             time.sleep(.2)
         raise RuntimeError('Inspect completion did not become visibly settled')
@@ -1515,14 +1698,14 @@ class Reader:
             obs,n = self.locate_ember('freeze')
             second = self.observe('freeze-settled',control=True)
             again,_,_,binding = self.ember_navigation(second,'freeze')
-            require(n == again and all(obs.get(k) == second.get(k) for k in ('pid','window','window_rect')),
+            require(n == again and all(obs.get(k) == second.get(k) for k in ('pid','window','window_title','window_rect','x11_geometry')),
                     'Freeze control changed before readback')
             disabled = not state(n,8) and not state(n,24)
             self.coverage['stages']['freeze_after_refresh'] = dict(
                 status='disabled' if disabled else 'unexpected_enabled', evidence=second['evidence'])
             require(disabled, 'Refresh did not visibly disable adoption')
             return
-        self.scroll(-30)
+        self.rewind()
         for index in range(16):
             obs = self.observe('refresh-freeze-state-%02d' % index, control=True)
             if self.app == 'frost':

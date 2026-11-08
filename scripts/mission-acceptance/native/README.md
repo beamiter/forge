@@ -30,6 +30,11 @@ must pin the compiled core. Publication of new acceptance code changes Forge's
 HEAD, so a new freeze and exact-head prerequisite CI are needed before dispatch.
 An old accepted snapshot cannot approve new workflow code.
 
+The current prerequisite contract requires 22 exact-head workflows: the base
+20 now include core `security.yml`, plus the existing Forge/Frost security gates.
+The historical rounds below used 21 and are not relabelled. Core Security accepts
+only exact-master push or explicit dispatch; all other event restrictions remain.
+
 All clients receive one short canonical private `JTERM_WORKSPACE_STATE_DIR`.
 An independently built production `jterm-sessiond --jterm-session-host` owns it.
 Record and monitor PID, Linux process birth tick, executable and private socket. The helper also
@@ -67,34 +72,45 @@ inspection may restore current source observations, never validation completion.
 
 ## Status and result scope
 
-The latest executed round, [42312173963, attempt 1](https://github.com/beamiter/forge/actions/runs/42312173963),
-**failed native acceptance**. Its five production builds and 21 prerequisite
-checks passed. The final independent host check passed with the whole saved plan
-unchanged, both native/conversation catalogs empty, no Tasks, and every required
-validation still `not_run`. The recorded frontend binaries matched the same-run
-production build artifacts. No complete native inspection/refresh/reopen sequence
-passed.
+The latest executed round, [42348116404, attempt 1](https://github.com/beamiter/forge/actions/runs/42348116404),
+**failed native acceptance** on exact Forge `e4c1228`. Its five production builds
+and 21 prerequisite checks passed. The final independent host check passed with
+the whole saved plan unchanged, both native/conversation catalogs empty, no
+Tasks, and every required validation still `not_run`. Source, installed binary,
+process and shared-host identities were checked against the same-run artifacts.
+The [final artifact](https://github.com/beamiter/forge/actions/runs/42348116404/artifacts/13564932113)
+contains 740 members; its ZIP SHA256 is
+`555c1c2e339d63e3b2393a43bdfd0a02efecaf3f9edc41b8730dbcdbdd4df55c`.
 
-Anvil and Forge opened real windows, but the observer stopped with an AT-SPI
-`NotSupported` error before Mission input. GTK 4.14 does not implement general
-Text.GetRangeExtents for these widgets. The old diagnostic did not identify the
-failing node, so this is a verified compatibility defect, not proof of that
-particular exception's call site. Ember selected the existing Mission and read
-its exact identity/revision, five repository candidates and four core pins.
-Its fixed-distance rewind then left Inspect above the viewport and searched in
-the wrong direction. Inspect, refresh, close and reopen were not executed.
-Frost opened the plan and really scrolled, but a single adjacent pixel merged
-with its scrollbar thumb and made the strict shape check reject it. Its ID crop
-also failed the unchanged OCR confidence threshold. Identity and subsequent
-inspection phases were not accepted.
+- Anvil and Forge opened real windows but found no unique eligible settled open
+  control. Neither received any input or opened the Mission surface. The captured
+  GTK controls were sensitive and visible without the ENABLED state bit; this
+  is distinct from the earlier SCREEN-coordinate and Text capability failures.
+- Ember opened and selected the existing Mission, expanded all five repositories
+  and completed one explicit Inspect. Both initial and inspected scans bound the
+  exact ID/revision, five candidate SHAs and four core pins. The inspected scan
+  also retained missing-validation evidence for all five repositories. During
+  the subsequent upward scroll toward Refresh, a Text range-extents response
+  was rejected as malformed. That failed frame did not record the raw response,
+  so its exact geometry cause remains unconfirmed.
+- Frost opened and selected the existing Mission but did not complete its initial
+  scan or establish an identity binding. Repeated full-frame observation consumed
+  almost the entire 300-second application budget, and the final scrollbar-mask
+  command timed out with 2.795 seconds remaining. This is not an OCR-confidence
+  pass or a completed inspection.
 
-The earlier [42245525353](https://github.com/beamiter/forge/actions/runs/42245525353)
-and [42228324473](https://github.com/beamiter/forge/actions/runs/42228324473) rounds
-remain failed. Their observations must not be combined with later rounds to
-claim a completed sequence. Offline pixel replay and pure observer regression
-tests do not replace another exact-head native run. Frost displays its stable
-Mission ID, but the ID/revision and repository-bound fields must still be
-observed in every required stage.
+No frontend clicked Refresh, completed normal close or reopened in this round.
+The separate real GTK observer fixture passed in ordinary e4c CI; that result
+cannot replace any missing application-level checks above.
+
+The earlier [42312173963](https://github.com/beamiter/forge/actions/runs/42312173963),
+[42245525353](https://github.com/beamiter/forge/actions/runs/42245525353),
+[42228324473](https://github.com/beamiter/forge/actions/runs/42228324473) and the
+first formal round remain failed. Their observations must not be combined with
+later rounds to claim a completed sequence. Offline pixel replay and pure
+observer regression tests do not replace another exact-head native run. Frost
+displays its stable Mission ID, but the ID/revision and repository-bound fields
+must still be observed in every required stage.
 
 Results must distinguish:
 
@@ -111,11 +127,69 @@ Only the specific native checks actually executed may be marked passed. Preserve
 failed or unexecuted phases and their reasons; never fill missing observations
 with assertions from source code or an earlier CI run.
 
+## Current observer corrections and verification limits
+
+The GTK control path uses the pinned frontends' actual public state semantics:
+Anvil and Forge require SENSITIVE and non-defunct state through their complete
+owned widget ancestry. Only the validated application root is exempt. Ember
+continues to require both ENABLED and SENSITIVE. Exact allowed labels, supported
+button roles, full visibility, stable repeated observations and owned-window
+bindings remain mandatory. This does not make an absent ENABLED bit proof that
+Freeze is disabled. The real GTK control fixture runs in a separate window so
+it cannot alter the existing wrapped-text and OCR geometry fixture.
+
+AccessKit's exact signed-i32 Text range sentinel `(-1,-1,-1,-1)` denotes
+unavailable bounds, not a visible or invisible rectangle. Such a range supplies
+no visible-text or field proof and does not enter the NotSupported-only OCR
+fallback. Other malformed replies still fail with bounded raw-reply diagnostics.
+This compatibility correction is based on the pinned AccessKit implementation;
+the old failed frame did not retain its reply, so it is not a reproduced cause
+or proof that a later native round will pass.
+
+Frost's full-frame scrollbar mask retains the original sRGB Q16 floating-point
+comparisons and connected-component geometry. The optimized RGB16 walk keeps
+host/deadline checks, rejects malformed extraction and unexpected transparency,
+and does not increase the 300-second application budget or observation budget.
+Offline comparisons against the actual failed-round frames establish pixel and
+component equivalence, not native interaction coverage. OCR, scrolling and the
+rest of the application sequence still need a complete exact-head run.
+
 ## Observation readiness
 
+The separate ordinary-CI GTK compatibility fixture at
+[4c3e4e7 / run 42319455807](https://github.com/beamiter/forge/actions/runs/42319455807)
+started and painted a real GTK 4.14.5 window, but failed its first visible-label
+assertion. All observed Component SCREEN origins were `(0, 0)`, so the strict
+OCR clips did not contain the displayed controls. This is a failed standalone
+observer test, not a passed frontend or formal native round. The same screenshot
+also showed that `max-width-chars` alone did not make the wrapping fixture
+narrow; its later width assertion was not reached.
+
+[GTK 4.14.5's Component implementation](https://github.com/GNOME/gtk/blob/4.14.5/gtk/a11y/gtkatspicomponent.c#L106-L153)
+returns zero SCREEN origins, while WINDOW coordinates accumulate actual
+accessible-parent bounds. When every Component SCREEN origin is zero, the
+observer requires the reader's freshly observed X11 client XID, PID, title and
+rectangle. A unique direct top-level frame must match both the observed title
+and client dimensions in the same PID-owned accessibility tree. Only that
+frame's subtree is translated from WINDOW coordinates using the captured client
+origin. Other clients retain raw diagnostic geometry but cannot supply visible
+text or input targets. Ambiguous matches, missing bindings, dimension conflicts
+and unsupported nested native dialog/window boundaries fail closed. Nested
+in-client FRAME containers retain their clipping boundaries.
+
+Raw SCREEN and WINDOW extents, the chosen anchor and the converted rectangles
+are recorded. Both raw coordinate sets, the complete tree, node properties,
+text, owner and PID are rechecked; the reader separately rechecks XID, title,
+PID and client geometry after observation. No decoration offset, scaling or
+expected text is used to invent a position. Implementations with nonzero SCREEN
+origins keep the existing SCREEN path. Local mock regressions do not prove this
+compatibility path works in real GTK; the ordinary fixture and subsequent
+formal round must independently pass.
+
 AT-SPI requests keep introspection disabled and use explicit protocol types:
-unsigned SCREEN coordinates for Component.GetExtents and Text.GetRangeExtents,
-signed text offsets for Text.GetText and Text.GetRangeExtents. Signature tests
+unsigned SCREEN or bound WINDOW coordinates for Component.GetExtents and
+Text.GetRangeExtents, signed text offsets for Text.GetText and
+Text.GetRangeExtents. Signature tests
 use a typed mock when dbus-python is unavailable locally; they are not a real
 D-Bus or native-application pass. Protocol errors remain hard failures, with one
 explicit capability fallback: only the actual Text.GetRangeExtents call's exact
@@ -203,3 +277,57 @@ the wrong GTK version fails. CI preserves only fixture JSON/PNG/version evidence
 not private homes or host state. A pass would cover this isolated compatibility
 fixture only, never the four-application Mission contract. Local tests on a
 machine without GTK are not a real GTK pass.
+
+
+## Native run 42383439132: observed failure, not acceptance
+
+The exact Forge `4965b2cca714596ff4606bc347e247192c7eb616` attempt passed
+preflight and all five production builds. The four-reader runtime failed; it
+did not establish four-application acceptance or real Task/provider delivery.
+Artifact `13579410747` is 70,404,217 bytes, SHA-256
+`a7df71d7c525bbd3f9bcf87fac1a24c0097c9e860698becce2b4ca7d52493b3b`.
+Its independent host check passed: the complete saved plan stayed unchanged and
+both conversation catalogs remained empty.
+
+Anvil and Forge opened their Mission surfaces but did not select the saved row.
+Ember proved identity, all five candidates and four common core pins, Inspect,
+Refresh and the disabled post-refresh freeze control. It closed and reopened
+the Mission surface, then could not reselect the offscreen saved row. Whole-app
+restart was not reached. Frost selected the plan, but its exact ID/hash OCR was
+below confidence 80, so it correctly did not Inspect. Its fixed rewind stopped
+midway down the content, leaving Refresh offscreen. These partial observations
+are not a passed contract.
+
+The navigation corrections do not weaken these evidence requirements:
+- Ember saved-row selection uses the existing owned, bounded navigation path.
+  A genuinely absent initial catalog may wait up to ten frames within the same
+  24-step budget. Disabled, foreign, duplicate or disappearing-after-scroll
+  matches still fail; pointer input still needs two equal visible observations.
+- Frost rewinds by at most 24 batches of four upward wheel events. Each batch
+  uses the current unique measured thumb/track, stable in two frames and bound
+  to the preceding observation. The distance from the track top must strictly
+  shrink; success requires exact top equality and a second matching frame.
+  Horizontal geometry and track stay fixed. The observed one-pixel raster
+  rounding of thumb height is bounded across the whole seek, not accumulated.
+  This is navigation only, never identity, candidate, pin or validation proof.
+- X11 client coordinates come from strict `xwininfo` output, not guessed
+  decoration offsets. The measured border is added to its absolute outer
+  origin. Window/root identity, map state, dimensions, complete root containment
+  and the before/after binding are checked. Existing xdotool PID, active-window
+  and dimension checks remain; its legacy X/Y are retained only diagnostically.
+  Only local screen 0 is accepted, matching the isolated input/capture server.
+  Pointer input rechecks the complete second-frame window/title/root/client
+  binding; a small move that leaves the old point inside the window still fails.
+  This avoids the old xdotool reparented-window offset calculation.
+
+The ordinary compatibility fixture additionally creates two synthetic X11
+windows with nonzero parent/child offsets and borders. It checks the measured
+client origin and saves a separate receipt. It is not a terminal application,
+host or provider, and does not upgrade the failed native result.
+
+The GTK mixed content-origin/border-size issue and Frost low-confidence
+identifier/hash pixels remain separate from the navigation corrections.
+No clipping tolerance, confidence reduction, punctuation repair, expected-value
+OCR dictionary, cross-frame text joining or fabricated validation is introduced.
+A later native experiment still needs separately reviewed frozen heads and all
+22 current prerequisite checks.

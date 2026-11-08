@@ -18,7 +18,7 @@ ID/revision and existing host state path. Then explicitly set `frozen: true`.
 Never put private runtime identities or paths in a repository commit.
 
 The schema accepts exactly the five beamiter repositories, unique paths, full
-lowercase 40-character commits, compiled core `4ffa774138ee89dc2916ce21786c45e411196ca4`,
+lowercase 40-character commits, compiled core `e8bd7a2b3edd48d7a0f8f0304fa3d8c864dab40e`,
 and no unknown keys. Input must be a regular file at most 64 KiB. Symlinks and
 FIFOs are rejected using a no-follow, nonblocking open and descriptor metadata.
 The saved Mission must match every candidate, path, baseline, canonical repository

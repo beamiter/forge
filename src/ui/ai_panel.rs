@@ -849,7 +849,11 @@ impl AiPanel {
     }
 
     pub(crate) fn connect_close_requested(&self, callback: impl Fn() + 'static) {
-        self.close_btn.connect_clicked(move |_| callback());
+        let shared = self.shared.clone();
+        self.close_btn.connect_clicked(move |_| {
+            shared.borrow_mut().retire_navigation();
+            callback();
+        });
     }
 
     pub(crate) fn set_persistence_callback(&self, callback: impl Fn() + 'static) {
@@ -857,6 +861,7 @@ impl AiPanel {
     }
 
     pub(crate) fn restore_persisted_conversation(&self) {
+        self.shared.borrow_mut().retire_navigation();
         let Some(snapshot) = crate::state::get_ai_conversation_snapshot() else {
             return;
         };
@@ -880,6 +885,10 @@ impl AiPanel {
             drop(request);
             let _ = store.cancel_request(token, "Response continues in the session host.".into());
         }
+    }
+
+    pub(crate) fn retire_pending_navigation(&self) {
+        self.shared.borrow_mut().retire_navigation();
     }
 
     pub(crate) fn focus_input(&self) {
@@ -944,6 +953,7 @@ impl AiPanel {
     }
 
     fn toggle_chat_library(&self) {
+        self.shared.borrow_mut().retire_navigation();
         if self.content_stack.visible_child_name().as_deref() == Some(CHAT_LIBRARY_PAGE) {
             self.show_chat_page();
         } else {
@@ -952,6 +962,7 @@ impl AiPanel {
     }
 
     fn show_chat_library(&self) {
+        self.shared.borrow_mut().retire_navigation();
         self.handoff_navigation_epoch
             .set(self.handoff_navigation_epoch.get().wrapping_add(1));
         self.refresh_chat_library();
@@ -1054,7 +1065,13 @@ impl AiPanel {
                     }
                     let payload = self.pending_new_context.borrow_mut().remove(&request);
                     if let Some(payload) = payload {
-                        self.send_with_context(payload.user_text, payload.context, false, false);
+                        self.send_with_context_for_chat(
+                            chat_id,
+                            payload.user_text,
+                            payload.context,
+                            false,
+                            false,
+                        );
                     }
                     if !background_handoff {
                         self.render_active_chat();
@@ -1071,6 +1088,10 @@ impl AiPanel {
                     if draft_conflict {
                         self.show_error_status("The new conversation already has a draft. The handoff remains in its source context; no text was overwritten.");
                     }
+                }
+                super::workspace_chats::Event::Refreshed => {
+                    self.render_active_chat();
+                    self.publish_persisted_conversation();
                 }
                 super::workspace_chats::Event::Opened(id) => {
                     let job = self.shared.borrow().hosted_job(id);
@@ -1135,7 +1156,11 @@ impl AiPanel {
                 }
                 super::workspace_chats::Event::Rejected { request, message } => {
                     self.pending_shared.borrow_mut().remove(&request);
+                    self.show_error_status(&message);
+                }
+                super::workspace_chats::Event::CreateRejected { request, message } => {
                     self.pending_new_drafts.borrow_mut().remove(&request);
+                    self.pending_new_context.borrow_mut().remove(&request);
                     self.show_error_status(&message);
                 }
                 super::workspace_chats::Event::Deleted(id) => {
@@ -1188,6 +1213,7 @@ impl AiPanel {
     }
 
     pub(crate) fn select_chat(&self, id: u64) {
+        self.shared.borrow_mut().retire_navigation();
         self.handoff_navigation_epoch
             .set(self.handoff_navigation_epoch.get().wrapping_add(1));
         let selected = self.store.borrow_mut().select_chat(id);
@@ -1202,6 +1228,7 @@ impl AiPanel {
         let result = self.store.borrow_mut().toggle_archive_active();
         match result {
             Ok(_) => {
+                self.shared.borrow_mut().retire_navigation();
                 self.render_active_chat();
                 self.publish_persisted_conversation();
                 self.show_chat_page();
@@ -1272,6 +1299,7 @@ impl AiPanel {
                 p.show_info_status("Stopping the background response. Delete this chat after cleanup finishes.");
                 return;
             }
+            p.shared.borrow_mut().retire_navigation();
             match p.shared.borrow_mut().delete(deleted_id) {
                 Ok(true) => { p.show_info_status("Deleting the shared conversation…"); return; }
                 Ok(false) => {},
@@ -1995,11 +2023,29 @@ impl AiPanel {
         restore_pending_as_draft: bool,
         clear_composer_on_start: bool,
     ) -> bool {
+        let chat_id = self.store.borrow().active_id();
+        self.send_with_context_for_chat(
+            chat_id,
+            user_text,
+            context,
+            restore_pending_as_draft,
+            clear_composer_on_start,
+        )
+    }
+
+    fn send_with_context_for_chat(
+        &self,
+        chat_id: u64,
+        user_text: String,
+        context: Option<BlockContext>,
+        restore_pending_as_draft: bool,
+        clear_composer_on_start: bool,
+    ) -> bool {
         if !self.config.borrow().ai_enabled {
             self.show_error_status("Enable AI in Settings before sending a message.");
             return false;
         }
-        if user_text.trim().is_empty() || self.store.borrow().is_active_busy() {
+        if user_text.trim().is_empty() {
             return false;
         }
         let user_text = if self.config.borrow().ai_redact_secrets {
@@ -2007,11 +2053,12 @@ impl AiPanel {
         } else {
             user_text
         };
-        let local = self.store.borrow().active_id();
-        let result =
-            self.shared
-                .borrow_mut()
-                .prepare(local, user_text.clone(), clear_composer_on_start);
+        let result = self.shared.borrow_mut().prepare_for_chat(
+            &self.store.borrow(),
+            chat_id,
+            user_text.clone(),
+            clear_composer_on_start,
+        );
         match result {
             Ok(request) => {
                 self.pending_shared.borrow_mut().insert(

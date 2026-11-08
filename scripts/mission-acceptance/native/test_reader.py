@@ -459,6 +459,16 @@ class NativeStartupTests(unittest.TestCase):
         out='';err='';code=0
         if command[0]=='import':
             Path(command[-1]).write_bytes(b'diagnostic screenshot stub, not UI evidence')
+        elif command[0]=='xwininfo':
+            from test_x11_geometry import raw as x11_raw
+            if '-root' in command:
+                out=x11_raw(wid=543,x=0,y=0,relative_x=0,relative_y=0,width=1600,height=1200)
+            else:
+                wid=command[command.index('-id')+1]
+                legacy=self.geometry_overrides.get(wid,'WINDOW=%s\nX=80\nY=40\nWIDTH=1200\nHEIGHT=850\nSCREEN=0\n' % wid)
+                rect=reader.window_geometry(legacy,wid)
+                out=x11_raw(wid=int(wid),root=543,x=rect[0],y=rect[1],width=rect[2],height=rect[3],
+                            relative_x=0,relative_y=0)
         elif command[1]=='search':
             self.search_count+=1
             if self.search_count<=self.empty_searches:
@@ -503,7 +513,7 @@ class NativeStartupTests(unittest.TestCase):
     def test_real_shell_geometry_output_is_data_and_bound_to_window(self):
         raw='WINDOW=4194307\nX=-8\nY=40\nWIDTH=1200\nHEIGHT=850\nSCREEN=0\n'
         self.assertEqual(reader.window_geometry(raw,'4194307'),[-8,40,1200,850])
-        for invalid in [raw.replace('WINDOW=4194307','WINDOW=99'),raw.replace('WIDTH=1200','WIDTH=0'),
+        for invalid in [raw.replace('SCREEN=0','SCREEN=1'),raw.replace('WINDOW=4194307','WINDOW=99'),raw.replace('WIDTH=1200','WIDTH=0'),
                         raw+'X=1\n',raw.replace('SCREEN=0\n',''),raw+'HOOK=$(touch /tmp/unsafe)\n',
                         raw.replace('Y=40','Y=not-a-number')]:
             with self.subTest(raw=invalid),self.assertRaises(RuntimeError):

@@ -150,6 +150,9 @@ impl MissionSurface {
     pub fn new(callback: Rc<dyn Fn(Action)>) -> Self {
         let state = Rc::new(RefCell::new(MissionWorkbench::new()));
         let root = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        // The central canvas is light while shell text is light. Opt into the
+        // same paired foreground/background palette as the other readers.
+        root.add_css_class("workspace-surface");
         root.set_margin_top(16);
         root.set_margin_bottom(16);
         root.set_margin_start(16);

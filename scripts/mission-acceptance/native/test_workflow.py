@@ -597,7 +597,7 @@ class SecurityGateTests(unittest.TestCase):
 
     def test_only_two_fixed_security_gates_allow_push_or_dispatch(self):
         self.assertEqual(p.EXTRA_SECURITY_WORKFLOWS, {'forge': 'security-audit.yml', 'frost': 'security.yml'})
-        self.assertEqual(p.NATIVE_REQUIRED_WORKFLOW_COUNT, 21)
+        self.assertEqual(p.NATIVE_REQUIRED_WORKFLOW_COUNT, 22)
         for name in p.EXTRA_SECURITY_WORKFLOWS:
             for event in ('push', 'workflow_dispatch'):
                 result = self.select([self.run_record(name, event=event)], name)
@@ -605,7 +605,7 @@ class SecurityGateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             p.select_security_run(self.item('anvil'), {'total_count': 0, 'workflow_runs': []})
         self.assertEqual(p.collector.MANUAL_WORKFLOWS,
-                         frozenset({('anvil', 'link-recovery.yml'), ('forge', 'flatpak.yml')}))
+                         frozenset({('jterm_core', 'security.yml'), ('anvil', 'link-recovery.yml'), ('forge', 'flatpak.yml')}))
 
     def test_wrong_commit_branch_path_event_and_missing_runs_fail(self):
         changes = [{'head_sha': '0' * 40}, {'head_branch': 'feature'},

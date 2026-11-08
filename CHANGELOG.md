@@ -4,6 +4,37 @@ All notable user-visible and operational changes are recorded here.
 
 ## Unreleased
 
+- Preserve the order of selected diffs, logs and evidence while context loads.
+  Pending selections are bounded and retained when saved materials fill capacity;
+  overflow is reported explicitly, and changing conversations cancels old selections.
+
+- Reject oversized context insertions before GTK mutates the buffer, keeping
+  caller iterators valid; enforce fatal GTK warnings in the focused regression.
+
+- Rejected oversized context pastes now restore the visible field or material
+  to the retained draft, so Save and Preview match the text on screen.
+
+- Context save confirmations now distinguish the saved version from newer
+  unsaved edits typed while the save was pending.
+
+- Late new-chat replies preserve newer navigation, and deferred block-context
+  messages target the exact created chat even when multiple creations finish
+  together. Creation failures no longer clear unrelated pending submissions.
+
+- Delayed chat open and reload replies now refresh cached data without
+  overriding a newer conversation selection or reopening a retired view.
+
+- Imported API conversations can retry binding after a full command queue
+  instead of remaining indefinitely marked as syncing.
+
+- Catalog refresh now indexes incoming identities across pages instead of
+  rescanning prior rows, avoiding quadratic UI-thread work in large workspaces
+  while preserving row order and duplicate-update behavior.
+
+- Dependency queue rendering now indexes known task identities once per update
+  instead of repeatedly scanning the catalog, reducing UI-thread work for large
+  workspaces without changing which tasks can be selected as dependencies.
+
 ### Highlights
 
 - Mission Needs-you now shows concrete shared reasons and exact candidate,

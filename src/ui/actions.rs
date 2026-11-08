@@ -705,6 +705,7 @@ impl UiState {
             self.show_ai_error("AI features are disabled in Settings or safe mode.");
             return;
         }
+        self.ai_panel.retire_pending_navigation();
         self.set_ai_panel_visible(next, true);
         if self.ai_panel_visible.get() {
             self.agent_tasks.borrow_mut().panel_visible = false;
@@ -723,6 +724,7 @@ impl UiState {
             self.show_ai_error("AI features are disabled in Settings or safe mode.");
             return;
         }
+        self.ai_panel.retire_pending_navigation();
         self.set_ai_panel_visible(true, true);
         self.agent_tasks.borrow_mut().panel_visible = false;
         self.sync_side_panel();

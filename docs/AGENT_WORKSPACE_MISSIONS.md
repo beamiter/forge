@@ -81,11 +81,16 @@ any task or plan write.
 ## Source and verification
 
 The production/test dependency is the public shared-core commit
-`4ffa774138ee89dc2916ce21786c45e411196ca4`. Cargo.lock, dependency policy,
+`e8bd7a2b3edd48d7a0f8f0304fa3d8c864dab40e`. Cargo.lock, dependency policy,
 Flatpak's generated sources, Nix's source hash and adapter compatibility records
 all name that source. Its NAR is
-`sha256-CZinWRNrlmclrkzh9GbiKs/SEGraa5xlIL1GyIIljuk=`. The global sibling path
+`sha256-MwXJBOTtzVfjNYveL9KMkLAdGR52wP46VDkURdjg12Q=`. The global sibling path
 patch and historical archive are not build inputs.
+
+The security-audit-only source migration leaves core runtime/Cargo inputs and
+frontend UI unchanged. It requires its own exact-commit source and CI verification.
+The historical local results below were recorded at the prior PR4 pin,
+`4ffa774138ee89dc2916ce21786c45e411196ca4`; they are not relabelled as new-pin results.
 
 Local Rustfmt, five production-source mutation tests, seven real Linux PTY input
 tests, adapter manifests and fresh Flatpak source-generation checks passed.

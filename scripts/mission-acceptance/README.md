@@ -10,11 +10,11 @@ the native evidence. The manual job requires explicit frozen invocation data.
 On an ordinary GitHub-hosted Ubuntu 24.04 runner, use only these public repositories:
 `beamiter/jterm_core`, `beamiter/anvil`, `beamiter/forge`, `beamiter/ember`,
 `beamiter/frost`. The harness pins published core
-`4ffa774138ee89dc2916ce21786c45e411196ca4` and carries its own Cargo.lock.
+`e8bd7a2b3edd48d7a0f8f0304fa3d8c864dab40e` and carries its own Cargo.lock.
 
 The job reads the exact frozen five master refs and each predeclared exact-head
-master workflow before checkout. All gates require push runs except two fixed paths-filtered workflows:
-Anvil `link-recovery.yml` and Forge `flatpak.yml`. These require an explicit
+master workflow before checkout. The base contract requires 20 workflows, including core Security. All gates require push runs except three fixed paths-filtered workflows:
+Core `security.yml`, Anvil `link-recovery.yml` and Forge `flatpak.yml`. These require an explicit
 `workflow_dispatch` at that same master SHA when no push run exists. Anvil
 link-recovery native lanes remain SKIPPED and are not accepted as native recovery
 evidence; the Forge Flatpak bundle and smoke job must actually succeed. Missing, pending,
@@ -85,7 +85,7 @@ and `scripts/mission-acceptance/`. Core does not change just to host this job:
 that would unnecessarily change the pin required by all four frontends.
 
 1. Review the implementation and let the selected frontend's normal gates pass
-   after its authorized publication. Finish all final exact-head gates first. Run Anvil link-recovery and Forge Flatpak manually on master if their
+   after its authorized publication. Finish all final exact-head gates first. Run core Security, Anvil link-recovery and Forge Flatpak manually on master if their
    paths-filtered push workflows did not run. Record Anvil link-recovery source/build
    scope and native SKIPPED status without substituting another gate.
 2. Read all five current master SHAs, native evidence and exact-head workflow
