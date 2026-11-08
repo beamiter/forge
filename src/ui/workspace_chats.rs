@@ -483,6 +483,52 @@ impl SharedChats {
         Ok(true)
     }
 
+    /// The pagination cursor is meaningful only while its rendered pages remain
+    /// cached. Retire both unread requests and the cursor when those pages leave.
+    pub fn retire_history(&mut self, local: u64) {
+        self.history_cursor.remove(&local);
+        self.pending.retain(|_, pending| {
+            !matches!(pending, Pending::History { local: id } | Pending::PrimeHistory { local: id } if *id == local)
+        });
+    }
+
+    pub fn append_earlier_history(
+        &mut self,
+        cache: &mut HashMap<u64, String>,
+        local: u64,
+        text: &str,
+    ) -> bool {
+        // poll reduces all replies before the UI consumes its event batch.
+        // Eviction may have retired an Earlier event already in that batch.
+        if !self.history_cursor.contains_key(&local) {
+            return false;
+        }
+        if cache.len() >= 8 && !cache.contains_key(&local) {
+            if let Some(id) = cache.keys().next().copied() {
+                cache.remove(&id);
+                self.retire_history(id);
+            }
+        }
+        let earlier = cache.entry(local).or_default();
+        *earlier = format!("{text}{earlier}");
+        if earlier.len() > 1024 * 1024 {
+            let mut end = 1024 * 1024;
+            while !earlier.is_char_boundary(end) {
+                end -= 1;
+            }
+            earlier.truncate(end);
+        }
+        true
+    }
+
+    fn take_pending_reply(
+        &mut self,
+        event: WorkspaceEvent,
+    ) -> Option<(u64, Pending, Result<Reply, String>)> {
+        let WorkspaceEvent::Reply { request_id, result } = event;
+        self.pending.remove(&request_id).map(|pending| (request_id, pending, result))
+    }
+
     pub fn history(&mut self, local: u64) -> Result<(), String> {
         let known = self
             .known
@@ -625,8 +671,7 @@ impl SharedChats {
     pub fn poll(&mut self, store: &mut ChatStore, redact: bool) -> Vec<Event> {
         let mut events = Vec::new();
         for event in self.client.poll() {
-            let WorkspaceEvent::Reply { request_id, result } = event;
-            let Some(pending) = self.pending.remove(&request_id) else {
+            let Some((request_id, pending, result)) = self.take_pending_reply(event) else {
                 continue;
             };
             let reply = match result {
@@ -848,7 +893,7 @@ impl SharedChats {
                     if let Some(known) = self.known.remove(&local) {
                         self.rows.retain(|row| row.id != known.chat.row.id);
                     }
-                    self.history_cursor.remove(&local);
+                    self.retire_history(local);
                     self.importing.insert(local);
                     events.push(Event::Deleted(local));
                 }
@@ -1189,6 +1234,99 @@ mod tests {
             api_job: None,
             background_api_supported: true,
         }
+    }
+
+    #[test]
+    fn evicted_history_retires_cursors_and_late_replies_before_repriming() {
+        for cursor in [None, Some(42)] {
+            let mut bridge = SharedChats::new("history-retirement".into());
+            let path = std::env::temp_dir().join(format!(
+                "forge-history-retirement-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            ));
+            // This client can only attempt a nonexistent socket, not launch a host.
+            bridge.client = WorkspaceClient::for_state_dir(path);
+            let mut cache = HashMap::new();
+            for local in 1..=9 {
+                bridge.history_cursor.insert(local, cursor);
+                let chat = navigation_chat(local, "History fixture");
+                bridge.known.insert(local, Known {
+                    saved: chat.snapshot_json.clone(),
+                    chat,
+                    writing: false,
+                    blocked: false,
+                });
+                if local <= 8 {
+                    assert!(bridge.append_earlier_history(&mut cache, local, "cached"));
+                    bridge.pending.insert(100 + local, Pending::History { local });
+                    bridge.pending.insert(200 + local, Pending::PrimeHistory { local });
+                }
+            }
+            bridge.pending.insert(999, Pending::Open { activate: false });
+            assert!(bridge.append_earlier_history(&mut cache, 9, "ninth"));
+            assert_eq!(cache.len(), 8);
+            let evicted = (1..=8).find(|id| !cache.contains_key(id)).unwrap();
+            assert!(!bridge.history_cursor.contains_key(&evicted));
+            assert!(!bridge.pending.contains_key(&(100 + evicted)));
+            assert!(!bridge.pending.contains_key(&(200 + evicted)));
+            assert!(bridge.pending.contains_key(&999));
+            for local in (1..=8).filter(|id| *id != evicted) {
+                assert_eq!(bridge.history_cursor.get(&local), Some(&cursor));
+                assert!(bridge.pending.contains_key(&(100 + local)));
+                assert!(bridge.pending.contains_key(&(200 + local)));
+                assert_eq!(cache[&local], "cached");
+            }
+            for request_id in [100 + evicted, 200 + evicted] {
+                assert!(bridge.take_pending_reply(WorkspaceEvent::Reply {
+                    request_id,
+                    result: Ok(Reply::Messages { messages: vec![], next_before: Some(1) }),
+                }).is_none());
+            }
+            // An Earlier event already emitted by the same poll batch cannot
+            // resurrect a retired cache after another conversation evicted it.
+            assert!(!bridge.append_earlier_history(&mut cache, evicted, "late emitted"));
+            assert!(!cache.contains_key(&evicted));
+            bridge.history(evicted).unwrap();
+            let prime_id = bridge.pending.iter().find_map(|(id, pending)| {
+                matches!(pending, Pending::PrimeHistory { local } if *local == evicted).then_some(*id)
+            }).unwrap();
+            assert!(!bridge.history_cursor.contains_key(&evicted));
+            assert!(!bridge.append_earlier_history(&mut cache, evicted, "late after request"));
+            let count = bridge.pending.len();
+            bridge.history(evicted).unwrap();
+            assert_eq!(bridge.pending.len(), count, "one prime request at a time");
+            let (_, pending, result) = bridge.take_pending_reply(WorkspaceEvent::Reply {
+                request_id: prime_id,
+                result: Ok(Reply::Messages { messages: vec![], next_before: Some(7) }),
+            }).unwrap();
+            assert!(matches!(pending, Pending::PrimeHistory { local } if local == evicted));
+            let Ok(Reply::Messages { next_before, .. }) = result else { panic!("history reply") };
+            // Same cursor transition as the existing PrimeHistory reducer.
+            bridge.history_cursor.insert(evicted, next_before);
+            bridge.history(evicted).unwrap();
+            assert!(bridge.pending.values().any(|pending| matches!(pending, Pending::History { local } if *local == evicted)));
+            assert!(bridge.append_earlier_history(&mut cache, evicted, "reloaded"));
+            assert_eq!(cache[&evicted], "reloaded");
+        }
+    }
+
+    #[test]
+    fn earlier_history_cache_keeps_existing_prepend_and_utf8_budget() {
+        let mut bridge = SharedChats::new("history-budget".into());
+        let mut cache = HashMap::new();
+        bridge.history_cursor.insert(1, None);
+        assert!(bridge.append_earlier_history(&mut cache, 1, "tail"));
+        assert!(bridge.append_earlier_history(&mut cache, 1, "head"));
+        assert_eq!(cache[&1], "headtail");
+        let text = "界".repeat(400_000);
+        assert!(bridge.append_earlier_history(&mut cache, 1, &text));
+        assert_eq!(cache[&1].len(), (1024 * 1024 / 3) * 3);
+        assert!(cache[&1].chars().all(|ch| ch == '界'));
+        assert!(bridge.history_cursor.contains_key(&1));
     }
 
     #[test]

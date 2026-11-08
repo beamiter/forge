@@ -4,6 +4,9 @@ All notable user-visible and operational changes are recorded here.
 
 ## Unreleased
 
+- Retire pagination cursors and pending replies when an earlier-history cache
+  is evicted, so returning to a conversation reloads its missing pages safely.
+
 - Preserve the order of selected diffs, logs and evidence while context loads.
   Pending selections are bounded and retained when saved materials fill capacity;
   overflow is reported explicitly, and changing conversations cancels old selections.
