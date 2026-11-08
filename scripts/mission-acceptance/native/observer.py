@@ -419,6 +419,15 @@ def observe_atspi(pid, window, mission_title=None, *, deadline=None,
                 continue
             raw = component_rect(n['path'], coordinates)
             if raw[2:] != n['rect'][2:]:
+                # The two coordinate reads are not atomic (e.g. GTK overlay
+                # scrollbars animate). Prove a same-coordinate change before
+                # classifying this as readiness, never accept mismatched boxes.
+                # One bounded recheck uses the original observation deadline;
+                # callers must discard the whole capture/tree and retry it.
+                checked_screen = component_rect(n['path'], screen)
+                checked_window = component_rect(n['path'], coordinates)
+                if checked_screen != n['rect'] or checked_window != raw:
+                    raise ObservationNotReady('Component geometry changed between SCREEN and WINDOW reads')
                 raise RuntimeError('SCREEN and WINDOW component dimensions differ')
             if n['path'] == anchor and raw != [0, 0, *window[2:]]:
                 raise RuntimeError('WINDOW frame origin or size does not match captured native client')
