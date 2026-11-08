@@ -595,4 +595,3 @@ mod tests {
         assert!(editor.dirty());
     }
 }
-

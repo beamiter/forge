@@ -651,7 +651,8 @@ mod tests {
             goal.insert(&mut end, "é");
             assert_eq!(end.offset(), 128 * 1024);
             assert_eq!(
-                goal.text(&goal.start_iter(), &goal.end_iter(), false).as_str(),
+                goal.text(&goal.start_iter(), &goal.end_iter(), false)
+                    .as_str(),
                 boundary
             );
             goal.delete(&mut goal.start_iter(), &mut goal.end_iter());
@@ -667,4 +668,3 @@ mod tests {
         }
     }
 }
-

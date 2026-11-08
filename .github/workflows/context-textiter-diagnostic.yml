@@ -35,6 +35,23 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           G_DEBUG=fatal-warnings dbus-run-session -- xvfb-run --auto-servernum cargo test --lib --all-features --locked ui::workspace_context_ui::tests::rejected_context_paste_restores_field_and_material_buffers -- --ignored --exact --nocapture
+      - name: Negative control rejects the known iterator warning
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          file=src/ui/workspace_context_ui.rs
+          cp "$file" "$RUNNER_TEMP/context-ui-fixed.rs"
+          trap 'cp "$RUNNER_TEMP/context-ui-fixed.rs" "$file"' EXIT
+          git fetch --no-tags origin 74e6c454883b592b7339e4af86d680b9321fdbad
+          git show 74e6c454883b592b7339e4af86d680b9321fdbad:"$file" > "$file"
+          set +e
+          G_DEBUG=fatal-warnings dbus-run-session -- xvfb-run --auto-servernum cargo test --lib --all-features --locked ui::workspace_context_ui::tests::rejected_context_paste_restores_field_and_material_buffers -- --ignored --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/context-negative.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -F 'Invalid text buffer iterator' "$RUNNER_TEMP/context-negative.log"
+          echo "Confirmed old implementation fails the fatal-warning gate (status $status)"
       - name: Script contracts
         if: ${{ !cancelled() }}
         run: python3 scripts/test-gtk-display-contract.py
