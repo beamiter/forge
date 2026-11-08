@@ -2437,6 +2437,31 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires a GTK display"]
+    fn composer_limit_preserves_insert_iter_and_utf8_draft() {
+        gtk4::init().expect("GTK display");
+        let panel = AiPanel::build(Rc::new(RefCell::new(Config::default())));
+        let prefix = "x".repeat(MAX_LIVE_MESSAGE_BYTES - 4);
+        panel.input_buffer.set_text(&prefix);
+        let mut iter = panel.input_buffer.end_iter();
+        panel.input_buffer.insert(&mut iter, "界ab");
+        // GTK updates the caller's iterator after insertion, including when
+        // a paste is limited. The caller must be able to use it immediately.
+        assert_eq!(iter.offset(), (prefix.len() + 2) as i32);
+        assert_eq!(panel.input_text(), format!("{prefix}界a"));
+        assert_eq!(panel.store.borrow().active_draft(), panel.input_text());
+        panel.input_buffer.insert(&mut iter, "more");
+        assert_eq!(panel.input_text(), format!("{prefix}界a"));
+        let mut start = panel.input_buffer.start_iter();
+        let mut end = panel.input_buffer.end_iter();
+        panel.input_buffer.delete(&mut start, &mut end);
+        panel.input_buffer.insert(&mut start, "再入力");
+        assert_eq!(start.offset(), 3);
+        assert_eq!(panel.input_text(), "再入力");
+        assert_eq!(panel.store.borrow().active_draft(), "再入力");
+    }
+
+    #[test]
     fn composer_enter_shortcuts_send_or_insert_newline_as_documented() {
         use gtk4::gdk::{Key, ModifierType};
 
