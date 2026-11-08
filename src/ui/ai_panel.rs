@@ -670,8 +670,9 @@ impl AiPanel {
         }
         {
             let p = panel.clone();
+            let normalization_pending = Rc::new(Cell::new(false));
             input_buffer.connect_changed(move |_| {
-                let input = p.input_text();
+                let input = p.raw_input_text();
                 let truncated = input.len() > MAX_LIVE_MESSAGE_BYTES;
                 let draft = bounded_live_message(input);
                 let changed = p.store.borrow_mut().set_active_draft(draft.clone());
@@ -679,15 +680,27 @@ impl AiPanel {
                     p.handoff_input_epoch
                         .set(p.handoff_input_epoch.get().wrapping_add(1));
                 }
-                if truncated {
-                    // `set_text` emits `changed` synchronously. Store the
-                    // bounded draft first so the nested callback is a no-op.
-                    p.input_buffer.set_text(&draft);
-                    let end = p.input_buffer.end_iter();
-                    p.input_buffer.place_cursor(&end);
-                    if !p.store.borrow().is_active_busy() {
-                        p.show_info_status("Draft was limited to 64 KiB.");
-                    }
+                if truncated && !normalization_pending.replace(true) {
+                    // `changed` runs inside GTK insertion, whose caller still
+                    // owns a live TextIter. Defer buffer mutation until that
+                    // insertion returns; business reads and the store already
+                    // use the bounded draft during this short interval.
+                    let panel = p.clone();
+                    let pending = normalization_pending.clone();
+                    glib::idle_add_local_once(move || {
+                        pending.set(false);
+                        // Read current text, not the captured draft: a later
+                        // edit, clear or chat switch must never be rolled back.
+                        let input = panel.raw_input_text();
+                        if input.len() > MAX_LIVE_MESSAGE_BYTES {
+                            panel.input_buffer.set_text(&bounded_live_message(input));
+                            let end = panel.input_buffer.end_iter();
+                            panel.input_buffer.place_cursor(&end);
+                            if !panel.store.borrow().is_active_busy() {
+                                panel.show_info_status("Draft was limited to 64 KiB.");
+                            }
+                        }
+                    });
                 }
                 p.sync_composer_state();
                 if changed {
@@ -1554,6 +1567,10 @@ impl AiPanel {
     }
 
     fn input_text(&self) -> String {
+        bounded_live_message(self.raw_input_text())
+    }
+
+    fn raw_input_text(&self) -> String {
         let start = self.input_buffer.start_iter();
         let end = self.input_buffer.end_iter();
         self.input_buffer.text(&start, &end, false).to_string()
@@ -2435,6 +2452,76 @@ fn plural(count: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a GTK display"]
+    fn composer_limit_preserves_insert_iter_and_utf8_draft() {
+        gtk4::init().expect("GTK display");
+        let panel = AiPanel::build(Rc::new(RefCell::new(Config::safe_defaults())));
+        let prefix = "x".repeat(MAX_LIVE_MESSAGE_BYTES - 4);
+        panel.input_buffer.set_text(&prefix);
+        let mut iter = panel.input_buffer.end_iter();
+        panel.input_buffer.insert(&mut iter, "界ab");
+        // GTK updates the caller's iterator after insertion, including when
+        // a paste is limited. The caller must be able to use it immediately.
+        assert_eq!(iter.offset(), (prefix.len() + 3) as i32);
+        assert_eq!(panel.input_text(), format!("{prefix}界a"));
+        assert_eq!(panel.store.borrow().active_draft(), panel.input_text());
+        panel.input_buffer.insert(&mut iter, "more");
+        assert_eq!(iter.offset(), (prefix.len() + 7) as i32);
+        assert_eq!(panel.input_text(), format!("{prefix}界a"));
+        while glib::MainContext::default().iteration(false) {}
+        assert_eq!(panel.raw_input_text(), format!("{prefix}界a"));
+        let mut start = panel.input_buffer.start_iter();
+        let mut end = panel.input_buffer.end_iter();
+        panel.input_buffer.delete(&mut start, &mut end);
+        panel.input_buffer.insert(&mut start, "再入力");
+        assert_eq!(start.offset(), 3);
+        assert_eq!(panel.input_text(), "再入力");
+        assert_eq!(panel.store.borrow().active_draft(), "再入力");
+
+        // Pending normalization must not restore a paste over a newer draft
+        // (the same replacement used when switching the active chat).
+        panel
+            .input_buffer
+            .set_text(&"界".repeat(MAX_LIVE_MESSAGE_BYTES));
+        assert!(panel.input_text().len() <= MAX_LIVE_MESSAGE_BYTES);
+        panel.input_buffer.set_text("newer draft");
+        while glib::MainContext::default().iteration(false) {}
+        assert_eq!(panel.raw_input_text(), "newer draft");
+        assert_eq!(panel.store.borrow().active_draft(), "newer draft");
+
+        let original_chat = panel.store.borrow().active_id();
+        panel
+            .input_buffer
+            .set_text(&"p".repeat(MAX_LIVE_MESSAGE_BYTES + 9));
+        panel.store.borrow_mut().new_chat().expect("new local chat");
+        panel
+            .store
+            .borrow_mut()
+            .set_active_draft("other chat".into());
+        panel.render_active_chat();
+        while glib::MainContext::default().iteration(false) {}
+        assert_eq!(panel.raw_input_text(), "other chat");
+        panel.store.borrow_mut().select_chat(original_chat);
+        panel.render_active_chat();
+        assert_eq!(panel.raw_input_text(), "p".repeat(MAX_LIVE_MESSAGE_BYTES));
+
+        // Middle insertion retains the original whole-prefix truncation
+        // policy, rather than rejecting the paste or preserving the tail.
+        panel
+            .input_buffer
+            .set_text(&"z".repeat(MAX_LIVE_MESSAGE_BYTES));
+        let mut at = panel.input_buffer.start_iter();
+        panel.input_buffer.insert(&mut at, "界");
+        assert_eq!(at.offset(), 1);
+        assert_eq!(
+            panel.input_text(),
+            format!("界{}", "z".repeat(MAX_LIVE_MESSAGE_BYTES - 3))
+        );
+        while glib::MainContext::default().iteration(false) {}
+        assert_eq!(panel.raw_input_text(), panel.store.borrow().active_draft());
+    }
 
     #[test]
     fn composer_enter_shortcuts_send_or_insert_newline_as_documented() {

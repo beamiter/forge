@@ -1,5 +1,7 @@
 # Changelog
 
+- Defer oversized API composer normalization until GTK insertion returns, preserving UTF-8 prefix limits, bounded drafts and newer edits without invalidating caller iterators.
+
 All notable user-visible and operational changes are recorded here.
 
 ## Unreleased
