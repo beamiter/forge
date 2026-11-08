@@ -1177,22 +1177,12 @@ impl AiPanel {
                     self.publish_persisted_conversation();
                 }
                 super::workspace_chats::Event::Earlier { chat_id, text } => {
-                    {
-                        let mut history = self.earlier_history.borrow_mut();
-                        if history.len() >= 8 && !history.contains_key(&chat_id) {
-                            if let Some(id) = history.keys().next().copied() {
-                                history.remove(&id);
-                            }
-                        }
-                        let earlier = history.entry(chat_id).or_default();
-                        *earlier = format!("{text}{earlier}");
-                        if earlier.len() > 1024 * 1024 {
-                            let mut end = 1024 * 1024;
-                            while !earlier.is_char_boundary(end) {
-                                end -= 1;
-                            }
-                            earlier.truncate(end);
-                        }
+                    if !self.shared.borrow_mut().append_earlier_history(
+                        &mut self.earlier_history.borrow_mut(),
+                        chat_id,
+                        &text,
+                    ) {
+                        continue;
                     }
                     if self.store.borrow().active_id() == chat_id {
                         self.render_active_chat();
