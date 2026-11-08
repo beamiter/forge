@@ -1,7 +1,7 @@
 {
   "adapter_source_core_base": "10120c3aa690ff5e1a66ae15f2418b753e2053f1",
   "bundle": "pty-process-v1",
-  "core_pin_verification": "Selected the published security-audit-only core child on 2026-11-07. Core runtime/Cargo inputs and adapter files, source origins and checksums are unchanged. Exact-commit frontend CI remains a separate verification gate.",
+  "core_pin_verification": "Aligned active core pin to the published shared-engine architecture checkpoint. Adapter source origins and checksums are unchanged. Exact-commit frontend CI remains a separate verification gate.",
   "files_sha256": {
     "src/gtk_process.rs": "d04bc567730d352c00a8feb9da72211553c0f6fda6a484fa389c5fa61cd84015",
     "src/gtk_spawn.rs": "6614651ce110c538fdd8659fd00ee042c402befd7ac4caf6a7f361967dc87ecc",
@@ -12,7 +12,7 @@
     "vendor/companion-process/src/pty_session.rs": "34ef861a92c1afe27059f491664802f932b996306f09d5a04e91db94b8661a2f",
     "vendor/companion-process/src/shell_identity.rs": "cff15f40ec159f8c099a74335d51bc236d524e4166088f9d1bf785ebff28435f"
   },
-  "public_core_base": "e8bd7a2b3edd48d7a0f8f0304fa3d8c864dab40e",
+  "public_core_base": "a6e47726d02bed2ca4a6ba1a682511f970853527",
   "schema": 1,
   "scope": "Versioned process observer and GTK launch ownership, validated against public_core_base. Bundled source origins and hashes are unchanged. No protocol or presentation proof.",
   "version": "0.1.0"

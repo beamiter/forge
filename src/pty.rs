@@ -1,4 +1,5 @@
 use gtk4::glib;
+use jterm_core::runtime_wake::WakeSink;
 use nix::libc;
 use nix::pty::{openpty, OpenptyResult};
 use nix::unistd::{self, ForkResult, Pid};
@@ -1327,9 +1328,9 @@ impl OwnedPty {
             "forge-pty-reader",
             Arc::clone(&self.reader_cancelled),
             self.reader_cancel_eventfd.clone(),
-            move || {
+            WakeSink::new(move || {
                 notify_eventfd_once(&eventfd_for_thread, &wake_pending_for_thread);
-            },
+            }),
         );
 
         let on_exit = std::cell::Cell::new(Some(on_exit));
@@ -1407,7 +1408,7 @@ impl OwnedPty {
             "forge-pty-reader-poll",
             Arc::clone(&self.reader_cancelled),
             self.reader_cancel_eventfd.clone(),
-            || {},
+            WakeSink::new(|| {}),
         );
 
         let on_exit = std::cell::Cell::new(Some(on_exit));
@@ -1466,7 +1467,7 @@ fn spawn_reader_thread(
     thread_name: &'static str,
     reader_cancelled: Arc<AtomicBool>,
     mut reader_cancel_eventfd: Option<Arc<OwnedFd>>,
-    notify: impl Fn() + Send + Clone + 'static,
+    notify: WakeSink,
 ) {
     let failure_tx = tx.clone();
     let failure_notify = notify.clone();
@@ -1484,7 +1485,7 @@ fn spawn_reader_thread(
                 if guard.ready_to_reap(&lifecycle) {
                     crate::gtk_process::drain_tail(&mut file, |data| {
                         let sent = tx.send(PtyMsg::Data(data)).is_ok();
-                        if sent { notify(); }
+                        if sent { notify.wake(); }
                         sent
                     });
                     break;
@@ -1522,14 +1523,14 @@ fn spawn_reader_thread(
                         if tx.send(PtyMsg::Data(combined)).is_err() {
                             return;
                         }
-                        notify();
+                        notify.wake();
                     }
                 }
             }
 
             let code = wait_for_child_exit(&lifecycle, &guard);
             if tx.send(PtyMsg::Exit(code)).is_ok() {
-                notify();
+                notify.wake();
             }
         })
     {
@@ -1539,7 +1540,7 @@ fn spawn_reader_thread(
         // stay a zombie for the life of the process.
         failure_lifecycle.force_kill_and_reap();
         if failure_tx.try_send(PtyMsg::Exit(1)).is_ok() {
-            failure_notify();
+            failure_notify.wake();
         }
     }
 }
