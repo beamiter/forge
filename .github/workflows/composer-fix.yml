@@ -1,0 +1,46 @@
+name: Composer TextIter fix validation
+on:
+  push:
+    branches: [diagnostics/forge-composer-limit-fix]
+permissions:
+  contents: read
+jobs:
+  context:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_INCREMENTAL: '0'
+      GDK_BACKEND: x11
+      GSK_RENDERER: cairo
+      GTK_A11Y: none
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: bash scripts/materialize-shared-core.sh
+      - run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y pkg-config libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev libpcre2-dev xvfb xauth dbus-x11 libxtst6
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: rustfmt,clippy
+      - name: Format and record tested source
+        run: |
+          cargo fmt --all
+          python3 - <<'PYCODE'
+          import base64,hashlib,subprocess
+          from pathlib import Path
+          p='src/ui/ai_panel.rs'
+          print('FORMAT_PATCH',base64.b64encode(subprocess.check_output(['git','diff','--',p])).decode())
+          print('TESTED_SHA256',p,hashlib.sha256(Path(p).read_bytes()).hexdigest())
+          PYCODE
+          cargo fmt --all -- --check
+      - name: Clippy and models
+        run: |
+          cargo clippy --lib --all-features --locked -- -D warnings
+          cargo test --lib --all-features --locked ui::ai_panel::tests
+      - name: Composer GTK regression
+        run: |
+          GTK_IM_MODULE=simple G_DEBUG=fatal-warnings dbus-run-session -- xvfb-run --auto-servernum cargo test --lib --all-features --locked ui::ai_panel::tests::composer_limit_preserves_insert_iter_and_utf8_draft -- --ignored --exact --nocapture
+      - name: Runner contracts
+        run: python3 scripts/test-gtk-display-contract.py

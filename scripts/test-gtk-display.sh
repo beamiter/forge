@@ -52,6 +52,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    ui::ai_panel::tests::composer_limit_preserves_insert_iter_and_utf8_draft
     ui::workspace_context_ui::tests::pending_context_additions_preserve_order_capacity_and_cancellation
     ui::workspace_context_ui::tests::rejected_context_paste_restores_field_and_material_buffers
     ui::workspace_missions::tests::mission_editor_preserves_newer_drafts_stable_rows_and_releases_callbacks
@@ -307,7 +308,7 @@ for test_name in "${tests[@]}"; do
         fixture_im_module=simple
     fi
     fixture_g_debug="${G_DEBUG-}"
-    if [[ "$test_name" == ui::workspace_context_ui::tests::rejected_context_paste_restores_field_and_material_buffers || "$test_name" == ui::workspace_context_ui::tests::pending_context_additions_preserve_order_capacity_and_cancellation ]]; then
+    if [[ "$test_name" == ui::ai_panel::tests::composer_limit_preserves_insert_iter_and_utf8_draft || "$test_name" == ui::workspace_context_ui::tests::rejected_context_paste_restores_field_and_material_buffers || "$test_name" == ui::workspace_context_ui::tests::pending_context_additions_preserve_order_capacity_and_cancellation ]]; then
         # Do not inject the inherited empty IM name: GTK warns before the
         # iterator regression starts, and this case intentionally makes warnings fatal.
         fixture_im_module=simple
