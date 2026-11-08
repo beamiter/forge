@@ -6,6 +6,8 @@ All notable user-visible and operational changes are recorded here.
 
 ## Unreleased
 
+- Preserve newer local drafts when duplicate conversation-open replies arrive; reconcile peer edits and protect active submissions instead of replacing them.
+
 - Retire pagination cursors and pending replies when an earlier-history cache
   is evicted, so returning to a conversation reloads its missing pages safely.
 
