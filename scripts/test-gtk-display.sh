@@ -305,8 +305,12 @@ for test_name in "${tests[@]}"; do
     if [[ "$test_name" == block_view::tests::native_ime_commit_cancel_and_independent_ptys || "$test_name" == block_view::tests::native_ime_send_button_preserves_composition ]]; then
         fixture_im_module=simple
     fi
+    fixture_g_debug="${G_DEBUG-}"
+    if [[ "$test_name" == ui::workspace_context_ui::tests::rejected_context_paste_restores_field_and_material_buffers ]]; then
+        fixture_g_debug="${fixture_g_debug:+${fixture_g_debug},}fatal-warnings"
+    fi
     # A wedged fixture must fail explicitly and leave the remaining cases runnable.
-    if GTK_IM_MODULE="$fixture_im_module" GTK_A11Y="$a11y_backend" \
+    if G_DEBUG="$fixture_g_debug" GTK_IM_MODULE="$fixture_im_module" GTK_A11Y="$a11y_backend" \
         timeout --signal=TERM --kill-after=10s 120s \
         dbus-run-session "${dbus_run_args[@]}" -- \
         xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
@@ -337,3 +341,4 @@ if (( ${#failed_cases[@]} > 0 )); then
     # A diagnostic replay or a later passing case must never turn the run green.
     exit "${failed_statuses[0]}"
 fi
+

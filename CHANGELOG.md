@@ -4,6 +4,9 @@ All notable user-visible and operational changes are recorded here.
 
 ## Unreleased
 
+- Reject oversized context insertions before GTK mutates the buffer, keeping
+  caller iterators valid; enforce fatal GTK warnings in the focused regression.
+
 - Rejected oversized context pastes now restore the visible field or material
   to the retained draft, so Save and Preview match the text on screen.
 
@@ -841,3 +844,4 @@ All notable user-visible and operational changes are recorded here.
 ### Security
 
 - Persisted commands, output, working directories, and session metadata are restricted to `0700` directories and `0600` files on Unix.
+

@@ -154,12 +154,24 @@ impl ContextEditor {
         self.notice = entry.value.validate().err();
         true
     }
+    pub(crate) fn accept_text_size(&mut self, bytes: usize, material: bool) -> bool {
+        if bytes <= 256 * 1024 {
+            return true;
+        }
+        self.notice = Some(
+            if material {
+                "That material is too large; the previous excerpt was kept."
+            } else {
+                "That paste is too large; the previous context draft was kept."
+            }
+            .into(),
+        );
+        false
+    }
     pub(crate) fn set_field(&mut self, field: ContextField, text: String) -> bool {
         // Preserve ordinary over-budget edits for review; refuse only an
         // implausibly large paste instead of truncating its meaning.
-        if text.len() > 256 * 1024 {
-            self.notice =
-                Some("That paste is too large; the previous context draft was kept.".into());
+        if !self.accept_text_size(text.len(), false) {
             return false;
         }
         self.edit(|draft| {
@@ -175,8 +187,7 @@ impl ContextEditor {
         self.edit(|draft| draft.materials.retain(|material| material.id != id));
     }
     pub(crate) fn set_material(&mut self, id: &str, text: String) -> bool {
-        if text.len() > 256 * 1024 {
-            self.notice = Some("That material is too large; the previous excerpt was kept.".into());
+        if !self.accept_text_size(text.len(), true) {
             return false;
         }
         self.edit(|draft| {
@@ -584,3 +595,4 @@ mod tests {
         assert!(editor.dirty());
     }
 }
+
