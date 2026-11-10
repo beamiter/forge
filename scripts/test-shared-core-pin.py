@@ -26,7 +26,9 @@ class PinTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         for name in ("Cargo.toml", "Cargo.lock", "deny.toml", ".cargo/config.toml",
-                     "flake.nix", "packaging/flatpak/cargo-sources.json"):
+                     "flake.nix", "packaging/flatpak/cargo-sources.json",
+                     "scripts/mission-acceptance/harness/Cargo.toml",
+                     "scripts/mission-acceptance/harness/Cargo.lock"):
             target = self.root / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / name, target)
@@ -70,6 +72,14 @@ class PinTests(unittest.TestCase):
                 self.assertEqual(result.stderr, "")
                 self.assertEqual(result.stdout,
                                  f"Production core source is consistent: {self.revision}\n")
+
+    def test_harness_manifest_drift_is_rejected(self):
+        self.replace("scripts/mission-acceptance/harness/Cargo.toml", self.revision, self.stale_revision)
+        self.assert_rejected("mission harness core pin differs")
+
+    def test_harness_lock_drift_is_rejected(self):
+        self.replace("scripts/mission-acceptance/harness/Cargo.lock", self.revision, self.stale_revision)
+        self.assert_rejected("mission harness locked source differs")
 
     def test_short_manifest_pin_is_rejected(self):
         self.replace("Cargo.toml", self.revision, self.revision[:12], 1)

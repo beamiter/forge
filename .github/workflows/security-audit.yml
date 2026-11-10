@@ -9,6 +9,10 @@ on:
       - .cargo/audit.toml
       - prototypes/ascii-organism/Cargo.toml
       - prototypes/ascii-organism/Cargo.lock
+      - scripts/mission-acceptance/harness/Cargo.toml
+      - scripts/mission-acceptance/harness/Cargo.lock
+      - tools/eva-native-render/Cargo.toml
+      - tools/eva-native-render/Cargo.lock
       - scripts/security-check.sh
       - scripts/test-security-check.py
       - .github/workflows/security-audit.yml
@@ -20,6 +24,10 @@ on:
       - .cargo/audit.toml
       - prototypes/ascii-organism/Cargo.toml
       - prototypes/ascii-organism/Cargo.lock
+      - scripts/mission-acceptance/harness/Cargo.toml
+      - scripts/mission-acceptance/harness/Cargo.lock
+      - tools/eva-native-render/Cargo.toml
+      - tools/eva-native-render/Cargo.lock
       - scripts/security-check.sh
       - scripts/test-security-check.py
       - .github/workflows/security-audit.yml

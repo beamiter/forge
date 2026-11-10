@@ -15,7 +15,9 @@ import unittest
 SCRIPT = Path(__file__).with_name("security-check.sh")
 WORKFLOW = SCRIPT.parent.parent / ".github/workflows/security-audit.yml"
 AUDIT_CONFIG = SCRIPT.parent.parent / ".cargo/audit.toml"
-LOCKFILES = ("Cargo.lock", "prototypes/ascii-organism/Cargo.lock")
+LOCKFILES = ("Cargo.lock", "prototypes/ascii-organism/Cargo.lock",
+             "scripts/mission-acceptance/harness/Cargo.lock",
+             "tools/eva-native-render/Cargo.lock")
 DIAGNOSTICS = {
     "lookup": (
         "error: couldn't check if the package is yanked: "
@@ -131,12 +133,12 @@ class AuditGateTests(unittest.TestCase):
                 self.assertNotIn(forbidden, call)
         return audits
 
-    def test_clean_success_audits_both_locked_graphs(self):
+    def test_clean_success_audits_all_locked_graphs(self):
         result, calls = self.run_audit()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_audit_calls(calls, LOCKFILES)
         metadata = [call for call in calls if call[0] == "metadata"]
-        self.assertEqual(len(metadata), 2)
+        self.assertEqual(len(metadata), len(LOCKFILES))
         for call in metadata:
             self.assertIn("--locked", call)
             self.assertIn("--no-deps", call)
@@ -190,7 +192,7 @@ def add_infrastructure_test(lockfile, diagnostic_name, stream):
         expected = LOCKFILES[: LOCKFILES.index(lockfile) + 1]
         self.assert_audit_calls(calls, expected)
 
-    suffix = "root" if lockfile == LOCKFILES[0] else "prototype"
+    suffix = str(LOCKFILES.index(lockfile))
     setattr(AuditGateTests, f"test_{suffix}_{diagnostic_name}_{stream}_zero_exit_fails", test)
 
 
@@ -208,7 +210,7 @@ def add_exit_status_test(lockfile, status):
         expected = LOCKFILES[: LOCKFILES.index(lockfile) + 1]
         self.assert_audit_calls(calls, expected)
 
-    suffix = "root" if lockfile == LOCKFILES[0] else "prototype"
+    suffix = str(LOCKFILES.index(lockfile))
     setattr(AuditGateTests, f"test_{suffix}_preserves_upstream_exit_{status}", test)
 
 
@@ -226,7 +228,7 @@ def add_finding_test(lockfile, finding):
         expected = LOCKFILES[: LOCKFILES.index(lockfile) + 1]
         self.assert_audit_calls(calls, expected)
 
-    suffix = "root" if lockfile == LOCKFILES[0] else "prototype"
+    suffix = str(LOCKFILES.index(lockfile))
     setattr(AuditGateTests, f"test_{suffix}_rejects_{finding}", test)
 
 
@@ -236,7 +238,7 @@ def add_metadata_test(manifest):
         self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
         self.assertFalse(any(call[0] == "audit" for call in calls))
 
-    suffix = "root" if manifest == "Cargo.toml" else "prototype"
+    suffix = str(LOCKFILES.index(manifest.replace("Cargo.toml", "Cargo.lock")))
     setattr(AuditGateTests, f"test_{suffix}_invalid_lock_graph_stops_before_audit", test)
 
 
@@ -264,7 +266,7 @@ def add_checker_failure_test(lockfile, status, audit_status=0):
         expected = LOCKFILES[: LOCKFILES.index(lockfile) + 1]
         self.assert_audit_calls(calls, expected)
 
-    suffix = "root" if lockfile == LOCKFILES[0] else "prototype"
+    suffix = str(LOCKFILES.index(lockfile))
     name = f"test_{suffix}_checker_exit_{status}_audit_exit_{audit_status}"
     setattr(AuditGateTests, name, test)
 
@@ -281,7 +283,7 @@ for _lockfile in LOCKFILES:
         add_checker_failure_test(_lockfile, _grep_status)
         add_checker_failure_test(_lockfile, _grep_status, audit_status=37)
 
-for _manifest in ("Cargo.toml", "prototypes/ascii-organism/Cargo.toml"):
+for _manifest in (lock.replace("Cargo.lock", "Cargo.toml") for lock in LOCKFILES):
     add_metadata_test(_manifest)
 
 if __name__ == "__main__":

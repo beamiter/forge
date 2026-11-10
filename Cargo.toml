@@ -2,6 +2,7 @@
 name = "forge"
 version = "0.2.0"
 edition = "2021"
+rust-version = "1.92"
 description = "A session-aware GTK4 terminal with structured command blocks"
 repository = "https://github.com/beamiter/forge"
 readme = "README.md"
@@ -21,7 +22,7 @@ companion-host = { version = "0.1.0", path = "vendor/companion-host" }
 companion-process = { version = "0.1.0", path = "vendor/companion-process" }
 eva-character-atlas = { version = "0.1.0", git = "https://github.com/beamiter/jcompanion.git", rev = "9aa569540091524d637a7115b64c587b9177a55b" }
 # Published shared family source, identical for Cargo, Nix, Flatpak and tests.
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "a6e47726d02bed2ca4a6ba1a682511f970853527" }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "598f15808086dbea14d56fc1b86e77b6cb2e3201" }
 jagent = { version = "0.7.0", git = "https://github.com/beamiter/jagent.git", rev = "f269c3c6afafcf9b6d60b3cccd741649fdb74576" }
 log = { version = "0.4", features = ["std"] }
 crossbeam-channel = "0.5"
@@ -47,7 +48,7 @@ gtk4 = { version = "0.11.4", features = ["v4_14"] }
 libadwaita = { version = "0.9.2", features = ["v1_5"] }
 
 [dev-dependencies]
-jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "a6e47726d02bed2ca4a6ba1a682511f970853527" }
+jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "598f15808086dbea14d56fc1b86e77b6cb2e3201" }
 env_logger = "0.11"
 
 [profile.dev]

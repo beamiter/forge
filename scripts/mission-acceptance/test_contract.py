@@ -62,6 +62,8 @@ class DependencyMutations(unittest.TestCase):
 class Contract(unittest.TestCase):
     def setUp(self):
         self.manifest=json.loads((HERE/"frozen-candidates.json").read_text())
+        # Build a synthetic current-core set without rewriting historical examples.
+        self.manifest["repositories"][0]["revision"]=collector.CORE
         self.manifest["frozen"]=True
         self.digest=collector.digest_set(self.manifest)
         self.item=self.manifest["repositories"][0]
@@ -225,6 +227,8 @@ class Contract(unittest.TestCase):
 class CoreSecurityGateTests(unittest.TestCase):
     def setUp(self):
         self.manifest=json.loads((HERE/"frozen-candidates.json").read_text())
+        # Build a synthetic current-core set without rewriting historical examples.
+        self.manifest["repositories"][0]["revision"]=collector.CORE
         self.manifest["frozen"]=True
         self.item=next(r for r in self.manifest["repositories"] if r["name"]=="jterm_core")
         self.digest=collector.digest_set(self.manifest)

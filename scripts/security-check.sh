@@ -13,7 +13,7 @@ Usage: scripts/security-check.sh [--all | --policy | --audit | --shell]
 
   --all     Run every check (default).
   --policy  Enforce dependency sources, licenses, bans, and lock consistency.
-  --audit   Audit both committed lockfiles with RustSec.
+  --audit   Audit all committed lockfiles with RustSec.
   --shell   Parse and lint every shell script in scripts/ and packaging/.
 EOF
 }
@@ -53,6 +53,10 @@ check_locked_graphs() {
     require_command cargo 'install Rust with rustup'
     cargo metadata --locked --format-version 1 --no-deps >/dev/null
     cargo metadata --locked --manifest-path prototypes/ascii-organism/Cargo.toml \
+        --format-version 1 --no-deps >/dev/null
+    cargo metadata --locked --manifest-path scripts/mission-acceptance/harness/Cargo.toml \
+        --format-version 1 --no-deps >/dev/null
+    cargo metadata --locked --manifest-path tools/eva-native-render/Cargo.toml \
         --format-version 1 --no-deps >/dev/null
 }
 
@@ -106,6 +110,8 @@ check_rustsec() {
     # --no-fetch also disables sparse-index downloads. The prototype has
     # dependencies absent from the root graph, so it needs its own fetch.
     audit_lockfile prototypes/ascii-organism/Cargo.lock
+    audit_lockfile scripts/mission-acceptance/harness/Cargo.lock
+    audit_lockfile tools/eva-native-render/Cargo.lock
 }
 
 check_shell_scripts() {

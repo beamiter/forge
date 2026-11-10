@@ -45,6 +45,12 @@ def check(root: Path) -> str:
     nix = (root / "flake.nix").read_text()
     require(source in nix and '"jterm_core-0.2.0"' in nix, "Nix lacks the pinned core source hash")
     require("jterm-core-src.tar.gz" not in nix, "Nix substitutes a bundled core for the production pin")
+    harness = root / "scripts/mission-acceptance/harness"
+    fixture = tomllib.loads((harness / "Cargo.toml").read_text())["dependencies"]["jterm_core"]
+    require(fixture.get("git") == dep["git"] and fixture.get("rev") == rev and "path" not in fixture, "mission harness core pin differs")
+    fixture_packages = tomllib.loads((harness / "Cargo.lock").read_text())["package"]
+    fixture_cores = [p for p in fixture_packages if p["name"] == "jterm_core"]
+    require(len(fixture_cores) == 1 and fixture_cores[0].get("source") == source, "mission harness locked source differs")
     return rev
 
 
