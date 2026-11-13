@@ -29603,8 +29603,8 @@ mod tests {
                 return Some(String::new());
             }
             let mut text = String::new();
-            for index in first..=last {
-                let row: Vec<char> = grid.rows[index].chars().collect();
+            for (index, row) in grid.rows.iter().enumerate().take(last + 1).skip(first) {
+                let row: Vec<char> = row.chars().collect();
                 if index > first {
                     text.push('\n');
                 }

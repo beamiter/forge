@@ -111,7 +111,7 @@ impl Filter {
         row: &Row,
         query: &jterm_core::agent_workspace::WorkspaceQuery,
     ) -> bool {
-        if (self.archive == 0 && row.archived && !query.includes_archived())
+        !((self.archive == 0 && row.archived && !query.includes_archived())
             || (self.archive == 1 && !row.archived)
             || (self.needs_attention && !row.attention)
             || (self.running && !row.busy)
@@ -123,11 +123,7 @@ impl Filter {
             || self
                 .project
                 .as_ref()
-                .is_some_and(|project| !std::path::Path::new(&row.project).starts_with(project))
-        {
-            return false;
-        }
-        true
+                .is_some_and(|project| !std::path::Path::new(&row.project).starts_with(project)))
     }
 }
 

@@ -15,7 +15,7 @@
         "type": "git",
         "url": "https://github.com/beamiter/jterm_core",
         "commit": "1ebfe4573d43c1b6de0332476cfea75f42899a96",
-        "dest": "flatpak-cargo/git/jterm_core-1ebfe457"
+        "dest": "flatpak-cargo/git/jterm_core-1ebfe45"
     },
     {
         "type": "archive",
@@ -1114,7 +1114,7 @@
     {
         "type": "shell",
         "commands": [
-            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-1ebfe457/.\" \"cargo/vendor/jterm_core\""
+            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-1ebfe45/.\" \"cargo/vendor/jterm_core\""
         ]
     },
     {

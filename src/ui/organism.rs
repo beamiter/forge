@@ -2576,7 +2576,7 @@ impl OrganismRuntime {
     }
 
     fn greeting_is_eligible(&self, view: &TermView) -> bool {
-        if !self.enabled.get()
+        !(!self.enabled.get()
             || self.motion.get() == OrganismMotion::Static
             || !self.presence.is_owner(self.presence_token)
             || !self.live_body.is_mapped()
@@ -2586,11 +2586,7 @@ impl OrganismRuntime {
             || self
                 .human_input_age(Instant::now())
                 .is_some_and(|age| age < HUMAN_INPUT_RETREAT)
-            || view.live_organism_surface_metrics().alt_screen
-        {
-            return false;
-        }
-        true
+            || view.live_organism_surface_metrics().alt_screen)
     }
 
     fn pointer_within_body(
