@@ -27,6 +27,7 @@ class PinTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         for name in ("Cargo.toml", "Cargo.lock", "deny.toml", ".cargo/config.toml",
                      "flake.nix", "packaging/flatpak/cargo-sources.json",
+                     "packaging/jterm-core-production.json",
                      "scripts/mission-acceptance/harness/Cargo.toml",
                      "scripts/mission-acceptance/harness/Cargo.lock"):
             target = self.root / name
@@ -146,6 +147,22 @@ class PinTests(unittest.TestCase):
     def test_stale_nix_pin_is_rejected(self):
         self.replace("flake.nix", self.revision, self.stale_revision)
         self.assert_rejected("Nix lacks")
+
+    def test_stale_production_receipt_is_rejected(self):
+        self.replace("packaging/jterm-core-production.json", self.revision, self.stale_revision)
+        self.assert_rejected("production source receipt differs")
+
+    def test_stale_nix_hash_is_rejected(self):
+        receipt = json.loads((self.root / "packaging/jterm-core-production.json").read_text())
+        self.replace("flake.nix", receipt["source_nar_sha256"], "sha256-" + "A" * 43 + "=")
+        self.assert_rejected("Nix source hash differs")
+
+    def test_malformed_receipt_hash_is_rejected(self):
+        path = self.root / "packaging/jterm-core-production.json"
+        receipt = json.loads(path.read_text())
+        receipt["source_nar_sha256"] = "sha256-not-a-hash"
+        path.write_text(json.dumps(receipt))
+        self.assert_rejected("valid NAR hash")
 
     def test_nix_bundle_substitution_is_rejected(self):
         path = self.root / "flake.nix"

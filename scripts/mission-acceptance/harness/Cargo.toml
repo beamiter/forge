@@ -6,7 +6,7 @@ rust-version = "1.89"
 publish = false
 
 [dependencies]
-jterm_core = { git = "https://github.com/beamiter/jterm_core.git", rev = "598f15808086dbea14d56fc1b86e77b6cb2e3201" }
+jterm_core = { git = "https://github.com/beamiter/jterm_core.git", rev = "1ebfe4573d43c1b6de0332476cfea75f42899a96" }
 serde_json = "=1.0.151"
 serde = { version = "=1.0.229", features = ["derive"] }
 libc = "=0.2.191"

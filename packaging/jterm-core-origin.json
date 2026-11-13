@@ -1,12 +1,12 @@
 {
-  "published_core_commit": "598f15808086dbea14d56fc1b86e77b6cb2e3201",
-  "published_core_tree": "895d71a78c46521bb5fb4715fc2b9603028c9ef7",
-  "archive_sha256": "471363aa3df2d499c9776e000638e6f9bd8eab80737b82c7339a708bf03cb494",
-  "archive_members": 312,
-  "archive_files": 283,
+  "published_core_commit": "1ebfe4573d43c1b6de0332476cfea75f42899a96",
+  "published_core_tree": "3182eea68594424a08642b68fe8ccf1f3422f114",
+  "archive_sha256": "13f7f6e86438a9ec02e9c0d84ef346228441d07cd1b02fb9c24c9173d1ff0051",
+  "archive_members": 336,
+  "archive_files": 305,
   "scope": "Cargo files, README.md, src/, runtime/, scripts/, tests/, assets/ and crates/ when present, exported from immutable committed blobs; docs and CI excluded.",
   "verification": "git archive exports committed blobs and executable modes; archive timestamps and owner IDs normalized.",
   "usage": "Audit export only; production Cargo, Nix and Flatpak use the published Git pin.",
-  "source_nar_sha256": "sha256-8LaOmShfGD8LacIf24iwBsfQ+VbEQiZ4n+UqF1l4ktE=",
-  "publication_boundary": "Public source verified at 2026-11-10T03:37:40.518191+00:00; no native acceptance implied."
+  "source_nar_sha256": "sha256-C7/iUJkO6ebXNXymEMhdrpqhbCKC737YQdE5FESgj44=",
+  "publication_boundary": "Public source verified at 2026-11-13T05:06:28.369045+00:00; no native acceptance implied."
 }

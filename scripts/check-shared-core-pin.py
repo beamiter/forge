@@ -45,6 +45,14 @@ def check(root: Path) -> str:
     nix = (root / "flake.nix").read_text()
     require(source in nix and '"jterm_core-0.2.0"' in nix, "Nix lacks the pinned core source hash")
     require("jterm-core-src.tar.gz" not in nix, "Nix substitutes a bundled core for the production pin")
+    receipt = json.loads((root / "packaging/jterm-core-production.json").read_text())
+    require(receipt.get("repository") == dep["git"] and receipt.get("revision") == rev,
+            "production source receipt differs from manifest")
+    nar = receipt.get("source_nar_sha256", "")
+    require(isinstance(nar, str) and re.fullmatch(r"sha256-[A-Za-z0-9+/]{43}=", nar),
+            "production source receipt lacks a valid NAR hash")
+    nix_hashes = re.findall(r'"jterm_core-0\.2\.0"\s*=\s*"([^"]+)"', nix)
+    require(nix_hashes == [nar], "Nix source hash differs from production receipt")
     harness = root / "scripts/mission-acceptance/harness"
     fixture = tomllib.loads((harness / "Cargo.toml").read_text())["dependencies"]["jterm_core"]
     require(fixture.get("git") == dep["git"] and fixture.get("rev") == rev and "path" not in fixture, "mission harness core pin differs")
