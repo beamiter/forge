@@ -2028,9 +2028,11 @@ pub fn run() -> glib::ExitCode {
         });
 
         // Enter/Shift+Enter are handled by the capture-phase key controller
-        // below (next/prev); incremental highlighting runs on search_changed.
+        // below (next/prev). Register edits immediately so navigation cannot
+        // step the old query before GtkSearchEntry's delayed search-changed.
+        // schedule_search_apply already owns the single debounce timer.
         let ui_for_search_changed = ui.clone();
-        search_entry.connect_search_changed(move |_| {
+        search_entry.connect_changed(move |_| {
             ui_for_search_changed.schedule_search_apply();
         });
 

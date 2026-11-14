@@ -210,8 +210,11 @@ mod block_view {
         }
     }
 }
+type EntryCallback = Rc<dyn Fn(&Entry)>;
 #[derive(Clone, Default)]
 struct Entry {
+    changed: Rc<RefCell<Option<EntryCallback>>>,
+    search_changed: Rc<RefCell<Option<EntryCallback>>>,
     text: Rc<RefCell<String>>,
     focus_count: Rc<Cell<usize>>,
     focus_events: Rc<RefCell<Vec<&'static str>>>,
@@ -230,6 +233,15 @@ impl Entry {
     }
     fn set_text(&self, s: &str) {
         *self.text.borrow_mut() = s.into();
+        if let Some(callback) = self.changed.borrow().clone() {
+            callback(self);
+        }
+    }
+    fn connect_changed(&self, callback: impl Fn(&Self) + 'static) {
+        *self.changed.borrow_mut() = Some(Rc::new(callback));
+    }
+    fn connect_search_changed(&self, callback: impl Fn(&Self) + 'static) {
+        *self.search_changed.borrow_mut() = Some(Rc::new(callback));
     }
 }
 #[derive(Clone, Default)]
@@ -414,6 +426,60 @@ mod ui {
         let search_entry = ui.search_entry.clone();
         // @search-lifecycle:after-registration
         notebook
+    }
+
+    fn connect_entry_changes(ui: &UiState) {
+        let search_entry = ui.search_entry.clone();
+        // @search-lifecycle:entry-registration
+    }
+
+    #[test]
+    fn entry_changes_share_one_debounce_and_apply_only_the_latest_text() {
+        let ui = setup();
+        connect_entry_changes(&ui);
+        ui.search_entry.set_text("first");
+        ui.search_entry.set_text("latest");
+        assert!(ui.terminals[0].installed.borrow().is_none());
+        assert_eq!(*ui.search_status.0.borrow(), "Searching…");
+        glib::run_pending();
+        assert_eq!(*ui.terminals[0].installed.borrow(), Some("latest".into()));
+        assert_eq!(ui.terminals[0].steps.get(), 1);
+        assert!(ui.search_debounce_source.borrow().is_none());
+        ui.toggle_search();
+        ui.search_entry.set_text("hidden");
+        glib::run_pending();
+        assert!(ui.terminals[0].installed.borrow().is_none());
+        ui.search_entry.changed.borrow_mut().take();
+        ui.search_entry.search_changed.borrow_mut().take();
+    }
+
+    #[test]
+    fn editing_then_immediate_navigation_never_steps_the_old_query() {
+        for backwards in [false, true] {
+            let ui = setup();
+            ui.search_entry.set_text("old");
+            ui.search_apply();
+            connect_entry_changes(&ui);
+            // GTK's Editable::changed has happened, but SearchEntry's delayed
+            // search-changed signal has not. Enter/buttons can arrive here.
+            ui.search_entry.set_text("new");
+            if backwards {
+                ui.search_prev();
+            } else {
+                ui.search_next();
+            }
+            assert_eq!(*ui.terminals[0].installed.borrow(), Some("new".into()));
+            assert!(ui.search_debounce_source.borrow().is_none());
+            let steps = ui.terminals[0].steps.get();
+            glib::run_pending();
+            assert_eq!(ui.terminals[0].steps.get(), steps);
+            // Deleting the query clears native state synchronously as well.
+            ui.search_entry.set_text("");
+            assert!(ui.terminals[0].installed.borrow().is_none());
+            assert!(ui.search_status.0.borrow().is_empty());
+            ui.search_entry.changed.borrow_mut().take();
+            ui.search_entry.search_changed.borrow_mut().take();
+        }
     }
 
     #[test]

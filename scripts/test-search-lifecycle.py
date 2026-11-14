@@ -132,6 +132,16 @@ def check_extraction_guards(source):
         raise AssertionError(f"extraction guard accepted {label}")
 
 
+def entry_change_registration(source):
+    start_marker = "        let ui_for_search_changed = ui.clone();"
+    end_marker = "        let ui_for_search_next = ui.clone();"
+    if source.count(start_marker) != 1 or source.count(end_marker) != 1:
+        raise ValueError("expected one search entry registration boundary")
+    start = source.index(start_marker)
+    end = source.index(end_marker, start)
+    return textwrap.dedent(source[start:end])
+
+
 def build_harness():
     source = (ROOT / "src/ui/search.rs").read_text()
     source = "\n".join(line for line in source.splitlines() if not line.startswith(("//!", "use adw::", "use gtk4::glib;", "use libadwaita", "use vte4::TerminalExt;")))
@@ -140,6 +150,7 @@ def build_harness():
     fixture = (ROOT / "scripts/search_lifecycle_harness.rs").read_text()
     for marker, value in [
         ("source", source),
+        ("entry-registration", entry_change_registration(main)),
         ("focus-helper", braced_item(main, "pub(crate) fn focus_switched_page(")),
         ("after-helper", braced_item(main, "pub(crate) fn connect_tab_search_focus_after_switch(")),
         ("after-registration", after_invocation(main)),
