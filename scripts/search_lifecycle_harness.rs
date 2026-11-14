@@ -113,6 +113,9 @@ mod vte4 {
         pub fn search_set_regex(&self, re: Option<&Regex>, _: u32) {
             *self.installed.borrow_mut() = re.map(|r| r.0.clone());
         }
+        pub fn search_get_regex(&self) -> Option<Regex> {
+            self.installed.borrow().as_ref().map(|s| Regex(s.clone()))
+        }
         pub fn search_set_wrap_around(&self, _: bool) {}
         pub fn search_find_next(&self) -> bool {
             if self.installed.borrow().is_some() {
@@ -661,6 +664,35 @@ mod ui {
     }
 
     #[test]
+    fn navigation_preserves_rejected_and_empty_query_feedback() {
+        for (query, expected) in [
+            ("/[/".to_owned(), "Invalid regex"),
+            ("x".repeat(8 * 1024 + 1), "Query too long (8 KiB limit)"),
+            (String::new(), ""),
+        ] {
+            let ui = setup();
+            ui.search_entry.set_text("old-live-query");
+            ui.search_apply();
+            ui.search_entry.set_text(&query);
+            ui.search_apply();
+            assert_eq!(*ui.search_status.0.borrow(), expected);
+            for _ in 0..2 {
+                ui.search_next();
+                assert_eq!(*ui.search_status.0.borrow(), expected);
+                ui.search_prev();
+                assert_eq!(*ui.search_status.0.borrow(), expected);
+            }
+            ui.search_entry.set_text("recovered");
+            ui.search_apply();
+            let steps = ui.terminals[0].steps.get();
+            ui.search_next();
+            ui.search_prev();
+            assert_eq!(ui.terminals[0].steps.get(), steps + 2);
+            assert_eq!(*ui.search_status.0.borrow(), "1 of 1+");
+        }
+    }
+
+    #[test]
     fn invalid_regex_removes_previous_native_search() {
         let ui = setup();
         ui.search_entry.set_text("needle");
@@ -708,11 +740,13 @@ mod ui {
             ui.search_apply();
             assert!(ui.terminals[0].installed.borrow().is_none(), "{result:?}");
             let steps = ui.terminals[0].steps.get();
+            let status = ui.search_status.0.borrow().clone();
             // The test boundary deliberately makes Block navigation inactive;
             // even then neither direction may fall back to the obsolete regex.
             ui.search_next();
             ui.search_prev();
             assert_eq!(ui.terminals[0].steps.get(), steps, "{result:?}");
+            assert_eq!(*ui.search_status.0.borrow(), status, "{result:?}");
         }
     }
 

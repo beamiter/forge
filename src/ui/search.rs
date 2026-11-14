@@ -355,7 +355,13 @@ impl UiState {
                 FindNavigationResult::Inactive => {}
             }
         }
-        if let Some(term) = self.search_targets().0 {
+        // Without an installed native query, false means no search ran. Keep
+        // the empty-query, validation-error or scan-limit feedback intact.
+        if let Some(term) = self
+            .search_targets()
+            .0
+            .filter(|term| term.search_get_regex().is_some())
+        {
             self.search_status
                 .set_text(terminal_status_text(term.search_find_next()));
         }
@@ -383,7 +389,13 @@ impl UiState {
                 FindNavigationResult::Inactive => {}
             }
         }
-        if let Some(term) = self.search_targets().0 {
+        // Without an installed native query, false means no search ran. Keep
+        // the empty-query, validation-error or scan-limit feedback intact.
+        if let Some(term) = self
+            .search_targets()
+            .0
+            .filter(|term| term.search_get_regex().is_some())
+        {
             self.search_status
                 .set_text(terminal_status_text(term.search_find_previous()));
         }
