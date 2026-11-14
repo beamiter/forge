@@ -1578,14 +1578,52 @@ pub(crate) fn observe_task(window: &gtk::Window, task: Option<&jterm_core::agent
     });
 }
 
+fn clip_intersection(a: Rect, b: Rect) -> Option<Rect> {
+    let left = a.x.max(b.x);
+    let top = a.y.max(b.y);
+    let right = (a.x + a.width).min(b.x + b.width);
+    let bottom = (a.y + a.height).min(b.y + b.height);
+    let width = right - left;
+    let height = bottom - top;
+    (width > 0. && height > 0.).then_some(Rect {
+        x: left,
+        y: top,
+        width,
+        height,
+    })
+}
+
+fn widget_bounds(widget: &gtk::Widget, overlay: &gtk::Overlay, clip: Option<Rect>) -> Option<Rect> {
+    let bounds = widget.compute_bounds(overlay)?;
+    let rect = Rect {
+        x: bounds.x() as f64,
+        y: bounds.y() as f64,
+        width: bounds.width() as f64,
+        height: bounds.height() as f64,
+    };
+    if !rect.valid() {
+        return None;
+    }
+    match clip {
+        Some(c) => clip_intersection(rect, c),
+        None => Some(rect),
+    }
+}
+
 /// Conservative metadata-only native exclusion scan. Never reads label/text contents.
 fn protections(root: &gtk::Widget, overlay: &gtk::Overlay) -> (bool, Vec<Rect>) {
     use vte4::prelude::TerminalExt;
-    let mut pending = vec![root.clone()];
+    let root_clip = (overlay.width() > 0 && overlay.height() > 0).then_some(Rect {
+        x: 0.,
+        y: 0.,
+        width: overlay.width() as f64,
+        height: overlay.height() as f64,
+    });
+    let mut pending = vec![(root.clone(), root_clip, false)];
     let mut exclusions = Vec::new();
     let mut blocked = false;
     let mut visited = 0;
-    while let Some(w) = pending.pop() {
+    while let Some((w, clip, excluded)) = pending.pop() {
         visited += 1;
         if visited > 2048 {
             return (true, Vec::new());
@@ -1604,6 +1642,17 @@ fn protections(root: &gtk::Widget, overlay: &gtk::Overlay) -> (bool, Vec<Rect>) 
         if let Some(vte) = w.downcast_ref::<vte4::Terminal>() {
             blocked |= vte.has_selection();
         }
+        let clips = w.overflow() == gtk::Overflow::Hidden
+            || w.is::<gtk::ScrolledWindow>()
+            || w.is::<gtk::Viewport>();
+        let next_clip = if clips {
+            match widget_bounds(&w, overlay, clip) {
+                Some(clipped) => Some(clipped),
+                None => continue,
+            }
+        } else {
+            clip
+        };
         let chrome = [
             "reference-inspector",
             "workspace-inspector",
@@ -1616,35 +1665,37 @@ fn protections(root: &gtk::Widget, overlay: &gtk::Overlay) -> (bool, Vec<Rect>) 
         ]
         .iter()
         .any(|class| w.has_css_class(class));
-        if chrome
-            || w.is::<vte4::Terminal>()
-            || w.is::<gtk::Label>()
-            || w.is::<gtk::Entry>()
-            || w.is::<gtk::TextView>()
-            || w.is::<gtk::Button>()
-            || w.is::<gtk::Scrollbar>()
+        let card = w.has_css_class("block-finished") || w.has_css_class("developer-command-card");
+        if !excluded
+            && (chrome
+                || card
+                || w.is::<vte4::Terminal>()
+                || w.is::<gtk::Label>()
+                || w.is::<gtk::Entry>()
+                || w.is::<gtk::TextView>()
+                || w.is::<gtk::Button>()
+                || w.is::<gtk::Scrollbar>())
         {
-            if let Some(r) = w.compute_bounds(overlay) {
-                if r.width() > 0. && r.height() > 0. {
-                    exclusions.push(Rect {
-                        x: r.x() as f64 - 8.,
-                        y: r.y() as f64 - 8.,
-                        width: r.width() as f64 + 16.,
-                        height: r.height() as f64 + 16.,
-                    });
+            if let Some(r) = widget_bounds(&w, overlay, next_clip) {
+                exclusions.push(Rect {
+                    x: r.x - 8.,
+                    y: r.y - 8.,
+                    width: r.width + 16.,
+                    height: r.height + 16.,
+                });
+                if exclusions.len() > host::MAX_REGIONS {
+                    return (true, Vec::new());
                 }
             }
         }
-        if chrome || w.is::<vte4::Terminal>() {
+        if chrome || w.is::<vte4::Terminal>() || w.is::<gtk::Button>() {
             continue;
         }
+        let child_excluded = excluded || card;
         let mut child = w.first_child();
         while let Some(c) = child {
             child = c.next_sibling();
-            pending.push(c);
-        }
-        if exclusions.len() > host::MAX_REGIONS {
-            return (true, Vec::new());
+            pending.push((c, next_clip, child_excluded));
         }
     }
     (blocked, exclusions)
@@ -2769,6 +2820,37 @@ mod tests {
         assert!(!presentation_evidence(true, 0));
         assert!(presentation_evidence(true, 42));
     }
+    #[test]
+    fn clip_intersection_bounds_overflowing_children() {
+        let clip = Rect {
+            x: 100.,
+            y: 400.,
+            width: 500.,
+            height: 120.,
+        };
+        let child = Rect {
+            x: 100.,
+            y: 400.,
+            width: 500.,
+            height: 700.,
+        };
+        assert_eq!(
+            clip_intersection(child, clip),
+            Some(Rect {
+                x: 100.,
+                y: 400.,
+                width: 500.,
+                height: 120.,
+            })
+        );
+        let offscreen = Rect {
+            x: 100.,
+            y: 600.,
+            width: 500.,
+            height: 100.,
+        };
+        assert_eq!(clip_intersection(offscreen, clip), None);
+    }
     /// Requires a real GTK display; intentionally not silently mocked by CI.
     #[test]
     #[ignore = "requires native GTK display; run explicitly in native matrix"]
@@ -2781,5 +2863,75 @@ mod tests {
         overlay.set_measure_overlay(&body, false);
         assert!(!overlay.is_measure_overlay(&body));
         assert!(!body.can_target());
+    }
+    #[test]
+    #[ignore = "requires native GTK display; run explicitly in native matrix"]
+    fn protections_clip_overflow_and_deduplicate_cards_and_buttons() {
+        gtk::init().unwrap();
+        let win = gtk::Window::new();
+        win.set_default_size(900, 700);
+        let overlay = gtk::Overlay::new();
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 8);
+
+        let clip = gtk::Overlay::new();
+        clip.set_overflow(gtk::Overflow::Hidden);
+        let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        spacer.set_size_request(400, 120);
+        clip.set_child(Some(&spacer));
+        let fixed = gtk::Fixed::new();
+        fixed.set_overflow(gtk::Overflow::Hidden);
+        let overflowing = gtk::Label::new(Some("tall"));
+        overflowing.set_size_request(400, 500);
+        fixed.put(&overflowing, 0.0, 0.0);
+        clip.add_overlay(&fixed);
+        clip.set_measure_overlay(&fixed, false);
+        clip.set_clip_overlay(&fixed, true);
+        root.append(&clip);
+
+        let card = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        card.add_css_class("block-finished");
+        for i in 0..8 {
+            card.append(&gtk::Button::with_label(&format!("btn-{i}")));
+            card.append(&gtk::Label::new(Some("meta")));
+        }
+        root.append(&card);
+
+        let scroller = gtk::ScrolledWindow::new();
+        scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::External);
+        scroller.set_size_request(300, 60);
+        let scrolled_content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let top_gap = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        top_gap.set_size_request(300, 200);
+        let offscreen = gtk::Label::new(Some("offscreen"));
+        scrolled_content.append(&top_gap);
+        scrolled_content.append(&offscreen);
+        scroller.set_child(Some(&scrolled_content));
+        root.append(&scroller);
+
+        let btn = gtk::Button::with_label("Action");
+        root.append(&btn);
+
+        overlay.set_child(Some(&root));
+        win.set_child(Some(&overlay));
+        win.present();
+        let ctx = gtk::glib::MainContext::default();
+        while ctx.pending() {
+            ctx.iteration(false);
+        }
+
+        let (blocked, exclusions) = protections(overlay.upcast_ref(), &overlay);
+        assert!(!blocked);
+        // One clipped `overflowing` label (height <= 120 + 16), one `card`, one `btn`;
+        // offscreen label inside `ScrolledWindow` is pruned.
+        assert_eq!(exclusions.len(), 3, "exclusions={exclusions:?}");
+        assert!(exclusions.iter().all(|r| r.height <= 136.0));
+
+        // Selection marker inside a deduplicated card still blocks companion placement.
+        let inner = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        inner.add_css_class("block-selection-active");
+        card.append(&inner);
+        let (blocked_with_selection, _) = protections(overlay.upcast_ref(), &overlay);
+        assert!(blocked_with_selection);
+        win.destroy();
     }
 }
