@@ -45,6 +45,8 @@ pub(crate) mod reference_conversation;
 pub(crate) mod reference_shell;
 mod remote_fs;
 mod search;
+#[cfg(test)]
+mod search_native_tests;
 mod search_preview;
 mod session;
 mod sidebar_resize;

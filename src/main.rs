@@ -2027,14 +2027,8 @@ pub fn run() -> glib::ExitCode {
             ui_for_focus_presence.sync_organism_presence();
         });
 
-        // Enter/Shift+Enter are handled by the capture-phase key controller
-        // below (next/prev). Register edits immediately so navigation cannot
-        // step the old query before GtkSearchEntry's delayed search-changed.
-        // schedule_search_apply already owns the single debounce timer.
-        let ui_for_search_changed = ui.clone();
-        search_entry.connect_changed(move |_| {
-            ui_for_search_changed.schedule_search_apply();
-        });
+        // Enter/Shift+Enter are handled by the capture-phase controller below.
+        ui.connect_search_entry_changes();
 
         let ui_for_search_next = ui.clone();
         search_next_btn.connect_clicked(move |_| {

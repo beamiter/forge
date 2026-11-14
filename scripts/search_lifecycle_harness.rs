@@ -27,6 +27,7 @@ macro_rules! closure_local {
 }
 pub(crate) use closure_local;
 pub mod glib {
+    pub type SignalHandlerId = ();
     use super::*;
     pub(crate) use crate::closure_local;
     pub struct WeakRef<T>(pub Rc<dyn Fn() -> Option<T>>);
@@ -278,6 +279,8 @@ impl SearchBar {
         self.mode.get()
     }
     fn set_search_mode(&self, b: bool) {
+        // This policy fixture deliberately retains entry text. Real GTK clears
+        // its connected entry on close; search_native_tests covers that path.
         self.mode.set(b)
     }
     fn root(&self) -> Option<FocusRoot> {
@@ -429,8 +432,7 @@ mod ui {
     }
 
     fn connect_entry_changes(ui: &UiState) {
-        let search_entry = ui.search_entry.clone();
-        // @search-lifecycle:entry-registration
+        Rc::new(ui.clone()).connect_search_entry_changes();
     }
 
     #[test]

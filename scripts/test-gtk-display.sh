@@ -52,6 +52,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    ui::search_native_tests::native_entry_navigation_and_close_reopen_retire_stale_queries
     ui::ai_panel::tests::composer_limit_preserves_insert_iter_and_utf8_draft
     ui::workspace_context_ui::tests::pending_context_additions_preserve_order_capacity_and_cancellation
     ui::workspace_context_ui::tests::rejected_context_paste_restores_field_and_material_buffers

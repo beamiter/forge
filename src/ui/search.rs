@@ -92,6 +92,14 @@ fn terminal_status_text(found: bool) -> &'static str {
 }
 
 impl UiState {
+    /// Register edits before GtkSearchEntry's delayed search-changed signal.
+    /// The controller already owns the single debounce timer.
+    pub(crate) fn connect_search_entry_changes(self: &Rc<Self>) -> glib::SignalHandlerId {
+        let ui = self.clone();
+        self.search_entry
+            .connect_changed(move |_| ui.schedule_search_apply())
+    }
+
     pub(super) fn show_search_for(&self, view: &Rc<TermView>) {
         self.cancel_pending_search();
         self.clear_search_owner();
