@@ -53,6 +53,8 @@ fi
 
 tests=(
     ui::search_native_tests::native_entry_navigation_and_close_reopen_retire_stale_queries
+    eva_companion::tests::protections_clip_overflow_and_deduplicate_cards_and_buttons
+    eva_companion::tests::navigation_background_hosts_body_without_covering_controls
     ui::ai_panel::tests::composer_limit_preserves_insert_iter_and_utf8_draft
     ui::workspace_context_ui::tests::pending_context_additions_preserve_order_capacity_and_cancellation
     ui::workspace_context_ui::tests::rejected_context_paste_restores_field_and_material_buffers
