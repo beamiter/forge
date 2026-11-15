@@ -183,10 +183,15 @@ dialog.forge-workspace-dialog {
 .forge-workspace-dialog scale value {
     color: @POPUP_FOREGROUND@;
 }
-.forge-workspace-dialog scale:focus-visible trough,
-.forge-workspace-dialog switch:focus-visible {
+.forge-workspace-dialog scale:focus-visible trough {
     outline: 2px solid @ACCENT@;
     outline-offset: 2px;
+}
+/* Keep the switch focus ring inside its allocated bounds. Compact native
+ * rows and WidgetPaintable snapshots may clip an outside-only outline. */
+.forge-workspace-dialog switch:focus-visible {
+    outline: 2px solid @ACCENT@;
+    outline-offset: -2px;
 }
 .forge-workspace-dialog scale:disabled highlight,
 .forge-workspace-dialog switch:disabled,

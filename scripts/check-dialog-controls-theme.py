@@ -31,6 +31,11 @@ class DialogControlsTheme(unittest.TestCase):
         for selector in RULES:
             self.assertIn('.forge-workspace-dialog', selector)
 
+    def test_switch_focus_is_inside_allocation(self):
+        body = RULES['.forge-workspace-dialog switch:focus-visible']
+        self.assertIn('outline: 2px solid @ACCENT@', body)
+        self.assertIn('outline-offset: -2px', body)
+
     def test_disabled_and_focus_are_explicit(self):
         for node in ['scale:disabled highlight', 'scale:disabled slider', 'switch:disabled', 'switch:disabled slider', 'checkbutton:disabled check']:
             self.assertIn('.forge-workspace-dialog ' + node, RULES)

@@ -3327,7 +3327,10 @@ mod role_font_tests {
             let declaration = |size: f64| format!("{selector} {{ font-size: {size:.6}px; }}");
             assert!(normal.contains(&declaration(size)), "{selector}");
             assert!(ui.contains(&declaration(ui_size)), "UI: {selector}");
-            assert!(content.contains(&declaration(size)), "Content leaves UI: {selector}");
+            assert!(
+                content.contains(&declaration(size)),
+                "Content leaves UI: {selector}"
+            );
         }
         for (selector, size) in [
             ("label.reference-message-heading", 20.0),
@@ -3791,6 +3794,12 @@ mod popup_theme_tests {
                 assert!(matching_pixels(switch, super::token::color::CHROME_TEXT) < plain_slider);
                 switch.unset_state_flags(gtk::StateFlags::PRELIGHT);
                 compact.set_active(false);
+                settle();
+                assert_eq!(
+                    matching_pixels(switch, super::token::color::ACCENT),
+                    0,
+                    "unchecked unfocused switch must not satisfy the focus-ring oracle"
+                );
                 switch.set_state_flags(
                     gtk::StateFlags::FOCUSED | gtk::StateFlags::FOCUS_VISIBLE,
                     false,
