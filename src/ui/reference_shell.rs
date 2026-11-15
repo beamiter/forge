@@ -3697,15 +3697,128 @@ mod popup_theme_tests {
         entry.set_title("Host");
         entry.set_text("example.test");
         group.add(&entry);
+        // The same native control types and opacity bounds as Settings in
+        // dialogs.rs. This fixture checks rendering, not AppModel persistence.
+        let compact = adw::SwitchRow::builder()
+            .title("Compact Block Layout")
+            .build();
+        group.add(&compact);
+        let opacity_row = adw::ActionRow::builder().title("Opacity").build();
+        let opacity = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.01, 1.0, 0.025);
+        opacity.set_value(0.5);
+        opacity.set_hexpand(true);
+        opacity.set_draw_value(true);
+        opacity.set_value_pos(gtk::PositionType::Left);
+        opacity.set_format_value_func(|_, value| format!("{:.0}%", value * 100.0));
+        opacity_row.add_suffix(&opacity);
+        group.add(&opacity_row);
         page.add(&group);
         preferences.add(&page);
         preferences.present(Some(&host));
-        for scheme in [adw::ColorScheme::ForceLight, adw::ColorScheme::ForceDark] {
-            style.set_color_scheme(scheme);
-            settle();
-            assert_color(entry.color(), super::token::color::CHROME_TEXT);
-            assert!(matching_pixels(&preferences, super::token::color::NAVIGATION) > 100);
+        settle();
+        // Snapshot the actual switch, not the row's text/background, so a
+        // correct label cannot mask an unthemed slider or checked track.
+        let mut descendants = vec![compact.clone().upcast::<gtk::Widget>()];
+        let mut index = 0;
+        while index < descendants.len() {
+            let mut child = descendants[index].first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                descendants.push(widget);
+            }
+            index += 1;
         }
+        let switch = descendants
+            .iter()
+            .find_map(|widget| widget.downcast_ref::<gtk::Switch>())
+            .expect("SwitchRow contains its native switch");
+        let control_geometry = || {
+            [
+                switch.upcast_ref::<gtk::Widget>(),
+                opacity.upcast_ref(),
+                entry.upcast_ref(),
+            ]
+            .map(|widget| {
+                (
+                    widget.width(),
+                    widget.height(),
+                    widget.measure(gtk::Orientation::Horizontal, -1),
+                    widget.measure(gtk::Orientation::Vertical, -1),
+                )
+            })
+        };
+        let initial_control_geometry = control_geometry();
+        let terminal_theme = gtk::CssProvider::new();
+        let errors = parsing_errors.clone();
+        terminal_theme.connect_parsing_error(move |_, _, error| {
+            errors.borrow_mut().push(error.to_string());
+        });
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &terminal_theme,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+        );
+        for scheme in [
+            adw::ColorScheme::ForceLight,
+            adw::ColorScheme::ForceDark,
+            adw::ColorScheme::ForceLight,
+        ] {
+            style.set_color_scheme(scheme);
+            for (background, foreground) in [("#16161e", "#c0caf5"), ("#f6f8fa", "#24292f")] {
+                terminal_theme.load_from_string(&crate::font::menu_theme_css(
+                    "Monospace 12",
+                    &gtk::gdk::RGBA::parse(background).unwrap(),
+                    &gtk::gdk::RGBA::parse(foreground).unwrap(),
+                ));
+                compact.set_sensitive(true);
+                opacity.set_sensitive(true);
+                compact.set_active(false);
+                settle();
+                assert!(switch.is_mapped() && opacity.is_mapped());
+                assert_color(entry.color(), super::token::color::CHROME_TEXT);
+                assert!(matching_pixels(&preferences, super::token::color::NAVIGATION) > 100);
+                assert!(matching_pixels(switch, super::token::color::CHROME_TEXT) > 4);
+                assert!(matching_pixels(&opacity, super::token::color::CHROME_TEXT) > 4);
+                assert!(matching_pixels(&opacity, super::token::color::ACCENT) > 4);
+                assert!(matching_pixels(&opacity, super::token::color::INSPECTOR) > 4);
+                compact.set_active(true);
+                settle();
+                assert!(matching_pixels(switch, super::token::color::ACCENT) > 4);
+                // These are explicit GTK state transitions, not OS input.
+                let plain_slider = matching_pixels(switch, super::token::color::CHROME_TEXT);
+                switch.set_state_flags(gtk::StateFlags::PRELIGHT, false);
+                settle();
+                assert!(matching_pixels(switch, super::token::color::CHROME_TEXT) < plain_slider);
+                switch.unset_state_flags(gtk::StateFlags::PRELIGHT);
+                compact.set_active(false);
+                switch.set_state_flags(
+                    gtk::StateFlags::FOCUSED | gtk::StateFlags::FOCUS_VISIBLE,
+                    false,
+                );
+                settle();
+                assert!(matching_pixels(switch, super::token::color::ACCENT) > 4);
+                switch.unset_state_flags(gtk::StateFlags::FOCUSED | gtk::StateFlags::FOCUS_VISIBLE);
+                compact.set_active(true);
+                compact.set_sensitive(false);
+                opacity.set_sensitive(false);
+                settle();
+                assert!(matching_pixels(switch, super::token::color::CHROME_MUTED) > 4);
+                assert!(matching_pixels(&opacity, super::token::color::CHROME_MUTED) > 4);
+                assert_eq!(matching_pixels(switch, super::token::color::ACCENT), 0);
+                assert_eq!(matching_pixels(&opacity, super::token::color::ACCENT), 0);
+                assert!(
+                    compact.is_active(),
+                    "theme/state changes must not reset the switch"
+                );
+                assert!((opacity.value() - 0.5).abs() < 0.000_001);
+                assert_eq!(
+                    control_geometry(),
+                    initial_control_geometry,
+                    "paint-only theme/state changes must preserve native control geometry"
+                );
+            }
+        }
+        gtk::style_context_remove_provider_for_display(&display, &terminal_theme);
         assert!(
             parsing_errors.borrow().is_empty(),
             "{:?}",

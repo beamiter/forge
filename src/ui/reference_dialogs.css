@@ -158,3 +158,48 @@ dialog.forge-workspace-dialog {
 .forge-workspace-dialog scrollbar slider:hover {
     background: @POPUP_MUTED@;
 }
+
+/* Complete the native controls used by Preferences. Keep shell chrome on
+ * shared tokens rather than the terminal ANSI palette or the system accent. */
+.forge-workspace-dialog scale trough {
+    background: @INSPECTOR@;
+    border: 1px solid @POPUP_BORDER@;
+    box-shadow: none;
+}
+.forge-workspace-dialog scale highlight {
+    background: @ACCENT@;
+    border-color: @ACCENT@;
+}
+.forge-workspace-dialog scale slider,
+.forge-workspace-dialog switch slider {
+    background: @POPUP_FOREGROUND@;
+    border: 1px solid @POPUP_BORDER@;
+    box-shadow: none;
+}
+.forge-workspace-dialog scale slider:hover,
+.forge-workspace-dialog switch:hover slider {
+    background: mix(@POPUP_FOREGROUND@, @ACCENT@, .15);
+}
+.forge-workspace-dialog scale value {
+    color: @POPUP_FOREGROUND@;
+}
+.forge-workspace-dialog scale:focus-visible trough,
+.forge-workspace-dialog switch:focus-visible {
+    outline: 2px solid @ACCENT@;
+    outline-offset: 2px;
+}
+.forge-workspace-dialog scale:disabled highlight,
+.forge-workspace-dialog switch:disabled,
+.forge-workspace-dialog checkbutton:disabled check {
+    background: @INSPECTOR_CARD@;
+    border-color: @DARK_BORDER@;
+    color: @POPUP_MUTED@;
+}
+.forge-workspace-dialog scale:disabled slider,
+.forge-workspace-dialog switch:disabled slider {
+    background: @POPUP_MUTED@;
+    border-color: @DARK_BORDER@;
+}
+.forge-workspace-dialog scale:disabled value {
+    color: @POPUP_MUTED@;
+}
