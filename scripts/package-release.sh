@@ -12,7 +12,16 @@ cd "${PROJECT_ROOT}"
 BINARY="${1:-target/release/forge}"
 DIST_DIR="${DIST_DIR:-${PROJECT_ROOT}/target/dist}"
 VERSION="${VERSION:-$(awk -F ' *= *' '$1 == "version" { gsub(/"/, "", $2); print $2; exit }' Cargo.toml)}"
-TARGET="${TARGET:-$(rustc -vV | sed -n 's/^host: //p')}"
+# TARGET may be supplied when packaging a prebuilt binary without Rust installed.
+TARGET_EXPLICIT=1
+if [[ -z "${TARGET:-}" ]]; then
+    TARGET_EXPLICIT=0
+    if ! RUSTC_VERBOSE="$(rustc -vV)"; then
+        printf 'Error: cannot determine Rust target; set TARGET for a prebuilt binary.\n' >&2
+        exit 1
+    fi
+    TARGET="$(sed -n 's/^host: //p' <<<"${RUSTC_VERBOSE}")"
+fi
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct 2>/dev/null || date +%s)}"
 
 [[ -n "${VERSION}" ]] || { printf 'Error: cannot read Cargo version.\n' >&2; exit 1; }
@@ -31,6 +40,23 @@ if [[ "${SOURCE_DATE_EPOCH}" == *[!0-9]* ]]; then
     printf 'Error: SOURCE_DATE_EPOCH must be a nonnegative integer.\n' >&2
     exit 1
 fi
+# This records the packaging environment, not the compiler used for BINARY.
+# A failed probe is permitted for an explicitly targeted prebuilt binary, but
+# successful output must be one nonempty, control-free BUILDINFO value.
+# Map NUL to a rejected control byte before Bash can discard it. pipefail
+# preserves a failed rustc status through this byte filter.
+if ! PACKAGE_RUSTC="$(rustc --version | tr '\000' '\r')"; then
+    if [[ "${TARGET_EXPLICIT}" -eq 0 ]]; then
+        printf 'Error: cannot read packaging rustc version without explicit TARGET.\n' >&2
+        exit 1
+    fi
+    PACKAGE_RUSTC=unknown
+    printf 'Warning: packaging rustc unavailable; BUILDINFO rustc=unknown (not binary provenance).\n' >&2
+elif [[ -z "${PACKAGE_RUSTC}" || "${PACKAGE_RUSTC}" == *[[:cntrl:]]* ]]; then
+    printf 'Error: rustc --version must return one nonempty line without control characters.\n' >&2
+    exit 1
+fi
+
 [[ -x "${BINARY}" ]] || {
     printf 'Error: release binary not found or not executable: %s\n' "${BINARY}" >&2
     printf "Run 'make package' outside a Nix shell, or pass an explicit system-linked release binary.\n" >&2
@@ -86,7 +112,7 @@ install -d "${PACKAGE_ROOT}/share/doc/forge"
     printf 'target=%s\n' "${TARGET}"
     printf 'source_date_epoch=%s\n' "${SOURCE_DATE_EPOCH}"
     printf 'git_commit=%s\n' "$(git rev-parse HEAD 2>/dev/null || printf unknown)"
-    printf 'rustc=%s\n' "$(rustc --version)"
+    printf 'rustc=%s\n' "${PACKAGE_RUSTC}"
 } >"${PACKAGE_ROOT}/share/doc/forge/BUILDINFO"
 
 install -d "${PACKAGE_ROOT}/share/forge/shell-integration"

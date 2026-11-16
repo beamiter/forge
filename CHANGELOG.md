@@ -6,6 +6,9 @@ All notable user-visible and operational changes are recorded here.
 
 ## Unreleased
 
+- Validate packaging compiler metadata before staging; record unavailable tools
+  explicitly and clarify that BUILDINFO is not prebuilt binary provenance.
+
 - Reject release version/target path separators and control characters, and
   nonnumeric build timestamps, before creating staging paths or BUILDINFO.
 
