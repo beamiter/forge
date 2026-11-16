@@ -18646,9 +18646,10 @@ impl TermView {
         let clipboard = self.active_vte.clipboard();
         let request = self.clipboard_paste_request();
         let feedback = self.input_feedback.clone();
+        let notify = paste_feedback::notifier(&self.active_vte);
         let active_vte = self.active_vte.downgrade();
         clipboard.read_text_async(None::<&gtk4::gio::Cancellable>, move |result| {
-            let Ok(Some(text)) = result else {
+            let Some(text) = paste_feedback::read_text(result, notify.as_ref()) else {
                 return;
             };
             match request.complete(Some(text.as_str())) {
