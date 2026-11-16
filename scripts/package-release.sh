@@ -27,7 +27,14 @@ PACKAGE_NAME="forge-${VERSION}-${TARGET}"
 ARCHIVE_NAME="${PACKAGE_NAME}.tar.gz"
 STAGE_DIR="$(mktemp -d)"
 PACKAGE_ROOT="${STAGE_DIR}/${PACKAGE_NAME}"
-trap 'rm -rf -- "${STAGE_DIR}"' EXIT
+ARCHIVE_STAGE=""
+cleanup() {
+    rm -rf -- "${STAGE_DIR}"
+    if [[ -n "${ARCHIVE_STAGE}" ]]; then
+        rm -rf -- "${ARCHIVE_STAGE}"
+    fi
+}
+trap cleanup EXIT
 
 install -Dm0755 "${BINARY}" "${PACKAGE_ROOT}/bin/forge"
 install -Dm0755 scripts/support-bundle.sh "${PACKAGE_ROOT}/bin/forge-support-bundle"
@@ -76,14 +83,21 @@ install -Dm0644 scripts/notebooks/welcome.jtnb.md \
     "${PACKAGE_ROOT}/share/forge/notebooks/welcome.jtnb.md"
 
 mkdir -p "${DIST_DIR}"
-rm -f -- "${DIST_DIR}/${ARCHIVE_NAME}" "${DIST_DIR}/${ARCHIVE_NAME}.sha256"
+# Build both outputs before replacing either old artifact. Staging inside the
+# destination keeps each final rename on the same filesystem. The two renames
+# are not a transaction: this protects build/hash failures, not power loss or
+# concurrent readers between publication steps.
+ARCHIVE_STAGE="$(mktemp -d "${DIST_DIR}/.forge-package.XXXXXX")"
 tar --sort=name --mtime="@${SOURCE_DATE_EPOCH}" --owner=0 --group=0 --numeric-owner \
     -C "${STAGE_DIR}" -cf - "${PACKAGE_NAME}" \
-    | gzip -n -9 >"${DIST_DIR}/${ARCHIVE_NAME}"
+    | gzip -n -9 >"${ARCHIVE_STAGE}/${ARCHIVE_NAME}"
 (
-    cd "${DIST_DIR}"
+    cd "${ARCHIVE_STAGE}"
     sha256sum "${ARCHIVE_NAME}" >"${ARCHIVE_NAME}.sha256"
 )
+
+mv -fT -- "${ARCHIVE_STAGE}/${ARCHIVE_NAME}" "${DIST_DIR}/${ARCHIVE_NAME}"
+mv -fT -- "${ARCHIVE_STAGE}/${ARCHIVE_NAME}.sha256" "${DIST_DIR}/${ARCHIVE_NAME}.sha256"
 
 printf 'Created %s\n' "${DIST_DIR}/${ARCHIVE_NAME}"
 printf 'Created %s\n' "${DIST_DIR}/${ARCHIVE_NAME}.sha256"

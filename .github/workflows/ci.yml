@@ -221,6 +221,7 @@ jobs:
           scripts/uninstall.sh --help >/dev/null
           bash scripts/test-install-paths.sh
           bash scripts/test-release-assets.sh
+          bash scripts/test-package-failure.sh
 
   gtk-display:
     name: GTK display regression

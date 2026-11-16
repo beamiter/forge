@@ -6,6 +6,9 @@ All notable user-visible and operational changes are recorded here.
 
 ## Unreleased
 
+- Preserve an existing release archive and checksum when a replacement fails
+  during compression or checksum generation; publish only completed artifacts.
+
 - Preserve newer local drafts when duplicate conversation-open replies arrive; reconcile peer edits and protect active submissions instead of replacing them.
 
 - Retire pagination cursors and pending replies when an earlier-history cache
