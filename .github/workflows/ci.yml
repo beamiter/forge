@@ -222,6 +222,7 @@ jobs:
           bash scripts/test-install-paths.sh
           bash scripts/test-release-assets.sh
           bash scripts/test-package-failure.sh
+          bash scripts/test-package-metadata.sh
 
   gtk-display:
     name: GTK display regression

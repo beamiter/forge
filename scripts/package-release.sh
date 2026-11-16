@@ -3,6 +3,7 @@
 
 set -Eeuo pipefail
 umask 022
+export LC_ALL=C
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
@@ -16,6 +17,20 @@ SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct 2>/dev/null ||
 
 [[ -n "${VERSION}" ]] || { printf 'Error: cannot read Cargo version.\n' >&2; exit 1; }
 [[ -n "${TARGET}" ]] || { printf 'Error: cannot determine Rust target.\n' >&2; exit 1; }
+# VERSION and TARGET become path components and line-oriented BUILDINFO values.
+# Reject separators/control bytes before creating any staging or output paths.
+# Preserve semver build metadata and ordinary Rust target triples.
+for field in VERSION TARGET; do
+    value="${!field}"
+    if [[ "${value}" == *[!a-zA-Z0-9._+-]* ]]; then
+        printf 'Error: %s must contain only ASCII letters, digits, dot, underscore, plus or hyphen.\n' "${field}" >&2
+        exit 1
+    fi
+done
+if [[ "${SOURCE_DATE_EPOCH}" == *[!0-9]* ]]; then
+    printf 'Error: SOURCE_DATE_EPOCH must be a nonnegative integer.\n' >&2
+    exit 1
+fi
 [[ -x "${BINARY}" ]] || {
     printf 'Error: release binary not found or not executable: %s\n' "${BINARY}" >&2
     printf "Run 'make package' outside a Nix shell, or pass an explicit system-linked release binary.\n" >&2

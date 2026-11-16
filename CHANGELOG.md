@@ -6,6 +6,9 @@ All notable user-visible and operational changes are recorded here.
 
 ## Unreleased
 
+- Reject release version/target path separators and control characters, and
+  nonnumeric build timestamps, before creating staging paths or BUILDINFO.
+
 - Preserve an existing release archive and checksum when a replacement fails
   during compression or checksum generation; publish only completed artifacts.
 
