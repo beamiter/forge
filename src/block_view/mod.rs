@@ -34599,6 +34599,17 @@ mod tests {
             "native adjustment records reading"
         );
         let reading_position = adjustment.value();
+        let trace_viewport = |stage: &str| {
+            eprintln!(
+                "tab-reader stage={stage} mode={mode:?} value={} upper={} page={} reading={} mapped={} focused={} native_focus_reveal={:?}",
+                adjustment.value(), adjustment.upper(), adjustment.page_size(),
+                view.user_scrolled_up.get(), view.active_vte.is_mapped(),
+                view.active_vte.has_focus(),
+                view.block_scroll.child().and_downcast::<gtk4::Viewport>()
+                    .map(|viewport| viewport.is_scroll_to_focus()),
+            );
+        };
+        trace_viewport("before-hide");
         view.unread_count.set(3);
         if view.unified_navigation.is_some() {
             view.navigated_record_id.set(Some(42));
@@ -34606,6 +34617,7 @@ mod tests {
         notebook.set_current_page(Some(1));
         chat_display_settle();
         assert!(!view.active_vte.is_mapped());
+        trace_viewport("hidden-before-growth");
         if view.unified_navigation.is_some() {
             view.active_vte
                 .feed("background row\r\n".repeat(100).as_bytes());
@@ -34616,13 +34628,20 @@ mod tests {
                 .set_height_request(4000);
         }
         chat_display_settle();
+        trace_viewport("hidden-after-growth");
         notebook.set_current_page(Some(0));
+        trace_viewport("switch-synchronous");
         chat_display_settle();
+        trace_viewport("remap-settled");
         assert!(
             view.user_scrolled_up.get(),
             "tab activation must preserve reading"
         );
-        assert!((adjustment.value() - reading_position).abs() < 1.0);
+        assert!(
+            (adjustment.value() - reading_position).abs() < 1.0,
+            "{mode:?}: expected history position {reading_position}, got {}",
+            adjustment.value()
+        );
         assert_eq!(view.unread_count.get(), 3);
         if view.unified_navigation.is_some() {
             assert_eq!(view.navigated_record_id.get(), Some(42));
