@@ -34652,6 +34652,41 @@ mod tests {
         let bottom = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
         assert!((adjustment.value() - bottom).abs() < 1.0);
         assert!(!view.user_scrolled_up.get());
+        if view.unified_navigation.is_none() {
+            let viewport = view
+                .block_scroll
+                .child()
+                .and_downcast::<gtk4::Viewport>()
+                .expect("native block viewport");
+            assert!(
+                viewport.is_scroll_to_focus(),
+                "automatic tab focus must restore native policy"
+            );
+            let history = view
+                .block_list
+                .first_child()
+                .and_downcast::<gtk4::Box>()
+                .expect("history spacer");
+            let manual_target = gtk4::Button::with_label("Historical action");
+            manual_target.set_valign(gtk4::Align::Start);
+            history.append(&manual_target);
+            chat_display_settle();
+            assert!(manual_target.grab_focus());
+            chat_display_settle();
+            assert!(
+                adjustment.value() < bottom - 20.0,
+                "manual focus must still reveal history"
+            );
+            view.reveal_live_input();
+            chat_display_settle();
+        }
+        // Returning a following tab continues to reveal its current live edge.
+        for page in [1_u32, 0] {
+            notebook.set_current_page(Some(page));
+            chat_display_settle();
+        }
+        let bottom = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+        assert!((adjustment.value() - bottom).abs() < 1.0);
         search.set_search_mode(true);
         chat_display_settle();
         assert!(entry.grab_focus());

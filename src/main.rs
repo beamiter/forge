@@ -349,7 +349,24 @@ pub(crate) fn queue_tab_terminal_focus(
         );
         stable_frames.set(focus_frame.stable_frames);
         if focus_frame.should_grab {
+            // Tab activation restores keyboard ownership, not a request to
+            // reveal the live child through a history-reading outer canvas.
+            // GtkViewport handles root focus notifications synchronously;
+            // restore every prior policy immediately for later manual focus.
+            let mut viewports = Vec::new();
+            let mut ancestor = target_terminal.parent();
+            while let Some(widget) = ancestor {
+                ancestor = widget.parent();
+                if let Ok(viewport) = widget.downcast::<gtk4::Viewport>() {
+                    let reveal = viewport.is_scroll_to_focus();
+                    viewport.set_scroll_to_focus(false);
+                    viewports.push((viewport, reveal));
+                }
+            }
             target_terminal.grab_focus();
+            for (viewport, reveal) in viewports {
+                viewport.set_scroll_to_focus(reveal);
+            }
         }
         if focus_frame.complete {
             return glib::ControlFlow::Break;
