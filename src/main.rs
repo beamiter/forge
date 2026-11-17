@@ -2887,9 +2887,9 @@ mod tests {
             if terminal_tick.has_focus() {
                 assert!(chrome_tick.grab_focus());
                 moved_tick.set(true);
-                glib::ControlFlow::Break
+                gtk4::glib::ControlFlow::Break
             } else {
-                glib::ControlFlow::Continue
+                gtk4::glib::ControlFlow::Continue
             }
         });
         window.present();
