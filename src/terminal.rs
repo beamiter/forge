@@ -79,6 +79,27 @@ fn belongs_to_selected_notebook_page(terminal: &Terminal) -> bool {
         .is_some_and(|selected| widget == selected || widget.is_ancestor(&selected))
 }
 
+/// Automatic map/tab focus must not reveal a live child through retained
+/// history. Keep the actual focus-in (including IM context activation), and
+/// restore every native viewport policy before later manual focus navigation.
+pub(crate) fn focus_terminal_without_viewport_reveal(terminal: &Terminal) -> bool {
+    let mut viewports = Vec::new();
+    let mut ancestor = terminal.parent();
+    while let Some(widget) = ancestor {
+        ancestor = widget.parent();
+        if let Ok(viewport) = widget.downcast::<gtk4::Viewport>() {
+            let reveal = viewport.is_scroll_to_focus();
+            viewport.set_scroll_to_focus(false);
+            viewports.push((viewport, reveal));
+        }
+    }
+    let focused = terminal.grab_focus();
+    for (viewport, reveal) in viewports {
+        viewport.set_scroll_to_focus(reveal);
+    }
+    focused
+}
+
 /// Focus a mapped terminal now, then once more after the current container
 /// transition.
 ///

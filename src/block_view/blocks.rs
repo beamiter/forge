@@ -4979,7 +4979,7 @@ impl ActiveBlock {
                 || terminal.has_css_class("docked-live-terminal"))
                 || first_map.replace(false)
             {
-                terminal.grab_focus();
+                crate::terminal::focus_terminal_without_viewport_reveal(terminal);
             }
         });
 
