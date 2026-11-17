@@ -155,6 +155,9 @@ jobs:
       - name: Check search callback lifecycle
         run: python3 scripts/test-search-lifecycle.py
 
+      - name: Check native IME injector focus policy (pure mocks)
+        run: python3 scripts/test-qa-native-ime-keyboard.py
+
       - name: Check pane focus and zoom lifecycle
         run: python3 scripts/test-pane-lifecycle.py
 
