@@ -18835,7 +18835,16 @@ impl TermView {
             .push(Box::new(f));
     }
 
-    /// Reveal the live input when its tab becomes active.
+    /// Restore a tab without replacing a deliberate history-reading position.
+    /// Explicit return-to-live and typing recovery still use reveal_live_input.
+    pub(crate) fn restore_tab_viewport(&self) {
+        if self.user_scrolled_up.get() || self.navigated_record_id.get().is_some() {
+            return;
+        }
+        self.reveal_live_input();
+    }
+
+    /// Reveal the live input after a deliberate return-to-live request.
     ///
     /// This deliberately reuses the same frame-spaced, generation-aware bottom
     /// pin as output finalization. The old activation-only idle loop could spend
@@ -34528,7 +34537,7 @@ mod tests {
                 },
                 || Some(view.active_vte.clone()),
                 |terminal| {
-                    view.reveal_live_input();
+                    view.restore_tab_viewport();
                     generation.set(generation.get().wrapping_add(1));
                     let entry = entry_for_switch.clone();
                     let queued_events = events_for_switch.clone();
@@ -34561,6 +34570,68 @@ mod tests {
                 "{mode:?}: ordinary switch must focus page {page}"
             );
         }
+        // A real existing-tab switch must not silently become Return to live.
+        // Populate the actual scroll surface, then record a native reader move.
+        let view = &views[0];
+        if view.unified_navigation.is_some() {
+            view.active_vte
+                .feed("history row\r\n".repeat(200).as_bytes());
+        } else {
+            let spacer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            spacer.set_height_request(3000);
+            view.block_list.prepend(&spacer);
+        }
+        chat_display_settle();
+        let adjustment = if view.unified_navigation.is_some() {
+            view.active_vte
+                .vadjustment()
+                .expect("native transcript adjustment")
+        } else {
+            view.block_scroll.vadjustment()
+        };
+        let bottom = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+        assert!(bottom > 20.0, "tab fixture needs a real history range");
+        adjustment.set_value(adjustment.lower() + (bottom - adjustment.lower()) / 2.0);
+        chat_display_settle();
+        assert!(
+            view.user_scrolled_up.get(),
+            "native adjustment records reading"
+        );
+        let reading_position = adjustment.value();
+        view.unread_count.set(3);
+        if view.unified_navigation.is_some() {
+            view.navigated_record_id.set(Some(42));
+        }
+        notebook.set_current_page(Some(1));
+        chat_display_settle();
+        assert!(!view.active_vte.is_mapped());
+        if view.unified_navigation.is_some() {
+            view.active_vte
+                .feed("background row\r\n".repeat(100).as_bytes());
+        } else {
+            view.block_list
+                .first_child()
+                .expect("history spacer")
+                .set_height_request(4000);
+        }
+        chat_display_settle();
+        notebook.set_current_page(Some(0));
+        chat_display_settle();
+        assert!(
+            view.user_scrolled_up.get(),
+            "tab activation must preserve reading"
+        );
+        assert!((adjustment.value() - reading_position).abs() < 1.0);
+        assert_eq!(view.unread_count.get(), 3);
+        if view.unified_navigation.is_some() {
+            assert_eq!(view.navigated_record_id.get(), Some(42));
+        }
+        // The explicit action still wins when the user actually requests it.
+        view.reveal_live_input();
+        chat_display_settle();
+        let bottom = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+        assert!((adjustment.value() - bottom).abs() < 1.0);
+        assert!(!view.user_scrolled_up.get());
         search.set_search_mode(true);
         chat_display_settle();
         assert!(entry.grab_focus());

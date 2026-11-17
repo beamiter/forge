@@ -2102,7 +2102,7 @@ pub fn run() -> glib::ExitCode {
                 || ui_for_switch.terminal_in_page(widget),
                 |target_terminal| {
                     if let Some(term_view) = ui_for_switch.term_view_in_page(widget) {
-                        term_view.reveal_live_input();
+                        term_view.restore_tab_viewport();
                     }
                     // GTK may not have mapped the selected child yet. DnD can
                     // supersede this target through the shared generation.
