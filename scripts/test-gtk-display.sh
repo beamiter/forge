@@ -52,6 +52,8 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    app::tests::startup_terminal_focus_survives_delayed_window_mapping
+    app::tests::startup_focus_completion_releases_ownership_and_closed_requests
     ui::search_native_tests::native_entry_navigation_and_close_reopen_retire_stale_queries
     eva_companion::tests::protections_clip_overflow_and_deduplicate_cards_and_buttons
     eva_companion::tests::navigation_background_hosts_body_without_covering_controls
@@ -349,3 +351,4 @@ if (( ${#failed_cases[@]} > 0 )); then
     # A diagnostic replay or a later passing case must never turn the run green.
     exit "${failed_statuses[0]}"
 fi
+

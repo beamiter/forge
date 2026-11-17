@@ -260,6 +260,108 @@ impl UiState {
             },
         );
     }
+
+    fn request_startup_terminal_focus(&self, terminal: vte4::Terminal, page: u32) {
+        let generation = self.invalidate_tab_focus_requests();
+        queue_startup_terminal_focus(
+            &self.notebook,
+            self.window.upcast_ref(),
+            self.tab_focus_generation.clone(),
+            generation,
+            terminal,
+            page,
+            self.search_bar.clone(),
+        );
+    }
+}
+
+/// Startup owns only the initial keyboard destination. User input and any
+/// later nonempty focus owner supersede it; no preedit/IM state is touched.
+struct StartupFocusGuard {
+    window: glib::WeakRef<gtk4::Window>,
+    click: gtk4::GestureClick,
+    key: gtk4::EventControllerKey,
+    focus_changed: Option<glib::SignalHandlerId>,
+}
+
+impl Drop for StartupFocusGuard {
+    fn drop(&mut self) {
+        if let Some(window) = self.window.upgrade() {
+            window.remove_controller(&self.click);
+            window.remove_controller(&self.key);
+            if let Some(handler) = self.focus_changed.take() {
+                window.disconnect(handler);
+            }
+        }
+    }
+}
+
+fn queue_startup_terminal_focus(
+    notebook: &Notebook,
+    window: &gtk4::Window,
+    generation: Rc<Cell<u64>>,
+    request: u64,
+    terminal: vte4::Terminal,
+    page: u32,
+    search: SearchBar,
+) {
+    let cancel = {
+        let generation = generation.clone();
+        move || {
+            if generation.get() == request {
+                generation.set(request.wrapping_add(1));
+            }
+        }
+    };
+    let click = gtk4::GestureClick::new();
+    click.set_button(0);
+    click.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    let cancel_click = cancel.clone();
+    click.connect_pressed(move |_, _, _, _| cancel_click());
+    window.add_controller(click.clone());
+    let key = gtk4::EventControllerKey::new();
+    key.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    let cancel_key = cancel.clone();
+    key.connect_key_pressed(move |_, _, _, _| {
+        cancel_key();
+        glib::Propagation::Proceed
+    });
+    window.add_controller(key.clone());
+    let target = terminal.downgrade();
+    let initial_owner = gtk4::prelude::GtkWindowExt::focus(window).map(|owner| owner.downgrade());
+    let acquired = Cell::new(terminal.has_focus());
+    let focus_changed = window.connect_focus_widget_notify(move |window| {
+        if let Some(owner) = gtk4::prelude::GtkWindowExt::focus(window) {
+            if target.upgrade().as_ref().map(|vte| vte.upcast_ref()) == Some(&owner) {
+                acquired.set(true);
+            } else if acquired.get()
+                || initial_owner
+                    .as_ref()
+                    .is_some_and(|initial| initial.upgrade().as_ref() != Some(&owner))
+            {
+                cancel();
+            }
+        }
+    });
+    let guard = StartupFocusGuard {
+        window: window.downgrade(),
+        click,
+        key,
+        focus_changed: Some(focus_changed),
+    };
+    queue_tab_terminal_focus(
+        notebook,
+        generation,
+        request,
+        terminal,
+        page,
+        search,
+        move || {
+            // Keep the guard alive exactly as long as the bounded frame request.
+            let _ = &guard;
+            // Opening search already supersedes initial terminal ownership.
+        },
+    );
 }
 
 /// GTK's RUN_LAST default handler maps the destination after ordinary signal
@@ -323,10 +425,16 @@ pub(crate) fn queue_tab_terminal_focus(
     search_bar: SearchBar,
     focus_search: impl Fn() + 'static,
 ) {
-    let notebook_for_focus = notebook.clone();
+    // A request installed before the first map must not keep its own
+    // Notebook alive forever: no frame clock runs if the window is closed
+    // before mapping, so the bounded tick count cannot clean up that case.
+    let notebook_for_focus = notebook.downgrade();
     let frame_count = Cell::new(0u8);
     let stable_frames = Cell::new(0u8);
     notebook.add_tick_callback(move |_, _| {
+        let Some(notebook_for_focus) = notebook_for_focus.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
         if !tab_focus_request_is_current(
             focus_generation.get(),
             generation,
@@ -2398,8 +2506,16 @@ pub fn run() -> glib::ExitCode {
             });
         }
 
-        // Focus the active terminal after window is shown
-        ui.focus_current_terminal();
+        // Initial/restored pages were created before switch-page was wired.
+        // Present does not guarantee that the live VTE has mapped yet; the
+        // generic immediate/one-idle fallback can expire before that happens.
+        // Give startup the same mapped, generation-scoped reconciliation as a
+        // tab round-trip, without changing the saved reading viewport.
+        if let Some(page_num) = notebook.current_page() {
+            if let Some(terminal) = ui.current_terminal() {
+                ui.request_startup_terminal_focus(terminal, page_num);
+            }
+        }
         ui.sync_organism_presence();
 
         // Safe mode deliberately ignores later config-file changes.
@@ -2742,6 +2858,172 @@ mod tests {
                 complete: false,
             }
         );
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display"]
+    fn startup_terminal_focus_survives_delayed_window_mapping() {
+        use gtk4::prelude::*;
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::time::{Duration, Instant};
+
+        gtk4::init().expect("GTK display");
+        let notebook = gtk4::Notebook::new();
+        let terminal = vte4::Terminal::new();
+        notebook.append_page(&terminal, None::<&gtk4::Widget>);
+        // A focusable chrome control precedes the terminal, as in the real
+        // window. GTK's default initial focus must not make this pass without
+        // the terminal reconciliation request.
+        let chrome = gtk4::Entry::new();
+        let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        root.append(&chrome);
+        root.append(&notebook);
+        let window = gtk4::Window::builder().child(&root).build();
+        let generation = Rc::new(Cell::new(1));
+        super::queue_startup_terminal_focus(
+            &notebook,
+            &window,
+            generation.clone(),
+            1,
+            terminal.clone(),
+            0,
+            gtk4::SearchBar::new(),
+        );
+        let context = gtk4::glib::MainContext::default();
+        // Drain startup idles before mapping: a one-idle focus request expires
+        // here, whereas the production frame request remains attached.
+        while context.iteration(false) {}
+        assert!(!terminal.is_mapped());
+        assert!(!terminal.has_focus());
+        let moved = Rc::new(Cell::new(false));
+        let moved_tick = moved.clone();
+        let terminal_tick = terminal.clone();
+        let chrome_tick = chrome.clone();
+        notebook.add_tick_callback(move |_, _| {
+            if terminal_tick.has_focus() {
+                assert!(chrome_tick.grab_focus());
+                moved_tick.set(true);
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        });
+        window.present();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !moved.get() {
+            while context.iteration(false) {}
+            assert!(
+                Instant::now() < deadline,
+                "startup VTE never acquired focus"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // Interrupt immediately after the first acquisition, before waiting
+        // out the two stable frames. A newer chrome owner retires the request.
+        assert_ne!(generation.get(), 1);
+        let settle = Instant::now() + Duration::from_millis(150);
+        while Instant::now() < settle {
+            while context.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!terminal.has_focus(), "startup must not steal newer focus");
+        let owner = gtk4::prelude::GtkWindowExt::focus(&window).expect("chrome owner");
+        assert!(owner == chrome.clone().upcast::<gtk4::Widget>() || owner.is_ancestor(&chrome));
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display"]
+    fn startup_focus_completion_releases_ownership_and_closed_requests() {
+        use gtk4::prelude::*;
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::time::{Duration, Instant};
+        gtk4::init().expect("GTK display");
+        let context = gtk4::glib::MainContext::default();
+        let settle = || {
+            let deadline = Instant::now() + Duration::from_millis(250);
+            while Instant::now() < deadline {
+                while context.iteration(false) {}
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let notebook = gtk4::Notebook::new();
+        let terminal = vte4::Terminal::new();
+        notebook.append_page(&terminal, None::<&gtk4::Widget>);
+        let chrome = gtk4::Entry::new();
+        let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        root.append(&chrome);
+        root.append(&notebook);
+        let window = gtk4::Window::builder().child(&root).build();
+        let generation = Rc::new(Cell::new(1));
+        let controllers = window.observe_controllers();
+        let baseline_controllers = controllers.n_items();
+        super::queue_startup_terminal_focus(
+            &notebook,
+            &window,
+            generation.clone(),
+            1,
+            terminal.clone(),
+            0,
+            gtk4::SearchBar::new(),
+        );
+        assert_eq!(controllers.n_items(), baseline_controllers + 2);
+        window.present();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !terminal.has_focus() || controllers.n_items() != baseline_controllers {
+            while context.iteration(false) {}
+            assert!(
+                Instant::now() < deadline,
+                "startup focus never settled and released its guard"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(terminal.has_focus());
+        assert_eq!(generation.get(), 1);
+        assert!(chrome.grab_focus());
+        settle();
+        // The completed request has removed its notify hook, not merely
+        // stopped trying to focus the terminal while retaining ownership.
+        assert_eq!(generation.get(), 1);
+        assert!(!terminal.has_focus());
+        window.close();
+
+        let stale_notebook = gtk4::Notebook::new();
+        let stale_terminal = vte4::Terminal::new();
+        stale_notebook.append_page(&stale_terminal, None::<&gtk4::Widget>);
+        let stale_window = gtk4::Window::builder().child(&stale_notebook).build();
+        super::queue_startup_terminal_focus(
+            &stale_notebook,
+            &stale_window,
+            Rc::new(Cell::new(1)),
+            1,
+            stale_terminal.clone(),
+            0,
+            gtk4::SearchBar::new(),
+        );
+        let stale_window_weak = stale_window.downgrade();
+        let stale_notebook_weak = stale_notebook.downgrade();
+        let stale_terminal_weak = stale_terminal.downgrade();
+        stale_window.destroy();
+        drop(stale_window);
+        drop(stale_notebook);
+        drop(stale_terminal);
+        while context.iteration(false) {}
+        assert!(stale_window_weak.upgrade().is_none());
+        assert!(stale_notebook_weak.upgrade().is_none());
+        assert!(stale_terminal_weak.upgrade().is_none());
+        let replacement = gtk4::Window::new();
+        // Remove from its old root before reusing the entry.
+        root.remove(&chrome);
+        replacement.set_child(Some(&chrome));
+        replacement.present();
+        assert!(chrome.grab_focus());
+        settle();
+        let owner = gtk4::prelude::GtkWindowExt::focus(&replacement).expect("replacement owner");
+        assert!(owner == chrome.clone().upcast::<gtk4::Widget>() || owner.is_ancestor(&chrome));
+        replacement.close();
     }
 
     #[test]
