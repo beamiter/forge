@@ -34525,6 +34525,7 @@ mod tests {
         let search_for_switch = search.clone();
         let entry_for_switch = entry.clone();
         let events_for_switch = events.clone();
+        crate::app::connect_tab_viewport_focus_guard(&notebook);
         notebook.connect_switch_page(move |notebook, _, page| {
             let view = &views_for_switch[page as usize];
             crate::app::focus_switched_page(

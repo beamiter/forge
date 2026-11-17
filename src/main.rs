@@ -394,6 +394,42 @@ pub(crate) fn connect_tab_search_focus_after_switch(
     );
 }
 
+/// GtkNotebook's RUN_LAST switch handler also restores a page's last focus
+/// after mapping it. Scope native viewport reveal suppression across that
+/// synchronous emission, not just our own map/frame focus calls.
+pub(crate) fn connect_tab_viewport_focus_guard(notebook: &Notebook) {
+    let pending = Rc::new(RefCell::new(Vec::<Vec<(gtk4::Viewport, bool)>>::new()));
+    let before = pending.clone();
+    notebook.connect_switch_page(move |_, page, _| {
+        let mut widgets = vec![page.clone()];
+        let mut viewports = Vec::new();
+        while let Some(widget) = widgets.pop() {
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                child = current.next_sibling();
+                widgets.push(current);
+            }
+            if let Ok(viewport) = widget.downcast::<gtk4::Viewport>() {
+                let reveal = viewport.is_scroll_to_focus();
+                viewport.set_scroll_to_focus(false);
+                viewports.push((viewport, reveal));
+            }
+        }
+        before.borrow_mut().push(viewports);
+    });
+    notebook.connect_closure(
+        "switch-page",
+        true,
+        glib::closure_local!(move |_: Notebook, _: gtk4::Widget, _: u32| {
+            // A stack also handles a nested synchronous switch correctly.
+            let viewports = pending.borrow_mut().pop().unwrap_or_default();
+            for (viewport, reveal) in viewports {
+                viewport.set_scroll_to_focus(reveal);
+            }
+        }),
+    );
+}
+
 /// The switch-page focus decision, shared with native mapping regressions.
 /// Search is applied to the explicit destination before GTK commits it.
 pub(crate) fn focus_switched_page(
@@ -2192,6 +2228,7 @@ pub fn run() -> glib::ExitCode {
 
         // Focus terminal when switching tabs (split-aware) and sync tab strip
         let ui_for_switch = ui.clone();
+        connect_tab_viewport_focus_guard(&notebook);
         notebook.connect_switch_page(move |_, widget, page_num| {
             // `current_page` still names the old tab inside this signal.
             // Revoke its spatial body synchronously; the idle below resolves
