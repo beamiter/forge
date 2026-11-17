@@ -34490,6 +34490,7 @@ mod tests {
 
     fn assert_tab_switch_keeps_search_focus(mode: crate::config::TerminalMode) {
         use gtk4::prelude::*;
+        use vte4::TerminalExt;
         gtk4::init().unwrap();
         let views = Rc::new([
             chat_display_view(mode.clone()),

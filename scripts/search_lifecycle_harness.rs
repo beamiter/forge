@@ -206,7 +206,8 @@ mod block_view {
         pub fn find_prev(&self) -> FindNavigationResult {
             FindNavigationResult::Inactive
         }
-        pub fn reveal_live_input(&self) {
+        // Routing stub only; native display fixtures check viewport policy.
+        pub fn restore_tab_viewport(&self) {
             self.revealed.set(self.revealed.get() + 1);
         }
     }
@@ -663,7 +664,7 @@ mod ui {
     }
 
     #[test]
-    fn closed_search_switch_focuses_explicit_destination_and_reveals_live_input() {
+    fn closed_search_switch_focuses_explicit_destination_and_restores_viewport() {
         let mut ui = setup();
         ui.search_bar.set_search_mode(false);
         ui.search_entry.set_text("must-not-apply");
@@ -1061,3 +1062,4 @@ mod ui {
         assert!(ui.search_debounce_source.borrow().is_none());
     }
 }
+
