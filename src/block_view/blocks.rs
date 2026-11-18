@@ -2,7 +2,6 @@
 use super::bounded_bytes::BoundedByteRing;
 use super::*;
 use crate::config::Config;
-use crate::terminal::open_uri;
 use gtk4::Orientation;
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
@@ -3324,34 +3323,7 @@ impl FinishedBlock {
         collapsed_summary.set_visible(false);
         content.append(&collapsed_summary);
 
-        // Ctrl+click on a URL inside the output VTE → open in browser.
-        // VTE's `match_add_regex` (registered in create_finished_terminal) makes
-        // `check_match_at` return the matching URL at the pointer position, and
-        // `check_hyperlink_at` an OSC 8 target (see `openable_link_at`);
-        // VTE handles word/line double/triple-click selection natively.
-        {
-            let click = gtk4::GestureClick::new();
-            click.set_button(1);
-            let vte_for_click = output_vte.downgrade();
-            click.connect_pressed(move |controller, n_press, x, y| {
-                if n_press != 1 {
-                    return;
-                }
-                let Some(vte_for_click) = vte_for_click.upgrade() else {
-                    return;
-                };
-                let state = controller.current_event_state();
-                if !state.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
-                    return;
-                }
-                if let Some(uri) = crate::terminal::openable_link_at(&vte_for_click, x, y) {
-                    open_uri(&uri);
-                    controller.set_state(gtk4::EventSequenceState::Claimed);
-                }
-            });
-            output_vte.add_controller(click);
-            crate::terminal::install_hyperlink_hover_tooltip(&output_vte);
-        }
+        crate::terminal::setup_terminal_click_handler(&output_vte);
 
         let has_images = hidden_image_count > 0;
         // Output-only controls are noise for commands such as `cd`,

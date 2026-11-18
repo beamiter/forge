@@ -1,10 +1,7 @@
 use adw::prelude::*;
-use gtk4::gdk::ffi::GDK_BUTTON_PRIMARY;
-use gtk4::gdk::ModifierType;
 use gtk4::gdk::RGBA;
 use gtk4::gio;
 use gtk4::pango::FontDescription;
-use gtk4::GestureClick;
 use gtk4::{glib, Entry, Label, Orientation, Paned};
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
@@ -477,7 +474,7 @@ impl VteTerminalView {
     }
 
     pub fn copy_to_clipboard(&self) {
-        self.terminal.copy_clipboard_format(vte4::Format::Text);
+        crate::vte_reference::copy_selection(&self.terminal);
     }
 
     pub fn paste_from_clipboard(&self) {
@@ -1124,7 +1121,7 @@ pub(crate) fn openable_link(
 pub(crate) fn openable_link_at(terminal: &Terminal, x: f64, y: f64) -> Option<String> {
     openable_link(
         terminal.check_hyperlink_at(x, y).map(|uri| uri.to_string()),
-        || terminal.check_match_at(x, y).0.map(|uri| uri.to_string()),
+        || crate::vte_reference::web_match(terminal, x, y),
     )
 }
 
@@ -1149,36 +1146,14 @@ pub(crate) fn install_hyperlink_hover_tooltip(terminal: &Terminal) {
 }
 
 pub(crate) fn setup_terminal_click_handler(terminal: &Terminal) {
-    // Use a click gesture in Capture phase to intercept Ctrl+Click before VTE sees it
-    // For normal clicks, let them pass through to VTE for text selection
-    let click_controller = GestureClick::new();
-    click_controller.set_button(GDK_BUTTON_PRIMARY as u32);
-    click_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
-    let terminal_clone = terminal.clone();
-
-    click_controller.connect_pressed(move |controller, n_press, x, y| {
-        // Only intercept single Ctrl+Click on hyperlinks
-        // Let all other clicks pass through to VTE for selection
-        if n_press == 1 {
-            let state = controller.current_event_state();
-            if state.contains(ModifierType::CONTROL_MASK) {
-                // Claim only a link that will actually open; anything else
-                // (a refused scheme, a Unified zone marker) falls through to
-                // VTE instead of being swallowed.
-                if let Some(uri) = openable_link_at(&terminal_clone, x, y) {
-                    open_uri(&uri);
-                    // Claim this event to prevent VTE from processing it
-                    controller.set_state(gtk4::EventSequenceState::Claimed);
-                    return;
-                }
-            }
-        }
-        // Explicitly deny to pass event to VTE for text selection
-        controller.set_state(gtk4::EventSequenceState::Denied);
-    });
-
-    terminal.add_controller(click_controller);
     install_hyperlink_hover_tooltip(terminal);
+    crate::vte_reference::install_hover(terminal);
+    let weak = terminal.downgrade();
+    crate::vte_reference::click(
+        terminal,
+        move |x, y| openable_link_at(&weak.upgrade()?, x, y),
+        |uri| open_uri(&uri),
+    );
 }
 
 /// Find the first Terminal in a widget tree (depth-first). Traverses children

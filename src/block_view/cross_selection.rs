@@ -613,8 +613,7 @@ impl CrossSelection {
                 if !vte.has_selection() {
                     continue;
                 }
-                vte.text_selected(vte4::Format::Text)
-                    .map(|text| text.to_string())
+                crate::vte_reference::selected_text(&vte)
             };
             if let Some(text) = text.filter(|text| !text.is_empty()) {
                 output

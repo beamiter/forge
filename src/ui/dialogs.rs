@@ -10,9 +10,7 @@ use libadwaita as adw;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
-use vte4::Format;
 use vte4::Terminal;
-use vte4::TerminalExt;
 
 use super::*;
 use crate::block_view::RecordNavigationResult;
@@ -5989,7 +5987,7 @@ impl UiState {
                 let term_copy = term.clone();
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
-                    term_copy.copy_clipboard_format(Format::Text);
+                    crate::vte_reference::copy_selection(&term_copy);
                 });
                 vbox.append(&item);
             }

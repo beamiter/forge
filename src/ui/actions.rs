@@ -5,7 +5,6 @@ use gtk4::glib;
 use gtk4::Orientation;
 use libadwaita as adw;
 use std::rc::Rc;
-use vte4::Format;
 use vte4::Terminal;
 use vte4::TerminalExt;
 
@@ -214,7 +213,7 @@ impl UiState {
                 } else {
                     log::debug!(">>> UI Copy: no current term_view, falling back to VTE");
                     if let Some(ref term) = current_terminal {
-                        term.copy_clipboard_format(Format::Text);
+                        crate::vte_reference::copy_selection(&term);
                     }
                 }
             }
