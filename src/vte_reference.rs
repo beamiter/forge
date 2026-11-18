@@ -65,7 +65,7 @@ pub(crate) fn hit(terminal: &Terminal, x: f64, y: f64) -> Option<Reference> {
 
 pub(crate) fn web_match(terminal: &Terminal, x: f64, y: f64) -> Option<String> {
     if let Some(reference) = hit(terminal, x, y) {
-        return reference.web.then_some(reference.target);
+        return (reference.web && !reference.blocked).then_some(reference.target);
     }
     let text = terminal.check_match_at(x, y).0?;
     let mut url: &str = text.as_str();
@@ -82,34 +82,11 @@ pub(crate) fn web_match(terminal: &Terminal, x: f64, y: f64) -> Option<String> {
 }
 
 pub(crate) fn selected_text(terminal: &Terminal) -> Option<String> {
-    let selected = terminal.text_selected(Format::Text)?.to_string();
-    if selected.len() > 4096 || !selected.trim_end_matches('\n').contains('\n') {
-        return Some(selected);
-    }
-    let Some(adjustment) = terminal.vadjustment() else {
-        return Some(selected);
-    };
-    let first = adjustment.value().floor() as i64;
-    let last = (first + terminal.row_count()).min(adjustment.upper().ceil() as i64 - 1);
-    let lines = rows(terminal, first, last);
-    let fragments: Vec<_> = selected
-        .trim_end_matches('\n')
-        .split('\n')
-        .map(str::trim)
-        .collect();
-    for reference in detect(terminal, &lines) {
-        if !reference.blocked
-            && (!reference.web || jterm_core::link::is_openable_url(&reference.target))
-            && reference
-                .spans
-                .iter()
-                .map(|(row, span)| &lines[*row][span.clone()])
-                .eq(fragments.iter().copied())
-        {
-            return Some(reference.target);
-        }
-    }
-    Some(selected)
+    // Native VTE selection owns real soft-wrap handling. Hard-line whitespace
+    // must never be rewritten into a different authority or filename.
+    terminal
+        .text_selected(Format::Text)
+        .map(|text| text.to_string())
 }
 
 pub(crate) fn copy_selection(terminal: &Terminal) {
@@ -211,6 +188,58 @@ mod tests {
             while context.iteration(false) {}
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display"]
+    fn mapped_vte_never_reconstructs_a_url_authority() {
+        gtk4::init().unwrap();
+        let terminal = Terminal::new();
+        terminal.set_size(80, 4);
+        crate::block_view::add_url_match_regex(&terminal);
+        let window = gtk4::Window::new();
+        window.set_child(Some(&terminal));
+        window.present();
+        terminal.feed(b"(https://trusted. \r\nevil.example/path)\r\n");
+        settle();
+        let border = terminal.border();
+        let left = border.as_ref().map_or(0.0, |b| f64::from(b.left()));
+        let top = border.as_ref().map_or(0.0, |b| f64::from(b.top()));
+        let point = |row: f64, col: f64| {
+            (
+                left + (col + 0.5) * terminal.char_width() as f64,
+                top + (row + 0.5) * terminal.char_height() as f64,
+            )
+        };
+        for (row, col) in [(0.0, 8.0), (1.0, 5.0)] {
+            let (x, y) = point(row, col);
+            let reference = hit(&terminal, x, y).unwrap();
+            assert!(reference.blocked);
+            assert_eq!(web_match(&terminal, x, y), None);
+            assert_eq!(crate::terminal::openable_link_at(&terminal, x, y), None);
+        }
+        terminal.select_all();
+        let native = terminal.text_selected(Format::Text).unwrap().to_string();
+        assert!(native.contains('\n') && native.contains("trusted."));
+        assert_eq!(selected_text(&terminal), Some(native));
+        terminal.unselect_all();
+        terminal.feed(b"\x1b[2J\x1b[H(https://example.org/path)\r\n");
+        settle();
+        let (x, y) = point(0.0, 8.0);
+        assert_eq!(
+            crate::terminal::openable_link_at(&terminal, x, y).as_deref(),
+            Some("https://example.org/path")
+        );
+        terminal.feed(
+            b"\x1b[2J\x1b[H\x1b]8;;https://explicit.example/path\x1b\\label\x1b]8;;\x1b\\\r\n",
+        );
+        settle();
+        let (x, y) = point(0.0, 2.0);
+        assert_eq!(
+            crate::terminal::openable_link_at(&terminal, x, y).as_deref(),
+            Some("https://explicit.example/path")
+        );
+        window.close();
     }
 
     #[test]

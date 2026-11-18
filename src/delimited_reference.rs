@@ -2,7 +2,6 @@
 use std::ops::Range;
 use std::sync::LazyLock;
 
-const MAX_ROWS: usize = 8;
 const MAX_BYTES: usize = 4096;
 
 pub(crate) struct Reference {
@@ -48,89 +47,43 @@ pub(crate) fn detect(rows: &[(&str, bool)]) -> Vec<Reference> {
         let is_web = raw.as_str().split_once("://").is_some_and(|(scheme, _)| {
             scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
         });
-        if !is_web {
-            // VTE row width is not proof of a soft wrap. Never remove whitespace
-            // or guess a local filename across physical rows. Retain the whole
-            // region so rejected references cannot fall back to a partial match.
-            let spans = raw
-                .as_str()
-                .split('\n')
-                .enumerate()
-                .map(|(index, fragment)| {
-                    let row = first_row + index;
-                    let start = if index == 0 {
-                        raw.start() - row_starts[row]
-                    } else {
-                        0
-                    };
-                    (row, start..start + fragment.len())
-                })
-                .collect::<Vec<_>>();
-            let target = raw.as_str().to_owned();
-            let blocked = spans.len() > 1
-                || target.chars().any(char::is_control)
-                || target.contains("://")
-                || target.contains(['\\', '<', '>', '|'])
-                || !FILE_END.is_match(&target);
-            // Exact single-line spaced references are the extra capability;
-            // ordinary single-line tokens remain owned by existing matchers.
-            if blocked || target.contains(char::is_whitespace) {
-                references.push(Reference {
-                    target,
-                    web: false,
-                    blocked,
-                    spans,
-                });
-            }
-            continue;
-        }
-        let mut spans = Vec::new();
-        let mut target = String::new();
-        for (index, fragment) in raw.as_str().split('\n').enumerate() {
-            let row = first_row + index;
-            let fragment_offset = if index == 0 {
-                raw.start() - row_starts[row]
+        // Row width cannot distinguish a hard newline from a soft wrap.
+        // Retain exact text and reserve ambiguous regions without inventing a
+        // different filesystem path, host name, or URL path by trimming.
+        let spans = raw
+            .as_str()
+            .split('\n')
+            .enumerate()
+            .map(|(index, fragment)| {
+                let row = first_row + index;
+                let start = if index == 0 {
+                    raw.start() - row_starts[row]
+                } else {
+                    0
+                };
+                (row, start..start + fragment.len())
+            })
+            .collect::<Vec<_>>();
+        let target = raw.as_str().to_owned();
+        let blocked = spans.len() > 1
+            || if is_web {
+                !jterm_core::link::is_openable_url(&target)
             } else {
-                0
+                target.chars().any(char::is_control)
+                    || target.contains("://")
+                    || target.contains(['\\', '<', '>', '|'])
+                    || !FILE_END.is_match(&target)
             };
-            let trimmed = fragment.trim();
-            if trimmed.is_empty() || index >= MAX_ROWS {
-                break;
-            }
-            // A full row or an explicit token break is evidence of wrapping.
-            // A short row ending in prose must not capture the next line.
-            if index != 0 && !rows[row - 1].1 && !target.ends_with(['-', '/', '_', '.']) {
-                break;
-            }
-            let start = fragment_offset + fragment.len() - fragment.trim_start().len();
-            spans.push((row, start..start + trimmed.len()));
-            target.push_str(trimmed);
+        // Valid single-row URLs/tokens keep their native matchers. Spaced local
+        // names and refused delimited regions need our exact span handling.
+        if blocked || (!is_web && target.contains(char::is_whitespace)) {
+            references.push(Reference {
+                target,
+                web: is_web,
+                blocked,
+                spans,
+            });
         }
-        if spans.len() != raw.as_str().bytes().filter(|&b| b == b'\n').count() + 1
-            || target.chars().any(char::is_control)
-        {
-            continue;
-        }
-        let web = target.split_once("://").is_some_and(|(scheme, _)| {
-            scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
-        });
-        if web {
-            if spans.len() == 1 {
-                continue;
-            }
-        } else if target.contains("://")
-            || target.contains(['\\', '<', '>', '|'])
-            || !FILE_END.is_match(&target)
-            || (spans.len() == 1 && !target.contains(char::is_whitespace))
-        {
-            continue;
-        }
-        references.push(Reference {
-            target,
-            web,
-            blocked: false,
-            spans,
-        });
     }
     references
 }
@@ -138,6 +91,28 @@ pub(crate) fn detect(rows: &[(&str, bool)]) -> Vec<Reference> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn never_invents_authority_or_path_across_rows() {
+        for full in [false, true] {
+            for (head, tail) in [
+                ("https://trusted. ", "evil.example/path"),
+                ("https://trusted", ".evil.example/path"),
+                ("https://example.org/a- ", " b"),
+                ("https://example.org/", "https://other.example/a"),
+            ] {
+                let first = format!("({head}");
+                let last = format!("{tail})");
+                let found = detect(&[(&first, full), (&last, false)]);
+                assert_eq!(found.len(), 1);
+                assert!(found[0].web && found[0].blocked);
+                assert_eq!(found[0].target, format!("{head}\n{tail}"));
+                assert_eq!(found[0].spans[1], (1, 0..tail.len()));
+            }
+        }
+        assert!(detect(&[("(https://example.org/path)", false)]).is_empty());
+        assert!(detect(&[("(https://example.org/path )", false)])[0].blocked);
+    }
 
     #[test]
     fn rejected_local_groups_still_block_partial_fallback() {
@@ -180,6 +155,7 @@ mod tests {
         assert!(!jterm_core::link::is_openable_url(&rejected[0].target));
         let links = detect(&[("(https://example.org/one-", false), ("two)", false)]);
         assert!(links[0].web);
-        assert_eq!(links[0].target, "https://example.org/one-two");
+        assert!(links[0].blocked);
+        assert_eq!(links[0].target, "https://example.org/one-\ntwo");
     }
 }
