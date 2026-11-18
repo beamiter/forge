@@ -1,0 +1,254 @@
+//! Confirmation-first, nonexecuting local source preview. Unknown live VTE
+//! ownership remains with the application; source text never opens an editor.
+use super::{local_preview_file, local_reference, PaneLeaf, UiState};
+use gtk4::prelude::*;
+use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use vte4::{prelude::TerminalExtManual, TerminalExt};
+
+static READER_BUSY: AtomicBool = AtomicBool::new(false);
+const PAGE: &str = "local-source-preview";
+#[derive(Default)]
+struct PreviewState {
+    generation: Cell<u64>,
+    previous: RefCell<String>,
+}
+
+fn candidate(raw: &str) -> Option<PathBuf> {
+    if raw.len() > local_reference::MAX_REFERENCE_BYTES {
+        return None;
+    }
+    let path = if raw.starts_with("file:///") || raw.starts_with("file://localhost/") {
+        gtk4::gio::File::for_uri(raw).path()?.to_str()?.to_owned()
+    } else {
+        raw.to_owned()
+    };
+    let parsed = local_reference::parse_candidate(&path)?;
+    let path = PathBuf::from(parsed.exact_path);
+    path.is_absolute().then_some(path)
+}
+
+fn host_owns_click(terminal: &vte4::Terminal) -> bool {
+    // Finished output VTEs cannot report this click to a PTY application.
+    if !terminal.is_input_enabled() {
+        return true;
+    }
+    let mut widget = terminal.clone().upcast::<gtk4::Widget>();
+    loop {
+        if let Some(leaf) = PaneLeaf::from_widget(&widget) {
+            return match leaf {
+                PaneLeaf::Block(view) => {
+                    view.vte() == terminal && view.host_owns_local_preview_click()
+                }
+                PaneLeaf::Vte(_) => false, // VTE exposes no trusted mouse-mode query.
+            };
+        }
+        let Some(parent) = widget.parent() else {
+            return false;
+        };
+        widget = parent;
+    }
+}
+
+fn hit(window: &gtk4::Widget, x: f64, y: f64) -> Option<PathBuf> {
+    let mut picked = window.pick(x, y, gtk4::PickFlags::DEFAULT)?;
+    let terminal = loop {
+        if let Ok(terminal) = picked.clone().downcast::<vte4::Terminal>() {
+            break terminal;
+        }
+        picked = picked.parent()?;
+    };
+    if !host_owns_click(&terminal) {
+        return None;
+    }
+    let point = window.compute_point(&terminal, &gtk4::graphene::Point::new(x as f32, y as f32))?;
+    // Explicit hyperlinks and the existing URL matcher take priority; never
+    // reinterpret a refused remote OSC8 label as a local path.
+    let raw = terminal
+        .check_hyperlink_at(point.x().into(), point.y().into())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            terminal
+                .check_match_at(point.x().into(), point.y().into())
+                .0
+                .map(|s| s.to_string())
+        });
+    if let Some(raw) = raw {
+        return candidate(&raw);
+    }
+    // Click-local probing does not register a competing URL/selection matcher.
+    thread_local! {
+        static ABSOLUTE: Option<vte4::Regex> = vte4::Regex::for_match(
+            r#"/[^[:space:]<>"'`()\[\]{}]+"#, pcre2_sys::PCRE2_MULTILINE).ok();
+    }
+    ABSOLUTE.with(|regex| {
+        terminal
+            .check_regex_simple_at(point.x().into(), point.y().into(), &[regex.as_ref()?], 0)
+            .first()
+            .and_then(|raw| candidate(raw))
+    })
+}
+
+fn show_candidate(ui: &Rc<UiState>, state: &Rc<PreviewState>, path: PathBuf) {
+    let token = state.generation.get().wrapping_add(1);
+    state.generation.set(token);
+    if ui.side_stack.visible_child_name().as_deref() != Some(PAGE) {
+        *state.previous.borrow_mut() = ui
+            .side_stack
+            .visible_child_name()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "overview".into());
+    }
+    // Every candidate gets fresh buttons with immutable path/token ownership.
+    // Old mouse/keyboard activations cannot authorize a replacement candidate.
+    if let Some(old) = ui.side_stack.child_by_name(PAGE) {
+        ui.side_stack.remove(&old);
+    }
+    let panel = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    let title = gtk4::Label::new(Some("Local source preview"));
+    let path_label = gtk4::Label::new(Some(&path.to_string_lossy()));
+    path_label.set_wrap(true);
+    path_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+    path_label.set_max_width_chars(40);
+    path_label.set_selectable(true);
+    let warning = gtk4::Label::new(Some("Output does not prove this file is local. Confirm before reading this machine. Read-only UTF-8 source, up to 256 KiB. No code is executed; images are not decoded."));
+    warning.set_wrap(true);
+    warning.set_max_width_chars(40);
+    let confirm = gtk4::Button::with_label("Read this machine's local file");
+    let close = gtk4::Button::with_label("Close preview");
+    let text = gtk4::TextView::new();
+    text.set_editable(false);
+    text.set_cursor_visible(false);
+    text.set_monospace(true);
+    text.set_wrap_mode(gtk4::WrapMode::None);
+    let scroll = gtk4::ScrolledWindow::new();
+    scroll.set_hexpand(true);
+    scroll.set_vexpand(true);
+    scroll.set_min_content_width(1);
+    scroll.set_child(Some(&text));
+    for widget in [
+        title.upcast::<gtk4::Widget>(),
+        path_label.upcast(),
+        warning.upcast(),
+        confirm.clone().upcast(),
+        close.clone().upcast(),
+        scroll.upcast(),
+    ] {
+        panel.append(&widget);
+    }
+    let weak_ui = Rc::downgrade(ui);
+    let close_state = state.clone();
+    close.connect_clicked(move |_| {
+        if close_state.generation.get() != token {
+            return;
+        }
+        close_state.generation.set(token.wrapping_add(1));
+        if let Some(ui) = weak_ui.upgrade() {
+            ui.side_stack
+                .set_visible_child_name(&close_state.previous.borrow());
+            if let Some(old) = ui.side_stack.child_by_name(PAGE) {
+                ui.side_stack.remove(&old);
+            }
+        }
+    });
+    let state = state.clone();
+    let buffer = text.buffer().downgrade();
+    confirm.connect_clicked(move |button| {
+        if state.generation.get() != token { return; }
+        let Some(buffer) = buffer.upgrade() else { return; };
+        if READER_BUSY.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+            buffer.set_text("Another local preview reader is still busy"); return;
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let path = path.clone();
+        button.set_sensitive(false);
+        buffer.set_text("Reading bounded local source…");
+        if std::thread::Builder::new().name("local-source-preview".into()).spawn(move || {
+            struct Release;
+            impl Drop for Release { fn drop(&mut self) { READER_BUSY.store(false, Ordering::Release); } }
+            let _release = Release;
+            let result = local_preview_file::read_source(&path).map_err(|_| "Cannot preview: use a readable regular UTF-8 file up to 256 KiB, with no symlink or parent-path components.".to_owned());
+            let _ = tx.send(result);
+        }).is_err() {
+            READER_BUSY.store(false, Ordering::Release);
+            button.set_sensitive(true);
+            buffer.set_text("Could not start preview reader"); return;
+        }
+        let weak_button = button.downgrade();
+        let weak_buffer = buffer.downgrade();
+        let state = state.clone();
+        gtk4::glib::timeout_add_local(Duration::from_millis(40), move || {
+            if state.generation.get() != token || weak_buffer.upgrade().is_none() { return gtk4::glib::ControlFlow::Break; }
+            match rx.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty) => gtk4::glib::ControlFlow::Continue,
+                result => {
+                    if let Some(button) = weak_button.upgrade() { button.set_sensitive(true); }
+                    if let Some(buffer) = weak_buffer.upgrade() {
+                        buffer.set_text(&match result { Ok(Ok(text)) => text, Ok(Err(error)) => error, Err(_) => "Preview reader stopped".into() });
+                    }
+                    gtk4::glib::ControlFlow::Break
+                }
+            }
+        });
+    });
+    ui.side_stack.add_named(&panel, Some(PAGE));
+    ui.side_stack.set_visible_child_name(PAGE);
+    super::reference_shell::sync_inspector(ui, true);
+}
+
+impl UiState {
+    pub(crate) fn install_local_source_preview(self: &Rc<Self>) {
+        let state = Rc::new(PreviewState::default());
+        let weak_ui = Rc::downgrade(self);
+        let click = gtk4::GestureClick::new();
+        click.set_button(1);
+        click.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        click.connect_pressed(move |gesture, count, x, y| {
+            let accepted = (|| {
+                if count != 1
+                    || gesture.current_event_state() != gtk4::gdk::ModifierType::CONTROL_MASK
+                {
+                    return None;
+                }
+                let ui = weak_ui.upgrade()?;
+                let path = hit(ui.window.upcast_ref(), x, y)?;
+                show_candidate(&ui, &state, path);
+                Some(())
+            })()
+            .is_some();
+            gesture.set_state(if accepted {
+                gtk4::EventSequenceState::Claimed
+            } else {
+                gtk4::EventSequenceState::Denied
+            });
+        });
+        self.window.add_controller(click);
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn candidates_are_not_remote_uris_or_relative_cwd_guesses() {
+        assert_eq!(
+            candidate("file:///tmp/source.tsx").unwrap(),
+            PathBuf::from("/tmp/source.tsx")
+        );
+        assert_eq!(
+            candidate("file://localhost/tmp/source%20file.md").unwrap(),
+            PathBuf::from("/tmp/source file.md")
+        );
+        for value in [
+            "file://remote/tmp/a.md",
+            "https://example.com/a.md",
+            "../a.md",
+            "javascript:alert(1)",
+            "file:///tmp/a%0ab.md",
+        ] {
+            assert!(candidate(value).is_none(), "{value}");
+        }
+    }
+}

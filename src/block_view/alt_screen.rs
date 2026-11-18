@@ -1022,3 +1022,32 @@ mod tests {
         }
     }
 }
+
+// Local source preview must not steal a live application's pointer sequence.
+fn local_preview_pointer_allowed(fullscreen: bool, mouse: MouseReporting) -> bool {
+    !fullscreen && mouse == MouseReporting::OFF
+}
+
+impl super::TermView {
+    pub(crate) fn host_owns_local_preview_click(&self) -> bool {
+        local_preview_pointer_allowed(self.fullscreen.get(), self.mouse_reporting_mode.get())
+    }
+}
+
+#[cfg(test)]
+mod local_preview_tests {
+    use super::*;
+    #[test]
+    fn retains_mouse_modes_and_fullscreen_ownership() {
+        assert!(local_preview_pointer_allowed(false, MouseReporting::OFF));
+        assert!(!local_preview_pointer_allowed(true, MouseReporting::OFF));
+        for mode in [9, 1000, 1002, 1003, 1005, 1006, 1015] {
+            let mut mouse = MouseReporting::OFF;
+            assert!(mouse.apply_decset(mode, true));
+            assert!(!local_preview_pointer_allowed(false, mouse));
+            assert!(!local_preview_pointer_allowed(true, mouse));
+            assert!(mouse.apply_decset(mode, false));
+            assert!(local_preview_pointer_allowed(false, mouse));
+        }
+    }
+}

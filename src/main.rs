@@ -1817,6 +1817,7 @@ pub fn run() -> glib::ExitCode {
 
         // Wire file-tree expansion and file activation.
         ui.connect_file_tree_handlers(&file_tree);
+        ui.install_local_source_preview();
 
         // Wire the file-tree location selector and fill it for the first time.
         ui.connect_file_tree_location_selector();
