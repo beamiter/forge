@@ -33,11 +33,12 @@ is eligible only while its host reports mouse mode off and no alternate screen;
 read-only finished output has no application mouse receiver. Existing OSC8/web
 URLs, ordinary selection, and non-Ctrl clicks retain their existing routing.
 
-Numeric `:line[:column]` suffixes remain part of the exact filename in this slice;
-they are not stripped and do not imply source navigation. Non-numeric ambiguous
-bare colon forms and ordinary prose are not treated as source filenames.
+Numeric `:line[:column]` suffixes are first tried as part of the literal filename.
+Only missing path lookup permits the explicitly disclosed source-location fallback;
+see the source-location rules below. Non-numeric ambiguous bare colon forms and
+ordinary prose are not treated as source filenames.
 
-Not yet covered: automatic cwd inference, `:line` navigation, other image formats,
+Not yet covered: automatic cwd inference, column navigation, other image formats,
 syntax highlighting, Markdown rendering, remote files, and a full
 Codex GUI workflow. The initial source viewer does not imply these features are
 implemented or that native pointer propagation has been validated locally.
