@@ -17,6 +17,14 @@ struct PreviewState {
     previous: RefCell<String>,
 }
 
+// Match semantic shortcut modifiers, not lock/button/backend bookkeeping bits.
+fn ctrl_preview_shortcut(state: gtk4::gdk::ModifierType) -> bool {
+    use gtk4::gdk::ModifierType as M;
+    state.contains(M::CONTROL_MASK)
+        && !state
+            .intersects(M::SHIFT_MASK | M::ALT_MASK | M::SUPER_MASK | M::HYPER_MASK | M::META_MASK)
+}
+
 fn candidate(raw: &str) -> Option<PathBuf> {
     if raw.len() > local_reference::MAX_REFERENCE_BYTES {
         return None;
@@ -208,9 +216,7 @@ impl UiState {
         click.set_propagation_phase(gtk4::PropagationPhase::Capture);
         click.connect_pressed(move |gesture, count, x, y| {
             let accepted = (|| {
-                if count != 1
-                    || gesture.current_event_state() != gtk4::gdk::ModifierType::CONTROL_MASK
-                {
+                if count != 1 || !ctrl_preview_shortcut(gesture.current_event_state()) {
                     return None;
                 }
                 let ui = weak_ui.upgrade()?;
@@ -231,6 +237,26 @@ impl UiState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ctrl_shortcut_ignores_lock_and_event_bookkeeping_not_competing_shortcuts() {
+        use gtk4::gdk::ModifierType as M;
+        let irrelevant = M::LOCK_MASK | M::BUTTON1_MASK | M::from_bits_retain(1 << 20);
+        for extra in [M::empty(), M::LOCK_MASK, M::BUTTON1_MASK, irrelevant] {
+            assert!(ctrl_preview_shortcut(M::CONTROL_MASK | extra));
+            assert!(!ctrl_preview_shortcut(extra));
+            for conflicting in [
+                M::SHIFT_MASK,
+                M::ALT_MASK,
+                M::SUPER_MASK,
+                M::HYPER_MASK,
+                M::META_MASK,
+            ] {
+                assert!(!ctrl_preview_shortcut(
+                    M::CONTROL_MASK | extra | conflicting
+                ));
+            }
+        }
+    }
     #[test]
     fn candidates_are_not_remote_uris_or_relative_cwd_guesses() {
         assert_eq!(
