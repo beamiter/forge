@@ -66,3 +66,7 @@ fallback rather than trim meaningful filename spaces. Single-row delimited
 paths keep their exact bytes. Native VTE selection of these local regions is
 preserved. This conservative policy may refuse a genuinely soft-wrapped path;
 explicit local file URIs remain available. The same no-reconstruction rule now applies to delimited URLs across display rows: trimming can otherwise change the authority. Single-row native URL matching and explicit OSC8 targets keep their existing policy. Copy preserves native VTE selection verbatim, including hard newlines and meaningful spaces.
+
+CRLF source line endings are displayed as ordinary line breaks. This only
+normalizes the read-only presentation; source bytes and line numbers are unchanged.
+A lone carriage return, ESC, and bidi controls remain visible escapes.
