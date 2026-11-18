@@ -33,6 +33,7 @@ mod jsh;
 mod layout;
 mod local_preview;
 mod local_preview_file;
+mod local_preview_image;
 mod local_preview_tokens;
 mod local_reference;
 mod notebooks;

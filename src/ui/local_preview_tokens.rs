@@ -36,7 +36,11 @@ pub fn is_bare_source_name(token: &str) -> bool {
         && stem.chars().any(char::is_alphanumeric)
         && matches!(
             extension.to_ascii_lowercase().as_str(),
-            "md" | "mdx"
+            "png"
+                | "jpg"
+                | "jpeg"
+                | "md"
+                | "mdx"
                 | "txt"
                 | "json"
                 | "jsonc"
@@ -73,6 +77,9 @@ mod tests {
     fn bare_names_are_conservative_and_colon_suffixes_remain_literal() {
         for name in [
             "README.md",
+            "picture.png",
+            "photo.JPG",
+            "photo.jpeg",
             "package.json",
             "Cargo.toml",
             "App.tsx",

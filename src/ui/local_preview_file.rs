@@ -32,23 +32,45 @@ pub fn selected_local_path(candidate: &Path, directory: &str) -> io::Result<std:
     Ok(base.join(candidate))
 }
 
-pub fn read_source(path: &Path) -> io::Result<String> {
+#[derive(Debug)]
+pub enum PreviewContent {
+    Text(String),
+    Image(super::local_preview_image::RgbaPreview),
+}
+
+pub fn read_preview(path: &Path) -> io::Result<PreviewContent> {
+    let image = path
+        .extension()
+        .and_then(|x| x.to_str())
+        .is_some_and(|x| matches!(x.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg"));
+    if image {
+        let bytes = read_bounded(path, super::local_preview_image::MAX_IMAGE_BYTES)?;
+        return super::local_preview_image::decode(&bytes).map(PreviewContent::Image);
+    }
+    read_source(path).map(PreviewContent::Text)
+}
+
+fn read_bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
     if !path.is_absolute() {
         return Err(io::Error::other("Choose an absolute local path"));
     }
-    let file = open_without_symlink_components(path)?;
+    let file = open_without_symlink_components(path, limit)?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > MAX_BYTES {
-        return Err(io::Error::other(
-            "Preview requires a regular file of at most 256 KiB",
-        ));
+    if !metadata.is_file() || metadata.len() > limit {
+        return Err(io::Error::other("Preview requires a bounded regular file"));
     }
     let mut bytes = Vec::new();
-    file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_BYTES || bytes.contains(&0) {
-        return Err(io::Error::other(
-            "Preview is too large or contains binary data",
-        ));
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(io::Error::other("Preview is too large"));
+    }
+    Ok(bytes)
+}
+
+pub fn read_source(path: &Path) -> io::Result<String> {
+    let bytes = read_bounded(path, MAX_BYTES)?;
+    if bytes.contains(&0) {
+        return Err(io::Error::other("Preview contains binary data"));
     }
     let text = String::from_utf8(bytes)
         .map_err(|_| io::Error::other("Preview requires UTF-8 source text"))?;
@@ -62,7 +84,7 @@ pub fn read_source(path: &Path) -> io::Result<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn open_without_symlink_components(path: &Path) -> io::Result<std::fs::File> {
+fn open_without_symlink_components(path: &Path, limit: u64) -> io::Result<std::fs::File> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
@@ -109,7 +131,7 @@ fn open_without_symlink_components(path: &Path) -> io::Result<std::fs::File> {
         if final_component {
             let source = std::fs::File::from(opened);
             let before = source.metadata()?;
-            if !before.is_file() || before.len() > MAX_BYTES {
+            if !before.is_file() || before.len() > limit {
                 return Err(io::Error::other("Expected a bounded regular file"));
             }
             use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -130,7 +152,7 @@ fn open_without_symlink_components(path: &Path) -> io::Result<std::fs::File> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn open_without_symlink_components(_: &Path) -> io::Result<std::fs::File> {
+fn open_without_symlink_components(_: &Path, _: u64) -> io::Result<std::fs::File> {
     Err(io::Error::other(
         "Safe local preview is only supported on Linux",
     ))
@@ -139,6 +161,38 @@ fn open_without_symlink_components(_: &Path) -> io::Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn image_reads_share_the_regular_file_and_symlink_guard() {
+        use image::ImageEncoder;
+        let dir = std::env::temp_dir().join(format!("forge-image-preview-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("picture.PNG");
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&[1, 2, 3, 255], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        std::fs::write(&path, png).unwrap();
+        assert!(matches!(
+            read_preview(&path).unwrap(),
+            PreviewContent::Image(_)
+        ));
+        let link = dir.join("link.png");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(read_preview(&link).is_err());
+        let parent = dir.join("parent");
+        std::os::unix::fs::symlink(&dir, &parent).unwrap();
+        assert!(read_preview(&parent.join("picture.PNG")).is_err());
+        assert!(read_preview(Path::new("/dev/null.png")).is_err());
+        std::fs::write(&path, "<script>not an image</script>").unwrap();
+        assert!(read_preview(&path).is_err());
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(super::super::local_preview_image::MAX_IMAGE_BYTES + 1)
+            .unwrap();
+        assert!(read_preview(&path).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn relative_paths_require_an_explicit_local_directory() {
         assert_eq!(
