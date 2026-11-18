@@ -195,6 +195,8 @@ mod tests {
     fn mapped_vte_never_reconstructs_a_url_authority() {
         gtk4::init().unwrap();
         let terminal = Terminal::new();
+        // Match production terminal construction: VTE otherwise ignores OSC 8.
+        terminal.set_allow_hyperlink(true);
         terminal.set_size(80, 4);
         crate::block_view::add_url_match_regex(&terminal);
         let window = gtk4::Window::new();
