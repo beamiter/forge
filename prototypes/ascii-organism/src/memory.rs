@@ -1,4 +1,3 @@
-use chrono::{Datelike, Local};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, DirBuilder, File, OpenOptions};
@@ -14,6 +13,21 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 const SCHEMA_VERSION: u32 = 1;
 const MAX_DAILY_RECORDS: usize = 32;
 const MAX_MEMORY_BYTES: u64 = 1024 * 1024;
+
+// Keep persisted day keys compatible with chrono's one-based CE ordinal.
+fn day_key(date: jiff::civil::Date) -> u64 {
+    let previous_year = i64::from(date.year()) - 1;
+    let days = 365 * previous_year + previous_year.div_euclid(4) - previous_year.div_euclid(100)
+        + previous_year.div_euclid(400)
+        + i64::from(date.day_of_year());
+    days.try_into().unwrap_or_default()
+}
+
+fn local_day_at(now: SystemTime, zone: jiff::tz::TimeZone) -> u64 {
+    jiff::Timestamp::try_from(now)
+        .map(|timestamp| day_key(timestamp.to_zoned(zone).date()))
+        .unwrap_or_default()
+}
 
 #[derive(Debug)]
 pub struct MemoryLock {
@@ -301,10 +315,10 @@ impl Memory {
     }
 
     pub fn local_day() -> u64 {
-        Local::now()
-            .date_naive()
-            .num_days_from_ce()
-            .try_into()
+        // Do not silently substitute UTC when the local zone cannot be resolved.
+        // Zero remains the existing unavailable/non-positive-date sentinel.
+        jiff::tz::TimeZone::try_system()
+            .map(|zone| local_day_at(SystemTime::now(), zone))
             .unwrap_or_default()
     }
 
@@ -389,6 +403,37 @@ mod tests {
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn local_day_keys_preserve_ce_epoch_and_gregorian_leaps() {
+        use jiff::civil::date;
+        assert_eq!(day_key(date(1, 1, 1)), 1);
+        assert_eq!(day_key(date(1970, 1, 1)), 719_163);
+        assert_eq!(day_key(date(2000, 3, 1)) - day_key(date(2000, 2, 28)), 2);
+        assert_eq!(day_key(date(1900, 3, 1)) - day_key(date(1900, 2, 28)), 1);
+        assert_eq!(day_key(date(0, 12, 31)), 0);
+        assert_eq!(day_key(date(-1, 1, 1)), 0);
+    }
+
+    #[test]
+    fn unrepresentable_clock_uses_unavailable_day_sentinel() {
+        if let Some(now) = UNIX_EPOCH.checked_add(std::time::Duration::from_secs(253_402_300_800)) {
+            assert_eq!(local_day_at(now, jiff::tz::TimeZone::UTC), 0);
+        }
+    }
+
+    #[test]
+    fn local_day_tracks_zone_midnight_and_dst_not_utc_buckets() {
+        let zone = jiff::tz::TimeZone::get("America/New_York").unwrap();
+        let at = |text: &str| {
+            let timestamp: jiff::Timestamp = text.parse().unwrap();
+            local_day_at(SystemTime::from(timestamp), zone.clone())
+        };
+        assert_eq!(at("2026-03-08T04:59:59Z") + 1, at("2026-03-08T05:00:00Z"));
+        assert_eq!(at("2026-03-08T06:59:59Z"), at("2026-03-08T07:00:00Z"));
+        assert_eq!(at("2026-11-01T05:59:59Z"), at("2026-11-01T06:00:00Z"));
+        assert_eq!(at("2026-11-02T04:59:59Z") + 1, at("2026-11-02T05:00:00Z"));
     }
 
     #[test]
