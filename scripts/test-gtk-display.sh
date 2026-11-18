@@ -52,6 +52,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    vte_reference::tests::mapped_vte_blocks_ambiguous_paths_and_preserves_native_selection
     app::tests::startup_terminal_focus_survives_delayed_window_mapping
     app::tests::startup_focus_completion_releases_ownership_and_closed_requests
     ui::search_native_tests::native_entry_navigation_and_close_reopen_retire_stale_queries

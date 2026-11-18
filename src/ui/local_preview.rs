@@ -80,8 +80,15 @@ fn hit(window: &gtk4::Widget, x: f64, y: f64) -> Option<(usize, PathBuf)> {
         .check_hyperlink_at(point.x().into(), point.y().into())
         .map(|s| s.to_string())
         .or_else(|| {
-            crate::vte_reference::hit(&terminal, point.x().into(), point.y().into())
-                .map(|reference| reference.target)
+            crate::vte_reference::hit(&terminal, point.x().into(), point.y().into()).map(
+                |reference| {
+                    if reference.blocked {
+                        String::new()
+                    } else {
+                        reference.target
+                    }
+                },
+            )
         })
         .or_else(|| {
             terminal

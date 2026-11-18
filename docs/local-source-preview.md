@@ -59,3 +59,10 @@ workers. A blocked read cannot be forcibly cancelled and retains the worker slot
 Tests cover PNG/JPEG, malformed/unsupported bytes, size/pixel/edge rejection and
 image-path symlink rejection. These are loader/decoder tests, not proof of
 physical Ctrl-click GUI behavior or physical mouse ownership.
+
+Delimited local paths spanning display rows are not reconstructed: a full-width
+row is not reliable evidence of a soft wrap. Such regions block partial-match
+fallback rather than trim meaningful filename spaces. Single-row delimited
+paths keep their exact bytes. Native VTE selection of these local regions is
+preserved. This conservative policy may refuse a genuinely soft-wrapped path;
+explicit local file URIs remain available. URL handling is unchanged.

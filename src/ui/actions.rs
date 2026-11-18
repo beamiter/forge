@@ -213,7 +213,7 @@ impl UiState {
                 } else {
                     log::debug!(">>> UI Copy: no current term_view, falling back to VTE");
                     if let Some(ref term) = current_terminal {
-                        crate::vte_reference::copy_selection(&term);
+                        crate::vte_reference::copy_selection(term);
                     }
                 }
             }

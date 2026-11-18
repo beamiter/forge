@@ -163,6 +163,40 @@ mod tests {
     use super::*;
     #[test]
     #[cfg(target_os = "linux")]
+    fn delimited_paths_never_redirect_between_space_distinct_files() {
+        let dir = std::env::temp_dir().join(format!("forge-path-identity-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let exact = dir.join("report- notes.md");
+        let other = dir.join("report-notes.md");
+        std::fs::write(&exact, "EXACT").unwrap();
+        std::fs::write(&other, "OTHER").unwrap();
+        let single = format!("({})", exact.display());
+        let references = crate::delimited_reference::detect(&[(&single, false)]);
+        assert_eq!(references.len(), 1);
+        assert!(!references[0].blocked);
+        assert_eq!(
+            read_source(Path::new(&references[0].target)).unwrap(),
+            "EXACT"
+        );
+        assert_eq!(read_source(&other).unwrap(), "OTHER");
+        // A hard newline and a full-width-looking row are equally ambiguous.
+        // Neither may activate the trimmed OTHER path or mutate clipboard text.
+        for full_width in [false, true] {
+            for (head, tail) in [("report- ", "notes.md)"), ("report-", " notes.md)")] {
+                let first = format!("({}/{head}", dir.display());
+                let references =
+                    crate::delimited_reference::detect(&[(&first, full_width), (tail, false)]);
+                assert_eq!(references.len(), 1);
+                assert!(references[0].blocked);
+                assert!(references[0].target.contains('\n'));
+                assert_ne!(references[0].target, other.to_str().unwrap());
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn image_reads_share_the_regular_file_and_symlink_guard() {
         use image::ImageEncoder;
         let dir = std::env::temp_dir().join(format!("forge-image-preview-{}", std::process::id()));

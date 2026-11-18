@@ -98,7 +98,8 @@ pub(crate) fn selected_text(terminal: &Terminal) -> Option<String> {
         .map(str::trim)
         .collect();
     for reference in detect(terminal, &lines) {
-        if (!reference.web || jterm_core::link::is_openable_url(&reference.target))
+        if !reference.blocked
+            && (!reference.web || jterm_core::link::is_openable_url(&reference.target))
             && reference
                 .spans
                 .iter()
@@ -181,7 +182,8 @@ pub(crate) fn install_hover(terminal: &Terminal) {
         };
         let matched = terminal.check_hyperlink_at(x, y).is_none()
             && hit(&terminal, x, y).is_some_and(|reference| {
-                !reference.web || jterm_core::link::is_openable_url(&reference.target)
+                !reference.blocked
+                    && (!reference.web || jterm_core::link::is_openable_url(&reference.target))
             });
         if matched != previous.replace(matched) {
             terminal.set_cursor_from_name(matched.then_some("pointer"));
@@ -212,8 +214,9 @@ mod tests {
     }
 
     #[test]
-    fn mapped_vte_resolves_both_fragments_of_a_codex_reference() {
-        let exercise_pointer = std::env::var_os("JTERM_TEST_VTE_POINTER").is_some();
+    #[ignore = "requires an isolated GTK display and real X11 pointer input"]
+    fn mapped_vte_blocks_ambiguous_paths_and_preserves_native_selection() {
+        let exercise_pointer = true;
         if gtk4::init().is_err() {
             assert!(!exercise_pointer, "pointer test requires an X11 display");
             return;
@@ -237,19 +240,30 @@ mod tests {
                 left + (col + 0.5) * terminal.char_width() as f64,
                 top + (row + 0.5) * terminal.char_height() as f64,
             )
+            .filter(|reference| !reference.blocked)
             .map(|reference| reference.target)
         };
         let expected = Some("/tmp/中 文/PMG-SOTA-roadmap.canvas.tsx".into());
-        assert_eq!(hit_col(0.0, 12.0), expected);
-        assert_eq!(hit_col(1.0, 8.0), expected);
+        assert_eq!(hit_col(0.0, 12.0), None);
+        assert_eq!(hit_col(1.0, 8.0), None);
         assert_eq!(hit_col(1.0, 2.0), None);
+        // Positive control: the identical exact target on one physical row is
+        // still available. Keep the same click coordinates for the OS fixture.
+        terminal
+            .feed("\x1b[2J\x1b[H\r\n    (/tmp/中 文/PMG-SOTA-roadmap.canvas.tsx) \r\n".as_bytes());
+        settle();
+        assert_eq!(hit_col(1.0, 8.0), expected);
         if exercise_pointer {
             let target = Rc::new(RefCell::new(None));
             let activated = target.clone();
             let weak = terminal.downgrade();
             click(
                 &terminal,
-                move |x, y| hit(&weak.upgrade()?, x, y).map(|reference| reference.target),
+                move |x, y| {
+                    hit(&weak.upgrade()?, x, y)
+                        .filter(|reference| !reference.blocked)
+                        .map(|reference| reference.target)
+                },
                 move |path| *activated.borrow_mut() = Some(path),
             );
             let xdotool = |args: &[&str]| {
@@ -303,6 +317,30 @@ mod tests {
             settle();
             assert!(target.borrow().is_none());
 
+            // Hard-line whitespace remains native selection data, never a
+            // synthesized no-space path. No blocked region may activate.
+            terminal.feed(
+                "\x1b[2J\x1b[H路线图 (/tmp/中 文/PMG-SOTA- \r\n    roadmap.canvas.tsx) \r\n"
+                    .as_bytes(),
+            );
+            settle();
+            xdotool(&[
+                "mousemove",
+                "--window",
+                id,
+                &x,
+                &y,
+                "keydown",
+                "Control_L",
+                "mousedown",
+                "1",
+                "mouseup",
+                "1",
+                "keyup",
+                "Control_L",
+            ]);
+            settle();
+            assert!(target.borrow().is_none());
             let start_x = (left + 8.1 * terminal.char_width() as f64)
                 .ceil()
                 .to_string();
@@ -326,11 +364,18 @@ mod tests {
             settle();
             xdotool(&["mouseup", "1"]);
             settle();
+            let native = terminal
+                .text_selected(Format::Text)
+                .expect("drag must select native text")
+                .to_string();
+            assert!(
+                native.contains('\n'),
+                "fixture must select both hard lines: {native:?}"
+            );
             assert_eq!(
                 selected_text(&terminal),
-                expected,
-                "raw VTE selection: {:?}",
-                terminal.text_selected(Format::Text),
+                Some(native),
+                "selection must remain exactly VTE-owned"
             );
         }
         window.close();
