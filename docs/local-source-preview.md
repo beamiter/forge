@@ -70,3 +70,11 @@ explicit local file URIs remain available. The same no-reconstruction rule now a
 CRLF source line endings are displayed as ordinary line breaks. This only
 normalizes the read-only presentation; source bytes and line numbers are unchanged.
 A lone carriage return, ESC, and bidi controls remain visible escapes.
+
+Source locations (`file.tsx:12:3`) are resolved only after explicit confirmation
+showing both the literal filename and the possible source-location fallback.
+The literal file always wins. Only missing path lookup permits fallback; denied,
+unsafe, oversized, invalid-content or post-open errors never select another file.
+The preview reports the file actually read and navigates to an in-range line.
+Columns are informational, not byte or character offsets; out-of-range lines are
+not clamped. Loader tests do not constitute native GTK navigation acceptance.

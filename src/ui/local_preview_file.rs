@@ -38,6 +38,56 @@ pub enum PreviewContent {
     Image(super::local_preview_image::RgbaPreview),
 }
 
+pub struct LocatedPreviewContent {
+    pub content: PreviewContent,
+    pub path: std::path::PathBuf,
+    pub location: Option<super::local_reference::SourceLocationCandidate>,
+}
+
+/// Pure disclosure; never probes either candidate before user confirmation.
+pub fn confirmation_target(path: &Path) -> String {
+    let exact = format!("Literal local file: {}", path.display());
+    match path.to_str().and_then(super::local_reference::parse_candidate)
+        .and_then(|candidate| candidate.source_location) {
+        Some(location) => format!("{exact}\nOnly if that literal file does not exist: {} (line {}, requested column {:?}; only line navigation).", location.path, location.line, location.column.map(|c| c.get())),
+        None => exact,
+    }
+}
+
+pub fn read_reference(path: &Path) -> io::Result<LocatedPreviewContent> {
+    read_reference_with(path, read_preview)
+}
+
+fn read_reference_with(
+    path: &Path,
+    mut read: impl FnMut(&Path) -> io::Result<PreviewContent>,
+) -> io::Result<LocatedPreviewContent> {
+    match read(path) {
+        Ok(content) => Ok(LocatedPreviewContent {
+            content,
+            path: path.to_path_buf(),
+            location: None,
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let Some(location) = path
+                .to_str()
+                .and_then(super::local_reference::parse_candidate)
+                .and_then(|candidate| candidate.source_location)
+            else {
+                return Err(error);
+            };
+            let target = std::path::PathBuf::from(&location.path);
+            let content = read(&target)?;
+            Ok(LocatedPreviewContent {
+                content,
+                path: target,
+                location: Some(location),
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub fn read_preview(path: &Path) -> io::Result<PreviewContent> {
     let image = path
         .extension()
@@ -55,16 +105,27 @@ fn read_bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
         return Err(io::Error::other("Choose an absolute local path"));
     }
     let file = open_without_symlink_components(path, limit)?;
-    let metadata = file.metadata()?;
+    let metadata = file.metadata().map_err(non_lookup_error)?;
     if !metadata.is_file() || metadata.len() > limit {
         return Err(io::Error::other("Preview requires a bounded regular file"));
     }
     let mut bytes = Vec::new();
-    file.take(limit + 1).read_to_end(&mut bytes)?;
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(non_lookup_error)?;
     if bytes.len() as u64 > limit {
         return Err(io::Error::other("Preview is too large"));
     }
     Ok(bytes)
+}
+
+// Only original path-component lookup may report absence to a location fallback.
+fn non_lookup_error(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::NotFound {
+        io::Error::other("Opened local file became unavailable")
+    } else {
+        error
+    }
 }
 
 pub fn read_source(path: &Path) -> io::Result<String> {
@@ -133,7 +194,7 @@ fn open_without_symlink_components(path: &Path, limit: u64) -> io::Result<std::f
         let opened = unsafe { OwnedFd::from_raw_fd(raw) };
         if final_component {
             let source = std::fs::File::from(opened);
-            let before = source.metadata()?;
+            let before = source.metadata().map_err(non_lookup_error)?;
             if !before.is_file() || before.len() > limit {
                 return Err(io::Error::other("Expected a bounded regular file"));
             }
@@ -142,8 +203,9 @@ fn open_without_symlink_components(path: &Path, limit: u64) -> io::Result<std::f
             let file = std::fs::OpenOptions::new()
                 .read(true)
                 .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC)
-                .open(format!("/proc/self/fd/{}", source.as_raw_fd()))?;
-            let after = file.metadata()?;
+                .open(format!("/proc/self/fd/{}", source.as_raw_fd()))
+                .map_err(non_lookup_error)?;
+            let after = file.metadata().map_err(non_lookup_error)?;
             if !after.is_file() || before.dev() != after.dev() || before.ino() != after.ino() {
                 return Err(io::Error::other("Local file identity changed"));
             }
@@ -163,6 +225,94 @@ fn open_without_symlink_components(_: &Path, _: u64) -> io::Result<std::fs::File
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn post_lookup_absence_is_not_a_fallback_signal() {
+        assert_eq!(
+            non_lookup_error(io::Error::from(io::ErrorKind::NotFound)).kind(),
+            io::ErrorKind::Other
+        );
+        assert_eq!(
+            non_lookup_error(io::Error::from(io::ErrorKind::PermissionDenied)).kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn disclosure_names_both_candidates_without_io() {
+        let note = confirmation_target(Path::new("/missing/project/App.tsx:12:3"));
+        assert!(note.contains("Literal local file: /missing/project/App.tsx:12:3"));
+        assert!(note.contains(
+            "Only if that literal file does not exist: /missing/project/App.tsx (line 12"
+        ));
+        assert_eq!(
+            confirmation_target(Path::new("/missing/plain.md")),
+            "Literal local file: /missing/plain.md"
+        );
+    }
+
+    #[test]
+    fn location_fallback_only_follows_lookup_absence() {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::Other,
+        ] {
+            let mut calls = 0;
+            let result = read_reference_with(Path::new("/local/App.tsx:12:3"), |_| {
+                calls += 1;
+                Err(io::Error::from(kind))
+            });
+            assert!(result.is_err());
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
+    fn literal_colon_file_precedes_location_and_unsafe_files_never_fall_back() {
+        let dir =
+            std::env::temp_dir().join(format!("forge-preview-location-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let base = dir.join("App.tsx");
+        let exact = dir.join("App.tsx:12:3");
+        std::fs::write(&base, "BASE").unwrap();
+        std::fs::write(&exact, "LITERAL").unwrap();
+        let result = read_reference(&exact).unwrap();
+        assert_eq!(result.path, exact);
+        assert!(result.location.is_none());
+        assert!(matches!(result.content, PreviewContent::Text(s) if s == "LITERAL"));
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exact, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = read_reference(&exact);
+        std::fs::set_permissions(&exact, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Root may bypass mode bits; the injected error test covers that policy too.
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(
+                denied.err().unwrap().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+        std::fs::remove_file(&exact).unwrap();
+        let result = read_reference(&exact).unwrap();
+        assert_eq!(result.path, base);
+        assert_eq!(result.location.unwrap().line.get(), 12);
+        assert!(matches!(result.content, PreviewContent::Text(s) if s == "BASE"));
+        std::os::unix::fs::symlink(&base, &exact).unwrap();
+        assert!(read_reference(&exact).is_err());
+        std::fs::remove_file(&exact).unwrap();
+        std::fs::write(&exact, [0xff]).unwrap();
+        assert!(read_reference(&exact).is_err());
+        std::fs::remove_file(&exact).unwrap();
+        std::fs::create_dir(&exact).unwrap();
+        assert!(read_reference(&exact).is_err());
+        std::fs::remove_dir(&exact).unwrap();
+        std::fs::remove_file(&base).unwrap();
+        assert_eq!(
+            read_reference(&exact).err().unwrap().kind(),
+            io::ErrorKind::NotFound
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn crlf_display_preserves_line_numbers_and_original_bytes() {
