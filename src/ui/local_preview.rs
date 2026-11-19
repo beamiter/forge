@@ -282,7 +282,7 @@ fn show_candidate(ui: &Rc<UiState>, state: &Rc<PreviewState>, path: PathBuf) {
             struct Release;
             impl Drop for Release { fn drop(&mut self) { READER_BUSY.store(false, Ordering::Release); } }
             let _release = Release;
-            let result = local_preview_file::read_reference(&path).map_err(|_| "Cannot preview: use bounded UTF-8 text or PNG/JPEG, with no symlink or parent-path components.".to_owned());
+            let result = local_preview_file::read_reference(&path).map_err(|_| "Cannot preview: require a regular local UTF-8 source (256 KiB) or bounded PNG/JPEG (4 MiB, 4096-pixel edges, 4M pixels), with no symlink or parent components.".to_owned());
             let _ = tx.send(result);
         }).is_err() {
             READER_BUSY.store(false, Ordering::Release);
