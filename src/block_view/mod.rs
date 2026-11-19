@@ -65,6 +65,8 @@ mod onboarding;
 mod palette;
 mod paste_feedback;
 mod prepared_search;
+mod resize_presentation;
+use resize_presentation::InlineResize;
 mod review;
 mod scroll;
 pub(crate) use native_transcript_scroll::install_inline_cli_reading;
@@ -8108,6 +8110,9 @@ impl ReaderCtx {
     }
 
     fn on_hard_reset(&self) {
+        if let Some(resize) = &self.pty_winsize.inline_resize {
+            resize.set_synchronized(false);
+        }
         self.watch_reader.reset(std::time::Instant::now());
         self.reset_kitty_keyboard();
         self.live_input_modes_rc.set(LiveInputModes::default());
@@ -8222,6 +8227,11 @@ impl ReaderCtx {
     }
 
     fn on_decset_mode(&self, mode: u32, set: bool) {
+        if mode == 2026 {
+            if let Some(resize) = &self.pty_winsize.inline_resize {
+                resize.set_synchronized(set);
+            }
+        }
         if mode == 2004 {
             self.bracketed_paste_rc.set(set);
             // The PTY write boundary needs the same answer.
@@ -11655,6 +11665,9 @@ impl ReaderCtx {
             self.handle_event(event);
         }
         drop(events);
+        if let Some(resize) = &self.pty_winsize.inline_resize {
+            resize.note_output();
+        }
         self.watch_reader.end_dispatch(std::time::Instant::now());
     }
 
@@ -11748,6 +11761,7 @@ fn sync_active_to_pty(
 /// real grid wins.
 struct PtyWinsize {
     sent: Cell<(u16, u16)>,
+    inline_resize: Option<InlineResize>,
     resize_attempt: Cell<((u16, u16), u8)>,
     resize_retry_pending: Cell<bool>,
     /// Bumped only when a publish really changed the size: the PromptEnd
@@ -11765,6 +11779,7 @@ impl PtyWinsize {
     fn new(generation: Rc<Cell<u64>>) -> Self {
         Self {
             sent: Cell::new((0, 0)),
+            inline_resize: None,
             resize_attempt: Cell::new(((0, 0), 0)),
             resize_retry_pending: Cell::new(false),
             generation,
@@ -11814,7 +11829,12 @@ impl PtyWinsize {
                 self.resize_attempt.set((sample, 0));
                 self.resize_retry_pending.set(false);
                 if changed {
-                    self.sent.set(sample);
+                    let previous = self.sent.replace(sample);
+                    if previous != (0, 0) {
+                        if let Some(resize) = &self.inline_resize {
+                            resize.resized(pty);
+                        }
+                    }
                     self.generation.set(self.generation.get().wrapping_add(1));
                 }
                 changed
@@ -14974,7 +14994,15 @@ impl TermView {
         let prompt_anchor_rows: Rc<Cell<i64>> = Rc::new(Cell::new(0));
         let prompt_anchor_resize_generation = Rc::new(Cell::new(0u64));
         let pty_resize_generation = Rc::new(Cell::new(0u64));
-        let pty_winsize = Rc::new(PtyWinsize::new(pty_resize_generation.clone()));
+        let running_cmd = Rc::new(RefCell::new(String::new()));
+        let mut pty_winsize = PtyWinsize::new(pty_resize_generation.clone());
+        pty_winsize.inline_resize = Some(InlineResize::new(
+            &active.borrow().resize_surface,
+            bstate.clone(),
+            running_cmd.clone(),
+            direct_cli,
+        ));
+        let pty_winsize = Rc::new(pty_winsize);
         let prompt_anchor_prefix = Rc::new(RefCell::new(String::new()));
         let prompt_anchor_ready = Rc::new(Cell::new(false));
         let prompt_identity_output = Rc::new(Cell::new(false));
@@ -15782,7 +15810,6 @@ impl TermView {
         // Sticky running-command header state: true while a command is executing,
         // plus the command text captured at CommandStart.
         let cmd_running: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let running_cmd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let block_start_time: Rc<Cell<Option<SystemTime>>> = Rc::new(Cell::new(None));
         let visible_indices: Rc<RefCell<std::collections::HashSet<usize>>> =
             Rc::new(RefCell::new(std::collections::HashSet::new()));
@@ -17643,7 +17670,18 @@ impl TermView {
                     }
                 }
                 if let Some(winsize) = winsize_for_tick.upgrade() {
-                    if winsize.publish(&pty_for_resize, pty_grid_size(vte, &scroll_for_resize))
+                    let sample = pty_grid_size(vte, &scroll_for_resize);
+                    let deferred = winsize.inline_resize.as_ref().is_some_and(|resize| {
+                        resize.defer_layout(
+                            &pty_for_resize,
+                            winsize.sent.get(),
+                            sample,
+                            last_pane.get(),
+                            vte,
+                        )
+                    });
+                    if deferred
+                        || winsize.publish(&pty_for_resize, sample)
                         || winsize.resize_retry_pending.get()
                     {
                         settling = true;
