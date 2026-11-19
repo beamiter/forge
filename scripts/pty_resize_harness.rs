@@ -60,6 +60,16 @@ struct OwnedPty {
 impl OwnedPty {
     /* METHODS */
 }
+// GTK presentation is outside this syscall harness. Record its notification
+// boundary only; production PtyWinsize and OwnedPty still perform real ioctls.
+struct InlineResize {
+    notifications: Rc<Cell<usize>>,
+}
+impl InlineResize {
+    fn resized(&self, _pty: &OwnedPty) {
+        self.notifications.set(self.notifications.get() + 1);
+    }
+}
 /* WINSIZE */
 fn pair() -> (OwnedPty, OwnedFd, PtyWinsize) {
     libc::FAILURE.set(None);
@@ -257,4 +267,34 @@ fn close_racing_ioctl_cannot_recycle_borrowed_descriptor() {
         pty.resize(101, 31).unwrap_err().kind(),
         io::ErrorKind::BrokenPipe
     );
+}
+
+#[test]
+fn presentation_notified_only_after_successful_changed_noninitial_size() {
+    let (pty, slave, mut state) = pair();
+    let notifications = Rc::new(Cell::new(0));
+    state.inline_resize = Some(InlineResize {
+        notifications: notifications.clone(),
+    });
+    assert!(state.publish(&pty, (80, 24)));
+    assert_eq!(size(&slave), (80, 24));
+    assert_eq!(notifications.get(), 0, "initial geometry is not a repaint");
+    assert!(state.publish(&pty, (100, 30)));
+    assert_eq!(size(&slave), (100, 30));
+    assert_eq!(notifications.get(), 1);
+    assert!(!state.publish(&pty, (100, 30)));
+    state.reassert(&pty, (100, 30));
+    assert_eq!(
+        notifications.get(),
+        1,
+        "unchanged geometry is not a repaint"
+    );
+    libc::FAILURE.set(Some(5));
+    assert!(!state.publish(&pty, (120, 40)));
+    assert_eq!(size(&slave), (100, 30));
+    assert_eq!(notifications.get(), 1, "failed ioctl must not notify");
+    libc::FAILURE.set(None);
+    assert!(state.publish(&pty, (121, 41)));
+    assert_eq!(size(&slave), (121, 41));
+    assert_eq!(notifications.get(), 2);
 }
