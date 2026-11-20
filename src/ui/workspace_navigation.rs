@@ -1,6 +1,7 @@
 //! Additional native/API conversations in the persistent workspace sidebar.
 //! Stable identities keep rows alive across stream updates; selection alone
 //! never creates a process or sends a provider request.
+use super::workspace_scope::{conversation_summary, ConversationScope};
 use gtk::prelude::*;
 use gtk4 as gtk;
 use jterm_core::agent_task::TaskId;
@@ -11,6 +12,7 @@ use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Action {
+    FiltersChanged,
     Api(u64),
     Cli(jterm_core::agent_workspace::ConversationId),
     PinCli(jterm_core::agent_workspace::ConversationId, bool),
@@ -64,6 +66,7 @@ pub(crate) struct Row {
 #[derive(Clone, Default, PartialEq, Eq)]
 pub(crate) struct Filter {
     pub query: String,
+    pub kind: ConversationScope,
     pub provider: Option<String>,
     pub needs_attention: bool,
     pub running: bool,
@@ -98,7 +101,9 @@ impl Filter {
         if self.archive == 1 {
             parts.push("is:archived".into());
         }
-        parts.join(" ")
+        let mut query = parts.join(" ");
+        self.kind.qualify(&mut query);
+        query
     }
     #[cfg(test)]
     fn matches(&self, row: &Row) -> bool {
@@ -111,19 +116,19 @@ impl Filter {
         row: &Row,
         query: &jterm_core::agent_workspace::WorkspaceQuery,
     ) -> bool {
-        !((self.archive == 0 && row.archived && !query.includes_archived())
-            || (self.archive == 1 && !row.archived)
-            || (self.needs_attention && !row.attention)
-            || (self.running && !row.busy)
-            || (self.pinned && !row.pinned)
-            || self
-                .provider
-                .as_ref()
-                .is_some_and(|provider| !row.provider.eq_ignore_ascii_case(provider))
-            || self
-                .project
-                .as_ref()
-                .is_some_and(|project| !std::path::Path::new(&row.project).starts_with(project)))
+        self.kind.includes(row.kind())
+            && !((self.archive == 0 && row.archived && !query.includes_archived())
+                || (self.archive == 1 && !row.archived)
+                || (self.needs_attention && !row.attention)
+                || (self.running && !row.busy)
+                || (self.pinned && !row.pinned)
+                || self
+                    .provider
+                    .as_ref()
+                    .is_some_and(|provider| !row.provider.eq_ignore_ascii_case(provider))
+                || self.project.as_ref().is_some_and(|project| {
+                    !std::path::Path::new(&row.project).starts_with(project)
+                }))
     }
 }
 
@@ -173,20 +178,26 @@ impl Row {
         }
     }
 
+    fn kind(&self) -> jterm_core::agent_workspace::ConversationKind {
+        use jterm_core::agent_workspace::ConversationKind;
+        self.source.as_ref().map_or_else(
+            || match self.action {
+                Action::Cli(_) => ConversationKind::Cli,
+                Action::Task(..) | Action::ExternalTask(_) => ConversationKind::Task,
+                _ => ConversationKind::Api,
+            },
+            |source| source.kind,
+        )
+    }
+
     fn search_row(&self) -> jterm_core::agent_workspace::WorkspaceRow {
-        use jterm_core::agent_workspace::{
-            ConversationId, ConversationKind, RuntimeState, WorkspaceRow,
-        };
+        use jterm_core::agent_workspace::{ConversationId, RuntimeState, WorkspaceRow};
         let mut row = self.source.clone().unwrap_or_else(|| WorkspaceRow {
             id: self
                 .shared_id()
                 .cloned()
                 .unwrap_or_else(|| ConversationId(format!("local:{:?}", self.action))),
-            kind: match self.action {
-                Action::Cli(_) => ConversationKind::Cli,
-                Action::Task(..) | Action::ExternalTask(_) => ConversationKind::Task,
-                _ => ConversationKind::Api,
-            },
+            kind: self.kind(),
             title: self.title.clone(),
             provider: self.provider.clone(),
             cwd: self.project.clone(),
@@ -528,6 +539,10 @@ impl Navigation {
         true
     }
 
+    pub fn filters_changed(&self) {
+        (self.callback)(Action::FiltersChanged);
+    }
+
     pub fn activate_selected(&self) {
         let action = self.list.selected_row().and_then(|row| {
             self.rows
@@ -654,16 +669,11 @@ impl Navigation {
             }
         }
         visible.truncate(self.visible_limit.get());
-        self.summary.set_text(&if total == 0 {
-            if filter.query.trim().is_empty() {
-                "No workspace items yet".into()
-            } else {
-                "No matching workspace items".into()
-            }
-        } else if total > visible.len() {
-            format!("{} of {total} workspace items", visible.len())
+        self.summary.set_visible(error.is_none());
+        self.summary.set_text(&if total > visible.len() {
+            format!("{} of {total} conversations", visible.len())
         } else {
-            format!("{total} workspace items")
+            conversation_summary(total, filter != &Filter::default(), false)
         });
         self.next_attention
             .set_label(&format!("Needs you · {all_attention}"));
@@ -1383,6 +1393,37 @@ mod tests {
             .history_query(),
             "title:\"Investigate renderer\""
         );
+    }
+
+    #[test]
+    fn workspace_catalog_scope_composes_with_pins_and_archive() {
+        let mut api = row();
+        api.action = Action::Api(1);
+        api.title = "Investigate renderer".into();
+        api.source = None;
+        api.archived = true;
+        api.pinned = true;
+        let mut task = api.clone();
+        task.action = Action::ExternalTask(jterm_core::agent_workspace::ConversationId(
+            "fixture-task".into(),
+        ));
+        let filter = Filter {
+            query: "title:\"Investigate renderer\"".into(),
+            archive: 1,
+            pinned: true,
+            kind: ConversationScope::Api,
+            ..Default::default()
+        };
+        assert!(filter.matches(&api));
+        assert!(!filter.matches(&task));
+        assert!(filter
+            .history_query()
+            .ends_with("is:pinned is:archived kind:api"));
+        api.pinned = false;
+        assert!(!filter.matches(&api));
+        api.pinned = true;
+        api.archived = false;
+        assert!(!filter.matches(&api));
     }
 
     #[test]

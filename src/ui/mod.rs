@@ -64,6 +64,7 @@ mod workspace_context_ui;
 mod workspace_mission_evidence;
 mod workspace_missions;
 pub(crate) mod workspace_navigation;
+mod workspace_scope;
 mod workspace_remote;
 mod workspace_remote_ui;
 mod workspace_review;
