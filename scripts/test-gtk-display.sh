@@ -52,6 +52,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    ui::local_preview::tests::mapped_preview_jumps_reloads_and_retires_the_page
     vte_reference::tests::mapped_vte_never_reconstructs_a_url_authority
     vte_reference::tests::mapped_vte_blocks_ambiguous_paths_and_preserves_native_selection
     app::tests::startup_terminal_focus_survives_delayed_window_mapping
