@@ -1592,6 +1592,7 @@ pub fn run() -> glib::ExitCode {
             tab_connections: Rc::new(RefCell::new(HashMap::new())),
             ai_panel: ai_panel_widget.clone(),
             side_stack: side_stack.clone(),
+            local_preview: Default::default(),
             reference_inspector: reference_inspector.clone(),
             tasks_panel: tasks_panel_widget.clone(),
             agent_tasks: Rc::new(RefCell::new(ui::AgentTaskDomain::new())),

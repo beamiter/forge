@@ -4960,6 +4960,27 @@ impl UiState {
             btn
         };
 
+        if let [entry] = entries.as_slice() {
+            if !entry.is_dir && !location.is_remote() {
+                let item = make_item("Preview file");
+                let popover = popover.clone();
+                let ui = self.clone();
+                let expected_location = location.clone();
+                let entry = entry.clone();
+                item.connect_clicked(move |_| {
+                    popover.popdown();
+                    if ui.require_current_file_tree_entries(
+                        context_generation,
+                        &expected_location,
+                        std::slice::from_ref(&entry),
+                    ) {
+                        ui.preview_file_tree_path(entry.path.clone());
+                    }
+                });
+                vbox.append(&item);
+            }
+        }
+
         {
             let item = make_item("Open Folder");
             let folder = entries
