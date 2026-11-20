@@ -2,6 +2,7 @@
 use super::workspace_navigation::{Action as WorkspaceAction, Row};
 use super::*;
 use gtk4::prelude::{CastNone, WidgetExt};
+use libadwaita::prelude::{AdwDialogExt, AlertDialogExt, AlertDialogExtManual};
 
 impl UiState {
     pub(crate) fn show_terminal_workspace(&self) {
@@ -26,6 +27,31 @@ impl UiState {
             }
             WorkspaceAction::ArchiveCli(id, archived) => {
                 self.session_sidebar.organize(&id, None, Some(archived))
+            }
+            WorkspaceAction::DeleteCli(id) => match self.session_sidebar.cli_deletion_target(&id) {
+                Ok(session) => {
+                    let title = jterm_core::review_input::safe_inline_display(&session.title, 180);
+                    let body = format!("Delete “{title}” from Agent Workspace and its history search? The original {} history is kept.", session.provider.label());
+                    let dialog = adw::AlertDialog::new(Some("Delete CLI session?"), Some(&body));
+                    super::reference_shell::style_workspace_dialog(&dialog);
+                    dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete session")]);
+                    dialog.set_default_response(Some("cancel"));
+                    dialog.set_close_response("cancel");
+                    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+                    let confirm = self.workspace_navigation.clone();
+                    dialog.connect_response(None, move |_, response| {
+                        if response == "delete" {
+                            confirm.confirm_cli_deletion(id.clone());
+                        }
+                    });
+                    dialog.present(Some(&self.window));
+                }
+                Err(error) => self.toast_overlay.add_toast(adw::Toast::new(&error)),
+            },
+            WorkspaceAction::ConfirmDeleteCli(id) => {
+                if let Err(error) = self.session_sidebar.delete_cli_session(&id) {
+                    self.toast_overlay.add_toast(adw::Toast::new(&error));
+                }
             }
             WorkspaceAction::Api(id) => {
                 self.open_ai_panel();
