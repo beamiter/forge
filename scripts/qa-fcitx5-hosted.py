@@ -83,7 +83,9 @@ def verify_fcitx_owner(p, env, address, timeout=5):
     raise owned.Unavailable("owned Fcitx5 did not acquire its private D-Bus name")
 
 
-def run(runtime, *, pinyin_fixture=None):
+def run(runtime, *, pinyin_fixture=None, probe_profile=None, probe_pinyin_bus=False):
+    if pinyin_fixture is not None and (probe_profile is not None or probe_pinyin_bus):
+        raise ValueError("full Pinyin and diagnostic factors cannot run together")
     started = time.monotonic()
 
     def stage(message):
@@ -106,8 +108,8 @@ def run(runtime, *, pinyin_fixture=None):
            "DISPLAY": f":{number}", "XAUTHORITY": str(auth), "GDK_BACKEND": "x11",
            "GTK_IM_MODULE": "fcitx5", "FORGE_FCITX_QA_ISOLATED": "1"}
     stage("starting owned private D-Bus")
-    bus = (owned.private_bus(runtime) if pinyin_fixture is None
-           else owned.private_bus(runtime, pinyin_fixture=True))
+    bus = (owned.private_bus(runtime, pinyin_fixture=True)
+           if pinyin_fixture is not None or probe_pinyin_bus else owned.private_bus(runtime))
     with bus as address:
         stage("owned D-Bus peer and GetId verified")
         env["DBUS_SESSION_BUS_ADDRESS"] = address
@@ -123,6 +125,8 @@ def run(runtime, *, pinyin_fixture=None):
             stage("owned Xvfb accepted fixture cookie and refused empty authority")
             if pinyin_fixture is not None:
                 pinyin_fixture.install_profile(env)
+            elif probe_profile is not None:
+                probe_profile(env)
             with child(["/usr/bin/fcitx5", "--disable=cloudpinyin"], env) as fcitx:
                 verify_fcitx_owner(fcitx, env, address)
                 stage("owned Fcitx5 D-Bus name verified")
