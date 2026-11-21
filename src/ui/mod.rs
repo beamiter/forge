@@ -49,8 +49,8 @@ pub(crate) mod path_drop;
 mod preview_navigation;
 pub(crate) mod reference_conversation;
 pub(crate) mod reference_shell;
-mod remote_fs;
 mod remote_desktop;
+mod remote_fs;
 mod search;
 #[cfg(test)]
 mod search_native_tests;
