@@ -104,11 +104,30 @@ class PreflightTests(unittest.TestCase):
             with self.assertRaises(preflight.Unavailable):
                 self.check()
 
-    def test_missing_or_wedged_probe_is_unavailable(self):
-        for failure in (FileNotFoundError(), subprocess.TimeoutExpired("probe", 5)):
-            self.run_probe.side_effect = failure
-            with self.assertRaises(preflight.Unavailable):
-                self.check()
+    def test_launch_failure_is_not_reported_as_probe_timeout(self):
+        for failure, reason in ((FileNotFoundError("private-path"), "executable not found"),
+                                (PermissionError(13, "private-path"), "launch failed .*13")):
+            with self.subTest(failure=failure):
+                self.run_probe.side_effect = failure
+                with self.assertRaisesRegex(preflight.Unavailable, reason) as error:
+                    self.check()
+                self.assertNotIn("private-path", str(error.exception))
+
+    def test_probe_timeout_is_bounded_and_reports_only_output_shape(self):
+        for output, state in (
+            (None, "no-output"),
+            (preflight.EXPECTED_MODULE, "expected-line"),
+            (b"unexpected-private-text", "unexpected-output"),
+        ):
+            with self.subTest(output=output):
+                self.run_probe.side_effect = subprocess.TimeoutExpired(
+                    ["probe", "/private-path"], 5, output=output, stderr=b"private-error")
+                with self.assertRaisesRegex(
+                        preflight.Unavailable,
+                        rf"timed out after 5s .*stdout={state}; stderr_bytes=13") as error:
+                    self.check()
+                self.assertNotIn("private", str(error.exception))
+                self.assertEqual(self.run_probe.call_args.kwargs["timeout"], 5)
 
 
 if __name__ == "__main__":

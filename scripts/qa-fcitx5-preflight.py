@@ -14,6 +14,9 @@ import subprocess
 import sys
 
 
+EXPECTED_MODULE = b"GTK_IM_MODULE=fcitx5\n"
+
+
 class Unavailable(Exception):
     pass
 
@@ -68,10 +71,22 @@ def check_probe(env, uid, run=subprocess.run):
     try:
         result = run(["fcitx5-gtk4-immodule-probing"], env=dict(env),
                      capture_output=True, timeout=5, check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise Unavailable("GTK4 Fcitx probe could not run successfully") from exc
-    require(result.returncode == 0, "GTK4 Fcitx probe did not exit successfully")
-    require(result.stdout == b"GTK_IM_MODULE=fcitx5\n",
+    except subprocess.TimeoutExpired as exc:
+        # Upstream flushes the ID line only after GTK init and all context
+        # calls. No line cannot identify which internal stage hung.
+        output = exc.stdout or b""
+        state = ("expected-line" if output == EXPECTED_MODULE
+                 else "unexpected-output" if output else "no-output")
+        raise Unavailable(
+            f"GTK4 Fcitx probe timed out after 5s (stdout={state}; "
+            f"stderr_bytes={len(exc.stderr or b'')})") from None
+    except FileNotFoundError:
+        raise Unavailable("GTK4 Fcitx probe executable not found") from None
+    except OSError as exc:
+        raise Unavailable(f"GTK4 Fcitx probe launch failed (errno={exc.errno})") from None
+    require(result.returncode == 0,
+            f"GTK4 Fcitx probe did not exit successfully (status={result.returncode})")
+    require(result.stdout == EXPECTED_MODULE,
             "GTK4 Fcitx probe did not report the requested single module")
     # A matching ID is not trustworthy in the presence of loader diagnostics.
     require(not result.stderr, "GTK4 Fcitx probe reported diagnostics")
