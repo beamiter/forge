@@ -104,6 +104,31 @@ class PreflightTests(unittest.TestCase):
             with self.assertRaises(preflight.Unavailable):
                 self.check()
 
+    def test_known_warning_still_fails_and_does_not_log_contents(self):
+        err = (b"\n(fcitx5-gtk4-immodule-probing:321): Gtk-WARNING **: 11:01:49.011: "
+               b"Unable to acquire session bus: /private-path\n"
+               b"Gtk-WARNING **: No IM module matching GTK_IM_MODULE=fcitx5 found\n"
+               b"Gtk-WARNING **: Unable to acquire the address of the accessibility bus: hidden. "
+               b"If you are attempting to run GTK without a11y support, GTK_A11Y should be set to 'none'.\n"
+               b"GLib-WARNING **: Unable to acquire session bus: /another-private-path\n"
+               b"Gtk-WARNING **: Unable to acquire the address of the accessibility bus: fake suffix\n")
+        self.run_probe.return_value = self.result(err=err)
+        with self.assertRaisesRegex(preflight.Unavailable, "reported diagnostics") as error:
+            self.check()
+        self.assertEqual(str(error.exception),
+                         f"GTK4 Fcitx probe reported diagnostics (stderr_bytes={len(err)}; "
+                         "gtk_im_module_missing=1, gtk_session_bus=1, gtk_accessibility_bus=1, "
+                         "unknown=2; sample_truncated=0)")
+
+    def test_bounded_diagnostics_unknown_and_truncation(self):
+        sample = b"\x00\n" * 80
+        summary = preflight.stderr_shape(sample)
+        self.assertIn("unknown=64; sample_truncated=1", summary)
+        giant_line = b"Gtk-WARNING **: Unable to acquire session bus: " + b"x" * 8192
+        summary = preflight.stderr_shape(giant_line)
+        self.assertIn("gtk_session_bus=0", summary)
+        self.assertIn("sample_truncated=1", summary)
+
     def test_launch_failure_is_not_reported_as_probe_timeout(self):
         for failure, reason in ((FileNotFoundError("private-path"), "executable not found"),
                                 (PermissionError(13, "private-path"), "launch failed .*13")):
