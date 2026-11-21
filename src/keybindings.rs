@@ -69,6 +69,7 @@ pub(crate) enum Action {
     /// the human-facing one-based form `connect_remote_1` … `_9`.
     ConnectRemote(u8),
     ShowRemotePicker,
+    ShowRemoteDesktop,
     ResizePaneLeft,
     ResizePaneRight,
     ResizePaneUp,
@@ -218,6 +219,7 @@ impl Action {
                 _ => "Connect to remote host 9",
             },
             Action::ShowRemotePicker => "Connect to remote host…",
+            Action::ShowRemoteDesktop => "Remote desktop…",
             Action::ResizePaneLeft => "Resize pane left",
             Action::ResizePaneRight => "Resize pane right",
             Action::ResizePaneUp => "Resize pane up",
@@ -322,6 +324,7 @@ impl Action {
                 _ => None,
             },
             Action::ShowRemotePicker => Some("show_remote_picker"),
+            Action::ShowRemoteDesktop => Some("show_remote_desktop"),
             Action::ResizePaneLeft => Some("resize_pane_left"),
             Action::ResizePaneRight => Some("resize_pane_right"),
             Action::ResizePaneUp => Some("resize_pane_up"),
@@ -424,6 +427,7 @@ impl Action {
             Action::ConnectRemote(7),
             Action::ConnectRemote(8),
             Action::ShowRemotePicker,
+            Action::ShowRemoteDesktop,
             Action::ResizePaneLeft,
             Action::ResizePaneRight,
             Action::ResizePaneUp,
@@ -924,6 +928,7 @@ mod tests {
         // and/or user TOML overrides — they have no default chord on
         // purpose (chord exhaustion + low frequency of use).
         let palette_only: &[Action] = &[
+            Action::ShowRemoteDesktop,
             Action::GreetAsciiOrganism,
             Action::InspectAsciiOrganism,
             Action::ExpandVteCompanion,

@@ -50,6 +50,7 @@ mod preview_navigation;
 pub(crate) mod reference_conversation;
 pub(crate) mod reference_shell;
 mod remote_fs;
+mod remote_desktop;
 mod search;
 #[cfg(test)]
 mod search_native_tests;
@@ -441,6 +442,7 @@ pub(crate) struct UiState {
     pub(crate) tab_focus_generation: Rc<Cell<u64>>,
     pub(crate) command_palette_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     pub(crate) remote_picker_dialog: Rc<RefCell<Option<adw::Dialog>>>,
+    pub(crate) remote_desktop_window: Rc<gtk4::glib::WeakRef<gtk4::Window>>,
     pub(crate) history_palette_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     pub(crate) cross_block_search_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     /// Window/dialog-shared physical-key latch for the configurable picker
