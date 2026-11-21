@@ -276,4 +276,9 @@ pub mod workflows;
 
 #[path = "main.rs"]
 pub mod app;
+#[path = "../vendor/jwm-remote/client.rs"]
+mod jwm_remote_session;
+#[path = "../vendor/jwm-remote/gtk.rs"]
+mod jwm_remote_gtk;
+use gtk4 as gtk;
 mod ui;

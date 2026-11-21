@@ -337,6 +337,23 @@ mod tests {
     }
 
     #[test]
+    fn remote_desktop_search_ranks_the_native_viewer_action_first() {
+        for query in ["Remote desktop", ">Remote desktop"] {
+            let results = gather(
+                &Query::parse(query, PaletteMode::All),
+                &KeybindingMap::from_defaults(),
+                &[],
+                &[],
+                12,
+            );
+            assert_eq!(
+                results.first().map(|entry| &entry.accept),
+                Some(&Accept::Action(Action::ShowRemoteDesktop))
+            );
+        }
+    }
+
+    #[test]
     fn prefixes_select_sources() {
         assert_eq!(
             Query::parse("  @ cargo", PaletteMode::All),

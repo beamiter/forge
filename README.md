@@ -25,11 +25,19 @@ forge 是一个面向开发工作流的原生 GTK4 终端。它默认使用 Bloc
 - 可执行 `.jtnb.md` Notebook，逐 cell 运行/停止并分离 stdout 与 stderr
 - 基于现代 GTK4 列表模型的异步文件树、Git 分支/脏状态条、长命令桌面通知
 - SSH 主机选择、连接复用与自动重连
+- JWM 远程桌面会话、授权来源切换和性能状态
 - 可选多 provider AI、可搜索和归档的多会话 Chats 库，以及绑定当前 Block pane 的原生 Shell Agent；每条候选命令均可编辑且需单独批准
 - 配置热重载、可覆盖的应用动作快捷键、8 套内置主题
 - CJK 输入法和 Unicode 安全的搜索/通知显示
 
 分屏会继承当前 pane 的后端：Block 创建 Block sibling，VTE 创建 VTE sibling，并可继续嵌套。每个可见 pane 都独立拥有并清理其进程，关闭 pane、标签或窗口前会统一检查前台任务。
+
+打开命令面板（`Ctrl+Shift+P`），搜索 `>Remote desktop` 并输入 JWM 主机地址。Forge
+使用 PATH 中的 `jwm-remote` 和默认 JWM 密钥，也可填写密钥文件路径。连接默认只读。
+X11 会话可显式启用键盘和鼠标，点击 viewer 画面接管，移出画面或点击面板的
+**Release Input** 交还。面板可切换主机授权的来源，显示实际编码、分辨率和呈现数据。
+Wayland 的显式键鼠授权限于固定来源。释放后可继续只读观看。
+点击 **Disconnect** 或关闭面板会结束会话，画面由独立的原生 viewer 窗口显示。
 
 Ctrl+滚轮按鼠标位置独立缩放：顶部栏与侧栏共用一组字号，主内容区（含分屏、Block/Chat/VTE）为另一组；基础字号与倍率分别保存并在重启后恢复。普通滚动不变，字号快捷键仍控制主内容区。
 

@@ -1412,6 +1412,7 @@ pub fn run() -> glib::ExitCode {
             tab_focus_generation: Rc::new(Cell::new(0)),
             command_palette_dialog: Rc::new(RefCell::new(None)),
             remote_picker_dialog: Rc::new(RefCell::new(None)),
+            remote_desktop_window: Rc::new(glib::WeakRef::new()),
             history_palette_dialog: Rc::new(RefCell::new(None)),
             cross_block_search_dialog: Rc::new(RefCell::new(None)),
             cross_block_search_toggle_latch: Rc::new(RefCell::new(Default::default())),

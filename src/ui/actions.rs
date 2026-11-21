@@ -407,6 +407,7 @@ impl UiState {
             Action::ShowRemotePicker => {
                 self.show_remote_picker();
             }
+            Action::ShowRemoteDesktop => self.show_remote_desktop(),
             Action::ResizePaneLeft => {
                 self.resize_pane(Orientation::Horizontal, -30);
             }
