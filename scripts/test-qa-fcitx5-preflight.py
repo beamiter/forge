@@ -111,14 +111,16 @@ class PreflightTests(unittest.TestCase):
                b"Gtk-WARNING **: Unable to acquire the address of the accessibility bus: hidden. "
                b"If you are attempting to run GTK without a11y support, GTK_A11Y should be set to 'none'.\n"
                b"GLib-WARNING **: Unable to acquire session bus: /another-private-path\n"
-               b"Gtk-WARNING **: Unable to acquire the address of the accessibility bus: fake suffix\n")
+               b"Gtk-WARNING **: Unable to acquire the address of the accessibility bus: fake suffix\n"
+               b"libEGL warning: arbitrary-private-driver-path\n"
+               b"MESA-LOADER: arbitrary-private-device-path\n")
         self.run_probe.return_value = self.result(err=err)
         with self.assertRaisesRegex(preflight.Unavailable, "reported diagnostics") as error:
             self.check()
         self.assertEqual(str(error.exception),
                          f"GTK4 Fcitx probe reported diagnostics (stderr_bytes={len(err)}; "
                          "gtk_im_module_missing=1, gtk_session_bus=1, gtk_accessibility_bus=1, "
-                         "unknown=2; sample_truncated=0)")
+                         "egl_warning=1, mesa_loader=1, unknown=2; sample_truncated=0)")
 
     def test_bounded_diagnostics_unknown_and_truncation(self):
         sample = b"\x00\n" * 80

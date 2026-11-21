@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise matrix orchestration and redaction; no actual display or service."""
+"""Exercise GL-only probe contrast and redaction; no display or engine."""
 
 from contextlib import contextmanager
 import importlib.util
@@ -15,76 +15,81 @@ spec.loader.exec_module(matrix)
 
 
 class MatrixTests(unittest.TestCase):
-    def test_each_factor_pair_gets_one_new_private_scope_and_no_widget_callback(self):
+    def test_each_arm_gets_one_fresh_scope_same_profile_and_no_widget_callback(self):
         inputs, output = [], []
 
-        def run(scope, *, probe_profile, probe_pinyin_bus):
+        def run(scope, *, module_probe_fixture, probe_disable_gl):
             self.assertTrue(scope.is_dir())
             self.assertEqual(scope.stat().st_mode & 0o777, 0o700)
             self.assertEqual(list(scope.iterdir()), [])
-            inputs.append((scope, probe_profile, probe_pinyin_bus))
-            if len(inputs) == 2:
+            self.assertIs(module_probe_fixture, matrix.pinyin)
+            inputs.append((scope, probe_disable_gl))
+            if not probe_disable_gl:
                 raise matrix.hosted.preflight.Unavailable("private diagnostic content")
-            if len(inputs) == 3:
-                raise OSError("private fixture path")
 
         matrix.run_matrix(run, lambda *a, **kw: output.extend(a))
-        self.assertEqual(len(inputs), 4)
-        self.assertEqual(len({scope for scope, _, _ in inputs}), 4)
-        self.assertTrue(all(not scope.exists() for scope, _, _ in inputs))
-        self.assertEqual([(bool(profile), policy) for _, profile, policy in inputs],
-                         [(False, False), (True, False), (False, True), (True, True)])
-        self.assertIn("module-matrix profile=0 pinyin_bus_policy=0 module-selected", output)
-        self.assertIn("module-matrix profile=1 pinyin_bus_policy=0 probe-rejected: "
+        self.assertEqual([flag for _, flag in inputs], [False, True])
+        self.assertNotEqual(inputs[0][0], inputs[1][0])
+        self.assertTrue(all(not scope.exists() for scope, _ in inputs))
+        self.assertIn("module-gl-contrast gl_disabled=0 probe-rejected: "
                       "probe-rejected-without-safe-detail", output)
-        self.assertIn("module-matrix profile=0 pinyin_bus_policy=1 setup-unavailable", output)
-        self.assertIn("module-matrix profile=1 pinyin_bus_policy=1 module-selected", output)
+        self.assertIn("module-gl-contrast gl_disabled=1 module-selected", output)
         self.assertNotIn("private", "\n".join(output))
 
-    def test_module_runner_installs_only_selected_profile_before_starting_daemon(self):
-        hosted = matrix.hosted
-        for profile, policy in matrix.FACTORS:
-            events = []
+    def test_only_probe_environment_changes_and_both_arms_have_pinyin_profile_and_policy(self):
+        h = matrix.hosted
+        for disable_gl in matrix.GL_MODES:
+            daemon_envs = []
 
             @contextmanager
             def bus(scope, **kwargs):
-                events.append(("bus", kwargs))
+                self.assertEqual(kwargs, {"pinyin_fixture": True})
                 yield f"unix:path={scope}/bus"
 
             @contextmanager
             def child(argv, env):
-                events.append(argv[0])
+                daemon_envs.append(env)
+                self.assertNotIn("GDK_DEBUG", env)
                 process = Mock(pid=4242)
                 process.poll.return_value = None
                 if argv[0] == "/usr/bin/fcitx5":
                     config = Path(env["XDG_CONFIG_HOME"]) / "fcitx5"
-                    self.assertEqual(config.exists(), profile)
+                    self.assertIn("DefaultIM=pinyin", original_read(config / "profile"))
                 yield process
 
-            with self.subTest(profile=profile, policy=policy), tempfile.TemporaryDirectory() as d, patch.object(
-                    hosted.owned, "private_bus", side_effect=bus), patch.object(
-                    hosted.owned, "wait_for_owned_peer"), patch.object(
-                    hosted, "child", side_effect=child), patch.object(
-                    hosted.os.path, "lexists", return_value=False), patch.object(
-                    hosted, "make_authority"), patch.object(
-                    hosted, "verify_x_auth"), patch.object(
-                    hosted, "verify_fcitx_owner"), patch.object(
-                    hosted.preflight, "check_probe") as probe, patch.object(
+            original_read = Path.read_text
+            with self.subTest(disable_gl=disable_gl), tempfile.TemporaryDirectory() as d, patch.object(
+                    h.owned, "private_bus", side_effect=bus), patch.object(
+                    h.owned, "wait_for_owned_peer"), patch.object(
+                    h, "child", side_effect=child), patch.object(
+                    h.os.path, "lexists", return_value=False), patch.object(
+                    h, "make_authority"), patch.object(
+                    h, "verify_x_auth"), patch.object(
+                    h, "verify_fcitx_owner"), patch.object(
+                    h.preflight, "check_probe") as probe, patch.object(
                     Path, "read_text", return_value="4242\n"):
-                hosted.run(Path(d), probe_profile=matrix.pinyin.install_profile if profile else None,
-                           probe_pinyin_bus=policy)
-                self.assertEqual(events, [("bus", {"pinyin_fixture": True} if policy else {}),
-                                          "/usr/bin/Xvfb", "/usr/bin/fcitx5"])
+                h.run(Path(d), module_probe_fixture=matrix.pinyin, probe_disable_gl=disable_gl)
                 probe.assert_called_once()
+                self.assertEqual(len(daemon_envs), 2)
+                base = daemon_envs[0]
+                self.assertEqual(daemon_envs[1], base)
+                self.assertEqual(probe.call_args.args[0],
+                                 {**base, "GDK_DEBUG": "gl-disable"} if disable_gl else base)
+
+    def test_disabled_gl_is_rejected_for_non_diagnostic_paths(self):
+        h = matrix.hosted
+        for kwargs in ({}, {"pinyin_fixture": Mock()}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                h.run(None, probe_disable_gl=True, **kwargs)
 
     def test_allow_only_precisely_bounded_numeric_probe_summary(self):
         err = ("GTK4 Fcitx probe reported diagnostics (stderr_bytes=134; "
                "gtk_im_module_missing=0, gtk_session_bus=0, gtk_accessibility_bus=0, "
-               "unknown=2; sample_truncated=0)")
+               "egl_warning=2, mesa_loader=0, unknown=0; sample_truncated=0)")
         self.assertEqual(matrix.classify(RuntimeError(err)), err)
         self.assertEqual(matrix.classify(RuntimeError(err + "\nprivate")),
                          "probe-rejected-without-safe-detail")
-        self.assertEqual(matrix.classify(RuntimeError(err.replace("unknown=2", "unknown=private"))),
+        self.assertEqual(matrix.classify(RuntimeError(err.replace("egl_warning=2", "egl_warning=private"))),
                          "probe-rejected-without-safe-detail")
 
 

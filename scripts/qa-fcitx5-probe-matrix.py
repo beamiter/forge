@@ -18,13 +18,14 @@ def load_pinyin():
 
 pinyin = load_pinyin()
 hosted = pinyin.hosted
-FACTORS = ((False, False), (True, False), (False, True), (True, True))
+GL_MODES = (False, True)
 # Accept only the preflight's fixed numeric/category diagnostics for reporting.
 # Never log exception strings, environment values, or native subprocess output.
 SAFE_PROBE = re.compile(
     r"GTK4 Fcitx probe (?:"
     r"reported diagnostics \(stderr_bytes=[0-9]{1,12}; gtk_im_module_missing=[0-9]{1,2}, "
-    r"gtk_session_bus=[0-9]{1,2}, gtk_accessibility_bus=[0-9]{1,2}, unknown=[0-9]{1,2}; "
+    r"gtk_session_bus=[0-9]{1,2}, gtk_accessibility_bus=[0-9]{1,2}, "
+    r"egl_warning=[0-9]{1,2}, mesa_loader=[0-9]{1,2}, unknown=[0-9]{1,2}; "
     r"sample_truncated=[01]\)|"
     r"timed out after 5s \(stdout=(?:no-output|expected-line|unexpected-output); stderr_bytes=[0-9]{1,12}\))"
 )
@@ -36,13 +37,14 @@ def classify(error):
 
 
 def run_matrix(run=hosted.run, emit=print):
-    for profile, policy in FACTORS:
-        row = f"module-matrix profile={int(profile)} pinyin_bus_policy={int(policy)}"
+    # Keep the failed native lane's profile and policy in both scopes. Only
+    # GTK's graphics initialization in the module subprocess differs.
+    for disable_gl in GL_MODES:
+        row = f"module-gl-contrast gl_disabled={int(disable_gl)}"
         emit(f"{row} begin", flush=True)
         try:
             with tempfile.TemporaryDirectory(prefix="forge-fcitx-factor-", dir="/tmp") as scope:
-                run(Path(scope), probe_profile=pinyin.install_profile if profile else None,
-                    probe_pinyin_bus=policy)
+                run(Path(scope), module_probe_fixture=pinyin, probe_disable_gl=disable_gl)
         except hosted.preflight.Unavailable as error:
             emit(f"{row} probe-rejected: {classify(error)}", flush=True)
         except (hosted.owned.Unavailable, OSError, RuntimeError, subprocess.SubprocessError):

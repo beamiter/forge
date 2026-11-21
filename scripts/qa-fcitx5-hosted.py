@@ -83,9 +83,11 @@ def verify_fcitx_owner(p, env, address, timeout=5):
     raise owned.Unavailable("owned Fcitx5 did not acquire its private D-Bus name")
 
 
-def run(runtime, *, pinyin_fixture=None, probe_profile=None, probe_pinyin_bus=False):
-    if pinyin_fixture is not None and (probe_profile is not None or probe_pinyin_bus):
-        raise ValueError("full Pinyin and diagnostic factors cannot run together")
+def run(runtime, *, pinyin_fixture=None, module_probe_fixture=None, probe_disable_gl=False):
+    if ((pinyin_fixture is not None and module_probe_fixture is not None)
+            or (probe_disable_gl and module_probe_fixture is None)):
+        raise ValueError("diagnostic GL flag is only allowed for a module-only probe")
+    profile = pinyin_fixture if pinyin_fixture is not None else module_probe_fixture
     started = time.monotonic()
 
     def stage(message):
@@ -109,7 +111,7 @@ def run(runtime, *, pinyin_fixture=None, probe_profile=None, probe_pinyin_bus=Fa
            "GTK_IM_MODULE": "fcitx5", "FORGE_FCITX_QA_ISOLATED": "1"}
     stage("starting owned private D-Bus")
     bus = (owned.private_bus(runtime, pinyin_fixture=True)
-           if pinyin_fixture is not None or probe_pinyin_bus else owned.private_bus(runtime))
+           if profile is not None else owned.private_bus(runtime))
     with bus as address:
         stage("owned D-Bus peer and GetId verified")
         env["DBUS_SESSION_BUS_ADDRESS"] = address
@@ -123,14 +125,13 @@ def run(runtime, *, pinyin_fixture=None, probe_profile=None, probe_pinyin_bus=Fa
                 raise owned.Unavailable("private X display lock does not match the owned Xvfb")
             verify_x_auth(env, runtime / "Xauthority-no-cookie")
             stage("owned Xvfb accepted fixture cookie and refused empty authority")
-            if pinyin_fixture is not None:
-                pinyin_fixture.install_profile(env)
-            elif probe_profile is not None:
-                probe_profile(env)
+            if profile is not None:
+                profile.install_profile(env)
             with child(["/usr/bin/fcitx5", "--disable=cloudpinyin"], env) as fcitx:
                 verify_fcitx_owner(fcitx, env, address)
                 stage("owned Fcitx5 D-Bus name verified")
-                preflight.check_probe(env, os.geteuid())
+                probe_env = {**env, "GDK_DEBUG": "gl-disable"} if probe_disable_gl else env
+                preflight.check_probe(probe_env, os.geteuid())
                 if fcitx.poll() is not None:
                     raise owned.Unavailable("owned Fcitx5 exited during GTK preflight")
                 stage("GTK4 selected fcitx5")

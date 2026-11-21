@@ -79,7 +79,8 @@ def stderr_shape(stderr):
         sample = sample[:sample.rfind(b"\n") + 1]  # no partial match
     records = sample.split(b"\n", lines)
     truncated |= len(records) > lines and bool(records[-1])
-    counts = dict(gtk_im_module_missing=0, gtk_session_bus=0, gtk_accessibility_bus=0, unknown=0)
+    counts = dict(gtk_im_module_missing=0, gtk_session_bus=0, gtk_accessibility_bus=0,
+                  egl_warning=0, mesa_loader=0, unknown=0)
     for line in records[:lines]:
         if not line:
             continue
@@ -94,6 +95,12 @@ def stderr_shape(stderr):
               and msg.endswith(b" If you are attempting to run GTK without a11y support, "
                                b"GTK_A11Y should be set to 'none'.")):
             counts["gtk_accessibility_bus"] += 1
+        # Mesa 25.2.8 src/egl/main/egllog.c and src/loader/loader.c.
+        # Only this label is reported, never the message or driver path.
+        elif line.startswith(b"libEGL warning: ") and len(line) > len(b"libEGL warning: "):
+            counts["egl_warning"] += 1
+        elif line.startswith(b"MESA-LOADER: ") and len(line) > len(b"MESA-LOADER: "):
+            counts["mesa_loader"] += 1
         else:
             counts["unknown"] += 1
     return (f"stderr_bytes={len(stderr)}; "
