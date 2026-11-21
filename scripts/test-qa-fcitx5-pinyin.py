@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""Pure policy, focus and event-contract checks; no X11, bus or IM engine."""
+
+import importlib.util
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import Mock, patch
+import xml.etree.ElementTree as ET
+
+p = Path(__file__).with_name("qa-fcitx5-pinyin.py")
+spec = importlib.util.spec_from_file_location("pinyin", p)
+pinyin = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(pinyin)
+
+
+class PinyinTests(unittest.TestCase):
+    def test_preedit_and_one_exact_commit_are_distinct(self):
+        base = ["TEXT EMPTY", "FOCUS ON", "PREEDIT ACTIVE"]
+        self.assertEqual(pinyin.evidence(base), (True, True, False))
+        self.assertEqual(pinyin.evidence(base + ["TEXT EXACT", "PREEDIT CLEAR"]),
+                         (True, False, True))
+        self.assertEqual(pinyin.evidence(base + ["TEXT EXACT", "FOCUS OFF"]),
+                         (False, True, True))
+
+    def test_ascii_leak_or_duplicate_commit_rejected(self):
+        for tail in (["TEXT OTHER"], ["TEXT EXACT", "TEXT EXACT"],
+                     ["TEXT EXACT", "TEXT EMPTY"], ["TEXT EMPTY"]):
+            with self.subTest(tail=tail), self.assertRaises(pinyin.Unavailable):
+                pinyin.evidence(["TEXT EMPTY", *tail])
+
+    def test_witness_path_is_bounded_and_rejects_arbitrary_output(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "events"
+            p.write_bytes(b"TEXT EMPTY\nFOCUS")
+            self.assertEqual(pinyin.observe(p), ["TEXT EMPTY"])
+            for data in (b"\xff\n", b"FAKE\n", b"X" * 8193):
+                p.write_bytes(data)
+                with self.assertRaises(pinyin.Unavailable):
+                    pinyin.observe(p)
+
+    def test_focused_context_requires_exact_fixture_program_and_one_context(self):
+        ident = "ab" * 16
+        active = f"  IC [{ident}] program:forge-fcitx5-gtk-text-fixture frontend:dbus cap:12 focus:1\n"
+
+        def wire(record):
+            return repr((record,)).encode("ascii")
+        self.assertEqual(pinyin.parse_focused_context(wire(active)), ident)
+        for line in (active.replace("focus:1", "focus:0"),
+                     active.replace("frontend:dbus", "frontend:xim"),
+                     active.replace("gtk-text-fixture", "gtk-text-other")):
+            self.assertIsNone(pinyin.parse_focused_context(wire(line)))
+        for bad in (wire(active * 2), b"x" * 16385, b"bad"):
+            with self.assertRaises(pinyin.Unavailable):
+                pinyin.parse_focused_context(bad)
+
+    def test_lost_focus_does_not_send_key_and_no_focus_repair(self):
+        p = Mock()
+        env = {}
+        with patch.object(pinyin, "active_window", return_value=False), patch.object(
+                pinyin, "xdotool") as x:
+            with self.assertRaisesRegex(pinyin.Unavailable, "lost X11 focus"):
+                pinyin.key(p, env, b"41", 1)
+            x.assert_not_called()
+        with patch.object(pinyin, "active_window", return_value=True), patch.object(
+                pinyin, "xdotool", return_value=Mock(returncode=0)) as x:
+            pinyin.key(p, env, b"41", 0)
+            x.assert_called_once_with(env, "key", "ctrl+space")
+
+    def test_opt_in_policy_only_adds_requested_replies_and_four_direct_signals(self):
+        bus = pinyin.hosted.owned
+        policies = []
+        for enabled in (False, True):
+            with tempfile.TemporaryDirectory() as d:
+                with patch.object(bus.subprocess, "Popen", side_effect=OSError):
+                    with self.assertRaises(bus.Unavailable):
+                        with bus.private_bus(Path(d), pinyin_fixture=enabled):
+                            self.fail("fake launch must fail")
+                cfg = ET.parse(Path(d) / "bus.conf")
+                policies.append([rule.attrib for rule in cfg.findall("policy/allow")])
+        base, expanded = policies
+        self.assertEqual(expanded[:len(base)], base)
+        self.assertCountEqual(expanded[len(base):], [
+            {"send_type": t, "send_requested_reply": "true"} for t in ("error", "method_return")
+        ] + [
+            {"send_type": "signal", "send_broadcast": "false",
+             "send_interface": "org.fcitx.Fcitx.InputContext1", "send_member": m}
+            for m in ("CurrentIM", "CommitString", "UpdateFormattedPreedit", "UpdateClientSideUI")
+        ])
+
+
+if __name__ == "__main__":
+    unittest.main()

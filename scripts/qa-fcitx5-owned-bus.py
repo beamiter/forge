@@ -59,7 +59,7 @@ def stop_owned_child(process):
 
 
 @contextmanager
-def private_bus(runtime):
+def private_bus(runtime, *, pinyin_fixture=False):
     """Yield only a verified address; callers own a fresh 0700 runtime."""
     uid = os.geteuid()
     if uid == 0:
@@ -76,6 +76,18 @@ def private_bus(runtime):
     address = f"unix:path={bus}"
     # A custom config does not import system/session service activation dirs.
     # The socket is reachable only within the caller's own private runtime.
+    pinyin_rules = ""
+    if pinyin_fixture:
+        # Fcitx 5.1.7 replies to the requesting connection's unique name and
+        # sends these input-context signals to that same client. Do not grant
+        # unsolicited replies, broadcast sends, or monitoring.
+        pinyin_rules = """
+            <allow send_type="method_return" send_requested_reply="true"/>
+            <allow send_type="error" send_requested_reply="true"/>
+"""
+        for member in ("CurrentIM", "CommitString", "UpdateFormattedPreedit", "UpdateClientSideUI"):
+            pinyin_rules += (f'<allow send_type="signal" send_broadcast="false" '
+                             f'send_interface="org.fcitx.Fcitx.InputContext1" send_member="{member}"/>')
     cfg = runtime / "bus.conf"
     with cfg.open("x") as f:
         f.write(f"""<busconfig>
@@ -91,6 +103,7 @@ def private_bus(runtime):
             <allow receive_sender="org.freedesktop.portal.Fcitx"/>
             <allow own="org.fcitx.Fcitx5"/>
             <allow own="org.freedesktop.portal.Fcitx"/>
+            {pinyin_rules}
           </policy>
         </busconfig>""")
     env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": str(runtime),

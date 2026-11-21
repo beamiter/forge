@@ -1,0 +1,44 @@
+name: Isolated GTK4 Fcitx5 Pinyin canary
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/fcitx5-hosted-pinyin.yml'
+      - 'scripts/qa-fcitx5-gtk-text.c'
+      - 'scripts/qa-fcitx5-hosted.py'
+      - 'scripts/qa-fcitx5-owned-bus.py'
+      - 'scripts/qa-fcitx5-pinyin.py'
+      - 'scripts/test-qa-fcitx5-pinyin.py'
+      - 'scripts/qa-fcitx5-preflight.py'
+
+permissions:
+  contents: read
+
+jobs:
+  gtk-text:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install signed Ubuntu fixture dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libgtk-4-dev libglib2.0-bin dbus-daemon \
+            xvfb xauth x11-utils xdotool openbox fonts-noto-cjk \
+            fcitx5 fcitx5-modules fcitx5-pinyin fcitx5-frontend-gtk4
+          dpkg-query -W libgtk-4-dev dbus-daemon xvfb xdotool openbox \
+            fcitx5 fcitx5-pinyin fcitx5-frontend-gtk4
+      - name: Check evidence and private bus rules
+        run: python3 -I -B scripts/test-qa-fcitx5-pinyin.py
+      - name: Build stock GtkText fixture
+        run: |
+          mkdir -p target
+          cc -Wall -Wextra -Werror scripts/qa-fcitx5-gtk-text.c \
+            -o target/qa-fcitx5-gtk-text $(pkg-config --cflags --libs gtk4)
+      - name: Exercise native Pinyin preedit and one exact commit
+        run: python3 -I -B scripts/qa-fcitx5-pinyin.py

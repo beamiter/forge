@@ -83,7 +83,7 @@ def verify_fcitx_owner(p, env, address, timeout=5):
     raise owned.Unavailable("owned Fcitx5 did not acquire its private D-Bus name")
 
 
-def run(runtime):
+def run(runtime, *, pinyin_fixture=None):
     started = time.monotonic()
 
     def stage(message):
@@ -106,7 +106,9 @@ def run(runtime):
            "DISPLAY": f":{number}", "XAUTHORITY": str(auth), "GDK_BACKEND": "x11",
            "GTK_IM_MODULE": "fcitx5", "FORGE_FCITX_QA_ISOLATED": "1"}
     stage("starting owned private D-Bus")
-    with owned.private_bus(runtime) as address:
+    bus = (owned.private_bus(runtime) if pinyin_fixture is None
+           else owned.private_bus(runtime, pinyin_fixture=True))
+    with bus as address:
         stage("owned D-Bus peer and GetId verified")
         env["DBUS_SESSION_BUS_ADDRESS"] = address
         make_authority(env, auth)
@@ -119,6 +121,8 @@ def run(runtime):
                 raise owned.Unavailable("private X display lock does not match the owned Xvfb")
             verify_x_auth(env, runtime / "Xauthority-no-cookie")
             stage("owned Xvfb accepted fixture cookie and refused empty authority")
+            if pinyin_fixture is not None:
+                pinyin_fixture.install_profile(env)
             with child(["/usr/bin/fcitx5", "--disable=cloudpinyin"], env) as fcitx:
                 verify_fcitx_owner(fcitx, env, address)
                 stage("owned Fcitx5 D-Bus name verified")
@@ -126,7 +130,11 @@ def run(runtime):
                 if fcitx.poll() is not None:
                     raise owned.Unavailable("owned Fcitx5 exited during GTK preflight")
                 stage("GTK4 selected fcitx5")
-    stage("owned processes reaped; engine and terminal remain untested")
+                if pinyin_fixture is not None:
+                    pinyin_fixture.run(env, runtime)
+    stage("owned processes reaped; terminal remains untested"
+          if pinyin_fixture is not None
+          else "owned processes reaped; engine and terminal remain untested")
 
 
 def main():
