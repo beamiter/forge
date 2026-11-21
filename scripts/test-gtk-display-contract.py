@@ -22,7 +22,8 @@ COMPOSER = "ui::ai_panel::tests::composer_limit_preserves_insert_iter_and_utf8_d
 CONTEXT_QUEUE = "ui::workspace_context_ui::tests::pending_context_additions_preserve_order_capacity_and_cancellation"
 A11Y = {DIAGNOSTIC, "ui::tasks_panel::tests::approval_details_are_paged_read_only_and_stale_controls_cannot_decide"}
 IME = {CONTEXT, CONTEXT_QUEUE, COMPOSER, "block_view::tests::native_ime_commit_cancel_and_independent_ptys",
-       "block_view::tests::native_ime_send_button_preserves_composition"}
+       "block_view::tests::native_ime_send_button_preserves_composition",
+       "block_view::tests::native_ime_initial_and_returning_stack_tab_keep_same_owner"}
 FAKE_CHILD = r'''
 import json, os, sys, time
 from pathlib import Path

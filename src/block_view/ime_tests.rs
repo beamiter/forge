@@ -269,3 +269,72 @@ fn native_ime_send_button_preserves_composition() {
     first.pty.kill();
     second.pty.kill();
 }
+
+// Mirror the first and returning tab focus ordering without AppModel or a shell.
+// This uses real X11 scripted keys and GTK simple-IM, not Fcitx or Wayland.
+#[test]
+#[ignore = "requires isolated X11 DISPLAY and GTK_IM_MODULE=simple; run through test-gtk-display.sh"]
+fn native_ime_initial_and_returning_stack_tab_keep_same_owner() {
+    use gtk4::prelude::*;
+    use std::time::Duration;
+
+    assert_eq!(std::env::var("GTK_IM_MODULE").as_deref(), Ok("simple"));
+    gtk4::init().expect("GTK display");
+    for mode in [
+        crate::config::TerminalMode::Block,
+        crate::config::TerminalMode::Chat,
+        crate::config::TerminalMode::Unified,
+    ] {
+        let view = chat_display_view(mode.clone());
+        view.block_onboarding.history_resolved(false);
+        let other = gtk4::Entry::new();
+        let stack = gtk4::Stack::new();
+        stack.set_transition_type(gtk4::StackTransitionType::None);
+        stack.add_named(&view.root, Some("terminal"));
+        stack.add_named(&other, Some("other"));
+        let window = gtk4::Window::builder()
+            .title("forge-native-ime-qa")
+            .default_width(800)
+            .default_height(600)
+            .child(&stack)
+            .build();
+        assert!(!view.active_vte.is_mapped());
+        stack.set_visible_child_name("terminal");
+        view.grab_focus();
+        window.present();
+        for returning in [false, true] {
+            if returning {
+                stack.set_visible_child_name("other");
+                chat_display_settle();
+                assert!(other.is_mapped());
+                assert!(other.grab_focus());
+                chat_display_settle();
+                assert!(!view.active_vte.is_mapped());
+                stack.set_visible_child_name("terminal");
+                view.grab_focus();
+            }
+            chat_display_settle();
+            assert!(
+                view.active_vte.is_mapped() && view.active_vte.has_focus(),
+                "{mode:?}, returning={returning}: terminal must own focus after layout"
+            );
+            view.pty.drain_test_slave(Duration::from_millis(30));
+            native_ime_keys("compose");
+            assert!(
+                view.pty
+                    .drain_test_slave(Duration::from_millis(30))
+                    .is_empty(),
+                "{mode:?}, returning={returning}: preedit must not reach the PTY"
+            );
+            native_ime_keys("commit");
+            native_ime_expect(&view.pty, "中".as_bytes());
+            assert!(
+                other.text().is_empty(),
+                "hidden sibling must not receive input"
+            );
+        }
+        window.close();
+        view.pty.kill();
+        chat_display_settle();
+    }
+}
