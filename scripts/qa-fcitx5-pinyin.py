@@ -51,7 +51,11 @@ Layout=
     (config / "config").write_text("[Hotkey/TriggerKeys]\n0=Control+space\n")
 
 
-def observe(path):
+WINDOW_EVENT = re.compile(r"WINDOW (GTK-READY|REALIZED (NO-XID|[1-9][0-9]{0,9})|"
+                          r"MAPPED|UNMAPPED|PRESENT-RETURNED)")
+
+
+def read_witness(path):
     with path.open("rb") as f:
         raw = f.read(8193)
     if len(raw) > 8192:
@@ -61,6 +65,13 @@ def observe(path):
         values = [line.decode("ascii") for line in lines]
     except UnicodeDecodeError:
         raise Unavailable("GtkText witness protocol invalid") from None
+    return values
+
+
+def observe(path, window_witness=False):
+    values = read_witness(path)
+    if window_witness:
+        values = [v for v in values if not WINDOW_EVENT.fullmatch(v)]
     if any(value not in EVENTS for value in values):
         raise Unavailable("GtkText witness protocol invalid")
     return values
@@ -99,6 +110,66 @@ def find_window(p, env):
     if len(ids) != 1 or not re.fullmatch(rb"[1-9][0-9]*", ids[0]):
         raise Unavailable("GtkText fixture window identity ambiguous")
     return ids[0]
+
+
+def diagnose_window(p, env, witness):
+    """Bounded read-only evidence. Never provides an XID to the input gate."""
+    try:
+        lines = read_witness(witness)
+    except (OSError, Unavailable):
+        lines = []
+        protocol = "unavailable"
+    else:
+        protocol = ("valid" if all(v in EVENTS or WINDOW_EVENT.fullmatch(v)
+                                   for v in lines) else "invalid")
+        if protocol != "valid":
+            lines = []
+    status = "running" if p.poll() is None else "exited"
+    lifecycle = [v for v in lines if v in ("WINDOW MAPPED", "WINDOW UNMAPPED")]
+    mapping = (lifecycle[-1].split()[-1].lower() if lifecycle else "unseen")
+    xids = [v.rsplit(" ", 1)[-1] for v in lines if v.startswith("WINDOW REALIZED ")]
+    xid = (xids[0] if len(xids) == 1 and xids[0] != "NO-XID"
+           and int(xids[0]) <= 0xffffffff else None)
+    xid_kind = "single" if xid else "unavailable"
+    view = pid = name = legacy_name = "unavailable"
+    if xid is not None:
+        # Trust only the owned child witness and the already authenticated private X display.
+        xid_arg = f"0x{int(xid):x}"
+
+        query_env = {**env, "LC_ALL": "C"}  # fixed locale for X11 CLI output, not the GTK child
+
+        def query(argv):
+            try:
+                result = hosted.command(argv, query_env, timeout=1)
+            except (OSError, subprocess.SubprocessError):
+                return b""
+            return result.stdout if result.returncode == 0 and len(result.stdout) <= 4096 else b""
+
+        info = query(["/usr/bin/xwininfo", "-id", xid_arg, "-stats"])
+        state = re.findall(rb"^ +Map State: (IsViewable|IsUnviewable|IsUnMapped)$", info, re.MULTILINE)
+        if len(state) == 1:
+            view = {b"IsViewable": "viewable", b"IsUnviewable": "unviewable",
+                    b"IsUnMapped": "unmapped"}[state[0]]
+        props = query(["/usr/bin/xprop", "-id", xid_arg, "_NET_WM_PID", "_NET_WM_NAME", "WM_NAME"])
+        owner = re.findall(rb"^_NET_WM_PID\(CARDINAL\) = ([1-9][0-9]{0,9})$", props, re.MULTILINE)
+        if len(owner) == 1:
+            pid = "match" if owner[0] == str(p.pid).encode("ascii") else "mismatch"
+        for prop, expected in ((b"_NET_WM_NAME", b"(UTF8_STRING) = "),
+                               (b"WM_NAME", b"(STRING) = ")):
+            values = [v[len(prop + expected):] for v in props.splitlines()
+                      if v.startswith(prop + expected)]
+            match = "unavailable"
+            if len(values) == 1:
+                match = "match" if values[0] == b'"Forge Fcitx5 Pinyin QA"' else "mismatch"
+            if prop == b"_NET_WM_NAME":
+                name = match
+            else:
+                legacy_name = match
+    print("GtkText window diagnostic:"
+          f" process={status} witness={protocol} gtk_ready={int('WINDOW GTK-READY' in lines)}"
+          f" realized={int(bool(xids))} widget_map={mapping}"
+          f" present_returned={int('WINDOW PRESENT-RETURNED' in lines)} surface_xid={xid_kind}"
+          f" x_view={view} x_pid={pid} x_net_name={name} x_legacy_name={legacy_name}", flush=True)
 
 
 def window_manager_ready(p, env):
@@ -152,9 +223,10 @@ def key(p, env, target, index):
 
 
 @contextmanager
-def editor(binary, env, witness):
+def editor(binary, env, witness, *, window_witness=False):
     with witness.open("xb") as out:
-        p = subprocess.Popen([str(binary)], env=env, stdin=subprocess.DEVNULL,
+        args = [str(binary), "--window-witness"] if window_witness else [str(binary)]
+        p = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL,
                              stdout=out, stderr=subprocess.DEVNULL)
         try:
             yield p
@@ -172,9 +244,15 @@ class Pinyin:
         witness = runtime / "gtk-text.events"
         with hosted.child(["/usr/bin/openbox", "--sm-disable"], env) as wm:
             wait(lambda: window_manager_ready(wm, env), "private window manager did not become ready")
-            with editor(self.binary, hosted.gtk_debug_environment(env, disable_gl), witness) as p:
-                target = wait(lambda: find_window(p, env), "no owned GtkText window")
-                wait(lambda: active_window(p, env, target) and evidence(observe(witness))[0],
+            with editor(self.binary, hosted.gtk_debug_environment(env, disable_gl), witness,
+                        window_witness=disable_gl) as p:
+                try:
+                    target = wait(lambda: find_window(p, env), "no owned GtkText window")
+                except (Unavailable, subprocess.SubprocessError):
+                    if disable_gl:
+                        diagnose_window(p, env, witness)
+                    raise
+                wait(lambda: active_window(p, env, target) and evidence(observe(witness, disable_gl))[0],
                      "GtkText did not get focus naturally")
                 context = wait(lambda: focused_context(env), "no focused GtkText D-Bus context")
                 key(p, env, target, 0)  # configured Pinyin trigger, not a CLI switch
@@ -189,7 +267,7 @@ class Pinyin:
                     key(p, env, target, i)
 
                 def preedit_only():
-                    focused, preedit, committed = evidence(observe(witness))
+                    focused, preedit, committed = evidence(observe(witness, disable_gl))
                     if committed:
                         raise Unavailable("GtkText committed before candidate selection")
                     return focused and preedit
@@ -199,7 +277,7 @@ class Pinyin:
                 key(p, env, target, 6)
 
                 def committed():
-                    focused, preedit, exact = evidence(observe(witness))
+                    focused, preedit, exact = evidence(observe(witness, disable_gl))
                     return focused and exact and not preedit
                 wait(committed, "GtkText did not observe one exact UTF-8 commit")
                 time.sleep(.15)

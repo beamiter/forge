@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Pure policy, focus and event-contract checks; no X11, bus or IM engine."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 import importlib.util
+from io import StringIO
 from pathlib import Path
 import tempfile
+import subprocess
 import unittest
 from unittest.mock import MagicMock
 from unittest.mock import Mock, patch
@@ -87,7 +89,8 @@ class PinyinTests(unittest.TestCase):
             w.poll.return_value = None
 
             @contextmanager
-            def editor(binary, env, witness):
+            def editor(binary, env, witness, *, window_witness):
+                self.assertIs(window_witness, disabled)
                 self.assertEqual(env, {"GDK_DEBUG": "gl-disable"} if disabled else {})
                 witness.write_text("TEXT EMPTY\nFOCUS ON\n")
                 yield w
@@ -123,6 +126,98 @@ class PinyinTests(unittest.TestCase):
                 else:
                     fixture.run({}, scope, disable_gl=disabled)
                     self.assertEqual(actions, list(range(7)))
+
+    def test_lifecycle_witness_is_opt_in_and_strict(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "events"
+            path.write_text("WINDOW GTK-READY\nWINDOW REALIZED 41\nTEXT EMPTY\n"
+                            "WINDOW MAPPED\nWINDOW PRESENT-RETURNED\n")
+            with self.assertRaises(pinyin.Unavailable):
+                pinyin.observe(path)
+            self.assertEqual(pinyin.observe(path, True), ["TEXT EMPTY"])
+            with path.open("a") as out:
+                out.write("WINDOW REALIZED /private/not-a-number\n")
+            with self.assertRaises(pinyin.Unavailable):
+                pinyin.observe(path, True)
+
+    def test_window_failure_is_observed_without_fallback_or_keys(self):
+        w = Mock(pid=101)
+        w.poll.return_value = None
+
+        for diagnostic in (False, True):
+            for visible in (False, True):
+                @contextmanager
+                def editor(binary, env, witness, *, window_witness):
+                    self.assertIs(window_witness, diagnostic)
+                    witness.write_text("WINDOW GTK-READY\nWINDOW REALIZED 41\nWINDOW MAPPED\n"
+                                       "WINDOW PRESENT-RETURNED\n" if diagnostic else "")
+                    yield w
+
+                def command(argv, env, timeout):
+                    self.assertEqual(env, {"LC_ALL": "C"})
+                    self.assertEqual(timeout, 1)
+                    self.assertEqual(argv[1:3], ["-id", "0x29"])
+                    if argv[0] == "/usr/bin/xwininfo":
+                        return Mock(returncode=0, stdout=(b"  Map State: IsViewable\n" if visible
+                                                          else b"  Map State: IsUnviewable\n"))
+                    self.assertEqual(argv[0], "/usr/bin/xprop")
+                    if not visible:
+                        raise subprocess.TimeoutExpired(argv, timeout)
+                    return Mock(returncode=0, stdout=b"_NET_WM_PID(CARDINAL) = 102\n"
+                                b'_NET_WM_NAME(UTF8_STRING) = "Forge Fcitx5 Pinyin QA"\n'
+                                b'WM_NAME(STRING) = "not the synthetic title /private/value"\n')
+
+                clock = iter((0, 1, 2, 3, 7))
+                out = StringIO()
+                with (self.subTest(diagnostic=diagnostic, visible=visible),
+                      tempfile.TemporaryDirectory() as d,
+                      patch.object(pinyin.hosted, "child", return_value=MagicMock()),
+                      patch.object(pinyin, "window_manager_ready", return_value=True)):
+                    with patch.object(pinyin, "editor", side_effect=editor), patch.object(
+                            pinyin, "xdotool", return_value=Mock(returncode=1)) as x, patch.object(
+                            pinyin.hosted, "command", side_effect=command) as query, patch.object(
+                            pinyin, "key") as key, patch.object(pinyin.time, "sleep"), patch.object(
+                            pinyin.time, "monotonic", side_effect=lambda: next(clock)), redirect_stdout(out):
+                        env = {"LC_ALL": "C"}
+                        with self.assertRaisesRegex(pinyin.Unavailable, "^no owned GtkText window$"):
+                            pinyin.Pinyin(Path("/synthetic")).run(env, Path(d), disable_gl=diagnostic)
+                        x.assert_called_once_with(env, "search", "--all", "--onlyvisible", "--pid", "101",
+                                                  "--name", pinyin.TITLE)
+                        key.assert_not_called()
+                    msg = out.getvalue()
+                    self.assertEqual(query.call_count, 2 if diagnostic else 0)
+                    if diagnostic:
+                        self.assertIn("gtk_ready=1 realized=1 widget_map=mapped present_returned=1", msg)
+                        if visible:
+                            self.assertIn("x_view=viewable x_pid=mismatch x_net_name=match x_legacy_name=mismatch", msg)
+                        else:
+                            self.assertIn("x_view=unviewable x_pid=unavailable", msg)
+                        self.assertNotIn("/private", msg)
+                        self.assertNotIn("0x29", msg)
+                    else:
+                        self.assertEqual(msg, "")
+
+    def test_window_diagnostic_without_single_bounded_xid_never_queries_display(self):
+        w = Mock()
+        w.poll.return_value = 1
+        cases = (("WINDOW GTK-READY\n", "realized=0"),
+                 ("WINDOW REALIZED NO-XID\n", "realized=1"),
+                 ("WINDOW REALIZED 4294967296\n", "realized=1"),
+                 ("WINDOW REALIZED 41\nWINDOW REALIZED 42\n", "realized=1"),
+                 ("WINDOW REALIZED /private/value\n", "witness=invalid"))
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "events"
+            for data, evidence in cases:
+                with self.subTest(data=data), patch.object(pinyin.hosted, "command") as command:
+                    out = StringIO()
+                    path.write_text(data)
+                    with redirect_stdout(out):
+                        pinyin.diagnose_window(w, {}, path)
+                    self.assertIn("process=exited", out.getvalue())
+                    self.assertIn("surface_xid=unavailable", out.getvalue())
+                    self.assertIn(evidence, out.getvalue())
+                    self.assertNotIn("/private", out.getvalue())
+                    command.assert_not_called()
 
     def test_opt_in_policy_only_adds_requested_replies_and_four_direct_signals(self):
         bus = pinyin.hosted.owned
