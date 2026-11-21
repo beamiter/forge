@@ -69,7 +69,10 @@ def verify_fcitx_owner(p, env, address, timeout=5):
             "--dest", "org.freedesktop.DBus", "--object-path", "/org/freedesktop/DBus",
             "--method", "org.freedesktop.DBus.GetConnectionUnixProcessID", "org.fcitx.Fcitx5"]
     while time.monotonic() < deadline and p.poll() is None:
-        result = command(argv, env, timeout=min(1.5, max(.001, deadline - time.monotonic())))
+        try:
+            result = command(argv, env, timeout=min(1.5, max(.001, deadline - time.monotonic())))
+        except subprocess.TimeoutExpired:
+            raise owned.Unavailable("owned Fcitx5 D-Bus owner query timed out") from None
         if result.returncode == 0:
             if result.stderr or not expected.fullmatch(result.stdout):
                 raise owned.Unavailable("private Fcitx5 bus owner is not the launched daemon")

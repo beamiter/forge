@@ -84,6 +84,11 @@ def private_bus(runtime):
             <allow send_destination="org.freedesktop.DBus"/>
             <allow send_destination="org.fcitx.Fcitx5"/>
             <allow send_destination="org.freedesktop.portal.Fcitx"/>
+            <!-- Custom bus receive policy defaults to deny, including the
+                 bus driver's initial Hello reply and its owner-change signals. -->
+            <allow receive_sender="org.freedesktop.DBus"/>
+            <allow receive_sender="org.fcitx.Fcitx5"/>
+            <allow receive_sender="org.freedesktop.portal.Fcitx"/>
             <allow own="org.fcitx.Fcitx5"/>
             <allow own="org.freedesktop.portal.Fcitx"/>
           </policy>
@@ -98,11 +103,14 @@ def private_bus(runtime):
         raise Unavailable("private D-Bus daemon is unavailable") from exc
     try:
         wait_for_owned_peer(process, bus, uid)
-        reply = subprocess.run(
-            [CLIENT, "call", "--address", address, "--timeout", "2",
-             "--dest", "org.freedesktop.DBus", "--object-path", "/org/freedesktop/DBus",
-             "--method", "org.freedesktop.DBus.GetId"],
-            capture_output=True, env=env, timeout=3, check=False)
+        try:
+            reply = subprocess.run(
+                [CLIENT, "call", "--address", address, "--timeout", "2",
+                 "--dest", "org.freedesktop.DBus", "--object-path", "/org/freedesktop/DBus",
+                 "--method", "org.freedesktop.DBus.GetId"],
+                capture_output=True, env=env, timeout=3, check=False)
+        except subprocess.TimeoutExpired:
+            raise Unavailable("owned private D-Bus Hello/GetId readiness timed out") from None
         if (process.poll() is not None or reply.returncode or reply.stderr
                 or not re.fullmatch(rb"\('[0-9a-f]{32}',\)\n", reply.stdout)):
             raise Unavailable("private bus did not answer the exact GetId readiness query")

@@ -8,6 +8,7 @@ import struct
 import subprocess
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from unittest.mock import Mock, patch
 
 p = Path(__file__).with_name("qa-fcitx5-owned-bus.py")
@@ -64,7 +65,7 @@ class OwnedBusTests(unittest.TestCase):
                 bus.wait_for_owned_peer(self.process(), Path("/tmp/test-fixture/bus"), self.uid,
                                         timeout=0.04)
 
-    def launch(self, reply, connectivity=None):
+    def launch(self, reply, connectivity=None, client_error=None):
         with tempfile.TemporaryDirectory(prefix="forge-bus-test-", dir="/tmp") as d:
             scope = Path(d)
             daemon = self.process()
@@ -74,11 +75,15 @@ class OwnedBusTests(unittest.TestCase):
                    "DISPLAY": ":0", "WAYLAND_DISPLAY": "wayland-0", "HOME": "/ambient"}
             with patch.dict(bus.os.environ, env), patch.object(bus.subprocess, "Popen", return_value=daemon) as spawn, patch.object(
                     bus, "wait_for_owned_peer", side_effect=connectivity) as ready, patch.object(
-                    bus.subprocess, "run", return_value=answer) as call:
-                if connectivity is not None or reply != (0, b"('0123456789abcdef0123456789abcdef',)\n", b""):
-                    with self.assertRaises(bus.Unavailable):
+                    bus.subprocess, "run", return_value=answer, side_effect=client_error) as call:
+                if connectivity is not None or client_error is not None or reply != (0, b"('0123456789abcdef0123456789abcdef',)\n", b""):
+                    with self.assertRaises(bus.Unavailable) as caught:
                         with bus.private_bus(scope):
                             self.fail("readiness must not yield")
+                    if client_error is not None:
+                        self.assertEqual(str(caught.exception),
+                                         "owned private D-Bus Hello/GetId readiness timed out")
+                        self.assertNotIn("do-not-leak", str(caught.exception))
                 else:
                     with bus.private_bus(scope) as actual:
                         self.assertEqual(actual, f"unix:path={scope}/bus")
@@ -93,9 +98,15 @@ class OwnedBusTests(unittest.TestCase):
                 cfg = (scope / "bus.conf").read_text()
                 self.assertIn(f"<listen>unix:path={scope}/bus</listen>", cfg)
                 self.assertNotIn("standard_session_servicedirs", cfg)
-                self.assertNotIn("eavesdrop", cfg)
-                self.assertNotIn('own="*"', cfg)
-                self.assertIn('own="org.fcitx.Fcitx5"', cfg)
+                xml = ET.fromstring(cfg)
+                self.assertEqual(xml.find("auth").text, "EXTERNAL")
+                self.assertEqual([item.text for item in xml.findall("listen")],
+                                 [f"unix:path={scope}/bus"])
+                rules = [rule.attrib for rule in xml.findall("policy/allow")]
+                names = {"org.freedesktop.DBus", "org.fcitx.Fcitx5", "org.freedesktop.portal.Fcitx"}
+                self.assertCountEqual(rules, [{"send_destination": n} for n in names] +
+                                      [{"receive_sender": n} for n in names] +
+                                      [{"own": n} for n in names - {"org.freedesktop.DBus"}])
                 if connectivity is not None:
                     call.assert_not_called()
                 else:
@@ -114,6 +125,10 @@ class OwnedBusTests(unittest.TestCase):
         self.launch((0, b"('0123456789abcdef0123456789abcdef',)\n", b"warning"))
         self.launch((0, b"('0123456789abcdef0123456789abcdef',)\n", b""),
                     connectivity=bus.Unavailable("not owned"))
+
+    def test_getid_timeout_redacts_address_and_reaps(self):
+        self.launch((0, b"", b""), client_error=subprocess.TimeoutExpired(
+            ["gdbus", "--address", "unix:path=/do-not-leak"], 3))
 
     def test_preexisting_bus_never_spawns_daemon(self):
         with tempfile.TemporaryDirectory(prefix="forge-bus-test-", dir="/tmp") as d:

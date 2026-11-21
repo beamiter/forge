@@ -54,6 +54,16 @@ class HostedTests(unittest.TestCase):
                 self.assertEqual(args[-1], "org.fcitx.Fcitx5")
                 self.assertIs(sent_env, env)
 
+    def test_private_owner_query_timeout_redacts_command_and_address(self):
+        p = Mock(pid=4242)
+        p.poll.return_value = None
+        address = "unix:path=/do-not-leak/bus"
+        failure = subprocess.TimeoutExpired(["gdbus", "--address", address], 1.5)
+        with patch.object(hosted, "command", side_effect=failure):
+            with self.assertRaisesRegex(hosted.owned.Unavailable, "owner query timed out") as error:
+                hosted.verify_fcitx_owner(p, {}, address)
+            self.assertNotIn(address, str(error.exception))
+
     def execute(self, auth_denied):
         events = []
 
