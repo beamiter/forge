@@ -47,7 +47,7 @@ jobs:
       - name: Exercise native Pinyin preedit and one exact commit
         id: native_pinyin
         run: python3 -I -B scripts/qa-fcitx5-pinyin.py
-      - name: Contrast default and disabled GL module probes after a failed native canary
+      - name: Diagnose full stock GtkText with GL disabled after a failed native canary
         if: ${{ failure() && steps.native_pinyin.outcome == 'failure' }}
         timeout-minutes: 2
-        run: python3 -I -B scripts/qa-fcitx5-probe-matrix.py
+        run: python3 -I -B scripts/qa-fcitx5-pinyin.py --diagnostic-gl-disabled

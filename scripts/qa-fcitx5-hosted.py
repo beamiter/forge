@@ -83,10 +83,17 @@ def verify_fcitx_owner(p, env, address, timeout=5):
     raise owned.Unavailable("owned Fcitx5 did not acquire its private D-Bus name")
 
 
-def run(runtime, *, pinyin_fixture=None, module_probe_fixture=None, probe_disable_gl=False):
+def gtk_debug_environment(env, disable_gl):
+    """The diagnostic GL option belongs only to the two GTK child processes."""
+    return {**env, "GDK_DEBUG": "gl-disable"} if disable_gl else env
+
+
+def run(runtime, *, pinyin_fixture=None, module_probe_fixture=None, probe_disable_gl=False,
+        pinyin_gl_diagnostic=False):
     if ((pinyin_fixture is not None and module_probe_fixture is not None)
-            or (probe_disable_gl and module_probe_fixture is None)):
-        raise ValueError("diagnostic GL flag is only allowed for a module-only probe")
+            or (probe_disable_gl and module_probe_fixture is None)
+            or (pinyin_gl_diagnostic and pinyin_fixture is None)):
+        raise ValueError("GL diagnostics require the explicitly selected fixture")
     profile = pinyin_fixture if pinyin_fixture is not None else module_probe_fixture
     started = time.monotonic()
 
@@ -130,13 +137,13 @@ def run(runtime, *, pinyin_fixture=None, module_probe_fixture=None, probe_disabl
             with child(["/usr/bin/fcitx5", "--disable=cloudpinyin"], env) as fcitx:
                 verify_fcitx_owner(fcitx, env, address)
                 stage("owned Fcitx5 D-Bus name verified")
-                probe_env = {**env, "GDK_DEBUG": "gl-disable"} if probe_disable_gl else env
+                probe_env = gtk_debug_environment(env, probe_disable_gl or pinyin_gl_diagnostic)
                 preflight.check_probe(probe_env, os.geteuid())
                 if fcitx.poll() is not None:
                     raise owned.Unavailable("owned Fcitx5 exited during GTK preflight")
                 stage("GTK4 selected fcitx5")
                 if pinyin_fixture is not None:
-                    pinyin_fixture.run(env, runtime)
+                    pinyin_fixture.run(env, runtime, disable_gl=pinyin_gl_diagnostic)
     stage("owned processes reaped; terminal remains untested"
           if pinyin_fixture is not None
           else "owned processes reaped; engine and terminal remain untested")

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Pure policy, focus and event-contract checks; no X11, bus or IM engine."""
 
+from contextlib import contextmanager
 import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import MagicMock
 from unittest.mock import Mock, patch
 import xml.etree.ElementTree as ET
 
@@ -66,6 +68,61 @@ class PinyinTests(unittest.TestCase):
                 pinyin, "xdotool", return_value=Mock(returncode=0)) as x:
             pinyin.key(p, env, b"41", 0)
             x.assert_called_once_with(env, "key", "ctrl+space")
+
+    def test_only_exact_diagnostic_cli_flag_can_select_experiment(self):
+        for args, want in (([], False), (["--diagnostic-gl-disabled"], True)):
+            with self.subTest(args=args), patch.object(Path, "is_file", return_value=True), patch.object(
+                    pinyin.os, "access", return_value=True), patch.object(pinyin.hosted, "run") as run:
+                self.assertEqual(pinyin.main(args), 0)
+                self.assertIs(run.call_args.kwargs["pinyin_gl_diagnostic"], want)
+                self.assertIsInstance(run.call_args.kwargs["pinyin_fixture"], pinyin.Pinyin)
+        with patch.object(pinyin.hosted, "run") as run:
+            self.assertEqual(pinyin.main(["--diagnostic-gl-disabled", "extra"]), 2)
+            run.assert_not_called()
+
+    def test_witness_rules_and_key_order_are_the_same_with_gl_disabled(self):
+        for disabled, leak in ((False, False), (True, False), (True, True)):
+            actions = []
+            w = Mock()
+            w.poll.return_value = None
+
+            @contextmanager
+            def editor(binary, env, witness):
+                self.assertEqual(env, {"GDK_DEBUG": "gl-disable"} if disabled else {})
+                witness.write_text("TEXT EMPTY\nFOCUS ON\n")
+                yield w
+
+            def press(p, env, target, index):
+                self.assertEqual(env, {})
+                actions.append(index)
+                if index == 5:
+                    with (scope / "gtk-text.events").open("a") as out:
+                        out.write(("TEXT OTHER\n" if leak else "PREEDIT ACTIVE\n"))
+                if index == 6:
+                    with (scope / "gtk-text.events").open("a") as out:
+                        out.write("TEXT EXACT\nPREEDIT CLEAR\n")
+
+            def command(args, env):
+                return Mock(returncode=0, stdout=b"pinyin\n" if args[-1] == "-n" else b"2\n")
+
+            with self.subTest(disabled=disabled, leak=leak), tempfile.TemporaryDirectory() as d, patch.object(
+                    pinyin.hosted, "child", return_value=MagicMock()), patch.object(
+                    pinyin, "window_manager_ready", return_value=True), patch.object(
+                    pinyin, "editor", side_effect=editor), patch.object(
+                    pinyin, "find_window", return_value=b"41"), patch.object(
+                    pinyin, "active_window", return_value=True), patch.object(
+                    pinyin, "focused_context", return_value="ab" * 16), patch.object(
+                    pinyin, "key", side_effect=press), patch.object(
+                    pinyin.hosted, "command", side_effect=command), patch.object(pinyin.time, "sleep"):
+                scope = Path(d)
+                fixture = pinyin.Pinyin(Path("/synthetic-binary"))
+                if leak:
+                    with self.assertRaisesRegex(pinyin.Unavailable, "unexpected or duplicate"):
+                        fixture.run({}, scope, disable_gl=disabled)
+                    self.assertEqual(actions, list(range(6)))
+                else:
+                    fixture.run({}, scope, disable_gl=disabled)
+                    self.assertEqual(actions, list(range(7)))
 
     def test_opt_in_policy_only_adds_requested_replies_and_four_direct_signals(self):
         bus = pinyin.hosted.owned

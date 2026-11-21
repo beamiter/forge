@@ -168,11 +168,11 @@ class Pinyin:
 
     install_profile = staticmethod(install_profile)
 
-    def run(self, env, runtime):
+    def run(self, env, runtime, *, disable_gl=False):
         witness = runtime / "gtk-text.events"
         with hosted.child(["/usr/bin/openbox", "--sm-disable"], env) as wm:
             wait(lambda: window_manager_ready(wm, env), "private window manager did not become ready")
-            with editor(self.binary, env, witness) as p:
+            with editor(self.binary, hosted.gtk_debug_environment(env, disable_gl), witness) as p:
                 target = wait(lambda: find_window(p, env), "no owned GtkText window")
                 wait(lambda: active_window(p, env, target) and evidence(observe(witness))[0],
                      "GtkText did not get focus naturally")
@@ -206,17 +206,26 @@ class Pinyin:
                 if (not committed() or not active_window(p, env, target)
                         or focused_context(env) != context):
                     raise Unavailable("GtkText final commit/focus did not stay stable")
-        print("Stock GTK4 GtkText accepted one private Fcitx5 Pinyin commit; terminal untested")
+        lane = "GL-disabled diagnostic: " if disable_gl else ""
+        print(f"{lane}Stock GTK4 GtkText accepted one private Fcitx5 Pinyin commit; terminal untested")
 
 
-def main():
+def main(argv=None):
+    args = sys.argv[1:] if argv is None else argv
+    if args not in ([], ["--diagnostic-gl-disabled"]):
+        print("Expected no arguments or --diagnostic-gl-disabled", file=sys.stderr)
+        return 2
+    diagnostic = bool(args)
+    if diagnostic:
+        print("GL-disabled stock GtkText diagnostic; normal native gate outcome is unchanged", flush=True)
     try:
         # No arbitrary executable input: runner builds the fixed sibling fixture.
         binary = Path(__file__).parent.parent / "target" / "qa-fcitx5-gtk-text"
         if binary.is_symlink() or not binary.is_file() or not os.access(binary, os.X_OK):
             raise Unavailable("build the owned GtkText fixture before running this lane")
         with tempfile.TemporaryDirectory(prefix="forge-fcitx-pinyin-", dir="/tmp") as scope:
-            hosted.run(Path(scope), pinyin_fixture=Pinyin(binary.resolve()))
+            hosted.run(Path(scope), pinyin_fixture=Pinyin(binary.resolve()),
+                       pinyin_gl_diagnostic=diagnostic)
     except (Unavailable, hosted.preflight.Unavailable, OSError, RuntimeError, subprocess.SubprocessError):
         # Do not log exception strings that can include private scope addresses.
         exc = sys.exc_info()[1]

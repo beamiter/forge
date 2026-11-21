@@ -64,11 +64,13 @@ class HostedTests(unittest.TestCase):
                 hosted.verify_fcitx_owner(p, {}, address)
             self.assertNotIn(address, str(error.exception))
 
-    def execute(self, auth_denied):
+    def execute(self, auth_denied, diagnostic=False):
         events = []
+        fixture = Mock() if diagnostic else None
 
         @contextmanager
-        def private_bus(runtime):
+        def private_bus(runtime, **kwargs):
+            self.assertEqual(kwargs, {"pinyin_fixture": True} if diagnostic else {})
             events.append("bus")
             try:
                 yield f"unix:path={runtime}/bus"
@@ -80,6 +82,7 @@ class HostedTests(unittest.TestCase):
             self.assertNotIn("DBUS_SYSTEM_BUS_ADDRESS", env)
             self.assertNotIn("WAYLAND_DISPLAY", env)
             self.assertNotIn("WAYLAND_SOCKET", env)
+            self.assertNotIn("GDK_DEBUG", env)
             daemon = Mock(pid=4141)
             daemon.poll.return_value = None
             events.append(argv[0])
@@ -103,15 +106,26 @@ class HostedTests(unittest.TestCase):
                 owner.assert_not_called()
                 probe.assert_not_called()
             else:
-                hosted.run(Path(d))
+                hosted.run(Path(d), pinyin_fixture=fixture, pinyin_gl_diagnostic=diagnostic)
                 self.assertEqual(events, ["bus", "/usr/bin/Xvfb", "/usr/bin/fcitx5",
                                           "stop /usr/bin/fcitx5", "stop /usr/bin/Xvfb", "bus stopped"])
                 owner.assert_called_once()
                 probe.assert_called_once()
+                self.assertEqual(probe.call_args.args[0].get("GDK_DEBUG"), "gl-disable" if diagnostic else None)
+                if diagnostic:
+                    fixture.install_profile.assert_called_once()
+                    fixture.run.assert_called_once()
+                    app_env, app_runtime = fixture.run.call_args.args
+                    self.assertNotIn("GDK_DEBUG", app_env)
+                    self.assertEqual(app_runtime, Path(d))
+                    self.assertEqual(fixture.run.call_args.kwargs, {"disable_gl": True})
             peer.assert_called_once()
 
     def test_actual_entrypoint_wires_all_steps_in_order(self):
         self.execute(False)
+
+    def test_gl_diagnostic_executes_same_full_fixture_with_scoped_probe_flag(self):
+        self.execute(False, diagnostic=True)
 
     def test_rejected_auth_never_starts_fcitx_or_module_probe(self):
         self.execute(True)
