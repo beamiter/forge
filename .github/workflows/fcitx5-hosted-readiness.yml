@@ -1,0 +1,41 @@
+name: Isolated Fcitx5 hosted readiness
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/fcitx5-hosted-readiness.yml'
+      - 'scripts/qa-fcitx5-hosted.py'
+      - 'scripts/test-qa-fcitx5-hosted.py'
+      - 'scripts/qa-fcitx5-owned-bus.py'
+      - 'scripts/test-qa-fcitx5-owned-bus.py'
+      - 'scripts/qa-fcitx5-preflight.py'
+      - 'scripts/test-qa-fcitx5-preflight.py'
+
+permissions:
+  contents: read
+
+jobs:
+  readiness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install signed Ubuntu fixture dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            dbus-daemon libglib2.0-bin xvfb xauth x11-utils \
+            fcitx5 fcitx5-modules fcitx5-frontend-gtk4
+          dpkg-query -W dbus-daemon libglib2.0-bin xvfb xauth x11-utils \
+            fcitx5 fcitx5-modules fcitx5-frontend-gtk4
+      - name: Run isolated readiness orchestration tests
+        run: |
+          python3 -I -B scripts/test-qa-fcitx5-preflight.py
+          python3 -I -B scripts/test-qa-fcitx5-owned-bus.py
+          python3 -I -B scripts/test-qa-fcitx5-hosted.py
+      - name: Check actual private Xvfb, D-Bus, Fcitx5 and GTK module
+        run: python3 -I -B scripts/qa-fcitx5-hosted.py
