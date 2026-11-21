@@ -85,7 +85,10 @@ explicit local file URIs remain available. The same no-reconstruction rule now a
 
 CRLF source line endings are displayed as ordinary line breaks. This only
 normalizes the read-only presentation; source bytes and line numbers are unchanged.
-A lone carriage return, ESC, and bidi controls remain visible escapes.
+A lone carriage return, ESC, bidi controls, and the Unicode paragraph separator
+(U+2029) appear as visible escapes in the preview and its copy commands. Escaping
+U+2029 keeps GTK from creating an extra paragraph that would shift source line
+numbers or search highlights; it does not alter the file.
 
 Source locations (`file.tsx:12:3`) are resolved only after explicit confirmation
 showing both the literal filename and the possible source-location fallback.
