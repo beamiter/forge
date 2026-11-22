@@ -931,7 +931,7 @@ impl UiState {
         }
         let directory = self
             .active_pane_leaf()
-            .and_then(|leaf| crate::terminal::terminal_working_directory(leaf.terminal()))
+            .and_then(|leaf| leaf.working_directory())
             .map(std::path::PathBuf::from)
             .or_else(|| std::env::current_dir().ok());
         let state = self.clone();
@@ -972,7 +972,7 @@ impl UiState {
         }
         let directory = self
             .active_pane_leaf()
-            .and_then(|leaf| crate::terminal::terminal_working_directory(leaf.terminal()))
+            .and_then(|leaf| leaf.working_directory())
             .map(std::path::PathBuf::from)
             .or_else(|| std::env::current_dir().ok());
         let weak = self.window.downgrade();
@@ -2015,14 +2015,14 @@ mod focus_tests {
         .unwrap();
         assert!(focus_task_leaf(&notebook, &target));
         settle();
-        assert!(b.terminal().has_focus());
+        assert!(b.focus_widget().has_focus());
         assert_eq!(notebook.current_page(), notebook.page_num(&split));
         let count = notebook.n_pages();
         notebook.reorder_child(&split, Some(1));
         assert!(focus_task_leaf(&notebook, &target));
         settle();
         assert_eq!(notebook.current_page(), Some(1));
-        assert!(b.terminal().has_focus());
+        assert!(b.focus_widget().has_focus());
         assert_eq!(notebook.n_pages(), count);
         let split_widget = split.clone().upcast::<gtk4::Widget>();
         let zoom =
@@ -2034,7 +2034,7 @@ mod focus_tests {
         crate::ui::restore_zoomed_leaf(&notebook, &zoom).unwrap();
         assert!(focus_task_leaf(&notebook, &target));
         settle();
-        assert!(b.terminal().has_focus());
+        assert!(b.focus_widget().has_focus());
         split.set_end_child(None::<&gtk4::Widget>);
         let replacement = create("replacement");
         split.set_end_child(Some(&replacement.root_widget()));

@@ -69,7 +69,7 @@ impl PaneNode {
 
     pub(crate) fn active_terminal(&self) -> Option<Terminal> {
         self.active_leaf()
-            .map(|controller| controller.terminal().clone())
+            .and_then(|controller| controller.terminal().cloned())
     }
 
     pub(crate) fn grab_focus(&self) {
@@ -100,7 +100,9 @@ impl PaneNode {
 
     fn focused_live_terminal_leaf(&self) -> Option<PaneLeaf> {
         match self {
-            Self::Leaf(controller) if controller.terminal().has_focus() => Some(controller.clone()),
+            Self::Leaf(controller) if controller.focus_widget().has_focus() => {
+                Some(controller.clone())
+            }
             Self::Leaf(_) => None,
             Self::Split { start, end } => start
                 .focused_live_terminal_leaf()

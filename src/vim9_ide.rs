@@ -1,6 +1,6 @@
 //! Native Vim9 workbench. Vim owns every editing operation and modified buffer;
-//! GTK/Pango paints the buffer from Vim's GUI RGB frame. VTE owns the real
-//! interactive PTY/input path and displays views outside the native contract.
+//! GTK/Pango paints Vim's GUI RGB frame. The editor terminal owns the live
+//! PTY, input and compatibility display during views outside that contract.
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -22,6 +22,9 @@ mod native_buffer;
 mod navigation;
 #[path = "vim9_ide_search.rs"]
 mod project_search;
+#[path = "vim9_ide_terminal.rs"]
+mod terminal;
+use terminal::EditorTerminal;
 
 // Stack itself is not a keyboard target. Restore its visible content and
 // return to the editor when that content cannot accept keyboard focus.
@@ -106,7 +109,7 @@ fn dispatch(
     session: &Vim9Session,
     command: Vim9Command,
     message: &gtk::Label,
-    editor: &vte4::Terminal,
+    editor: &EditorTerminal,
 ) {
     match session.send(command) {
         Ok(_) => {
@@ -119,7 +122,7 @@ fn dispatch(
 
 fn command_button(
     session: &Vim9Session,
-    editor: &vte4::Terminal,
+    editor: &EditorTerminal,
     message: &gtk::Label,
     icon: &str,
     title: &str,
@@ -147,7 +150,7 @@ struct Browser {
     up: gtk::Button,
     message: gtk::Label,
     session: Vim9Session,
-    editor: vte4::Terminal,
+    editor: EditorTerminal,
 }
 
 impl Browser {
@@ -556,7 +559,9 @@ pub(crate) fn embedded_owns_font_key(
     crate::vim9_zoom::owns_keyboard(
         native_buffer::font_zoom_key(key, modifiers).is_some(),
         gtk::prelude::RootExt::focus(window).is_some_and(|focus| {
-            focus.is_mapped() && focus.is::<vte4::Terminal>() && has_embedded_editor(&focus)
+            focus.is_mapped()
+                && EditorTerminal::owns_focus_widget(&focus)
+                && has_embedded_editor(&focus)
         }),
     )
 }
@@ -600,10 +605,16 @@ fn shell_source(
     request: &jterm_core::vim9::Vim9ShellInvocation,
 ) -> Option<(gtk::Box, gtk::Widget)> {
     if let Some(leaf) = crate::ui::PaneLeaf::from_widget(root) {
-        if request.matches_pty(leaf.process_probe().0) {
+        if leaf.matches_vim_source(request) {
             if let Some(container) = root.downcast_ref::<gtk::Box>() {
-                return Some((container.clone(), leaf.terminal().clone().upcast()));
+                return Some((container.clone(), leaf.focus_widget()));
             }
+        }
+    }
+    #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+    if let Some(session) = crate::ui::shared_terminal::SharedTerminal::from_page(root) {
+        if session.matches_vim_source(request) {
+            return Some((root.clone().downcast().ok()?, session.focus_widget()));
         }
     }
     if let Some(terminal) = root.downcast_ref::<vte4::Terminal>() {
@@ -742,6 +753,23 @@ fn open_with_config_and_exit(
             return;
         }
     };
+    let editor = match EditorTerminal::start(session.launch()) {
+        Ok(editor) => editor,
+        Err(error) => {
+            session.revoke();
+            if let Some(host) = &embedded {
+                eprintln!("forge: cannot start Vim in this tab: {error}");
+                host.finish(1);
+            } else if let Some(result) = &shell_exit {
+                result.set(Some(1));
+                eprintln!("forge: cannot start GUI Vim: {error}");
+                application.quit();
+            } else {
+                open_error(application, parent, &error);
+            }
+            return;
+        }
+    };
     let mut workspace_store =
         jterm_core::vim9::Vim9WorkspaceStateStore::new(session.root(), "forge");
     let workspace =
@@ -772,19 +800,6 @@ fn open_with_config_and_exit(
         window.set_destroy_with_parent(false);
     }
 
-    let editor = vte4::Terminal::new();
-    editor.set_hexpand(true);
-    editor.set_vexpand(true);
-    editor.set_mouse_autohide(true);
-    editor.set_scroll_on_keystroke(true);
-    editor.set_scrollback_lines(5000);
-    editor.set_font(Some(&gtk::pango::FontDescription::from_string(
-        "Monospace 12",
-    )));
-    editor.update_property(&[gtk::accessible::Property::Label("Vim9 editor")]);
-    let foreground = gdk::RGBA::new(0.85, 0.88, 0.93, 1.0);
-    let background = gdk::RGBA::new(0.07, 0.09, 0.12, 1.0);
-    editor.set_colors(Some(&foreground), Some(&background), &[]);
     let native = native_buffer::NativeBuffer::new(
         &session,
         &editor,
@@ -1780,10 +1795,7 @@ fn open_with_config_and_exit(
         let exited_session = session.clone();
         let shell_exit = shell_exit.clone();
         let embedded = embedded.clone();
-        editor.connect_child_exited(move |_, status| {
-            let Some(code) = jterm_core::process::exit_code_from_wait_status(status) else {
-                return;
-            };
+        editor.connect_exit(move |code| {
             exited_session.revoke();
             finished.set(true);
             if let Some(host) = &embedded {
@@ -1793,95 +1805,99 @@ fn open_with_config_and_exit(
             if let Some(result) = &shell_exit {
                 result.set(Some(code));
             }
-            if shell_exit.is_some() || closing.get() || status == 0 {
+            if shell_exit.is_some() || closing.get() || code == 0 {
                 if let Some(window) = weak.upgrade() {
                     window.close();
                 }
             } else {
                 message.set_label(&format!(
-                    "Vim exited (status {status}). You can close this window and reopen Vim9 IDE."
+                    "Vim exited (status {code}). You can close this window and reopen Vim9 IDE."
                 ));
             }
         });
     }
 
-    let launch = session.launch();
-    let mut argv = vec![launch.program.clone()];
-    argv.extend(launch.args.clone());
-    let extra = launch
-        .env
-        .iter()
-        .filter_map(|item| item.split_once('='))
-        .collect::<Vec<_>>();
-    let env = match jterm_core::child_env::vte_envv_from_captured(
-        &jterm_core::child_env::ChildEnv::from_identity(),
-        &extra,
-    ) {
-        Ok(env) => env,
-        Err(error) => {
-            session.revoke();
-            child_finished.set(true);
-            if let Some(host) = &embedded {
-                host.finish(1);
-                return;
-            }
-            if let Some(result) = &shell_exit {
-                result.set(Some(1));
-                eprintln!("forge: cannot prepare Vim environment: {error}");
-                window.close();
-                return;
-            }
-            message.set_label(&format!(
-                "Cannot prepare Vim environment: {}",
-                visible(&error.to_string())
-            ));
-            window.present();
-            return;
-        }
-    };
-    let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
-    let env = env.iter().map(String::as_str).collect::<Vec<_>>();
-    let flags = glib::SpawnFlags::SEARCH_PATH
-        | glib::SpawnFlags::from_bits_retain(jterm_core::child_env::VTE_SPAWN_NO_PARENT_ENVV_BITS);
-    {
-        let finished = child_finished.clone();
-        let message = message.clone();
-        let failed_session = session.clone();
-        let shell_exit = shell_exit.clone();
-        let weak_window = window.downgrade();
-        let embedded = embedded.clone();
-        editor.spawn_async(
-            vte4::PtyFlags::DEFAULT,
-            launch.cwd.to_str(),
-            &argv,
-            &env,
-            flags,
-            || {},
-            15_000,
-            None::<&gio::Cancellable>,
-            move |result| {
-                if let Err(error) = result {
-                    failed_session.revoke();
-                    finished.set(true);
-                    if let Some(host) = &embedded {
-                        host.finish(1);
-                        return;
-                    }
-                    if let Some(result) = &shell_exit {
-                        result.set(Some(1));
-                        eprintln!("forge: cannot start Vim: {error}");
-                        if let Some(window) = weak_window.upgrade() {
-                            window.close();
-                        }
-                        return;
-                    }
-                    message.set_label(&format!(
-                        "Cannot start Vim: {}",
-                        visible(&error.to_string())
-                    ));
+    if let Some(vte) = editor.vte() {
+        let launch = session.launch();
+        let mut argv = vec![launch.program.clone()];
+        argv.extend(launch.args.clone());
+        let extra = launch
+            .env
+            .iter()
+            .filter_map(|item| item.split_once('='))
+            .collect::<Vec<_>>();
+        let env = match jterm_core::child_env::vte_envv_from_captured(
+            &jterm_core::child_env::ChildEnv::from_identity(),
+            &extra,
+        ) {
+            Ok(env) => env,
+            Err(error) => {
+                session.revoke();
+                child_finished.set(true);
+                if let Some(host) = &embedded {
+                    host.finish(1);
+                    return;
                 }
-            },
-        );
+                if let Some(result) = &shell_exit {
+                    result.set(Some(1));
+                    eprintln!("forge: cannot prepare Vim environment: {error}");
+                    window.close();
+                    return;
+                }
+                message.set_label(&format!(
+                    "Cannot prepare Vim environment: {}",
+                    visible(&error.to_string())
+                ));
+                window.present();
+                return;
+            }
+        };
+        let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
+        let env = env.iter().map(String::as_str).collect::<Vec<_>>();
+        let flags = glib::SpawnFlags::SEARCH_PATH
+            | glib::SpawnFlags::from_bits_retain(
+                jterm_core::child_env::VTE_SPAWN_NO_PARENT_ENVV_BITS,
+            );
+        {
+            let finished = child_finished.clone();
+            let message = message.clone();
+            let failed_session = session.clone();
+            let shell_exit = shell_exit.clone();
+            let weak_window = window.downgrade();
+            let embedded = embedded.clone();
+            vte.spawn_async(
+                vte4::PtyFlags::DEFAULT,
+                launch.cwd.to_str(),
+                &argv,
+                &env,
+                flags,
+                || {},
+                15_000,
+                None::<&gio::Cancellable>,
+                move |result| {
+                    if let Err(error) = result {
+                        failed_session.revoke();
+                        finished.set(true);
+                        if let Some(host) = &embedded {
+                            host.finish(1);
+                            return;
+                        }
+                        if let Some(result) = &shell_exit {
+                            result.set(Some(1));
+                            eprintln!("forge: cannot start Vim: {error}");
+                            if let Some(window) = weak_window.upgrade() {
+                                window.close();
+                            }
+                            return;
+                        }
+                        message.set_label(&format!(
+                            "Cannot start Vim: {}",
+                            visible(&error.to_string())
+                        ));
+                    }
+                },
+            );
+        }
     }
 
     if config.project_panel {
@@ -1954,7 +1970,7 @@ fn open_with_config_and_exit(
                             &output_stack,
                             &build_output,
                             &problems,
-                            &poll_editor,
+                            poll_editor.widget(),
                         );
                     }
                     _ => {

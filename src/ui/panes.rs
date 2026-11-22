@@ -13,8 +13,7 @@ use super::*;
 use crate::block_view::TermView;
 use crate::keybindings::Direction;
 use crate::state::generate_session_id;
-use crate::terminal::{setup_terminal_click_handler, terminal_working_directory, VteTerminalView};
-use vte4::TerminalExt as _;
+use crate::terminal::{setup_terminal_click_handler, VteTerminalView};
 
 fn command_history_exit_code(reported: Option<i32>) -> Option<i32> {
     // The JSONL wire schema has a plain i32. Skipping an unknown status is the
@@ -405,12 +404,44 @@ impl UiState {
                 initial_commands,
                 tab_widget_name,
             ),
-            crate::config::TerminalMode::Vte => Ok(self.create_vte_leaf(
-                working_directory,
-                session_id,
-                initial_commands,
-                tab_widget_name,
-            )),
+            crate::config::TerminalMode::Vte => {
+                #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+                if initial_commands.is_empty() && std::env::var_os("FORGE_SAFE_MODE").is_none() {
+                    let shared = super::shared_terminal::SharedPane::open(
+                        &self.config.borrow(),
+                        &self.shell_argv.borrow(),
+                        working_directory,
+                    );
+                    if let Some(view) = shared {
+                        if let Some(error) = view.launch_error() {
+                            return Err(io::Error::other(error));
+                        }
+                        let leaf = PaneLeaf::Shared(view.clone());
+                        let root = leaf.root_widget();
+                        if let Some(name) = tab_widget_name {
+                            root.set_widget_name(&name);
+                        }
+                        leaf.attach_to(&root);
+                        let sid = session_id
+                            .filter(|sid| {
+                                jterm_core::execution_journal::is_valid_jsh_session_id(sid)
+                            })
+                            .map(str::to_owned)
+                            .unwrap_or_else(generate_session_id);
+                        leaf.set_session_id(&sid);
+                        leaf.set_remote(false);
+                        self.install_pane_rearrange(&leaf);
+                        self.connect_shared_pane(&view);
+                        return Ok(leaf);
+                    }
+                }
+                Ok(self.create_vte_leaf(
+                    working_directory,
+                    session_id,
+                    initial_commands,
+                    tab_widget_name,
+                ))
+            }
         }
     }
 
@@ -645,7 +676,7 @@ impl UiState {
         self.refresh_pane_headers_for(&page);
         source.leaf.grab_focus();
         if let Some(page_num) = self.notebook.page_num(&page) {
-            self.request_tab_terminal_focus(source.leaf.terminal().clone(), page_num);
+            self.request_tab_terminal_focus(source.leaf.focus_widget(), page_num);
         }
         // Drag-end normally restores the page that was active before a hover
         // preview. This transaction is the one exception: its new split page
@@ -763,15 +794,12 @@ impl UiState {
         leaf.block_view()
             .map(|view| view.cwd())
             .filter(|cwd| !cwd.is_empty())
-            .or_else(|| terminal_working_directory(leaf.terminal()))
+            .or_else(|| leaf.working_directory())
     }
 
     /// The OSC title this pane's terminal last reported, if any.
     fn pane_title(&self, leaf: &PaneLeaf) -> Option<String> {
-        leaf.terminal()
-            .window_title()
-            .map(|title| title.to_string())
-            .filter(|title| !title.trim().is_empty())
+        leaf.window_title().filter(|title| !title.trim().is_empty())
     }
 
     /// Exchange two panes' positions in the current tab's split tree after a
@@ -866,11 +894,11 @@ impl UiState {
         let Some(current_leaf) = page_node.active_leaf() else {
             return;
         };
-        let current_term = current_leaf.terminal().clone();
         // A split starts a local shell even beside a remote pane. Raw Block
         // cwd metadata may name a different machine, so use only a local OSC 7
         // authority or the original local PTY child's /proc directory.
-        let working_directory = terminal_working_directory(&current_term)
+        let working_directory = current_leaf
+            .working_directory()
             .or_else(|| crate::process::process_cwd(current_leaf.process_probe().1));
         let tab_widget_name = Some(page_widget.widget_name().to_string());
         let pinned = self.tab_page_is_pinned(&page_widget);
@@ -982,7 +1010,7 @@ impl UiState {
                 }
                 new_leaf.grab_focus();
                 if let Some(page_num) = self.notebook.current_page() {
-                    self.request_tab_terminal_focus(new_leaf.terminal().clone(), page_num);
+                    self.request_tab_terminal_focus(new_leaf.focus_widget(), page_num);
                 }
             },
         );

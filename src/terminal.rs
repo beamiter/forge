@@ -79,7 +79,7 @@ fn belongs_to_selected_notebook_page(terminal: &Terminal) -> bool {
 /// Automatic map/tab focus must not reveal a live child through retained
 /// history. Keep the actual focus-in (including IM context activation), and
 /// restore every native viewport policy before later manual focus navigation.
-pub(crate) fn focus_terminal_without_viewport_reveal(terminal: &Terminal) -> bool {
+pub(crate) fn focus_terminal_without_viewport_reveal(terminal: &impl IsA<gtk4::Widget>) -> bool {
     let mut viewports = Vec::new();
     let mut ancestor = terminal.parent();
     while let Some(widget) = ancestor {

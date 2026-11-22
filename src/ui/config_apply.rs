@@ -442,8 +442,12 @@ impl UiState {
                 // Updates the live surface, every finished renderer,
                 // and the TermView config used by future blocks.
                 view.set_font_scale(new_scale);
-            } else {
-                leaf.terminal().set_font_scale(new_scale);
+            } else if let Some(terminal) = leaf.terminal() {
+                terminal.set_font_scale(new_scale);
+            }
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+            if let PaneLeaf::Shared(view) = &leaf {
+                view.update_theme(&self.config.borrow(), new_scale);
             }
         }
         // Repaint chrome in the same idle sweep as every live/history VTE.
@@ -807,8 +811,12 @@ impl UiState {
         for leaf in self.configuration_leaves() {
             if let Some(view) = leaf.block_view() {
                 view.set_font(&desc);
-            } else {
-                leaf.terminal().set_font(Some(&font_desc));
+            } else if let Some(terminal) = leaf.terminal() {
+                terminal.set_font(Some(&font_desc));
+            }
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+            if let PaneLeaf::Shared(view) = &leaf {
+                view.update_theme(&self.config.borrow(), self.font_scale.get());
             }
         }
         // Existing popovers share the display provider and update in place.
@@ -820,6 +828,14 @@ impl UiState {
         self.for_each_terminal(|term| {
             term.set_scrollback_lines(lines as i64);
         });
+        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+        for leaf in self.configuration_leaves() {
+            if let PaneLeaf::Shared(view) = leaf {
+                if let Some(pane) = view.terminal_pane() {
+                    pane.set_history_row_limit(lines as usize);
+                }
+            }
+        }
     }
 
     pub(crate) fn apply_theme(&self, theme: &Theme) {
@@ -837,6 +853,12 @@ impl UiState {
         // a later command/font change can bring the old palette back.
         self.sync_block_configs();
         self.apply_colors_all();
+        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+        for leaf in self.configuration_leaves() {
+            if let PaneLeaf::Shared(view) = leaf {
+                view.update_theme(&self.config.borrow(), self.font_scale.get());
+            }
+        }
         // Finish with Block-specific treatment, including transparent
         // snapshot cursors that the generic VTE pass would otherwise reset.
         for leaf in self.configuration_leaves() {
@@ -1030,7 +1052,6 @@ impl UiState {
             }
         }
         let (mut new_config, _themes, new_keybindings) = load_config();
-        new_config.terminal_mode = new_config.terminal_mode.public_presentation();
         new_config.tab_placement = crate::config::TabPlacement::Sidebar;
         // `load_config` re-read the file. Prove it read the same bytes this
         // reload validated, and that it read them at all, before any of them
@@ -1073,7 +1094,11 @@ impl UiState {
 
         // New panes/tabs immediately use a changed shell; all other config is
         // replaced as one coherent snapshot instead of retaining stale fields.
-        *self.shell_argv.borrow_mut() = choose_shell_argv(new_config.shell.as_deref());
+        let shell = choose_shell_argv(new_config.shell.as_deref());
+        new_config.terminal_mode = new_config
+            .terminal_mode
+            .public_presentation_for_shell(&shell);
+        *self.shell_argv.borrow_mut() = shell;
         *self.config.borrow_mut() = new_config;
 
         // Preserve an index-backed tree location only when its exact profile

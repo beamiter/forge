@@ -174,18 +174,19 @@ impl UiState {
 
     pub(crate) fn execute_action(&self, action: Action) {
         #[cfg(forge_shared_terminal)]
-        if matches!(action, Action::Copy | Action::Paste) {
+        if matches!(action, Action::Copy | Action::Paste | Action::ToggleSearch) {
+            #[cfg(target_os = "linux")]
+            if let Some(PaneLeaf::Shared(view)) = self.current_pane_leaf() {
+                view.terminal_action(action);
+                return;
+            }
             let session = self
                 .notebook
                 .current_page()
                 .and_then(|index| self.notebook.nth_page(Some(index)))
                 .and_then(|page| super::shared_terminal::SharedTerminal::from_page(&page));
             if let Some(session) = session {
-                if matches!(action, Action::Copy) {
-                    session.copy();
-                } else {
-                    session.paste();
-                }
+                session.terminal_action(action);
                 return;
             }
         }
@@ -202,9 +203,9 @@ impl UiState {
             }
             Action::NewTab => {
                 log::info!("New tab");
-                let working_directory = current_terminal
-                    .as_ref()
-                    .and_then(terminal_working_directory);
+                let working_directory = self
+                    .current_pane_leaf()
+                    .and_then(|leaf| leaf.working_directory());
                 let startup = self.config.borrow().startup_commands.clone();
                 self.add_new_tab(
                     working_directory,

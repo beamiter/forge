@@ -4209,7 +4209,7 @@ impl UiState {
         match self.current_pane_leaf() {
             Some(PaneLeaf::Block(view)) => OrganismGreetingTarget::Block(Rc::downgrade(&view)),
             Some(PaneLeaf::Vte(view)) => OrganismGreetingTarget::Vte(view.widget().downgrade()),
-            None => OrganismGreetingTarget::Unavailable,
+            _ => OrganismGreetingTarget::Unavailable,
         }
     }
 

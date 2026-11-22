@@ -11,7 +11,6 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use std::path::PathBuf;
 use std::rc::Rc;
-use vte4::TerminalExt as _;
 
 use jterm_core::bottom_bar::{compose, Segment, SegmentKind, Snapshot, Tone};
 
@@ -60,12 +59,6 @@ fn set_segments(container: &gtk4::Box, segments: &[Segment]) {
         }
         container.append(&label);
     }
-}
-
-/// VTE reports grid dimensions as C longs; the snapshot wants u16 with 0
-/// meaning unknown.
-fn grid_dimension(count: i64) -> u16 {
-    count.clamp(0, i64::from(u16::MAX)) as u16
 }
 
 impl UiState {
@@ -173,16 +166,7 @@ impl UiState {
             leaf.foreground_process_name()
                 .is_some_and(|name| !name.is_empty())
         });
-        let (cols, rows) = leaf
-            .as_ref()
-            .map(|leaf| {
-                let terminal = leaf.terminal();
-                (
-                    grid_dimension(terminal.column_count()),
-                    grid_dimension(terminal.row_count()),
-                )
-            })
-            .unwrap_or((0, 0));
+        let (cols, rows) = leaf.as_ref().map(PaneLeaf::grid_size).unwrap_or((0, 0));
         let home = glib::home_dir();
 
         let snapshot = Snapshot {

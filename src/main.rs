@@ -20,7 +20,6 @@ use crate::state::{
     detach_all_pane_leaves, finalize_tabs_state, kill_all_terminal_children, load_tabs_state,
     save_all_block_histories, save_tabs_state,
 };
-use crate::terminal::terminal_working_directory;
 use crate::ui::{self, UiState};
 use jterm_core::keybindings::{Chord, KeySym, Mods, NamedKey};
 
@@ -242,7 +241,7 @@ impl UiState {
     /// not change.
     pub(crate) fn request_tab_terminal_focus(
         &self,
-        target_terminal: vte4::Terminal,
+        target_terminal: impl IsA<gtk4::Widget>,
         page_num: u32,
     ) {
         let generation = self.invalidate_tab_focus_requests();
@@ -261,7 +260,7 @@ impl UiState {
         );
     }
 
-    fn request_startup_terminal_focus(&self, terminal: vte4::Terminal, page: u32) {
+    fn request_startup_terminal_focus(&self, terminal: impl IsA<gtk4::Widget>, page: u32) {
         let generation = self.invalidate_tab_focus_requests();
         queue_startup_terminal_focus(
             &self.notebook,
@@ -301,10 +300,11 @@ pub(crate) fn queue_startup_terminal_focus(
     window: &gtk4::Window,
     generation: Rc<Cell<u64>>,
     request: u64,
-    terminal: vte4::Terminal,
+    terminal: impl IsA<gtk4::Widget>,
     page: u32,
     search: SearchBar,
 ) {
+    let terminal = terminal.upcast::<gtk4::Widget>();
     let cancel = {
         let generation = generation.clone();
         move || {
@@ -332,7 +332,7 @@ pub(crate) fn queue_startup_terminal_focus(
     let acquired = Cell::new(terminal.has_focus());
     let focus_changed = window.connect_focus_widget_notify(move |window| {
         if let Some(owner) = gtk4::prelude::GtkWindowExt::focus(window) {
-            if target.upgrade().as_ref().map(|vte| vte.upcast_ref()) == Some(&owner) {
+            if target.upgrade().as_ref() == Some(&owner) {
                 acquired.set(true);
             } else if acquired.get()
                 || initial_owner
@@ -437,8 +437,8 @@ pub(crate) fn focus_switched_page(
     search_entry: &SearchEntry,
     invalidate: impl FnOnce(),
     apply_search: impl FnOnce(),
-    terminal: impl FnOnce() -> Option<vte4::Terminal>,
-    focus_terminal: impl FnOnce(vte4::Terminal),
+    terminal: impl FnOnce() -> Option<gtk4::Widget>,
+    focus_terminal: impl FnOnce(gtk4::Widget),
 ) {
     if search_bar.is_search_mode() {
         invalidate();
@@ -456,11 +456,12 @@ pub(crate) fn queue_tab_terminal_focus(
     notebook: &Notebook,
     focus_generation: Rc<Cell<u64>>,
     generation: u64,
-    target_terminal: vte4::Terminal,
+    target_terminal: impl IsA<gtk4::Widget>,
     page_num: u32,
     search_bar: SearchBar,
     focus_search: impl Fn() + 'static,
 ) {
+    let target_terminal = target_terminal.upcast::<gtk4::Widget>();
     // A request installed before the first map must not keep its own
     // Notebook alive forever: no frame clock runs if the window is closed
     // before mapping, so the bounded tick count cannot clean up that case.
@@ -755,11 +756,6 @@ pub fn run() -> glib::ExitCode {
         } else {
             load_config()
         };
-        // New public Block uses native command cards over the existing PTY.
-        // Explicit legacy Unified sessions retain their continuous backend.
-        if !launch.safe_mode {
-            config.terminal_mode = config.terminal_mode.public_presentation();
-        }
         config.tab_placement = crate::config::TabPlacement::Sidebar;
 
         // Cache shell selection once to avoid extra process probes per new tab.
@@ -768,6 +764,11 @@ pub fn run() -> glib::ExitCode {
         } else {
             choose_shell_argv(config.shell.as_deref())
         }));
+        if !launch.safe_mode {
+            config.terminal_mode = config
+                .terminal_mode
+                .public_presentation_for_shell(&shell_argv.borrow());
+        }
 
         let window_opacity = Rc::new(Cell::new(config.window_opacity));
         crate::eva_companion::configure(config.eva_companion_enabled);
@@ -1865,9 +1866,8 @@ pub fn run() -> glib::ExitCode {
         let ui_for_add = ui.clone();
         add_tab_button.connect_clicked(move |_| {
             let working_directory = ui_for_add
-                .current_terminal()
-                .as_ref()
-                .and_then(terminal_working_directory);
+                .current_pane_leaf()
+                .and_then(|leaf| leaf.working_directory());
             let startup = ui_for_add.config.borrow().startup_commands.clone();
             ui_for_add.add_new_tab(
                 working_directory,
@@ -2250,7 +2250,9 @@ pub fn run() -> glib::ExitCode {
                 &ui_for_switch.search_entry,
                 || { ui_for_switch.invalidate_tab_focus_requests(); },
                 || ui_for_switch.search_apply_in_page(widget),
-                || ui_for_switch.terminal_in_page(widget),
+                || ui::PaneNode::from_widget(widget)
+                    .and_then(|node| node.active_leaf())
+                    .map(|leaf| leaf.focus_widget()),
                 |target_terminal| {
                     if let Some(term_view) = ui_for_switch.term_view_in_page(widget) {
                         term_view.restore_tab_viewport();
@@ -2550,8 +2552,8 @@ pub fn run() -> glib::ExitCode {
         // Give startup the same mapped, generation-scoped reconciliation as a
         // tab round-trip, without changing the saved reading viewport.
         if let Some(page_num) = notebook.current_page() {
-            if let Some(terminal) = ui.current_terminal() {
-                ui.request_startup_terminal_focus(terminal, page_num);
+            if let Some(leaf) = ui.current_pane_leaf() {
+                ui.request_startup_terminal_focus(leaf.focus_widget(), page_num);
             }
         }
         ui.sync_organism_presence();

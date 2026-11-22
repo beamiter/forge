@@ -2826,18 +2826,11 @@ impl TermView {
                     block.output.len(),
                     block.exit_code
                 );
-                let finished = FinishedBlock::new(
-                    block.id,
-                    &block.prompt,
-                    &block.cmd,
-                    block.cmd_markup.as_deref(),
-                    &block.output,
-                    block.exit_code,
+                let finished = FinishedBlock::from_retained(
+                    block,
                     &config,
-                    block.duration_ms,
-                    block.end_time_ms,
-                    block.cwd.as_deref(),
                     cols,
+                    self.dynamic_colors.get().foreground.is_none(),
                 );
                 finished.set_lifecycle(
                     block.lifecycle_health(),

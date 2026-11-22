@@ -23,6 +23,9 @@ use crate::terminal::{
 /// A launch diagnostic is rendered through VTE too. Only the first output of
 /// an attempt which has not failed may turn its remote badge green.
 fn connect_remote_launch_status(leaf: &PaneLeaf, on_status: impl Fn(ConnStatus) + 'static) {
+    let Some(terminal) = leaf.terminal() else {
+        return;
+    };
     let settled = Rc::new(Cell::new(false));
     let on_status = Rc::new(on_status);
     if let PaneLeaf::Vte(view) = leaf {
@@ -33,7 +36,7 @@ fn connect_remote_launch_status(leaf: &PaneLeaf, on_status: impl Fn(ConnStatus) 
             on_status(ConnStatus::Disconnected);
         });
     }
-    leaf.terminal().connect_contents_changed(move |_| {
+    terminal.connect_contents_changed(move |_| {
         if !settled.replace(true) {
             on_status(ConnStatus::Connected);
         }
@@ -982,6 +985,8 @@ impl UiState {
                     }
                 });
             }
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+            PaneLeaf::Shared(_) => {}
         }
 
         let ui_for_select = self.clone();
@@ -1094,7 +1099,7 @@ impl UiState {
                 .and_then(|page| PaneNode::from_widget(&page))
                 .and_then(|node| node.active_leaf())
             {
-                if let Some(cwd) = terminal_working_directory(leaf.terminal()) {
+                if let Some(cwd) = leaf.working_directory() {
                     let cwd = jterm_core::review_input::safe_inline_display(&cwd, 4 * 1024);
                     parts.push(format!("Dir: {cwd}"));
                 }
@@ -1254,7 +1259,7 @@ impl UiState {
         tab_name: Option<String>,
         session_id: Option<String>,
         initial_commands: crate::terminal::InitialCommands,
-    ) -> Terminal {
+    ) -> gtk4::Widget {
         let terminal_mode = self.config.borrow().terminal_mode.clone();
         self.add_tab_with_argv(TabLaunch {
             working_directory,
@@ -1266,6 +1271,7 @@ impl UiState {
             terminal_mode,
             task: None,
         })
+        .root_widget()
     }
 
     #[cfg(forge_shared_terminal)]
@@ -1340,7 +1346,7 @@ impl UiState {
         argv: Vec<String>,
     ) -> Terminal {
         let terminal_mode = self.config.borrow().terminal_mode.clone();
-        self.add_tab_with_argv(TabLaunch {
+        self.add_native_terminal_tab(TabLaunch {
             working_directory,
             tab_name: argv.first().cloned(),
             session_id: None,
@@ -1401,7 +1407,7 @@ impl UiState {
         let completion = request.completion.clone();
         let settled = Rc::new(Cell::new(false));
         let successful = settled.clone();
-        let terminal = self.add_tab_with_argv(TabLaunch {
+        let terminal = self.add_native_terminal_tab(TabLaunch {
             working_directory: Some(launch.cwd.to_string_lossy().into_owned()),
             tab_name: Some(request.title),
             session_id: None,
@@ -1426,7 +1432,7 @@ impl UiState {
             .and_then(|node| {
                 node.leaves()
                     .into_iter()
-                    .find(|leaf| leaf.terminal() == &terminal)
+                    .find(|leaf| leaf.terminal() == Some(&terminal))
             })
         {
             if let PaneLeaf::Vte(view) = &leaf {
@@ -1464,7 +1470,7 @@ impl UiState {
     }
 
     pub(crate) fn add_named_tab_with_argv(&self, tab_name: &str, argv: Vec<String>) -> Terminal {
-        self.add_tab_with_argv(TabLaunch {
+        self.add_native_terminal_tab(TabLaunch {
             working_directory: None,
             tab_name: Some(tab_name.to_string()),
             session_id: None,
@@ -1491,7 +1497,7 @@ impl UiState {
         role: crate::agent_task::TaskTerminalRole,
         on_launched: Option<Box<dyn FnOnce()>>,
     ) -> Option<PaneLeaf> {
-        let terminal = self.add_tab_with_argv(TabLaunch {
+        let terminal = self.add_native_terminal_tab(TabLaunch {
             working_directory,
             tab_name: Some(title.to_string()),
             session_id: None,
@@ -1557,7 +1563,7 @@ impl UiState {
             }
         };
         let terminal_mode = remote_tab_terminal_mode(&self.config.borrow().terminal_mode);
-        Some(self.add_tab_with_argv(TabLaunch {
+        Some(self.add_native_terminal_tab(TabLaunch {
             working_directory: None,
             tab_name: Some(format!("ssh: {} (temporary)", host.name)),
             session_id: None,
@@ -1589,6 +1595,7 @@ impl UiState {
             Some(host.name.clone()),
             profile_session_overridden,
         )
+        .and_then(|leaf| leaf.terminal().cloned())
     }
 
     /// Restore a managed remote through the same direct-argv path as a fresh
@@ -1599,8 +1606,9 @@ impl UiState {
         host: &crate::config::RemoteHost,
         session_id: String,
         tab_name: Option<String>,
-    ) -> Option<Terminal> {
+    ) -> Option<gtk4::Widget> {
         self.launch_remote(host, 0, Some(session_id), tab_name, true)
+            .map(|leaf| leaf.root_widget())
     }
 
     fn launch_remote(
@@ -1610,7 +1618,7 @@ impl UiState {
         session_id: Option<String>,
         tab_name: Option<String>,
         profile_session_overridden: bool,
-    ) -> Option<Terminal> {
+    ) -> Option<PaneLeaf> {
         let argv = match crate::config::checked_remote_argv(host) {
             Ok(argv) => argv,
             Err(message) => {
@@ -1728,7 +1736,8 @@ impl UiState {
 
         let ui = self.clone();
         let remaining = Rc::new(Cell::new(delay));
-        let dead_terminal = PaneLeaf::from_widget(&dead_leaf).map(|leaf| leaf.terminal().clone());
+        let dead_terminal =
+            PaneLeaf::from_widget(&dead_leaf).and_then(|leaf| leaf.terminal().cloned());
         self.set_tab_strip_label(tab_num, &format!("{} — reconnect {}s", host.name, delay));
 
         glib::timeout_add_seconds_local(1, move || {
@@ -1758,10 +1767,9 @@ impl UiState {
             let direct_page = notebook_page_named(&ui.notebook, &format!("tab-{current_tab_num}"))
                 .is_some_and(|page| page == dead_leaf);
             let zoomed_dead_leaf = dead_terminal.as_ref().is_some_and(|terminal| {
-                ui.zoom_state
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|state| state.zoomed_terminal == *terminal)
+                ui.zoom_state.borrow().as_ref().is_some_and(|state| {
+                    state.zoomed_terminal == *terminal.upcast_ref::<gtk4::Widget>()
+                })
             });
             if !direct_page || zoomed_dead_leaf {
                 // Reconnect-in-place is a whole-page operation. If the user
@@ -1843,7 +1851,14 @@ impl UiState {
     /// argv (e.g. an ssh command) instead of the configured local shell. When
     /// `remote` is `Some`, the tab is tracked as an ssh connection (status badge +
     /// auto-reconnect) via `tab_connections`.
-    fn add_tab_with_argv(&self, launch: TabLaunch) -> Terminal {
+    fn add_native_terminal_tab(&self, launch: TabLaunch) -> Terminal {
+        self.add_tab_with_argv(launch)
+            .terminal()
+            .expect("an explicit terminal launch owns its native terminal")
+            .clone()
+    }
+
+    fn add_tab_with_argv(&self, launch: TabLaunch) -> PaneLeaf {
         let TabLaunch {
             working_directory,
             tab_name,
@@ -1868,7 +1883,24 @@ impl UiState {
             .unwrap_or(configured_shell.as_slice());
 
         // Create terminal view based on configured mode
-        let (view_type, terminal) = {
+        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+        let shared = if allow_local_recovery
+            && initial_commands.as_slice().is_empty()
+            && matches!(terminal_mode, crate::config::TerminalMode::Vte)
+            && std::env::var_os("FORGE_SAFE_MODE").is_none()
+        {
+            super::shared_terminal::SharedPane::open(
+                &self.config.borrow(),
+                shell_argv,
+                working_directory.as_deref(),
+            )
+            .map(PaneLeaf::Shared)
+        } else {
+            None
+        };
+        #[cfg(not(all(forge_shared_terminal, target_os = "linux")))]
+        let shared: Option<PaneLeaf> = None;
+        let view_type = shared.unwrap_or_else(|| {
             match &terminal_mode {
                 // Unified renders inside the same `TermView` (the OSC 133
                 // engine with a single full-size surface); only the render
@@ -1901,8 +1933,7 @@ impl UiState {
                             }
                             term_view.set_menu_keybindings(self.keybinding_map.clone());
                             term_view.start_history_load();
-                            let terminal = term_view.vte().clone();
-                            (PaneLeaf::Block(term_view), terminal)
+                            PaneLeaf::Block(term_view)
                         }
                         Err(error) => {
                             self.report_block_spawn_error(
@@ -1922,8 +1953,7 @@ impl UiState {
                                 env_extra,
                                 on_launched,
                             ));
-                            let terminal = vte_view.vte().clone();
-                            (PaneLeaf::Vte(vte_view), terminal)
+                            PaneLeaf::Vte(vte_view)
                         }
                     }
                 }
@@ -1940,11 +1970,10 @@ impl UiState {
                         env_extra,
                         on_launched,
                     ));
-                    let terminal = vte_view.vte().clone();
-                    (PaneLeaf::Vte(vte_view), terminal)
+                    PaneLeaf::Vte(vte_view)
                 }
             }
-        };
+        });
 
         if allow_local_recovery {
             if let PaneLeaf::Vte(view) = &view_type {
@@ -1973,8 +2002,10 @@ impl UiState {
         }
 
         // Setup click handler for hyperlinks and context menu (uses VTE inside both views)
-        setup_terminal_click_handler(&terminal);
-        self.setup_context_menu(&terminal);
+        if let Some(terminal) = view_type.terminal() {
+            setup_terminal_click_handler(terminal);
+            self.setup_context_menu(terminal);
+        }
 
         // Connect callbacks based on view type. A local tab's original leaf may
         // later become one side of a split, so its exit must follow the same
@@ -2003,7 +2034,10 @@ impl UiState {
                             .zoom_state
                             .borrow()
                             .as_ref()
-                            .is_some_and(|state| state.zoomed_terminal == *term_view.vte());
+                            .is_some_and(|state| {
+                                state.zoomed_terminal
+                                    == *term_view.vte().upcast_ref::<gtk4::Widget>()
+                            });
                     if is_remote && !is_split {
                         ui_for_exit.handle_tab_exit(current_tab_num, code, &root);
                     } else {
@@ -2079,7 +2113,9 @@ impl UiState {
                             .zoom_state
                             .borrow()
                             .as_ref()
-                            .is_some_and(|state| state.zoomed_terminal == terminal);
+                            .is_some_and(|state| {
+                                state.zoomed_terminal == *terminal.upcast_ref::<gtk4::Widget>()
+                            });
                     if is_remote && !is_split {
                         ui_for_exit.handle_tab_exit(current_tab_num, code, &root);
                     } else {
@@ -2094,6 +2130,8 @@ impl UiState {
                     }
                 });
             }
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+            PaneLeaf::Shared(view) => self.connect_shared_pane(view),
         }
 
         // First child output is a visual connection signal only: backoff is
@@ -2230,6 +2268,8 @@ impl UiState {
                     }
                 });
             }
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+            PaneLeaf::Shared(_) => {}
         }
 
         // Keep the existing tab widgets alive for OSC 0/2 title changes.
@@ -2302,6 +2342,8 @@ impl UiState {
                     }),
                 );
             }
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+            PaneLeaf::Shared(_) => {}
         }
 
         let close_button = gtk4::Button::from_icon_name("window-close-symbolic");
@@ -2466,7 +2508,7 @@ impl UiState {
             ) {
                 if let Some(leaf) = PaneNode::from_widget(&page).and_then(|node| node.active_leaf())
                 {
-                    if let Some(cwd) = terminal_working_directory(leaf.terminal()) {
+                    if let Some(cwd) = leaf.working_directory() {
                         let cwd = jterm_core::review_input::safe_inline_display(&cwd, 4 * 1024);
                         tooltip_parts.push(format!("Dir: {cwd}"));
                     }
@@ -2518,15 +2560,17 @@ impl UiState {
 
         // Bell signal: badge the tab (the current one too while the window is
         // inactive) and toast an inactive window.
-        let ui_for_bell = self.clone();
-        let root_for_bell = view_type.root_widget().downgrade();
-        let last_bell_toast = Cell::new(None);
-        terminal.connect_bell(move |_| {
-            log::debug!("Bell signal received");
-            if let Some(root) = root_for_bell.upgrade() {
-                ui_for_bell.ring_tab_bell(&root, &last_bell_toast);
-            }
-        });
+        if let Some(terminal) = view_type.terminal() {
+            let ui_for_bell = self.clone();
+            let root_for_bell = view_type.root_widget().downgrade();
+            let last_bell_toast = Cell::new(None);
+            terminal.connect_bell(move |_| {
+                log::debug!("Bell signal received");
+                if let Some(root) = root_for_bell.upgrade() {
+                    ui_for_bell.ring_tab_bell(&root, &last_bell_toast);
+                }
+            });
+        }
 
         // Activity indicator: mark the tab when its pane *outputs*. Not VTE's
         // `commit`, which is input: agents enable focus reporting, so leaving
@@ -2945,13 +2989,75 @@ impl UiState {
         self.sync_tab_strip_active(Some(page_num));
         self.sync_tab_bar_visibility();
 
-        // Focus the new terminal
-        match &view_type {
-            PaneLeaf::Block(term_view) => term_view.grab_focus(),
-            PaneLeaf::Vte(vte_view) => vte_view.grab_focus(),
-        }
+        view_type.grab_focus();
+        view_type
+    }
 
-        terminal
+    #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+    pub(super) fn connect_shared_pane(&self, view: &super::shared_terminal::SharedPane) {
+        let Some(pane) = view.terminal_pane() else {
+            return;
+        };
+        let root = view.root().downgrade();
+        let ui = self.clone();
+        let pending = Rc::new(Cell::new(false));
+        let last_bell = Cell::new(None);
+        pane.set_event_handler(move |event| {
+            let Some(root) = root.upgrade() else { return };
+            match event {
+                jterm_gtk_view::PaneEvent::Output => {
+                    if !pending.get() {
+                        ui.update_shared_tab_title(&root);
+                    }
+                    ui.note_tab_activity(&root, &pending);
+                }
+                jterm_gtk_view::PaneEvent::TitleChanged(_) => ui.update_shared_tab_title(&root),
+                jterm_gtk_view::PaneEvent::Bell => ui.ring_tab_bell(&root, &last_bell),
+                jterm_gtk_view::PaneEvent::Exited(code) => {
+                    ui.handle_terminal_exited_with_code(&root, Some(code))
+                }
+            }
+        });
+    }
+
+    #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+    fn update_shared_tab_title(&self, root: &gtk4::Widget) {
+        let Some(tab_num) = tab_num_for_widget(root) else {
+            return;
+        };
+        let Some(page) = notebook_page_named(&self.notebook, &root.widget_name()) else {
+            return;
+        };
+        self.refresh_pane_headers_for(&page);
+        if tab_custom_title_cell(&page).is_some_and(|flag| flag.get()) {
+            return;
+        }
+        let Some(leaf) = PaneNode::from_widget(&page).and_then(|node| node.active_leaf()) else {
+            return;
+        };
+        if &leaf.root_widget() != root {
+            return;
+        }
+        let cwd = leaf.working_directory();
+        let reported = leaf.window_title().unwrap_or_default();
+        let title = jterm_core::title_bar::tab_label(
+            &reported,
+            &default_tab_title(tab_num + 1, cwd.as_deref()),
+        );
+        let Some(label) = self
+            .notebook
+            .tab_label(&page)
+            .and_then(|header| header.first_child())
+            .and_downcast::<Label>()
+        else {
+            return;
+        };
+        if label.text() != title {
+            label.set_text(&title);
+            if !tab_private_title_cell(&page).is_some_and(|flag| flag.get()) {
+                self.set_tab_strip_label(tab_num, &title);
+            }
+        }
     }
 }
 

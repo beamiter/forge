@@ -10524,6 +10524,14 @@ impl RenderBackend for BlockBackend {
         // hooks over time. Hand it an owned snapshot rather than holding the
         // pane's live config Ref across that boundary.
         let finished_config = self.config_for_cb.borrow().clone();
+        let mut precomputed = FinishedBlockPrecomputed::documents(
+            &finished_config,
+            record.command_source == CommandTextSource::ShellReported
+                && self.dynamic_colors_rc.get().foreground.is_none(),
+            payload.output_notice().is_none(),
+        );
+        precomputed.output_rows = Some(output_rows);
+        precomputed.output_preview = Some(fold_preview::from_output(output_with_ansi));
         let finished = FinishedBlock::new_with_pool(
             block_id,
             prompt,
@@ -10539,21 +10547,7 @@ impl RenderBackend for BlockBackend {
             &kitty_images,
             plain_output_bytes,
             recycled,
-            FinishedBlockPrecomputed {
-                #[cfg(forge_shared_terminal)]
-                document_command: record.command_source == CommandTextSource::ShellReported
-                    && self.dynamic_colors_rc.get().foreground.is_none()
-                    && matches!(
-                        finished_config.terminal_mode,
-                        crate::config::TerminalMode::Block | crate::config::TerminalMode::Chat
-                    )
-                    && std::env::var("JTERM_SHARED_FINISHED_COMMANDS").as_deref() == Ok("1"),
-                #[cfg(forge_shared_terminal)]
-                document_output: payload.output_notice().is_none()
-                    && std::env::var("JTERM_SHARED_FINISHED_OUTPUT").as_deref() == Ok("1"),
-                output_rows: Some(output_rows),
-                output_preview: Some(fold_preview::from_output(output_with_ansi)),
-            },
+            precomputed,
         );
         if self.block_list_rc.has_css_class("chat-transcript") {
             finished.set_chat_layout();
@@ -19376,18 +19370,11 @@ impl TermView {
                     self.finished_blocks.borrow().iter().map(|card| card.id),
                     block.id,
                 );
-                let finished = FinishedBlock::new(
-                    block.id,
-                    &block.prompt,
-                    &block.cmd,
-                    block.cmd_markup.as_deref(),
-                    &block.output,
-                    block.exit_code,
+                let finished = FinishedBlock::from_retained(
+                    &block,
                     &config,
-                    block.duration_ms,
-                    block.end_time_ms,
-                    block.cwd.as_deref(),
                     cols,
+                    self.dynamic_colors.get().foreground.is_none(),
                 );
                 finished.set_lifecycle(
                     block.lifecycle_health(),
@@ -19617,18 +19604,11 @@ impl TermView {
                 } else {
                     fallback_cols
                 };
-                let finished = FinishedBlock::new(
-                    block.id,
-                    &block.prompt,
-                    &block.cmd,
-                    block.cmd_markup.as_deref(),
-                    &block.output,
-                    block.exit_code,
+                let finished = FinishedBlock::from_retained(
+                    block,
                     &config,
-                    block.duration_ms,
-                    block.end_time_ms,
-                    block.cwd.as_deref(),
                     cols,
+                    self.dynamic_colors.get().foreground.is_none(),
                 );
                 finished.set_lifecycle(
                     block.lifecycle_health(),
@@ -22684,7 +22664,7 @@ mod tests {
         pump(Duration::from_millis(150));
         assert_eq!(
             window.upcast_ref::<gtk4::Root>().focus().as_ref(),
-            Some(leaf_a.terminal().upcast_ref::<gtk4::Widget>())
+            Some(&leaf_a.focus_widget())
         );
         assert!(a.pty.drain_test_slave(Duration::from_millis(20)).is_empty());
         // Typing on the same pane invalidates its captured input generation,
@@ -34748,7 +34728,7 @@ mod tests {
                         .borrow_mut()
                         .push(format!("search:{page}"))
                 },
-                || Some(view.active_vte.clone()),
+                || Some(view.active_vte.clone().upcast()),
                 |terminal| {
                     view.restore_tab_viewport();
                     generation.set(generation.get().wrapping_add(1));

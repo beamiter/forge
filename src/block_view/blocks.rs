@@ -1661,6 +1661,28 @@ pub(crate) struct FinishedBlockPrecomputed {
     pub(crate) output_rows: Option<i64>,
 }
 
+impl FinishedBlockPrecomputed {
+    pub(super) fn documents(config: &Config, exact_command: bool, complete_output: bool) -> Self {
+        #[cfg(not(forge_shared_terminal))]
+        let _ = (config, exact_command, complete_output);
+        Self {
+            #[cfg(forge_shared_terminal)]
+            document_command: exact_command
+                && matches!(
+                    config.terminal_mode,
+                    crate::config::TerminalMode::Block | crate::config::TerminalMode::Chat
+                )
+                && std::env::var_os("JTERM_SHARED_FINISHED_COMMANDS")
+                    .is_some_and(|value| value == "1"),
+            #[cfg(forge_shared_terminal)]
+            document_output: complete_output
+                && std::env::var_os("JTERM_SHARED_FINISHED_OUTPUT")
+                    .is_some_and(|value| value == "1"),
+            ..Self::default()
+        }
+    }
+}
+
 pub(crate) fn estimated_finished_block_height_for_text(
     config: &Config,
     command: &str,
@@ -2258,6 +2280,36 @@ impl FinishedBlock {
         Self::with_cached_stripped_output(&self.full_output, &self.stripped_output, f)
     }
 
+    pub(super) fn from_retained(
+        block: &BlockData,
+        config: &Config,
+        cols: i64,
+        static_foreground: bool,
+    ) -> Self {
+        Self::new_with_pool(
+            block.id,
+            &block.prompt,
+            &block.cmd,
+            block.cmd_markup.as_deref(),
+            &block.output,
+            block.exit_code,
+            config,
+            block.duration_ms,
+            block.end_time_ms,
+            block.cwd.as_deref(),
+            cols,
+            &[],
+            block.output.len(),
+            None,
+            FinishedBlockPrecomputed::documents(
+                config,
+                block.command_exact && static_foreground && !block.command_truncated,
+                block.output_notice.is_none(),
+            ),
+        )
+    }
+
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         id: u64,
@@ -2898,13 +2950,15 @@ impl FinishedBlock {
             jterm_core::screen_replay::project_bounded_archive(output)
                 .filter(|document| !document.text.trim().is_empty())
                 .map(|document| {
-                    jterm_gtk_view::FinishedTextView::output(
+                    let output = jterm_gtk_view::FinishedTextView::output(
                         &document,
                         crate::font::terminal_font_description(&config.font_desc, config),
                         config.default_font_scale,
                         super::developer_block::terminal_foreground(),
                         &config.palette,
-                    )
+                    );
+                    output.install_links(crate::ui::shared_terminal::SharedTerminal::links());
+                    output
                 })
         } else {
             None
@@ -5089,7 +5143,9 @@ impl ActiveBlock {
         #[cfg(forge_shared_terminal)]
         let shared_live_output = (matches!(
             config.terminal_mode,
-            crate::config::TerminalMode::Block | crate::config::TerminalMode::Chat
+            crate::config::TerminalMode::Block
+                | crate::config::TerminalMode::Chat
+                | crate::config::TerminalMode::Unified
         ) && std::env::var_os("JTERM_SHARED_LIVE_OUTPUT")
             .is_some_and(|value| value == "1"))
         .then(|| {
@@ -5337,7 +5393,7 @@ impl ActiveBlock {
     }
 
     #[cfg(forge_shared_terminal)]
-    pub(super) fn shared_live_widget(&self) -> Option<gtk4::Label> {
+    pub(super) fn shared_live_widget(&self) -> Option<gtk4::Fixed> {
         self.shared_live_output
             .as_ref()
             .map(|view| view.widget().clone())
@@ -5368,61 +5424,65 @@ impl ActiveBlock {
         let terminal = &self.active_vte;
         let (column, cursor) = terminal.cursor_position();
         let columns = terminal.column_count();
-        let Some(text) = jterm_gtk_view::captured_live_row(&capture, columns.max(0) as usize)
+        let Some(text_rows) = jterm_gtk_view::captured_live_rows(&capture, columns.max(0) as usize)
             .filter(|_| !truncated && column == 0)
         else {
             return;
         };
-        let row = cursor.saturating_sub(1);
         let Some(origin) = super::displayed_live_origin(terminal) else {
             return;
         };
-        let screen_row = row.saturating_sub(origin);
-        if screen_row < 0 || screen_row >= terminal.row_count() {
-            return;
-        }
-        let (native, _) = terminal.text_range_format(vte4::Format::Html, row, 0, row, columns - 1);
-        let Some(native) = native
-            .as_deref()
-            .and_then(|html| html.trim().strip_prefix("<pre>")?.strip_suffix("</pre>"))
-        else {
+        let first = cursor.saturating_sub(text_rows.len() as i64);
+        let Some(font) = terminal.font().filter(|_| terminal.font_scale() == 1.0) else {
             return;
         };
-        if native.trim_end_matches([' ', '\n']) != gtk4::glib::markup_escape_text(text) {
-            return;
-        }
-        let Some(font) = terminal.font() else {
-            return;
-        };
-        let background = terminal.color_background_for_draw();
-        if terminal.font_scale() != 1.0 {
-            return;
-        }
-        #[allow(deprecated)] // The host needs VTE's actual CSS content origin.
+        #[allow(deprecated)] // Match the native terminal content origin.
         let (padding, border) = {
             let style = terminal.style_context();
             (style.padding(), style.border())
         };
         let x = i32::from(padding.left()) + i32::from(border.left()) + terminal.margin_start();
+        let top = i32::from(padding.top()) + i32::from(border.top()) + terminal.margin_top();
         let height = terminal.char_height() as i32;
-        let y = i32::from(padding.top())
-            + i32::from(border.top())
-            + terminal.margin_top()
-            + screen_row as i32 * height;
-        let width = (terminal.char_width() as i32) * text.len() as i32;
-        if width > 0
-            && height > 0
-            && x + width <= self.live_clip.width()
-            && y + height <= self.live_visible_height_px()
-        {
-            view.present(
-                text,
-                gtk4::gdk::Rectangle::new(x, y, width, height),
-                &font,
-                self.shared_live_foreground.get(),
-                background,
-            );
+        let mut rows = Vec::with_capacity(text_rows.len());
+        for (offset, captured) in text_rows.into_iter().enumerate() {
+            let row = first + offset as i64;
+            let screen_row = row.saturating_sub(origin);
+            if screen_row < 0 || screen_row >= terminal.row_count() {
+                return;
+            }
+            let (native, _) =
+                terminal.text_range_format(vte4::Format::Html, row, 0, row, columns - 1);
+            let Some(native) = native
+                .as_deref()
+                .and_then(|html| html.trim().strip_prefix("<pre>")?.strip_suffix("</pre>"))
+            else {
+                return;
+            };
+            if native.trim_end_matches([' ', '\n']) != gtk4::glib::markup_escape_text(captured.text)
+            {
+                return;
+            }
+            let width = (terminal.char_width() as i32) * captured.columns as i32;
+            let y = top + screen_row as i32 * height;
+            if width <= 0
+                || height <= 0
+                || x + width > self.live_clip.width()
+                || y + height > self.live_visible_height_px()
+            {
+                return;
+            }
+            rows.push(jterm_gtk_view::LiveOutputRow {
+                text: captured.text,
+                area: gtk4::gdk::Rectangle::new(x, y, width, height),
+            });
         }
+        view.present(
+            &rows,
+            &font,
+            self.shared_live_foreground.get(),
+            terminal.color_background_for_draw(),
+        );
     }
 
     /// Return at most `max_bytes` from the live capture for bounded main-thread

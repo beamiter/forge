@@ -209,7 +209,7 @@ impl CrossBlockSearchToggleLatch {
 
 pub(crate) struct ZoomState {
     pub(crate) swap: ZoomPageSwap,
-    pub(crate) zoomed_terminal: Terminal,
+    pub(crate) zoomed_terminal: gtk4::Widget,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

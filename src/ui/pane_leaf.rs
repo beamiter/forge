@@ -30,6 +30,8 @@ static NEXT_PANE_FOCUS_SERIAL: AtomicU64 = AtomicU64::new(1);
 pub(crate) enum PaneLeaf {
     Block(Rc<TermView>),
     Vte(Rc<VteTerminalView>),
+    #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+    Shared(Rc<super::shared_terminal::SharedPane>),
 }
 
 impl PaneLeaf {
@@ -38,6 +40,8 @@ impl PaneLeaf {
         match self {
             Self::Block(view) => view.widget(),
             Self::Vte(view) => view.widget(),
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+            Self::Shared(view) => view.root().clone(),
         }
     }
 
@@ -45,10 +49,68 @@ impl PaneLeaf {
     ///
     /// Finished Block snapshots contain additional read-only VTE widgets, so
     /// generic widget-tree traversal cannot reliably identify this terminal.
-    pub(crate) fn terminal(&self) -> &Terminal {
+    pub(crate) fn terminal(&self) -> Option<&Terminal> {
         match self {
-            Self::Block(view) => view.vte(),
-            Self::Vte(view) => view.vte(),
+            Self::Block(view) => Some(view.vte()),
+            Self::Vte(view) => Some(view.vte()),
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+            Self::Shared(_) => None,
+        }
+    }
+
+    pub(crate) fn focus_widget(&self) -> gtk4::Widget {
+        match self {
+            Self::Block(view) => view.vte().clone().upcast(),
+            Self::Vte(view) => view.vte().clone().upcast(),
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+            Self::Shared(view) => view.focus_widget(),
+        }
+    }
+
+    pub(crate) fn working_directory(&self) -> Option<String> {
+        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+        if let Self::Shared(view) = self {
+            return view
+                .terminal_pane()?
+                .runtime()?
+                .inspect_child(jterm_core::process::process_cwd);
+        }
+        self.terminal()
+            .and_then(crate::terminal::terminal_working_directory)
+    }
+
+    pub(crate) fn window_title(&self) -> Option<String> {
+        use vte4::TerminalExt;
+        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+        if let Self::Shared(view) = self {
+            return view.terminal_pane()?.window_title();
+        }
+        self.terminal()?
+            .window_title()
+            .map(|title| title.to_string())
+    }
+
+    pub(crate) fn grid_size(&self) -> (u16, u16) {
+        use vte4::TerminalExt;
+        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+        if let Self::Shared(view) = self {
+            return view.terminal_pane().map_or((0, 0), |pane| pane.grid_size());
+        }
+        self.terminal().map_or((0, 0), |terminal| {
+            let dimension = |count: i64| count.clamp(0, i64::from(u16::MAX)) as u16;
+            (
+                dimension(terminal.column_count()),
+                dimension(terminal.row_count()),
+            )
+        })
+    }
+
+    pub(crate) fn input_generation(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::Block(view) => Some(view.path_drop_generation()),
+            Self::Vte(_) => None,
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+            Self::Shared(view) => view.terminal_pane().map(|pane| (pane.input_revision(), 0)),
         }
     }
 
@@ -57,6 +119,8 @@ impl PaneLeaf {
         match self {
             Self::Block(view) => view.pane_header(),
             Self::Vte(view) => view.pane_header(),
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+            Self::Shared(view) => view.header(),
         }
     }
 
@@ -94,6 +158,10 @@ impl PaneLeaf {
         match self {
             Self::Block(view) => view.grab_focus(),
             Self::Vte(view) => focus_terminal(view.vte()),
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+            Self::Shared(view) => {
+                view.focus_widget().grab_focus();
+            }
         }
     }
 
@@ -137,6 +205,12 @@ impl PaneLeaf {
                 view.write_input(data);
                 Ok(())
             }
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+            Self::Shared(view) => view
+                .terminal_pane()
+                .ok_or(crate::pty::PtyWriteError::ImmediateUnavailable)?
+                .write_input(data.to_vec())
+                .map_err(|_| crate::pty::PtyWriteError::ImmediateUnavailable),
         }
     }
 
@@ -152,7 +226,7 @@ impl PaneLeaf {
     pub(crate) fn block_view(&self) -> Option<Rc<TermView>> {
         match self {
             Self::Block(view) => Some(view.clone()),
-            Self::Vte(_) => None,
+            _ => None,
         }
     }
 
@@ -168,7 +242,26 @@ impl PaneLeaf {
         match self {
             Self::Block(view) => (view.pty_fd_i32(), view.pid_i32()),
             Self::Vte(view) => (view.pty_fd_i32(), view.pid_i32()),
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+            Self::Shared(view) => (
+                -1,
+                view.terminal_pane()
+                    .and_then(|pane| pane.runtime())
+                    .and_then(|runtime| runtime.child_pid())
+                    .unwrap_or_default(),
+            ),
         }
+    }
+
+    pub(crate) fn matches_vim_source(
+        &self,
+        invocation: &jterm_core::vim9::Vim9ShellInvocation,
+    ) -> bool {
+        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+        if let Self::Shared(view) = self {
+            return view.matches_vim_source(invocation);
+        }
+        invocation.matches_pty(self.process_probe().0)
     }
 
     /// Persist the per-pane session identity on the actual leaf root. Split
@@ -307,6 +400,8 @@ impl PaneLeaf {
         match self {
             Self::Block(view) => Some(view.child_lifecycle().into()),
             Self::Vte(view) => view.child_cleanup(),
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+            Self::Shared(view) => view.child_cleanup(),
         }
     }
 
@@ -316,6 +411,8 @@ impl PaneLeaf {
                 .foreground_process_name()
                 .or_else(|| view.close_blocker()),
             Self::Vte(view) => view.close_blocker(self.foreground_process_name()),
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+            Self::Shared(view) => view.close_blocker(),
         }
     }
 
@@ -323,6 +420,8 @@ impl PaneLeaf {
         match self {
             Self::Block(view) => view.withdrawal_work_probe(),
             Self::Vte(view) => crate::gtk_process::vte_withdrawal_work_probe(view.vte()),
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+            Self::Shared(view) => view.withdrawal_work_probe(),
         }
     }
 
@@ -348,6 +447,8 @@ impl PaneLeaf {
             // the escalation ladder starts.
             Self::Block(view) => view.kill(),
             Self::Vte(view) => view.kill(),
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+            Self::Shared(view) => view.stop(),
         }
     }
 
@@ -363,21 +464,22 @@ impl PaneLeaf {
             );
         }
         let root = widget.downgrade();
-        self.terminal().connect_has_focus_notify(move |terminal| {
-            if terminal.has_focus() {
-                let Some(root) = root.upgrade() else {
-                    return;
-                };
-                let serial = NEXT_PANE_FOCUS_SERIAL.fetch_add(1, Ordering::Relaxed);
-                unsafe {
-                    if let Some(stored) =
-                        root.data::<std::cell::Cell<u64>>(PANE_FOCUS_SERIAL_DATA_KEY)
-                    {
-                        stored.as_ref().set(serial);
+        self.focus_widget()
+            .connect_has_focus_notify(move |terminal| {
+                if terminal.has_focus() {
+                    let Some(root) = root.upgrade() else {
+                        return;
+                    };
+                    let serial = NEXT_PANE_FOCUS_SERIAL.fetch_add(1, Ordering::Relaxed);
+                    unsafe {
+                        if let Some(stored) =
+                            root.data::<std::cell::Cell<u64>>(PANE_FOCUS_SERIAL_DATA_KEY)
+                        {
+                            stored.as_ref().set(serial);
+                        }
                     }
                 }
-            }
-        });
+            });
     }
 
     /// Release the strong controller stored on a leaf root before that widget is

@@ -32,15 +32,17 @@ impl DropIntent {
         let cancel = intent.clone();
         focus.connect_leave(move |_| cancel.invalidate());
         leaf.root_widget().add_controller(focus);
+        if let Some(terminal) = leaf.terminal() {
+            let cancel = intent.clone();
+            terminal.connect_commit(move |_, _, _| cancel.invalidate());
+        }
         let cancel = intent.clone();
-        leaf.terminal()
-            .connect_commit(move |_, _, _| cancel.invalidate());
-        let cancel = intent.clone();
-        leaf.terminal().connect_has_focus_notify(move |terminal| {
-            if !terminal.has_focus() {
-                cancel.invalidate();
-            }
-        });
+        leaf.focus_widget()
+            .connect_has_focus_notify(move |terminal| {
+                if !terminal.has_focus() {
+                    cancel.invalidate();
+                }
+            });
         intent
     }
 }
@@ -75,11 +77,12 @@ impl DropDestination {
         // result. Subsequent typing, focus loss, or a newer drop cancels it.
         // Do not use the generic pane focus helper here: its deferred fallback
         // could focus this terminal later even if this capture is rejected.
-        if !leaf.terminal().grab_focus() {
+        let target = leaf.focus_widget();
+        if !target.grab_focus() {
             return None;
         }
         let focused_widget = leaf.root_widget().root()?.focus()?;
-        if focused_widget != *leaf.terminal().upcast_ref::<gtk4::Widget>() {
+        if focused_widget != target {
             return None;
         }
         intent.invalidate();
@@ -91,7 +94,7 @@ impl DropDestination {
             session: leaf.session_id(),
             process: leaf.process_probe(),
             focus_serial: leaf.focus_serial(),
-            input_generation: leaf.block_view().map(|view| view.path_drop_generation()),
+            input_generation: leaf.input_generation(),
             tab_generation_at_drop: tab_generation.get(),
             tab_generation,
             intent: intent.clone(),
@@ -121,7 +124,7 @@ impl DropDestination {
         if leaf.session_id() != self.session
             || leaf.process_probe() != self.process
             || leaf.focus_serial() != self.focus_serial
-            || leaf.block_view().map(|view| view.path_drop_generation()) != self.input_generation
+            || leaf.input_generation() != self.input_generation
         {
             return None;
         }

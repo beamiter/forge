@@ -65,7 +65,7 @@ pub(super) fn owns_dialog(dialog: &adw::Dialog) -> bool {
 pub(super) fn go_to_line(
     window: &adw::ApplicationWindow,
     session: &Vim9Session,
-    editor: &vte4::Terminal,
+    editor: &super::EditorTerminal,
     message: &gtk::Label,
 ) {
     let dialog = adw::AlertDialog::new(Some("Go to line"), Some("Enter line or line:column"));
@@ -117,7 +117,7 @@ pub(super) fn go_to_line(
 }
 
 /// Escape in a native field returns to Vim without consuming Vim's own Escape.
-pub(super) fn editor_escape(widget: &impl IsA<gtk::Widget>, editor: &vte4::Terminal) {
+pub(super) fn editor_escape(widget: &impl IsA<gtk::Widget>, editor: &super::EditorTerminal) {
     let keys = gtk::EventControllerKey::new();
     keys.set_name(Some("vim9-native-field-escape"));
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -245,7 +245,7 @@ pub(super) struct QuickOpen {
     dismissing: Cell<bool>,
     closed: Cell<bool>,
     session: Vim9Session,
-    editor: vte4::Terminal,
+    editor: super::EditorTerminal,
     message: gtk::Label,
 }
 
@@ -254,7 +254,7 @@ impl QuickOpen {
         window: &adw::ApplicationWindow,
         index: Rc<RefCell<Vim9ProjectIndex>>,
         session: &Vim9Session,
-        editor: &vte4::Terminal,
+        editor: &super::EditorTerminal,
         message: &gtk::Label,
     ) {
         let dialog = adw::Dialog::new();

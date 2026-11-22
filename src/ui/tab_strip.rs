@@ -503,10 +503,10 @@ impl UiState {
         let leaves = node.leaves();
         !leaves.is_empty()
             && leaves.iter().all(|leaf| {
-                self.agent_session_tabs
-                    .borrow()
-                    .values()
-                    .any(|bound| bound.upgrade().as_ref() == Some(leaf.terminal()))
+                self.agent_session_tabs.borrow().values().any(|bound| {
+                    leaf.terminal()
+                        .is_some_and(|terminal| bound.upgrade().as_ref() == Some(terminal))
+                })
             })
     }
 
@@ -1186,6 +1186,8 @@ impl UiState {
         match leaf {
             super::pane_leaf::PaneLeaf::Block(view) => view.connect_activity(on_activity),
             super::pane_leaf::PaneLeaf::Vte(view) => view.connect_activity(on_activity),
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+            super::pane_leaf::PaneLeaf::Shared(_) => {}
         }
     }
 

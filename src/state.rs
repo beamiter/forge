@@ -997,15 +997,15 @@ fn serialize_pane_layout_with_tab_state(
             )),
         }
     } else {
-        // Leaf terminal
-        let terminal = find_first_terminal(widget).expect("Leaf must contain terminal");
         let pane_leaf = PaneLeaf::from_widget(widget);
+        let terminal = find_first_terminal(widget);
         let dir = pane_leaf
             .as_ref()
             .and_then(PaneLeaf::block_view)
             .map(|view| view.cwd())
             .filter(|cwd| !cwd.is_empty())
-            .or_else(|| terminal_working_directory(&terminal))
+            .or_else(|| pane_leaf.as_ref().and_then(PaneLeaf::working_directory))
+            .or_else(|| terminal.as_ref().and_then(terminal_working_directory))
             .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/".to_string()));
 
         // Prefer the identity attached to this exact leaf. The tab-number map
@@ -1037,7 +1037,7 @@ fn serialize_pane_layout_with_tab_state(
                 pane_leaf
                     .as_ref()
                     .and_then(PaneLeaf::restorable_command)
-                    .or_else(|| get_restorable_commands(&terminal))
+                    .or_else(|| terminal.as_ref().and_then(get_restorable_commands))
                     .and_then(|argv| crate::process::match_restorable_command_bounded(&argv))
             })
             .flatten();

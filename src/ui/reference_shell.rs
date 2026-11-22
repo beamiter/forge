@@ -433,14 +433,14 @@ pub(crate) fn finish_sidebar_resize(ui: &UiState) {
 fn active_mode(ui: &UiState) -> Option<TerminalMode> {
     ui.current_pane_leaf().map(|leaf| match leaf {
         super::PaneLeaf::Block(view) => view.terminal_mode(),
-        super::PaneLeaf::Vte(_) => TerminalMode::Vte,
+        _ => TerminalMode::Vte,
     })
 }
 
 fn native_grid_input(ui: &UiState) -> bool {
     ui.current_pane_leaf().is_some_and(|leaf| match leaf {
         super::PaneLeaf::Block(view) => !view.has_input_dock(),
-        super::PaneLeaf::Vte(_) => true,
+        _ => true,
     })
 }
 

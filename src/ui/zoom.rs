@@ -31,7 +31,7 @@ impl UiState {
             return;
         };
 
-        let terminal = leaf.terminal().clone();
+        let terminal = leaf.focus_widget();
         let leaf_root = leaf.root_widget();
         let Some(swap) = detach_leaf_for_zoom(&self.notebook, &page_widget, &leaf_root) else {
             return;

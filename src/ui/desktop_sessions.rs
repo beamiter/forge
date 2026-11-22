@@ -42,7 +42,7 @@ pub(crate) fn install(ui: &Rc<UiState>) {
                 .filter_map(|index| ui.notebook.nth_page(Some(index)))
                 .filter_map(|page| PaneNode::from_widget(&page))
                 .flat_map(|node| node.leaves())
-                .find(|leaf| leaf.terminal() == &terminal)
+                .find(|leaf| leaf.terminal() == Some(&terminal))
                 .and_then(|leaf| leaf.session_id());
             let Some(pane) = pane else {
                 continue;

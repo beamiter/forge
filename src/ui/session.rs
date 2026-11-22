@@ -130,7 +130,7 @@ impl UiState {
                     cmds,
                     pinned,
                 };
-                let (terminal, remote_rejected) = if let Some(name) = seed.remote_name.as_deref() {
+                let (page, remote_rejected) = if let Some(name) = seed.remote_name.as_deref() {
                     if let Some(host) = self.resolve_restored_remote(name, &seed.sid) {
                         restored_launch_or_local(
                             self.add_restored_remote_tab(&host, seed.sid.clone(), tab_name),
@@ -163,7 +163,6 @@ impl UiState {
                         false,
                     )
                 };
-                let page = self.restored_page_for_terminal(&terminal);
                 if remote_rejected {
                     set_tab_custom_title(&page, true);
                 } else {
@@ -222,7 +221,7 @@ impl UiState {
         // The one fully wired page can represent a managed remote wherever it
         // sits in the saved split tree. The placeholder is consumed at that
         // exact leaf; local siblings are prepared around it transactionally.
-        let (terminal, remote_rejected) = if let Some((leaf, host)) = resolved_remote.as_ref() {
+        let (first_page, remote_rejected) = if let Some((leaf, host)) = resolved_remote.as_ref() {
             restored_launch_or_local(
                 self.add_restored_remote_tab(host, leaf.sid.clone(), tab_name),
                 || self.add_failed_remote_restore_tab(),
@@ -247,11 +246,10 @@ impl UiState {
             .as_ref()
             .and_then(|(leaf, _)| leaf.remote_name.clone());
 
-        let first_page = self.restored_page_for_terminal(&terminal);
         let page_num = self
             .notebook
             .page_num(&first_page)
-            .expect("the returned restore terminal belongs to its new page");
+            .expect("the restored page is attached to its notebook");
         if remote_rejected {
             set_tab_custom_title(&first_page, true);
         } else {
@@ -345,25 +343,13 @@ impl UiState {
 
     /// A rejected connection is visibly local and has no saved remote launch
     /// data: neither cwd/commands nor the remote session/history identity.
-    fn add_failed_remote_restore_tab(&self) -> vte4::Terminal {
+    fn add_failed_remote_restore_tab(&self) -> gtk4::Widget {
         self.add_new_tab(
             None,
             Some("Local (remote restore failed)".to_string()),
             None,
             crate::terminal::InitialCommands::default(),
         )
-    }
-
-    /// Bind the page to the actual constructor result. Unified's compatibility
-    /// VTE need not be a visible descendant, so use its attached PaneLeaf's
-    /// terminal identity rather than ancestry or current-page selection.
-    fn restored_page_for_terminal(&self, terminal: &vte4::Terminal) -> gtk4::Widget {
-        (0..self.notebook.n_pages())
-            .filter_map(|index| self.notebook.nth_page(Some(index)))
-            .find(|page| {
-                PaneLeaf::from_widget(page).is_some_and(|leaf| leaf.terminal() == terminal)
-            })
-            .expect("normal tab creation attached the returned terminal to a new page")
     }
 
     fn resolve_restored_remote(
@@ -644,12 +630,12 @@ mod tests {
         let production = source.split_once("\n#[cfg(test)]").unwrap().0;
         assert_eq!(production.matches("restored_launch_or_local(").count(), 2);
         assert!(!production.contains(".current_page()"));
-        assert!(production.contains("leaf.terminal() == terminal"));
+        assert!(production.contains(".page_num(&first_page)"));
         let fallback = production
             .split_once("fn add_failed_remote_restore_tab(")
             .unwrap()
             .1
-            .split_once("fn restored_page_for_terminal(")
+            .split_once("fn resolve_restored_remote(")
             .unwrap()
             .0;
         assert!(fallback.contains("Local (remote restore failed)"));
