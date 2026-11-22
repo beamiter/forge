@@ -296,7 +296,7 @@ impl Drop for StartupFocusGuard {
     }
 }
 
-fn queue_startup_terminal_focus(
+pub(crate) fn queue_startup_terminal_focus(
     notebook: &Notebook,
     window: &gtk4::Window,
     generation: Rc<Cell<u64>>,

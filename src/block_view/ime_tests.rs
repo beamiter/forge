@@ -3,12 +3,21 @@
 // The Send regression uses the actual pointer path and checks native IM safety.
 
 fn native_ime_keys(action: &str) {
-    let output = std::process::Command::new("python3")
+    native_ime_keys_with_focus(action, false);
+}
+
+fn native_ime_keys_with_focus(action: &str, require_focus: bool) {
+    let mut command = std::process::Command::new("python3");
+    command
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/scripts/qa-native-ime-keyboard.py"
         ))
-        .arg(action)
+        .arg(action);
+    if require_focus {
+        command.arg("--require-focus");
+    }
+    let output = command
         .output()
         .expect("start fixed-action native IME helper");
     assert!(
@@ -337,4 +346,146 @@ fn native_ime_initial_and_returning_stack_tab_keep_same_owner() {
         view.pty.kill();
         chat_display_settle();
     }
+}
+
+// The Stack fixture tests mode behavior. Use the production focus queues and
+// a Notebook here, without asking the key injector to activate the X11 window.
+#[test]
+#[ignore = "requires isolated X11 DISPLAY and GTK_IM_MODULE=simple; run through test-gtk-display.sh"]
+fn native_ime_notebook_startup_and_return_use_production_focus_queues() {
+    use gtk4::prelude::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
+
+    assert_eq!(std::env::var("GTK_IM_MODULE").as_deref(), Ok("simple"));
+    gtk4::init().expect("GTK display");
+    let first = chat_display_view(crate::config::TerminalMode::Block);
+    let second = chat_display_view(crate::config::TerminalMode::Block);
+    for view in [&first, &second] {
+        view.block_onboarding.history_resolved(false);
+    }
+    assert_ne!(first.pty.master_fd_raw(), second.pty.master_fd_raw());
+
+    let notebook = gtk4::Notebook::new();
+    let first_page = notebook.append_page(&first.root, None::<&gtk4::Widget>);
+    let second_page = notebook.append_page(&second.root, None::<&gtk4::Widget>);
+    notebook.set_current_page(Some(first_page));
+    let chrome = gtk4::Entry::new();
+    let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    root.append(&chrome);
+    root.append(&notebook);
+    let window = gtk4::Window::builder()
+        .title("forge-native-ime-qa")
+        .default_width(800)
+        .default_height(600)
+        .child(&root)
+        .build();
+    let generation = Rc::new(Cell::new(1u64));
+    let search = gtk4::SearchBar::new();
+    let baseline_controllers = window.observe_controllers().n_items();
+    crate::app::queue_startup_terminal_focus(
+        &notebook,
+        &window,
+        generation.clone(),
+        1,
+        first.active_vte.clone(),
+        first_page,
+        search.clone(),
+    );
+    assert_eq!(
+        window.observe_controllers().n_items(),
+        baseline_controllers + 2
+    );
+
+    let first_terminal = first.active_vte.clone();
+    let second_terminal = second.active_vte.clone();
+    let switch_generation = generation.clone();
+    notebook.connect_switch_page(move |notebook, _, page| {
+        let request = switch_generation.get().wrapping_add(1);
+        switch_generation.set(request);
+        let target = if page == first_page {
+            first_terminal.clone()
+        } else {
+            assert_eq!(page, second_page);
+            second_terminal.clone()
+        };
+        crate::app::queue_tab_terminal_focus(
+            notebook,
+            switch_generation.clone(),
+            request,
+            target,
+            page,
+            search.clone(),
+            || panic!("search is closed throughout this fixture"),
+        );
+    });
+
+    // Expire idle-only focus before the first map. Production reconciliation
+    // must retain the request until a real frame clock exists.
+    let context = gtk4::glib::MainContext::default();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while context.iteration(false) {
+        assert!(Instant::now() < deadline, "pre-map idles did not settle");
+    }
+    assert!(!first.active_vte.is_mapped());
+    assert!(!first.active_vte.has_focus());
+    assert_eq!(generation.get(), 1);
+    window.present();
+
+    for (stage, page, request, owner, other) in [
+        ("initial", first_page, 1, &first, &second),
+        ("switch-away", second_page, 2, &second, &first),
+        ("return", first_page, 3, &first, &second),
+    ] {
+        if notebook.current_page() != Some(page) {
+            notebook.set_current_page(Some(page));
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            while context.iteration(false) && Instant::now() < deadline {}
+            if window.is_active()
+                && notebook.current_page() == Some(page)
+                && owner.active_vte.is_mapped()
+                && owner.active_vte.has_focus()
+                && !other.active_vte.is_mapped()
+                && window.observe_controllers().n_items() == baseline_controllers
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{stage}: focus did not settle");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(generation.get(), request, "{stage}: exact Notebook request");
+        assert_eq!(chrome.text().as_str(), "", "{stage}: no input in chrome");
+        for view in [owner, other] {
+            // Existing asynchronous protocol traffic is outside this key
+            // sequence; from compose onward any non-commit byte is a failure.
+            let _ = view.pty.drain_test_slave(Duration::from_millis(30));
+        }
+        native_ime_keys_with_focus("compose", true);
+        for view in [owner, other] {
+            assert!(
+                view.pty
+                    .drain_test_slave(Duration::from_millis(30))
+                    .is_empty(),
+                "{stage}: preedit must not reach either PTY"
+            );
+        }
+        native_ime_keys_with_focus("commit", true);
+        native_ime_expect(&owner.pty, "中".as_bytes());
+        assert!(
+            other
+                .pty
+                .drain_test_slave(Duration::from_millis(50))
+                .is_empty(),
+            "{stage}: inactive PTY must not receive the commit"
+        );
+        assert_eq!(chrome.text().as_str(), "", "{stage}: no input in chrome");
+        println!("Native Notebook simple IM: {stage} selected PTY only; no X focus repair");
+    }
+    window.close();
+    first.pty.kill();
+    second.pty.kill();
+    chat_display_settle();
 }
