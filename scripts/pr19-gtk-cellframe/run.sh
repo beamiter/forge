@@ -23,7 +23,22 @@ cd "$scope"
 cargo fetch --locked
 cargo test --offline --locked
 cargo run --offline --locked --quiet > frames
-cc -std=c11 -Wall -Wextra -Werror -O2 -o display "$src/display.c" $(pkg-config --cflags --libs gtk4 pangocairo)
+# pkg-config emits shell-escaped compiler arguments. Parse them without shell
+# evaluation or glob expansion; a failed pkg-config query must stop the fixture.
+python3 -I - "$src/display.c" <<'PYTHON'
+import shlex
+import subprocess
+import sys
+
+flags = subprocess.check_output(
+    ["pkg-config", "--cflags", "--libs", "gtk4", "pangocairo"], text=True
+)
+subprocess.run(
+    ["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-O2", "-o", "display",
+     sys.argv[1], *shlex.split(flags)],
+    check=True,
+)
+PYTHON
 
 : > "$scope/Xauthority"
 chmod 600 "$scope/Xauthority"
