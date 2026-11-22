@@ -1,0 +1,8 @@
+[package]
+name = "gtk-cellframe-display-contract"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+jterm_engine = { path = "engine" }
