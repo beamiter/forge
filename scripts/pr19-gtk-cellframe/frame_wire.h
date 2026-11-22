@@ -1,6 +1,7 @@
 /* Fixture-private, bounded stdin reader; no production protocol. */
 #ifndef FORGE_PR19_FRAME_WIRE_H
 #define FORGE_PR19_FRAME_WIRE_H
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -10,7 +11,8 @@ typedef struct {
     unsigned red, green, blue, codepoint, width;
 } PaintCell;
 typedef struct {
-    unsigned revision, cols, rows, cursor_row, cursor_col;
+    uint64_t revision;
+    unsigned cols, rows, cursor_row, cursor_col;
     PaintCell cells[MAX_ROWS][MAX_COLS];
 } PaintFrame;
 
@@ -21,9 +23,10 @@ static bool read_frames(FILE *input, PaintFrame frames[FRAME_COUNT])
         return false;
     for (unsigned i = 0; i < FRAME_COUNT; ++i) {
         PaintFrame *f = &frames[i];
-        if (fscanf(input, "%4u %4u %4u %4u %4u", &f->revision, &f->cols, &f->rows,
+        if (fscanf(input, "%19" SCNu64 " %4u %4u %4u %4u", &f->revision, &f->cols, &f->rows,
                    &f->cursor_row, &f->cursor_col) != 5 ||
-            f->revision != i + 1 || f->cols == 0 || f->cols > MAX_COLS ||
+            f->revision == 0 || (i != 0 && f->revision <= frames[i - 1].revision) ||
+            f->cols == 0 || f->cols > MAX_COLS ||
             f->rows == 0 || f->rows > MAX_ROWS || f->cursor_row >= f->rows ||
             f->cursor_col >= f->cols)
             return false;

@@ -220,7 +220,10 @@ fn real_more_fold_restores_native_height_and_document_span() {
     settle();
     assert_eq!(view.finished_blocks.borrow().len(), 1);
     let card = view.finished_blocks.borrow()[0].clone();
-    let original_output = card.output_vte.text_format(vte4::Format::Text).unwrap();
+    let original_output = card
+        .output_vte_for_test()
+        .text_format(vte4::Format::Text)
+        .unwrap();
     let source_output = view.block_data.borrow()[0].output.clone();
     view.scroll_debouncer.user_scrolled_up.set(true);
     let menu_button = |name: &str| {
@@ -245,7 +248,7 @@ fn real_more_fold_restores_native_height_and_document_span() {
     menu_button("Hide Output").emit_clicked();
     settle();
     assert!(card.is_collapsed());
-    assert!(!card.output_vte.is_mapped());
+    assert!(!card.output_vte_for_test().is_mapped());
     assert!(card.widget().height() < expanded_height);
     assert_eq!(
         view.block_data.borrow()[0].estimated_height,
@@ -260,7 +263,7 @@ fn real_more_fold_restores_native_height_and_document_span() {
     menu_button("Show Output").emit_clicked();
     settle();
     assert!(!card.is_collapsed());
-    assert!(card.output_vte.is_mapped());
+    assert!(card.output_vte_for_test().is_mapped());
     assert_eq!(card.widget().height(), expanded_height);
     assert_eq!(
         view.block_data.borrow()[0].estimated_height,
@@ -271,7 +274,9 @@ fn real_more_fold_restores_native_height_and_document_span() {
         i64::from(expanded_height)
     );
     assert_eq!(
-        card.output_vte.text_format(vte4::Format::Text).unwrap(),
+        card.output_vte_for_test()
+            .text_format(vte4::Format::Text)
+            .unwrap(),
         original_output
     );
     assert_eq!(view.block_data.borrow()[0].output, source_output);

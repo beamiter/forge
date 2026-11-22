@@ -121,7 +121,9 @@ fn delayed_clipboard_paste_restores_original_history_only_after_admission() {
         crate::config::TerminalMode::Chat,
     ] {
         let (first, second, _, window) = paste_focus_fixture(mode);
-        let history = first.finished_blocks.borrow()[0].command_vte.clone();
+        let history = first.finished_blocks.borrow()[0]
+            .command_vte_for_test()
+            .clone();
         let oversized = "x".repeat(crate::pty::MAX_PTY_INPUT_MESSAGE_BYTES + 1);
         for text in [
             None,

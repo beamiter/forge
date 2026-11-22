@@ -927,7 +927,7 @@ mod tests {
         );
         assert!(block.set_filtered_out(true));
         assert!(!block.widget().is_visible());
-        let output_vte = block.output_vte.downgrade();
+        let output_vte = block.output_vte_for_test().downgrade();
         let outer = block.widget.clone();
         block.connect_scroll_forwarding(
             &gtk::ScrolledWindow::new(),

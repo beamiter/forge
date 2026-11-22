@@ -1,4 +1,4 @@
-/* GTK4 only, fixed synthetic frames. No Forge app, VTE, input or PTY. */
+/* GTK4 renderer for fixture frames. No Forge app, VTE or terminal authority. */
 #include <gtk/gtk.h>
 #include <pango/pangocairo.h>
 #include "frame_wire.h"
@@ -7,7 +7,7 @@ enum { CELL_W = 34, CELL_H = 26, CANVAS_W = 160, CANVAS_H = 64 };
 typedef struct {
     PaintFrame frames[FRAME_COUNT];
     unsigned phase, draw_count;
-    gboolean success;
+    gboolean success, from_pty;
     GtkWindow *window;
     GtkWidget *canvas;
     GdkPaintable *paintable;
@@ -80,11 +80,16 @@ static gboolean glyph_present(const guint8 *buffer, gsize stride, unsigned cell)
 
 static gboolean sample(gpointer opaque)
 {
-    static const guint32 expected[FRAME_COUNT][4] = {
+    static const guint32 synthetic[FRAME_COUNT][4] = {
         {0xffd01924, 0xff0fd22a, 0xff0b2cda, 0xffd6b20b},
         {0xff8717c9, 0xff0fd22a, 0xff0b2cda, 0xff040608},
     };
+    static const guint32 pty[FRAME_COUNT][4] = {
+        {0xffd01924, 0xff0fd22a, 0xff0fd22a, 0xffd6b20b},
+        {0xff8717c9, 0xff0fd22a, 0xff0fd22a, 0xff040608},
+    };
     Fixture *f = opaque;
+    const guint32 *expected = (f->from_pty ? pty : synthetic)[f->phase];
     if (!gtk_widget_get_mapped(f->canvas) || f->draw_count == 0 ||
         gtk_widget_get_width(f->canvas) != CANVAS_W || gtk_widget_get_height(f->canvas) != CANVAS_H)
         return G_SOURCE_CONTINUE;
@@ -112,13 +117,14 @@ static gboolean sample(gpointer opaque)
     g_object_unref(texture);
     unsigned cursor = f->phase == 0 ? 3 : 2;
     for (unsigned c = 0; c < 4; ++c)
-        if (pixel(pixels, stride, c * CELL_W + 1, 1) != expected[f->phase][c])
+        if (pixel(pixels, stride, c * CELL_W + 1, 1) != expected[c])
             return G_SOURCE_CONTINUE;
     if (pixel(pixels, stride, cursor * CELL_W + 1, CELL_H - 2) != 0xfff6f6f6 ||
         !glyph_present(pixels, stride, 0) || !glyph_present(pixels, stride, 1) ||
         (f->phase == 0 && !glyph_present(pixels, stride, 3)))
         return G_SOURCE_CONTINUE;
-    printf("PR19 mapped pixels revision=%u cell_backgrounds=4 cursor=ok glyph=ok\n", f->phase + 1);
+    printf("PR19 mapped pixels source=%s revision=%" PRIu64 " cell_backgrounds=4 cursor=ok glyph=ok\n",
+           f->from_pty ? "pty" : "synthetic", f->frames[f->phase].revision);
     fflush(stdout);
     if (f->phase + 1 == FRAME_COUNT) {
         f->success = TRUE;
@@ -138,9 +144,12 @@ static gboolean expired(gpointer opaque)
     return G_SOURCE_CONTINUE;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     Fixture f = {0};
+    f.from_pty = argc == 2 && strcmp(argv[1], "--pty") == 0;
+    if (argc != 1 && !f.from_pty)
+        return 1;
     if (!read_frames(stdin, f.frames)) {
         fputs("PR19 invalid private fixture frames\n", stderr);
         return 1;

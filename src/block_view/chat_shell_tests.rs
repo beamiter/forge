@@ -599,7 +599,7 @@ fn run_real_bash_keyboard_and_clipboard(metadata: bool) {
                 assert_eq!(matching[2]["command_source"], "Screen");
             }
             assert!(block.widget.has_css_class("chat-pair"));
-            let terminal = &block.command_vte;
+            let terminal = block.command_vte_for_test();
             let style = terminal.style_context();
             let pad = style.padding();
             let border = style.border();

@@ -1299,7 +1299,7 @@ mod tests {
         assert!(paint.contains("let config = self.config.borrow();"));
         assert!(paint.contains("apply_terminal_theme(&self.active_vte, &config)"));
         assert!(paint.contains("install_block_css(&config)"));
-        assert!(paint.contains("apply_snapshot_theme_to_vte(&block.output_vte, &config)"));
+        assert!(paint.contains("apply_snapshot_theme_to_vte(terminal, &config)"));
         let snapshots = include_str!("../block_view/alt_screen.rs");
         let snapshot_theme = snapshots
             .split_once("fn apply_snapshot_theme_to_vte(terminal: &Terminal, config: &Config) {")

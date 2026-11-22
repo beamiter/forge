@@ -29,6 +29,10 @@ use jterm_core::kitty_keyboard::{
 use jterm_core::pty_input::{self, Paste, PasteModes, PastePolicy, UnbracketedMultiline};
 use jterm_core::terminal_report::{classify_terminal_report, TerminalReport};
 use jterm_core::wheel::WheelAccumulator;
+#[cfg(forge_shared_terminal)]
+use jterm_gtk_view::authenticated_boundaries::{
+    private_command_id as command_id_uses_shell_token, AuthenticatedBoundaries,
+};
 
 mod activity_knowledge;
 mod alt_screen;
@@ -41,6 +45,8 @@ mod chat_layout_tests;
 mod click_cursor;
 mod command_row;
 mod cross_selection;
+mod text_surface;
+use text_surface::TerminalTextSurface;
 mod css;
 mod developer_block;
 #[cfg(test)]
@@ -952,6 +958,7 @@ impl BoundedClipboardAccumulator {
     }
 }
 
+#[cfg(not(forge_shared_terminal))]
 fn command_id_uses_shell_token(id: &str, token: &str) -> bool {
     !token.is_empty()
         && id
@@ -1258,7 +1265,10 @@ fn command_capture_range_is_bounded(start_row: i64, end_row: i64, columns: i64) 
 pub(crate) struct PendingCommandMeta {
     id: Option<String>,
     id_present: bool,
+    #[cfg(not(forge_shared_terminal))]
     id_trusted: bool,
+    #[cfg(forge_shared_terminal)]
+    authenticated_boundaries: AuthenticatedBoundaries,
     /// The durable journal capability minted from this command's `C` mark, or
     /// `None` when the shell did not hand over a complete jsh lifecycle
     /// envelope. Captured at `C` and never reconstructed later, because the
@@ -1313,11 +1323,20 @@ impl PendingCommandMeta {
             .as_deref()
             .filter(|id| jterm_core::execution_journal::is_valid_jsh_session_id(id))
             .map(str::to_owned);
+        #[cfg(forge_shared_terminal)]
+        let authenticated_boundaries = {
+            let mut boundaries = AuthenticatedBoundaries::default();
+            boundaries.observe_start(id.as_deref(), token);
+            boundaries
+        };
         Self {
             id_present: meta.id.is_some(),
+            #[cfg(not(forge_shared_terminal))]
             id_trusted: id
                 .as_deref()
                 .is_some_and(|id| command_id_uses_shell_token(id, token)),
+            #[cfg(forge_shared_terminal)]
+            authenticated_boundaries,
             id,
             // The journal capability is minted here or never: core's parser
             // accepts `session_id`, `seq` and `started_at_ms` only on `C`, so
@@ -1352,7 +1371,11 @@ impl PendingCommandMeta {
         }
     }
 
-    fn command_end_correlation(&self, meta: &CommandMeta) -> CommandIdCorrelation {
+    fn command_end_correlation(
+        &mut self,
+        meta: &CommandMeta,
+        shell_owns_foreground: bool,
+    ) -> CommandIdCorrelation {
         let end_present = meta.id.is_some();
         let end_id = meta
             .id
@@ -1360,11 +1383,18 @@ impl PendingCommandMeta {
             .filter(|id| jterm_core::execution_journal::is_valid_jsh_session_id(id));
         match (self.id_present, self.id.as_deref(), end_present, end_id) {
             (false, None, false, None) => CommandIdCorrelation::Bare,
-            (true, Some(start), true, Some(end)) if start == end && self.id_trusted => {
-                CommandIdCorrelation::MatchedTrusted
-            }
             (true, Some(start), true, Some(end)) if start == end => {
-                CommandIdCorrelation::MatchedUntrusted
+                #[cfg(forge_shared_terminal)]
+                let trusted = self
+                    .authenticated_boundaries
+                    .observe_end(Some(end), shell_owns_foreground);
+                #[cfg(not(forge_shared_terminal))]
+                let trusted = self.id_trusted && shell_owns_foreground;
+                if trusted {
+                    CommandIdCorrelation::MatchedTrusted
+                } else {
+                    CommandIdCorrelation::MatchedUntrusted
+                }
             }
             _ => CommandIdCorrelation::Mismatch,
         }
@@ -1389,6 +1419,8 @@ impl PendingCommandMeta {
     fn forget_correlated_identity(&mut self) {
         self.id = None;
         self.lifecycle = None;
+        #[cfg(forge_shared_terminal)]
+        self.authenticated_boundaries.clear();
     }
 }
 
@@ -2992,7 +3024,7 @@ fn format_color_query_reply(kind: ColorKind, rgba: RGBA) -> String {
 /// live view. The cursor slot is deliberately skipped: snapshot cursors are
 /// hidden via a transparent cursor color (see `apply_snapshot_theme_to_vte`).
 fn apply_dynamic_colors_to_finished(block: &FinishedBlock, dynamic: DynamicColors) {
-    for vte in [&block.command_vte, &block.output_vte] {
+    for vte in block.command_vte.iter().chain(block.output_vte.iter()) {
         if let Some(fg) = dynamic.foreground {
             vte.set_color_foreground(&fg);
         }
@@ -3000,10 +3032,12 @@ fn apply_dynamic_colors_to_finished(block: &FinishedBlock, dynamic: DynamicColor
             vte.set_color_background(&bg);
         }
     }
-    if block.command_vte.has_css_class("chat-command-terminal") {
-        block
-            .command_vte
-            .set_color_background(&RGBA::new(0.0, 0.0, 0.0, 0.0));
+    if let Some(terminal) = block
+        .command_vte
+        .as_ref()
+        .filter(|terminal| terminal.has_css_class("chat-command-terminal"))
+    {
+        terminal.set_color_background(&RGBA::new(0.0, 0.0, 0.0, 0.0));
     }
 }
 
@@ -3471,8 +3505,10 @@ fn clear_finished_block_selection(
 fn clear_vte_text_selections(finished: &[FinishedBlock], active_vte: &Terminal) {
     active_vte.unselect_all();
     for block in finished {
-        block.command_vte.unselect_all();
-        block.output_vte.unselect_all();
+        if let Some(command) = block.command_surface() {
+            command.clear_selection();
+        }
+        block.output_surface().clear_selection();
     }
 }
 
@@ -6614,7 +6650,7 @@ struct EngineState {
 /// Keeping that distinction behind the backend lets consumers avoid using an
 /// empty finished-widget list as an accidental mode test.
 struct RecordSearchTarget {
-    terminal: Terminal,
+    presentation: TerminalTextSurface,
     widget: gtk4::Widget,
     uses_live_surface: bool,
     /// What this record's VTE holds right now. Compared against the value a
@@ -6658,7 +6694,7 @@ struct BackendSearchSurface {
     /// hit finds nothing at all, so the pane reports "No matches" for a query
     /// the user can see on screen.
     reset_cursor: bool,
-    terminal: Terminal,
+    presentation: TerminalTextSurface,
     /// What this surface's VTE held at scan time — see [`RecordSearchTarget`].
     render_stamp: blocks::RenderStamp,
 }
@@ -6688,12 +6724,15 @@ struct BackendSearchBatch {
 /// the document, rather than looking up every hit independently, keeps this
 /// path linear even when many different blocks match.
 fn mounted_jumpable_records(
-    mounted_ids: impl IntoIterator<Item = u64>,
+    mounted_cards: impl IntoIterator<Item = (u64, bool)>,
     candidates: &HashSet<(u64, bool)>,
 ) -> HashSet<(u64, bool)> {
     let mut jumpable = HashSet::with_capacity(candidates.len());
-    for block_id in mounted_ids {
-        for is_output in [false, true] {
+    for (block_id, has_command) in mounted_cards {
+        for is_output in [false, true]
+            .into_iter()
+            .filter(|is_output| *is_output || has_command)
+        {
             let candidate = (block_id, is_output);
             if candidates.contains(&candidate) {
                 jumpable.insert(candidate);
@@ -9128,9 +9167,9 @@ impl ReaderCtx {
         }
         let id_correlation = self
             .engine
-            .borrow()
+            .borrow_mut()
             .pending_command_meta
-            .command_end_correlation(meta);
+            .command_end_correlation(meta, foreground_owner == PtyForeground::Shell);
         // Nested and foreign-foreground marks have already been handled.
         // Only ordinary commands with two explicit shell IDs gain this guard;
         // missing IDs and Agent lost/correlation handling retain their policy.
@@ -9214,6 +9253,8 @@ impl ReaderCtx {
         }
         let (command_cwd, duration_ms) = {
             let mut engine = self.engine.borrow_mut();
+            #[cfg(forge_shared_terminal)]
+            engine.pending_command_meta.authenticated_boundaries.clear();
             engine.pending_exit_code = exit;
             engine.pending_completion_provenance = CompletionProvenance::ShellReported;
             engine.pending_command_meta.merge_command_end(meta);
@@ -9851,6 +9892,12 @@ impl RenderBackend for BlockBackend {
     }
 
     fn feed_live(&self, bytes: &[u8]) {
+        #[cfg(forge_shared_terminal)]
+        if let Ok(active) = self.active_rc.try_borrow() {
+            if let Some(widget) = active.shared_live_widget() {
+                widget.set_visible(false);
+            }
+        }
         self.active_vte.feed(bytes);
     }
 
@@ -9898,16 +9945,21 @@ impl RenderBackend for BlockBackend {
     fn record_search_target(&self, block_id: u64, is_output: bool) -> Option<RecordSearchTarget> {
         let finished = self.finished_blocks_for_cb.borrow();
         let block = finished.iter().find(|block| block.id == block_id)?;
-        let terminal = if is_output {
-            block.output_vte.clone()
+        let presentation = if is_output {
+            block.output_surface()
         } else {
-            block.command_vte.clone()
+            block.command_surface()?
+        };
+        let render_stamp = if is_output || presentation.native().is_some() {
+            block.render_stamp()
+        } else {
+            blocks::NEUTRAL_RENDER_STAMP
         };
         Some(RecordSearchTarget {
-            terminal,
+            presentation,
             widget: block.widget().clone().upcast(),
             uses_live_surface: false,
-            render_stamp: block.render_stamp(),
+            render_stamp,
         })
     }
 
@@ -9934,7 +9986,12 @@ impl RenderBackend for BlockBackend {
 
     fn jumpable_records(&self, candidates: &HashSet<(u64, bool)>) -> HashSet<(u64, bool)> {
         let finished = self.finished_blocks_for_cb.borrow();
-        mounted_jumpable_records(finished.iter().map(|block| block.id), candidates)
+        mounted_jumpable_records(
+            finished
+                .iter()
+                .map(|block| (block.id, block.command_surface().is_some())),
+            candidates,
+        )
     }
 
     fn completed_search_surfaces(
@@ -9953,67 +10010,115 @@ impl RenderBackend for BlockBackend {
                     native_fallback: None,
                 };
             }
-            let mut command_incomplete = false;
-            if !push_search_surface_before_deadline(&mut surfaces, deadline_exhausted, || {
-                let command = jterm_core::review_input::safe_multiline_display(
-                    &block.cmd_text,
-                    jterm_core::review_input::MAX_REVIEW_INPUT_BYTES,
-                );
-                let command_prefix = utf8_prefix_bounded(&command, remaining);
-                command_incomplete = command_prefix.len() < command.len();
-                remaining = remaining.saturating_sub(command_prefix.len());
-                BackendSearchSurface {
-                    block_id: block.id,
-                    block_index,
-                    is_output: false,
-                    is_live: false,
-                    windows: vec![BackendSearchWindow {
-                        text: command_prefix.to_string(),
-                        incomplete: command_incomplete,
-                        initial_wrap: false,
-                    }],
-                    scanned_bytes: command_prefix.len(),
-                    reset_cursor: true,
-                    terminal: block.command_vte.clone(),
-                    render_stamp: block.render_stamp(),
+            if let Some(command_surface) = block.command_surface() {
+                if command_surface.native().is_none() && block.cmd_text.len() > remaining {
+                    // A partial immutable command would change anchored regex matches.
+                    return BackendSearchBatch {
+                        surfaces,
+                        incomplete: true,
+                        native_fallback: None,
+                    };
                 }
-            }) {
-                return BackendSearchBatch {
-                    surfaces,
-                    incomplete: true,
-                    native_fallback: None,
-                };
-            }
-            if command_incomplete {
-                return BackendSearchBatch {
-                    surfaces,
-                    incomplete: true,
-                    native_fallback: None,
-                };
-            }
-            if remaining == 0 {
-                let has_output = {
-                    let full_output = block.full_output.borrow();
-                    let display_override = block.displayed_output.borrow();
-                    !resolved_finished_output(full_output.as_str(), &display_override).is_empty()
-                };
-                let has_more = has_output || block_index + 1 < finished.len();
-                surfaces
-                    .last_mut()
-                    .expect("the command surface was just appended")
-                    .windows
-                    .last_mut()
-                    .expect("a command search window exists")
-                    .incomplete = has_more;
-                return BackendSearchBatch {
-                    surfaces,
-                    incomplete: has_more,
-                    native_fallback: None,
-                };
+                let mut command_incomplete = false;
+                if !push_search_surface_before_deadline(&mut surfaces, deadline_exhausted, || {
+                    let command = jterm_core::review_input::safe_multiline_display(
+                        &block.cmd_text,
+                        jterm_core::review_input::MAX_REVIEW_INPUT_BYTES,
+                    );
+                    let command_prefix = utf8_prefix_bounded(&command, remaining);
+                    command_incomplete = command_prefix.len() < command.len();
+                    remaining = remaining.saturating_sub(command_prefix.len());
+                    BackendSearchSurface {
+                        block_id: block.id,
+                        block_index,
+                        is_output: false,
+                        is_live: false,
+                        windows: vec![BackendSearchWindow {
+                            text: command_prefix.to_string(),
+                            incomplete: command_incomplete,
+                            initial_wrap: false,
+                        }],
+                        scanned_bytes: command_prefix.len(),
+                        reset_cursor: true,
+                        render_stamp: if command_surface.native().is_some() {
+                            block.render_stamp()
+                        } else {
+                            blocks::NEUTRAL_RENDER_STAMP
+                        },
+                        presentation: command_surface,
+                    }
+                }) {
+                    return BackendSearchBatch {
+                        surfaces,
+                        incomplete: true,
+                        native_fallback: None,
+                    };
+                }
+                if command_incomplete {
+                    return BackendSearchBatch {
+                        surfaces,
+                        incomplete: true,
+                        native_fallback: None,
+                    };
+                }
+                if remaining == 0 {
+                    let has_output = {
+                        let full_output = block.full_output.borrow();
+                        let display_override = block.displayed_output.borrow();
+                        !resolved_finished_output(full_output.as_str(), &display_override)
+                            .is_empty()
+                    };
+                    let has_more = has_output || block_index + 1 < finished.len();
+                    surfaces
+                        .last_mut()
+                        .expect("the command surface was just appended")
+                        .windows
+                        .last_mut()
+                        .expect("a command search window exists")
+                        .incomplete = has_more;
+                    return BackendSearchBatch {
+                        surfaces,
+                        incomplete: has_more,
+                        native_fallback: None,
+                    };
+                }
             }
 
             // Bound the raw decorated prefix before stripping, preserving the
             // old aggregate budget without allocating a full cached plain copy.
+            let output_surface = block.output_surface();
+            if let Some(text) = output_surface.document_text() {
+                let scanned_bytes = text.len();
+                if scanned_bytes > remaining
+                    || !push_search_surface_before_deadline(
+                        &mut surfaces,
+                        deadline_exhausted,
+                        || BackendSearchSurface {
+                            block_id: block.id,
+                            block_index,
+                            is_output: true,
+                            is_live: false,
+                            windows: vec![BackendSearchWindow {
+                                text,
+                                incomplete: false,
+                                initial_wrap: false,
+                            }],
+                            scanned_bytes,
+                            reset_cursor: true,
+                            presentation: output_surface.clone(),
+                            render_stamp: block.render_stamp(),
+                        },
+                    )
+                {
+                    return BackendSearchBatch {
+                        surfaces,
+                        incomplete: true,
+                        native_fallback: None,
+                    };
+                }
+                remaining -= scanned_bytes;
+                continue;
+            }
             let mut output_incomplete = false;
             if !push_search_surface_before_deadline(&mut surfaces, deadline_exhausted, || {
                 let full_output = block.full_output.borrow();
@@ -10034,7 +10139,7 @@ impl RenderBackend for BlockBackend {
                     }],
                     scanned_bytes: raw_prefix.len(),
                     reset_cursor: true,
-                    terminal: block.output_vte.clone(),
+                    presentation: output_surface,
                     render_stamp: block.render_stamp(),
                 }
             }) {
@@ -10435,6 +10540,17 @@ impl RenderBackend for BlockBackend {
             plain_output_bytes,
             recycled,
             FinishedBlockPrecomputed {
+                #[cfg(forge_shared_terminal)]
+                document_command: record.command_source == CommandTextSource::ShellReported
+                    && self.dynamic_colors_rc.get().foreground.is_none()
+                    && matches!(
+                        finished_config.terminal_mode,
+                        crate::config::TerminalMode::Block | crate::config::TerminalMode::Chat
+                    )
+                    && std::env::var("JTERM_SHARED_FINISHED_COMMANDS").as_deref() == Ok("1"),
+                #[cfg(forge_shared_terminal)]
+                document_output: payload.output_notice().is_none()
+                    && std::env::var("JTERM_SHARED_FINISHED_OUTPUT").as_deref() == Ok("1"),
                 output_rows: Some(output_rows),
                 output_preview: Some(fold_preview::from_output(output_with_ansi)),
             },
@@ -11289,7 +11405,7 @@ impl RenderBackend for UnifiedBackend {
                 windows,
                 scanned_bytes,
                 reset_cursor: true,
-                terminal: self.vte.clone(),
+                presentation: TerminalTextSurface::Native(self.vte.clone()),
                 // Unified has one persistent surface with no per-record
                 // snapshot to re-feed, so it reports the neutral stamp and its
                 // cursor is never invalidated by this check.
@@ -14503,6 +14619,10 @@ impl TermView {
         self.active
             .borrow()
             .set_preserve_live_scrollback(config.preserve_live_scrollback);
+        #[cfg(forge_shared_terminal)]
+        self.active
+            .borrow()
+            .set_shared_live_foreground(config.foreground);
     }
 
     /// Switch every card in this pane, and the live input cell, to the
@@ -15582,6 +15702,13 @@ impl TermView {
                 debouncer.pin_to_bottom_deferred(&scroll);
             });
         }
+
+        #[cfg(forge_shared_terminal)]
+        blocks::ActiveBlock::connect_shared_live_output(
+            &active,
+            bstate.clone(),
+            contents_generation.clone(),
+        );
 
         // True while an alt-screen app owns the viewport (finished blocks hidden).
         let fullscreen: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -19818,14 +19945,32 @@ impl TermView {
             developer_block::terminal_colors(&self.active_vte);
         }
         for block in self.finished_blocks.borrow().iter() {
-            apply_snapshot_theme_to_vte(&block.command_vte, &config);
-            apply_snapshot_theme_to_vte(&block.output_vte, &config);
-            if developer {
-                developer_block::terminal_colors(&block.command_vte);
-                block
-                    .command_vte
-                    .set_color_background(&gtk4::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
-                developer_block::terminal_colors(&block.output_vte);
+            #[cfg(forge_shared_terminal)]
+            let document_foreground = if block.widget().has_css_class("chat-pair") {
+                blocks::chat_snapshot_foreground()
+            } else {
+                developer_block::terminal_foreground()
+            };
+            if let Some(terminal) = &block.command_vte {
+                apply_snapshot_theme_to_vte(terminal, &config);
+                if developer {
+                    developer_block::terminal_colors(terminal);
+                    terminal.set_color_background(&gtk4::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
+                }
+            }
+            #[cfg(forge_shared_terminal)]
+            if let Some(command) = &block.command_document {
+                command.set_colors(document_foreground, &config.palette);
+            }
+            if let Some(terminal) = &block.output_vte {
+                apply_snapshot_theme_to_vte(terminal, &config);
+                if developer {
+                    developer_block::terminal_colors(terminal);
+                }
+            }
+            #[cfg(forge_shared_terminal)]
+            if let Some(output) = &block.output_document {
+                output.set_colors(document_foreground, &config.palette);
             }
         }
         install_block_css(&config);
@@ -19841,8 +19986,20 @@ impl TermView {
         let font_desc = crate::font::terminal_font_description(desc, &self.config.borrow());
         self.active_vte.set_font(Some(&font_desc));
         for block in self.finished_blocks.borrow().iter() {
-            block.command_vte.set_font(Some(&font_desc));
-            block.output_vte.set_font(Some(&font_desc));
+            if let Some(terminal) = &block.command_vte {
+                terminal.set_font(Some(&font_desc));
+            }
+            #[cfg(forge_shared_terminal)]
+            if let Some(command) = &block.command_document {
+                command.set_font(&font_desc);
+            }
+            if let Some(terminal) = &block.output_vte {
+                terminal.set_font(Some(&font_desc));
+            }
+            #[cfg(forge_shared_terminal)]
+            if let Some(output) = &block.output_document {
+                output.set_font(&font_desc);
+            }
         }
         // Update config and regenerate CSS with new font
         self.config.borrow_mut().font_desc = desc.to_string();
@@ -19955,9 +20112,10 @@ impl TermView {
                 "composer_dock":dock_bounds,
             })
         };
-        let outputs: Vec<_> = finished.iter().filter(|card| card.output_vte.is_mapped()).map(|card| {
-            let adjustment = card.output_vte.vadjustment();
-            serde_json::json!({"id":card.id,"adjustment":adjustment.map(|a|(a.lower(),a.value(),a.upper(),a.page_size())),"exit_code":data.iter().find(|record|record.id==card.id).and_then(|record|record.exit_code),"duration_ms":data.iter().find(|record|record.id==card.id).and_then(|record|record.duration_ms),"height":card.widget().height(),"height_request":card.widget().height_request(),"estimated_height":data.iter().find(|record|record.id==card.id).map(|record|record.estimated_height),"developer":card.widget().has_css_class("developer-command-card"),"rows":card.output_vte.row_count(),"columns":card.output_vte.column_count(),"cell":[card.output_vte.char_width(),card.output_vte.char_height()]})
+        let outputs: Vec<_> = finished.iter().filter(|card| card.output_vte.as_ref().is_some_and(|vte| vte.is_mapped())).map(|card| {
+            let Some(terminal) = card.output_vte.as_ref() else { unreachable!("filtered above") };
+            let adjustment = terminal.vadjustment();
+            serde_json::json!({"id":card.id,"adjustment":adjustment.map(|a|(a.lower(),a.value(),a.upper(),a.page_size())),"exit_code":data.iter().find(|record|record.id==card.id).and_then(|record|record.exit_code),"duration_ms":data.iter().find(|record|record.id==card.id).and_then(|record|record.duration_ms),"height":card.widget().height(),"height_request":card.widget().height_request(),"estimated_height":data.iter().find(|record|record.id==card.id).map(|record|record.estimated_height),"developer":card.widget().has_css_class("developer-command-card"),"rows":terminal.row_count(),"columns":terminal.column_count(),"cell":[terminal.char_width(),terminal.char_height()]})
         }).collect();
         serde_json::json!({"frame_time":self.root.frame_clock().map(|clock|clock.frame_time()),
             "adjustment":[adjustment.lower(),adjustment.value(),adjustment.upper(),adjustment.page_size()],
@@ -22718,7 +22876,8 @@ mod tests {
         }
         let cards = view.finished_blocks.borrow();
         let card = cards.last().expect("a finished card");
-        let shown = super::find::live_vte_search_text(&card.output_vte).expect("card text");
+        let shown =
+            super::find::live_vte_search_text(card.output_vte_for_test()).expect("card text");
         assert_in_order(&shown, &history);
         assert!(!card.output_notice.is_visible(), "nothing was dropped");
         drop(cards);
@@ -25846,37 +26005,46 @@ mod tests {
         assert_eq!(pending.cwd.as_deref(), Some("/tmp/project"));
         assert_eq!(pending.duration_ms, Some(1234));
         assert_eq!(
-            pending.command_end_correlation(&CommandMeta {
-                id: Some("jsh-7".to_string()),
-                ..CommandMeta::default()
-            }),
+            pending.command_end_correlation(
+                &CommandMeta {
+                    id: Some("jsh-7".to_string()),
+                    ..CommandMeta::default()
+                },
+                true,
+            ),
             CommandIdCorrelation::MatchedUntrusted
         );
 
         assert_eq!(
-            PendingCommandMeta::default().command_end_correlation(&CommandMeta::default()),
+            PendingCommandMeta::default().command_end_correlation(&CommandMeta::default(), true),
             CommandIdCorrelation::Bare
         );
         assert_eq!(
-            pending.command_end_correlation(&CommandMeta {
-                id: Some("jsh-8".to_string()),
-                ..CommandMeta::default()
-            }),
+            pending.command_end_correlation(
+                &CommandMeta {
+                    id: Some("jsh-8".to_string()),
+                    ..CommandMeta::default()
+                },
+                true,
+            ),
             CommandIdCorrelation::Mismatch
         );
         assert_eq!(
-            pending.command_end_correlation(&CommandMeta::default()),
+            pending.command_end_correlation(&CommandMeta::default(), true),
             CommandIdCorrelation::Mismatch
         );
-        let invalid_start = PendingCommandMeta::from_command_start(&CommandMeta {
+        let mut invalid_start = PendingCommandMeta::from_command_start(&CommandMeta {
             id: Some("bad/id".to_string()),
             ..CommandMeta::default()
         });
         assert_eq!(
-            invalid_start.command_end_correlation(&CommandMeta {
-                id: Some("also bad/id".to_string()),
-                ..CommandMeta::default()
-            }),
+            invalid_start.command_end_correlation(
+                &CommandMeta {
+                    id: Some("also bad/id".to_string()),
+                    ..CommandMeta::default()
+                },
+                true,
+            ),
             CommandIdCorrelation::Mismatch,
             "invalid raw ids must not collapse into the bare-marker case"
         );
@@ -26005,7 +26173,7 @@ mod tests {
         };
         assert_eq!(
             PendingCommandMeta::from_command_start_with_token(&start, token)
-                .command_end_correlation(&end),
+                .command_end_correlation(&end, true),
             CommandIdCorrelation::MatchedTrusted
         );
         assert!(
@@ -26015,7 +26183,7 @@ mod tests {
             "private shell tokens must never reach the persistent jsh journal"
         );
         assert_eq!(
-            PendingCommandMeta::from_command_start(&start).command_end_correlation(&end),
+            PendingCommandMeta::from_command_start(&start).command_end_correlation(&end, true),
             CommandIdCorrelation::MatchedUntrusted
         );
         // Same rule against a *complete* envelope. forge's own shims emit only
@@ -26915,10 +27083,10 @@ mod tests {
 
     #[test]
     fn mounted_jumpability_intersects_both_surfaces_in_one_document_pass() {
-        let candidates = HashSet::from([(2, false), (2, true), (3, true), (9, false)]);
+        let candidates = HashSet::from([(2, false), (2, true), (3, false), (3, true), (9, false)]);
         let visited = Cell::new(0);
         let jumpable = mounted_jumpable_records(
-            [1, 2, 3, 4]
+            [(1, true), (2, true), (3, false), (4, true)]
                 .into_iter()
                 .inspect(|_| visited.set(visited.get() + 1)),
             &candidates,
@@ -26963,7 +27131,7 @@ mod tests {
         let batched_started = Instant::now();
         for _ in 0..REPETITIONS {
             black_box(mounted_jumpable_records(
-                mounted.iter().copied(),
+                mounted.iter().map(|&id| (id, true)),
                 &candidates,
             ));
         }
@@ -31462,12 +31630,17 @@ mod tests {
         let harness = ReaderHarness::new();
         harness.feed_all([ParserEvent::PromptStart, ParserEvent::PromptEnd]);
         harness.feed(command_start(Some("agent-unknown")));
-        let trusted_id = "0123456789abcdef0123456789abcdef-7".to_string();
+        let token = "0123456789abcdef0123456789abcdef";
+        let trusted_id = format!("{token}-7");
         {
             let mut engine = harness.ctx.engine.borrow_mut();
-            engine.pending_command_meta.id_present = true;
-            engine.pending_command_meta.id_trusted = true;
-            engine.pending_command_meta.id = Some(trusted_id.clone());
+            engine.pending_command_meta = PendingCommandMeta::from_command_start_with_token(
+                &CommandMeta {
+                    id: Some(trusted_id.clone()),
+                    ..CommandMeta::default()
+                },
+                token,
+            );
         }
         harness.ctx.active_agent_generation_rc.set(Some(88));
         harness.feed(ParserEvent::CommandEnd {
@@ -34983,7 +35156,9 @@ mod tests {
                 b"\x1b]133;A\x07$ \x1b]133;B\x07history\r\n\x1b]133;C;cmdline_url=history\x07output\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07",
             );
             chat_display_settle();
-            let history = other.finished_blocks.borrow()[0].command_vte.clone();
+            let history = other.finished_blocks.borrow()[0]
+                .command_vte_for_test()
+                .clone();
             for alt_exit in [false, true] {
                 for (name, owner) in [
                     ("pane", other.active_vte.clone().upcast::<gtk4::Widget>()),

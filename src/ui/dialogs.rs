@@ -6636,21 +6636,27 @@ impl UiState {
             body.append(&note_label);
         }
 
-        let text = gtk4::TextView::new();
-        text.buffer().set_text(&view.output);
-        text.set_editable(false);
-        text.set_monospace(true);
-        text.set_top_margin(8);
-        text.set_bottom_margin(8);
-        text.set_left_margin(8);
-        text.set_right_margin(8);
-        let scrolled = ScrolledWindow::builder()
-            .hscrollbar_policy(gtk4::PolicyType::Automatic)
-            .vscrollbar_policy(gtk4::PolicyType::Automatic)
-            .vexpand(true)
-            .child(&text)
-            .build();
-        body.append(&scrolled);
+        #[cfg(forge_shared_terminal)]
+        body.append(jterm_gtk_view::DocumentView::new(&view.output).widget());
+
+        #[cfg(not(forge_shared_terminal))]
+        {
+            let text = gtk4::TextView::new();
+            text.buffer().set_text(&view.output);
+            text.set_editable(false);
+            text.set_monospace(true);
+            text.set_top_margin(8);
+            text.set_bottom_margin(8);
+            text.set_left_margin(8);
+            text.set_right_margin(8);
+            let scrolled = ScrolledWindow::builder()
+                .hscrollbar_policy(gtk4::PolicyType::Automatic)
+                .vscrollbar_policy(gtk4::PolicyType::Automatic)
+                .vexpand(true)
+                .child(&text)
+                .build();
+            body.append(&scrolled);
+        }
 
         let toolbar_view = adw::ToolbarView::new();
         toolbar_view.add_top_bar(&header_bar);

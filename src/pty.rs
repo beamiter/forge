@@ -18,6 +18,10 @@ use jterm_core::pty_input::{
     AdmittedInput, InputGuard, PasteModes, PastePolicy, UnbracketedMultiline,
 };
 
+#[cfg(forge_shared_terminal)]
+use jterm_gtk_view::PtyEvent as PtyMsg;
+
+#[cfg(not(forge_shared_terminal))]
 enum PtyMsg {
     Data(Vec<u8>),
     Exit(i32),
@@ -127,7 +131,13 @@ pub struct OwnedPty {
     test_foreground: std::sync::Mutex<Option<PtyForeground>>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", forge_shared_terminal))]
+fn shell_token_channel() -> io::Result<Option<(String, OwnedFd, OwnedFd)>> {
+    Ok(jterm_gtk_view::ShellIdentityChannel::allocate()?
+        .map(jterm_gtk_view::ShellIdentityChannel::into_parts))
+}
+
+#[cfg(all(target_os = "linux", not(forge_shared_terminal)))]
 fn shell_token_channel() -> io::Result<Option<(String, OwnedFd, OwnedFd)>> {
     let mut random = [0u8; 16];
     // SAFETY: `random` is writable for exactly the supplied length.
@@ -152,13 +162,16 @@ fn shell_token_channel() -> io::Result<Option<(String, OwnedFd, OwnedFd)>> {
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: pipe2 returned two fresh owned descriptors.
-    let read_fd = move_fd_above_stdio(unsafe { OwnedFd::from_raw_fd(fds[0]) })?;
-    let write_fd = move_fd_above_stdio(unsafe { OwnedFd::from_raw_fd(fds[1]) })?;
+    // SAFETY: pipe2 returned two fresh descriptors. Own both before either
+    // fallible remap so the other end closes even if the remap fails.
+    let (read_fd, write_fd) =
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    let read_fd = move_fd_above_stdio(read_fd)?;
+    let write_fd = move_fd_above_stdio(write_fd)?;
     Ok(Some((token, read_fd, write_fd)))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(forge_shared_terminal)))]
 fn move_fd_above_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
     if fd.as_raw_fd() > libc::STDERR_FILENO {
         return Ok(fd);
@@ -1292,7 +1305,7 @@ impl OwnedPty {
     /// GLib main thread; when the UI falls behind, the child is naturally slowed
     /// through the channel and kernel PTY buffers instead of growing memory
     /// without limit.
-    pub fn start_reader<F, E>(&self, mut callback: F, on_exit: E)
+    pub fn start_reader<F, E>(&self, callback: F, on_exit: E)
     where
         F: FnMut(Vec<u8>) + 'static,
         E: FnOnce(i32) + 'static,
@@ -1333,59 +1346,76 @@ impl OwnedPty {
             }),
         );
 
-        let on_exit = std::cell::Cell::new(Some(on_exit));
+        #[cfg(forge_shared_terminal)]
+        {
+            let mut dispatch = jterm_gtk_view::PtyDispatch::new(rx, callback, on_exit);
+            unix_fd_add_local(eventfd.as_raw_fd(), move || {
+                dispatch.on_wake(
+                    &wake_pending,
+                    || {
+                        let _ = drain_eventfd(eventfd.as_raw_fd());
+                    },
+                    || rearm_dispatch(&eventfd, &wake_pending),
+                )
+            });
+        }
+        #[cfg(not(forge_shared_terminal))]
+        {
+            let mut callback = callback;
+            let on_exit = std::cell::Cell::new(Some(on_exit));
 
-        unix_fd_add_local(eventfd.as_raw_fd(), move || {
-            let _ = drain_eventfd(eventfd.as_raw_fd());
+            unix_fd_add_local(eventfd.as_raw_fd(), move || {
+                let _ = drain_eventfd(eventfd.as_raw_fd());
 
-            // A producer may enqueue between the first empty read and clearing
-            // `wake_pending`. Recheck after clearing so that transition cannot
-            // lose its only eventfd notification.
-            let message = match rx.try_recv() {
-                Ok(message) => message,
-                Err(mpsc::TryRecvError::Empty) => {
-                    wake_pending.store(false, Ordering::Release);
-                    match rx.try_recv() {
-                        Ok(message) => {
-                            wake_pending.store(true, Ordering::Release);
-                            let _ = drain_eventfd(eventfd.as_raw_fd());
-                            message
+                // A producer may enqueue between the first empty read and clearing
+                // `wake_pending`. Recheck after clearing so that transition cannot
+                // lose its only eventfd notification.
+                let message = match rx.try_recv() {
+                    Ok(message) => message,
+                    Err(mpsc::TryRecvError::Empty) => {
+                        wake_pending.store(false, Ordering::Release);
+                        match rx.try_recv() {
+                            Ok(message) => {
+                                wake_pending.store(true, Ordering::Release);
+                                let _ = drain_eventfd(eventfd.as_raw_fd());
+                                message
+                            }
+                            Err(mpsc::TryRecvError::Empty) => return true,
+                            Err(mpsc::TryRecvError::Disconnected) => return false,
                         }
-                        Err(mpsc::TryRecvError::Empty) => return true,
-                        Err(mpsc::TryRecvError::Disconnected) => return false,
                     }
-                }
-                Err(mpsc::TryRecvError::Disconnected) => return false,
-            };
+                    Err(mpsc::TryRecvError::Disconnected) => return false,
+                };
 
-            match message {
-                PtyMsg::Data(data) => {
-                    callback(data);
-                    // Re-arm at idle priority rather than after a fixed sleep.
-                    // This watch is itself a DEFAULT_IDLE source, so GTK's input
-                    // handling (DEFAULT) and its frame clock (HIGH_IDLE + 20)
-                    // both preempt the loop: the frame boundary comes from the
-                    // priority that is already there instead of from a constant
-                    // that has to guess one. The former fixed 8 ms re-arm handed
-                    // the renderer at most one 32 KiB chunk per tick — a
-                    // ~4 MiB/s ceiling that spent ~98% of each interval asleep,
-                    // and it showed: measured over `seq 1 200000` in a
-                    // 1600x1000 pane, the screen only reached a new frame every
-                    // 6th capture frame (~200 ms of visibly frozen output at a
-                    // time). Idle re-arm removes the gap and cuts the run from
-                    // Enter to last repaint by about a quarter, with input
-                    // latency under a 20 MiB stream unchanged.
-                    rearm_dispatch(&eventfd, &wake_pending);
-                    true
-                }
-                PtyMsg::Exit(code) => {
-                    if let Some(f) = on_exit.take() {
-                        f(code);
+                match message {
+                    PtyMsg::Data(data) => {
+                        callback(data);
+                        // Re-arm at idle priority rather than after a fixed sleep.
+                        // This watch is itself a DEFAULT_IDLE source, so GTK's input
+                        // handling (DEFAULT) and its frame clock (HIGH_IDLE + 20)
+                        // both preempt the loop: the frame boundary comes from the
+                        // priority that is already there instead of from a constant
+                        // that has to guess one. The former fixed 8 ms re-arm handed
+                        // the renderer at most one 32 KiB chunk per tick — a
+                        // ~4 MiB/s ceiling that spent ~98% of each interval asleep,
+                        // and it showed: measured over `seq 1 200000` in a
+                        // 1600x1000 pane, the screen only reached a new frame every
+                        // 6th capture frame (~200 ms of visibly frozen output at a
+                        // time). Idle re-arm removes the gap and cuts the run from
+                        // Enter to last repaint by about a quarter, with input
+                        // latency under a 20 MiB stream unchanged.
+                        rearm_dispatch(&eventfd, &wake_pending);
+                        true
                     }
-                    false
+                    PtyMsg::Exit(code) => {
+                        if let Some(f) = on_exit.take() {
+                            f(code);
+                        }
+                        false
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 
     fn start_reader_polling<F, E>(
@@ -1394,7 +1424,7 @@ impl OwnedPty {
         lifecycle: Arc<ChildLifecycle>,
         tx: mpsc::SyncSender<PtyMsg>,
         rx: mpsc::Receiver<PtyMsg>,
-        mut callback: F,
+        callback: F,
         on_exit: E,
     ) where
         F: FnMut(Vec<u8>) + 'static,
@@ -1411,32 +1441,51 @@ impl OwnedPty {
             WakeSink::new(|| {}),
         );
 
-        let on_exit = std::cell::Cell::new(Some(on_exit));
-        let rx = std::cell::RefCell::new(rx);
-
-        // Idle priority, matching the eventfd watch above and the comment on
-        // G_PRIORITY_DEFAULT_IDLE. A plain `timeout_add_local` runs at
-        // G_PRIORITY_DEFAULT, so this path — reached exactly when `eventfd()`
-        // fails, i.e. under descriptor pressure with many panes open — used to
-        // preempt GTK's redraw and input dispatch on every tick.
-        glib::timeout_add_local_full(
-            PTY_DISPATCH_INTERVAL,
-            glib::Priority::DEFAULT_IDLE,
-            move || match rx.borrow().try_recv() {
-                Ok(PtyMsg::Data(data)) => {
-                    callback(data);
-                    glib::ControlFlow::Continue
-                }
-                Ok(PtyMsg::Exit(code)) => {
-                    if let Some(f) = on_exit.take() {
-                        f(code);
+        #[cfg(forge_shared_terminal)]
+        {
+            let mut dispatch = jterm_gtk_view::PtyDispatch::new(rx, callback, on_exit);
+            glib::timeout_add_local_full(
+                PTY_DISPATCH_INTERVAL,
+                glib::Priority::DEFAULT_IDLE,
+                move || {
+                    if dispatch.on_poll() {
+                        glib::ControlFlow::Continue
+                    } else {
+                        glib::ControlFlow::Break
                     }
-                    glib::ControlFlow::Break
-                }
-                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
-            },
-        );
+                },
+            );
+        }
+        #[cfg(not(forge_shared_terminal))]
+        {
+            let mut callback = callback;
+            let on_exit = std::cell::Cell::new(Some(on_exit));
+            let rx = std::cell::RefCell::new(rx);
+
+            // Idle priority, matching the eventfd watch above and the comment on
+            // G_PRIORITY_DEFAULT_IDLE. A plain `timeout_add_local` runs at
+            // G_PRIORITY_DEFAULT, so this path — reached exactly when `eventfd()`
+            // fails, i.e. under descriptor pressure with many panes open — used to
+            // preempt GTK's redraw and input dispatch on every tick.
+            glib::timeout_add_local_full(
+                PTY_DISPATCH_INTERVAL,
+                glib::Priority::DEFAULT_IDLE,
+                move || match rx.borrow().try_recv() {
+                    Ok(PtyMsg::Data(data)) => {
+                        callback(data);
+                        glib::ControlFlow::Continue
+                    }
+                    Ok(PtyMsg::Exit(code)) => {
+                        if let Some(f) = on_exit.take() {
+                            f(code);
+                        }
+                        glib::ControlFlow::Break
+                    }
+                    Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+                },
+            );
+        }
     }
 }
 

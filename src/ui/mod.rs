@@ -56,6 +56,8 @@ mod search;
 mod search_native_tests;
 mod search_preview;
 mod session;
+#[cfg(forge_shared_terminal)]
+pub(crate) mod shared_terminal;
 mod sidebar_resize;
 mod sidebar_tabs;
 mod workspace_chats;
@@ -65,12 +67,21 @@ mod workspace_context_ui;
 mod workspace_mission_evidence;
 mod workspace_missions;
 pub(crate) mod workspace_navigation;
+#[cfg(forge_shared_terminal)]
+use jterm_core::agent_workspace::controllers::remote as workspace_remote;
+#[cfg(not(forge_shared_terminal))]
 mod workspace_remote;
 mod workspace_remote_ui;
 mod workspace_review;
 mod workspace_review_ui;
+#[cfg(forge_shared_terminal)]
+use jterm_core::agent_workspace::controllers::scope as workspace_scope;
+#[cfg(not(forge_shared_terminal))]
 mod workspace_scope;
 mod workspace_search_ui;
+#[cfg(forge_shared_terminal)]
+use jterm_core::agent_workspace::controllers::tools as workspace_tools;
+#[cfg(not(forge_shared_terminal))]
 mod workspace_tools;
 pub(crate) mod workspace_visibility;
 pub(crate) use sidebar_tabs::configure_layout as configure_sidebar_layout;

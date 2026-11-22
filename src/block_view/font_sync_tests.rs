@@ -247,11 +247,11 @@ fn font_groups_stay_independent_across_native_panes_and_late_rows() {
             assert_eq!(view.vte().font_scale(), scale);
             for finished in view.finished_blocks.borrow().iter() {
                 assert_eq!(
-                    finished.command_vte.font().unwrap().size(),
+                    finished.command_vte_for_test().font().unwrap().size(),
                     view.vte().font().unwrap().size()
                 );
                 assert_eq!(
-                    finished.output_vte.font().unwrap().size(),
+                    finished.output_vte_for_test().font().unwrap().size(),
                     view.vte().font().unwrap().size()
                 );
             }

@@ -459,16 +459,16 @@ jobs:
         if: ${{ !cancelled() }}
         run: FORGE_NATIVE_CRASH_DIAGNOSTICS=1 GTK_PAINT_DIAGNOSTICS_DIR="$PWD/gtk-paint-diagnostics" FORGE_XTEST_DRIVER="$PWD/scripts/qa-cross-selection-pointer.py" bash scripts/test-gtk-display.sh
 
-      - name: Check out pinned shared engine for the synthetic GTK fixture
+      - name: Check out the pinned engine candidate for the GTK display fixture
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: beamiter/jterm_core
-          ref: 5f665fe7c56f118927d0f319bbabd05eb3cbe045
+          ref: 7e30d95d304a20d7820ae2afcd740e813cf4e786
           path: target/pr19-shared-engine
           persist-credentials: false
 
-      - name: Prove mapped GTK4 pixels from shared CellFrame (test fixture only)
-        timeout-minutes: 2
+      - name: Prove mapped GTK4 pixels from synthetic and real PTY CellFrames
+        timeout-minutes: 3
         run: bash scripts/pr19-gtk-cellframe/run.sh target/pr19-shared-engine
 
       - name: Upload synthetic GTK paint diagnostics

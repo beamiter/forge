@@ -1768,6 +1768,32 @@ pub(crate) fn center_header(top_tabs: &gtk4::ScrolledWindow) -> gtk4::Box {
     header
 }
 
+#[cfg(forge_shared_terminal)]
+pub(crate) fn install_shared_terminal_action(header: &gtk4::Box, ui: &Rc<UiState>) {
+    let Some(actions) = widget_with_class_any(header.upcast_ref(), "reference-header-actions")
+        .and_downcast::<gtk4::Box>()
+    else {
+        return;
+    };
+    let button = gtk4::Button::from_icon_name("utilities-terminal-symbolic");
+    button.set_size_request(
+        token::HEADER_ACTION_SIZE as i32,
+        token::HEADER_ACTION_SIZE as i32,
+    );
+    button.set_valign(gtk4::Align::Center);
+    button.set_tooltip_text(Some("New shared terminal tab"));
+    button.update_property(&[gtk4::accessible::Property::Label("New shared terminal tab")]);
+    button.set_focus_on_click(false);
+    button.add_css_class("reference-header-action");
+    let state = Rc::downgrade(ui);
+    button.connect_clicked(move |_| {
+        if let Some(state) = state.upgrade() {
+            state.add_shared_terminal_tab();
+        }
+    });
+    actions.prepend(&button);
+}
+
 /// Rebuild only the outer shell once. Real session widgets are reparented,
 /// never reconstructed when a frame, command or allocation changes.
 #[allow(clippy::too_many_arguments)]

@@ -173,6 +173,22 @@ impl UiState {
     }
 
     pub(crate) fn execute_action(&self, action: Action) {
+        #[cfg(forge_shared_terminal)]
+        if matches!(action, Action::Copy | Action::Paste) {
+            let session = self
+                .notebook
+                .current_page()
+                .and_then(|index| self.notebook.nth_page(Some(index)))
+                .and_then(|page| super::shared_terminal::SharedTerminal::from_page(&page));
+            if let Some(session) = session {
+                if matches!(action, Action::Copy) {
+                    session.copy();
+                } else {
+                    session.paste();
+                }
+                return;
+            }
+        }
         let font_step = 0.025;
         let opacity_step = 0.025;
         let current_terminal = self.current_terminal();
@@ -940,6 +956,11 @@ impl UiState {
 
     /// Focus the active leaf through the recursive typed pane tree.
     pub(crate) fn focus_terminal_in_page(&self, widget: &gtk4::Widget) {
+        #[cfg(forge_shared_terminal)]
+        if let Some(session) = super::shared_terminal::SharedTerminal::from_page(widget) {
+            session.focus();
+            return;
+        }
         if let Some(node) = PaneNode::from_widget(widget) {
             node.grab_focus();
         }

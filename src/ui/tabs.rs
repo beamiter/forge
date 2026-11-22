@@ -368,6 +368,10 @@ impl UiState {
     }
 
     pub(crate) fn running_processes_in_widget(widget: &gtk4::Widget) -> Vec<String> {
+        #[cfg(forge_shared_terminal)]
+        if let Some(session) = super::shared_terminal::SharedTerminal::from_page(widget) {
+            return session.close_blocker().into_iter().collect();
+        }
         if let Some(node) = PaneNode::from_widget(widget) {
             return node
                 .leaves()
@@ -1262,6 +1266,69 @@ impl UiState {
             terminal_mode,
             task: None,
         })
+    }
+
+    #[cfg(forge_shared_terminal)]
+    pub(crate) fn add_shared_terminal_tab(&self) {
+        use super::shared_terminal::SharedTerminal;
+
+        let cwd = self
+            .current_terminal()
+            .as_ref()
+            .and_then(terminal_working_directory);
+        let state = self.clone();
+        let page = match SharedTerminal::open(
+            &self.config.borrow(),
+            &self.shell_argv.borrow(),
+            cwd.as_deref(),
+            move |page| state.remove_tab_by_widget(page),
+        ) {
+            Ok(page) => page,
+            Err(error) => {
+                let error = jterm_core::review_input::safe_inline_display(&error, 256);
+                self.toast_overlay.add_toast(adw::Toast::new(&format!(
+                    "Cannot open shared terminal: {error}"
+                )));
+                return;
+            }
+        };
+
+        let number = self.tab_counter.get();
+        self.tab_counter.set(number + 1);
+        let name = format!("tab-{number}");
+        page.set_widget_name(&name);
+        let label_text = "Shared terminal";
+        let label = Label::new(Some(label_text));
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        let button = ToggleButton::new();
+        button.add_css_class("tab-strip-btn");
+        button.add_css_class("flat");
+        button.set_widget_name(&name);
+        button.set_hexpand(true);
+        button.set_child(Some(&label));
+        unsafe { button.set_data("tab-title-label", label.clone()) };
+        self.track_tab_title_for_filter(&button, &label);
+        let notebook = self.notebook.downgrade();
+        let weak_page = page.downgrade();
+        button.connect_clicked(move |_| {
+            if let (Some(notebook), Some(page)) = (notebook.upgrade(), weak_page.upgrade()) {
+                notebook.set_current_page(notebook.page_num(&page));
+                if let Some(session) = SharedTerminal::from_page(&page) {
+                    session.focus();
+                }
+            }
+        });
+        let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        header.append(&Label::new(Some(label_text)));
+        self.tab_strip.append(&button);
+        let index = self.notebook.append_page(&page, Some(&header));
+        self.show_terminal_workspace();
+        self.notebook.set_current_page(Some(index));
+        self.sync_tab_bar_visibility();
+        self.sync_tab_strip_active(Some(index));
+        self.apply_strip_btn_placement(&button);
+        self.apply_tab_filter(self.tab_search_entry.text().as_str());
     }
 
     /// Launch an explicit argv instead of the configured interactive shell.

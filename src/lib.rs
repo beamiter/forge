@@ -280,6 +280,9 @@ pub mod workflows;
 pub mod app;
 #[path = "../vendor/jwm-remote/gtk.rs"]
 mod jwm_remote_gtk;
+#[cfg(forge_shared_terminal)]
+use jterm_core::jterm_remote_client as jwm_remote_session;
+#[cfg(not(forge_shared_terminal))]
 #[path = "../vendor/jwm-remote/client.rs"]
 mod jwm_remote_session;
 use gtk4 as gtk;

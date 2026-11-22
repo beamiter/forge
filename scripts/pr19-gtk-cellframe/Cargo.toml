@@ -5,4 +5,10 @@ edition = "2021"
 publish = false
 
 [dependencies]
+aether-session = { package = "jterm-headless-session-spike", git = "https://github.com/beamiter/aether.git", rev = "5598a27dd7729a895c3632b96b4a3c759112244e" }
+jterm_engine = { path = "engine" }
+
+# The runner materializes the exact candidate source. Both the producer and
+# receiver must use the same CellFrame and no intermediary terminal parser.
+[patch."https://github.com/beamiter/jterm_core"]
 jterm_engine = { path = "engine" }

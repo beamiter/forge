@@ -1609,6 +1609,10 @@ pub fn run() -> glib::ExitCode {
             &add_tab_button, &sessions_button, &minimize_window_button,
             &maximize_window_button, &close_window_button,
         );
+        #[cfg(forge_shared_terminal)]
+        if !launch.safe_mode {
+            ui::reference_shell::install_shared_terminal_action(&canvas_header, &ui);
+        }
 
         *ui.unified_navigation_owner.borrow_mut() = Rc::downgrade(&ui);
         ui::desktop_sessions::install(&ui);
@@ -1872,7 +1876,6 @@ pub fn run() -> glib::ExitCode {
                 crate::terminal::InitialCommands::from_config(startup.as_deref()),
             );
         });
-
         let requested_cwd = launch
             .working_directory
             .as_ref()
@@ -2257,6 +2260,18 @@ pub fn run() -> glib::ExitCode {
                     ui_for_switch.request_tab_terminal_focus(target_terminal, page_num);
                 },
             );
+            #[cfg(forge_shared_terminal)]
+            if let Some(session) = ui::shared_terminal::SharedTerminal::from_page(widget) {
+                let widget = widget.downgrade();
+                let notebook = ui_for_switch.notebook.downgrade();
+                glib::idle_add_local_once(move || {
+                    if let (Some(widget), Some(notebook)) = (widget.upgrade(), notebook.upgrade()) {
+                        if notebook.current_page() == notebook.page_num(&widget) && widget.is_mapped() {
+                            session.focus();
+                        }
+                    }
+                });
+            }
             // Clear activity/bell indicators for the tab being switched to
             let tab_name = widget.widget_name();
             ui_for_switch.clear_tab_indicators(tab_name.as_str());

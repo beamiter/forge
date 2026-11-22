@@ -1810,6 +1810,17 @@ fn snapshot_owner_is_running(pid: i32) -> bool {
 }
 
 pub(crate) fn kill_widget_child_processes(widget: &gtk4::Widget) -> bool {
+    #[cfg(forge_shared_terminal)]
+    if let Some(session) = crate::ui::shared_terminal::SharedTerminal::from_page(widget) {
+        if let Some(window) = widget
+            .root()
+            .and_then(|root| root.downcast::<gtk4::Window>().ok())
+        {
+            crate::gtk_process::retain_children(&window, vec![session.child_cleanup()]);
+        }
+        session.stop();
+        return true;
+    }
     if let Some(node) = PaneNode::from_widget(widget) {
         for leaf in node.leaves() {
             leaf.kill();
@@ -1845,27 +1856,40 @@ pub(crate) fn kill_terminal_child(terminal: &Terminal) {
 
 /// Send SIGHUP to all child process groups across every terminal in the notebook.
 pub(crate) fn terminal_children(notebook: &Notebook) -> Vec<crate::gtk_process::ChildDrain> {
-    (0..notebook.n_pages())
-        .filter_map(|index| notebook.nth_page(Some(index)))
-        .flat_map(|widget| {
-            PaneNode::from_widget(&widget)
-                .map(|node| node.leaves())
-                .unwrap_or_default()
-        })
-        .filter_map(|leaf| leaf.child_cleanup())
-        .collect()
+    let mut children = Vec::new();
+    for page in (0..notebook.n_pages()).filter_map(|index| notebook.nth_page(Some(index))) {
+        #[cfg(forge_shared_terminal)]
+        if let Some(session) = crate::ui::shared_terminal::SharedTerminal::from_page(&page) {
+            children.push(session.child_cleanup());
+            continue;
+        }
+        if let Some(node) = PaneNode::from_widget(&page) {
+            children.extend(
+                node.leaves()
+                    .into_iter()
+                    .filter_map(|leaf| leaf.child_cleanup()),
+            );
+        }
+    }
+    children
 }
 
 pub(crate) fn withdrawal_work_probe(notebook: &Notebook) -> Box<dyn Fn() -> bool> {
-    let probes: Vec<_> = (0..notebook.n_pages())
-        .filter_map(|index| notebook.nth_page(Some(index)))
-        .flat_map(|widget| {
-            PaneNode::from_widget(&widget)
-                .map(|node| node.leaves())
-                .unwrap_or_default()
-        })
-        .map(|leaf| leaf.withdrawal_work_probe())
-        .collect();
+    let mut probes = Vec::new();
+    for page in (0..notebook.n_pages()).filter_map(|index| notebook.nth_page(Some(index))) {
+        #[cfg(forge_shared_terminal)]
+        if let Some(session) = crate::ui::shared_terminal::SharedTerminal::from_page(&page) {
+            probes.push(session.withdrawal_work_probe());
+            continue;
+        }
+        if let Some(node) = PaneNode::from_widget(&page) {
+            probes.extend(
+                node.leaves()
+                    .into_iter()
+                    .map(|leaf| leaf.withdrawal_work_probe()),
+            );
+        }
+    }
     Box::new(move || probes.iter().any(|probe| probe()))
 }
 
@@ -2016,9 +2040,13 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
     // relative order and `current_page` is remapped onto the survivors.
     let tab_is_task: Vec<bool> = (0..n_pages)
         .map(|index| {
-            notebook
-                .nth_page(Some(index))
-                .is_some_and(|widget| widget_hosts_task_terminal(&widget))
+            notebook.nth_page(Some(index)).is_some_and(|widget| {
+                #[cfg(forge_shared_terminal)]
+                if crate::ui::shared_terminal::SharedTerminal::from_page(&widget).is_some() {
+                    return true;
+                }
+                widget_hosts_task_terminal(&widget)
+            })
         })
         .collect();
     let active = notebook

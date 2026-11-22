@@ -25,6 +25,7 @@ use gtk::prelude::*;
 use vte4::TerminalExt;
 
 use super::selection_hold::{feed_hold_eligible, SelectionFeedHold};
+use super::text_surface::TerminalTextSurface;
 use super::{
     clear_finished_block_selection, BlockState, BoundedClipboardAccumulator, ClipboardTextTooLarge,
     FinishedBlock, MouseReporting, SelectedBlockIds, MAX_SELECTED_CLIPBOARD_BYTES,
@@ -116,17 +117,22 @@ fn capture_surface_text(
 }
 
 struct SelectedSurface {
-    terminal: gtk::glib::WeakRef<vte4::Terminal>,
-    handlers: Vec<gtk::glib::SignalHandlerId>,
+    widget: gtk::glib::WeakRef<gtk::Widget>,
+    handlers: Vec<(
+        gtk::glib::WeakRef<gtk::glib::Object>,
+        gtk::glib::SignalHandlerId,
+    )>,
 }
 
 impl Drop for SelectedSurface {
     fn drop(&mut self) {
-        if let Some(terminal) = self.terminal.upgrade() {
-            for handler in self.handlers.drain(..) {
-                terminal.disconnect(handler);
+        for (object, handler) in self.handlers.drain(..) {
+            if let Some(object) = object.upgrade() {
+                object.disconnect(handler);
             }
-            terminal.remove_css_class("cross-block-text-selected");
+        }
+        if let Some(widget) = self.widget.upgrade() {
+            widget.remove_css_class("cross-block-text-selected");
         }
     }
 }
@@ -149,7 +155,7 @@ pub(crate) struct CrossSelection {
     /// Stable identity of the drag origin. Virtualization and history eviction
     /// can change mapped-widget indices while a pointer drag is in progress.
     /// A weak reference does not retain an evicted terminal and its scrollback.
-    start_vte: RefCell<Option<gtk::glib::WeakRef<vte4::Terminal>>>,
+    start_vte: RefCell<Option<gtk::glib::WeakRef<gtk::Widget>>>,
     /// Once we've claimed the gesture and started painting cross-block
     /// selection, stay claimed for the rest of the drag.
     claimed: Cell<bool>,
@@ -278,7 +284,7 @@ impl CrossSelection {
                 return;
             }
             let start = this.vte_at(&scroll, x, y);
-            if start.as_ref() == Some(&this.active_vte)
+            if start.as_ref().and_then(TerminalTextSurface::native) == Some(&this.active_vte)
                 && this.mouse_reporting.get().is_reporting()
                 && !shift_held(gesture)
             {
@@ -286,12 +292,13 @@ impl CrossSelection {
                 gesture.set_state(gtk::EventSequenceState::Denied);
                 return;
             }
-            *this.start_vte.borrow_mut() = start.as_ref().map(|vte| vte.downgrade());
+            *this.start_vte.borrow_mut() =
+                start.as_ref().map(|surface| surface.widget().downgrade());
             this.claimed.set(false);
             if let Some(start) = start {
                 this.clear_block_selection();
                 this.clear_other_selections(Some(&start));
-                this.maybe_hold_active_feed(Some(&start), shift_held(gesture));
+                this.maybe_hold_active_feed(start.native(), shift_held(gesture));
             }
         });
 
@@ -306,7 +313,8 @@ impl CrossSelection {
             let Some(origin) = this.start_vte.borrow().clone() else {
                 return;
             };
-            let Some(start_vte) = origin.upgrade() else {
+            let Some(start_vte) = origin.upgrade().and_then(TerminalTextSurface::from_widget)
+            else {
                 this.cancel_drag_selection();
                 return;
             };
@@ -334,7 +342,11 @@ impl CrossSelection {
             gesture.set_state(gtk::EventSequenceState::Claimed);
             this.claimed.set(true);
             this.paint_range(&vtes, start, cur_idx);
-            this.maybe_hold_active_feed(vtes.get(start.max(cur_idx)), shift_held(gesture));
+            this.maybe_hold_active_feed(
+                vtes.get(start.max(cur_idx))
+                    .and_then(TerminalTextSurface::native),
+                shift_held(gesture),
+            );
         });
 
         let this_for_end = Rc::downgrade(&this);
@@ -428,27 +440,27 @@ impl CrossSelection {
 
     /// Every terminal surface in document order, including hidden ones used
     /// when clearing stale selections.
-    fn all_vtes(&self) -> Vec<vte4::Terminal> {
+    fn all_vtes(&self) -> Vec<TerminalTextSurface> {
         let finished = self.finished_blocks.borrow();
         let mut vtes = Vec::with_capacity(finished.len().saturating_mul(2) + 1);
         for block in finished.iter() {
-            vtes.push(block.command_vte.clone());
-            vtes.push(block.output_vte.clone());
+            vtes.extend(block.command_surface());
+            vtes.push(block.output_surface());
         }
-        vtes.push(self.active_vte.clone());
+        vtes.push(TerminalTextSurface::Native(self.active_vte.clone()));
         vtes
     }
 
     /// Hidden, collapsed, or virtualized surfaces cannot contribute invisible
     /// text to cross-selection or copy.
-    fn ordered_vtes(&self) -> Vec<vte4::Terminal> {
+    fn ordered_vtes(&self) -> Vec<TerminalTextSurface> {
         self.all_vtes()
             .into_iter()
-            .filter(|vte| vte.is_mapped() && vte.is_visible())
+            .filter(|surface| surface.widget().is_mapped() && surface.widget().is_visible())
             .collect()
     }
 
-    fn clear_other_selections(&self, keep: Option<&vte4::Terminal>) {
+    fn clear_other_selections(&self, keep: Option<&TerminalTextSurface>) {
         let had_cross_selection = !self.selected_surfaces.borrow().is_empty();
         self.clear_cross_selection();
         // Click and drag capture controllers can observe the same press in
@@ -459,7 +471,7 @@ impl CrossSelection {
         }
         for vte in self.all_vtes() {
             if keep.map(|target| target != &vte).unwrap_or(true) {
-                vte.unselect_all();
+                vte.clear_selection();
             }
         }
     }
@@ -469,18 +481,18 @@ impl CrossSelection {
         block_scroll: &impl IsA<gtk::Widget>,
         x: f64,
         y: f64,
-    ) -> Option<vte4::Terminal> {
+    ) -> Option<TerminalTextSurface> {
         let picked = block_scroll.pick(x, y, gtk::PickFlags::DEFAULT)?;
         self.ordered_vtes()
             .into_iter()
-            .find(|vte| widget_contains(vte, &picked))
+            .find(|vte| widget_contains(vte.widget(), &picked))
     }
 
-    fn surface_selected(&self, terminal: &vte4::Terminal) -> bool {
+    fn surface_selected(&self, widget: &impl IsA<gtk::Widget>) -> bool {
         self.selected_surfaces
             .borrow()
             .iter()
-            .any(|surface| surface.terminal.upgrade().as_ref() == Some(terminal))
+            .any(|surface| surface.widget.upgrade().as_ref() == Some(widget.upcast_ref()))
     }
 
     fn clear_cross_selection(&self) {
@@ -493,7 +505,7 @@ impl CrossSelection {
     /// Whole-surface cross selection has one application owner. Calling
     /// select_all on several VTEs loses every selection except PRIMARY's last
     /// owner. A non-measuring outline marks the exact surfaces copied instead.
-    fn paint_range(self: &Rc<Self>, vtes: &[vte4::Terminal], a: usize, b: usize) {
+    fn paint_range(self: &Rc<Self>, vtes: &[TerminalTextSurface], a: usize, b: usize) {
         let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
         let range = &vtes[lo.min(vtes.len())..hi.saturating_add(1).min(vtes.len())];
         if self.selected_surfaces.borrow().len() == range.len()
@@ -502,42 +514,79 @@ impl CrossSelection {
                 .borrow()
                 .iter()
                 .zip(range)
-                .all(|(selected, terminal)| selected.terminal.upgrade().as_ref() == Some(terminal))
+                .all(|(selected, terminal)| {
+                    selected.widget.upgrade().as_ref() == Some(terminal.widget())
+                })
         {
             return;
         }
         self.clear_cross_selection();
         for vte in self.all_vtes() {
-            vte.unselect_all();
+            vte.clear_selection();
         }
         let mut selected = Vec::new();
-        for terminal in range {
-            terminal.add_css_class("cross-block-text-selected");
+        for surface in range {
+            let widget = surface.widget();
+            widget.add_css_class("cross-block-text-selected");
             let weak = Rc::downgrade(self);
-            let unmap = terminal.connect_unmap(move |_| {
+            let unmap = widget.connect_unmap(move |_| {
                 if let Some(this) = weak.upgrade() {
                     this.cancel_drag_selection();
                 }
             });
+            let mut handlers = vec![(widget.upcast_ref::<gtk::glib::Object>().downgrade(), unmap)];
             let weak = Rc::downgrade(self);
-            let contents = terminal.connect_contents_changed(move |_| {
+            let native_selection_started = move || {
                 if let Some(this) = weak.upgrade() {
-                    this.cancel_drag_selection();
+                    this.clear_cross_selection();
+                    this.start_vte.borrow_mut().take();
+                    this.claimed.set(false);
                 }
-            });
-            let weak = Rc::downgrade(self);
-            let native_selection = terminal.connect_selection_changed(move |terminal| {
-                if terminal.has_selection() {
-                    if let Some(this) = weak.upgrade() {
-                        this.clear_cross_selection();
-                        this.start_vte.borrow_mut().take();
-                        this.claimed.set(false);
-                    }
+            };
+            match surface {
+                TerminalTextSurface::Native(terminal) => {
+                    let weak = Rc::downgrade(self);
+                    let contents = terminal.connect_contents_changed(move |_| {
+                        if let Some(this) = weak.upgrade() {
+                            this.cancel_drag_selection();
+                        }
+                    });
+                    let selection = terminal.connect_selection_changed(move |terminal| {
+                        if terminal.has_selection() {
+                            native_selection_started();
+                        }
+                    });
+                    let object = terminal.upcast_ref::<gtk::glib::Object>().downgrade();
+                    handlers.push((object.clone(), contents));
+                    handlers.push((object, selection));
                 }
-            });
+                #[cfg(forge_shared_terminal)]
+                TerminalTextSurface::Document(text) => {
+                    let buffer = text.buffer();
+                    let weak = Rc::downgrade(self);
+                    let contents = buffer.connect_changed(move |_| {
+                        if let Some(this) = weak.upgrade() {
+                            this.cancel_drag_selection();
+                        }
+                    });
+                    handlers.push((
+                        buffer.upcast_ref::<gtk::glib::Object>().downgrade(),
+                        contents,
+                    ));
+                    let selection = buffer.connect_has_selection_notify(move |buffer| {
+                        if buffer.has_selection() {
+                            native_selection_started();
+                        }
+                    });
+                    handlers.push((
+                        buffer.upcast_ref::<gtk::glib::Object>().downgrade(),
+                        selection,
+                    ));
+                }
+            }
             selected.push(SelectedSurface {
-                terminal: terminal.downgrade(),
-                handlers: vec![unmap, contents, native_selection],
+                widget: widget.downgrade(),
+                handlers,
             });
         }
         *self.selected_surfaces.borrow_mut() = selected;
@@ -551,20 +600,21 @@ impl CrossSelection {
         self.claimed.set(false);
         self.clear_cross_selection();
         for vte in self.all_vtes() {
-            vte.unselect_all();
+            vte.clear_selection();
         }
         self.feed_hold.flush_now();
     }
 
-    fn selected_surface_snapshot(&self) -> Result<Vec<vte4::Terminal>, SelectionCopyError> {
+    fn selected_surface_snapshot(&self) -> Result<Vec<TerminalTextSurface>, SelectionCopyError> {
         let selected: Vec<_> = self
             .selected_surfaces
             .borrow()
             .iter()
             .map(|surface| {
                 surface
-                    .terminal
+                    .widget
                     .upgrade()
+                    .and_then(TerminalTextSurface::from_widget)
                     .ok_or(SelectionCopyError::CaptureFailed)
             })
             .collect::<Result<_, _>>()?;
@@ -594,7 +644,7 @@ impl CrossSelection {
         for vte in selected.clone().unwrap_or_else(|| self.ordered_vtes()) {
             let text = if selected.is_some() {
                 Some(
-                    capture_surface_text(
+                    self.capture_whole_surface(
                         &vte,
                         MAX_CROSS_SELECTION_BYTES.saturating_sub(output.text.len()),
                         deadline,
@@ -613,7 +663,7 @@ impl CrossSelection {
                 if !vte.has_selection() {
                     continue;
                 }
-                crate::vte_reference::selected_text(&vte)
+                vte.selected_text()
             };
             if let Some(text) = text.filter(|text| !text.is_empty()) {
                 output
@@ -633,10 +683,38 @@ impl CrossSelection {
         }
     }
 
+    fn capture_whole_surface(
+        &self,
+        surface: &TerminalTextSurface,
+        max_bytes: usize,
+        deadline: std::time::Instant,
+    ) -> Result<String, SelectionCopyError> {
+        match surface {
+            TerminalTextSurface::Native(terminal) => {
+                capture_surface_text(terminal, max_bytes, deadline)
+            }
+            #[cfg(forge_shared_terminal)]
+            TerminalTextSurface::Document(text) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(SelectionCopyError::TimedOut);
+                }
+                let buffer = text.buffer();
+                let value = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+                if value.len() > max_bytes {
+                    return Err(SelectionCopyError::TooLarge {
+                        bytes: value.len(),
+                        limit: max_bytes,
+                    });
+                }
+                Ok(value.to_string())
+            }
+        }
+    }
+
     pub(crate) fn has_text_selection(&self) -> bool {
         self.ordered_vtes()
             .into_iter()
-            .any(|vte| vte.has_selection() || self.surface_selected(&vte))
+            .any(|vte| vte.has_selection() || self.surface_selected(vte.widget()))
     }
 }
 
@@ -675,7 +753,393 @@ fn widget_contains(haystack: &impl IsA<gtk::Widget>, needle: &gtk::Widget) -> bo
 
 #[cfg(test)]
 mod tests {
-    use super::{drag_surface_indices, CrossSelection};
+    use super::gtk;
+    use super::{drag_surface_indices, CrossSelection, TerminalTextSurface};
+
+    #[cfg(forge_shared_terminal)]
+    #[test]
+    #[ignore = "requires an isolated native GTK display and candidate environment"]
+    fn shared_finished_command_preserves_search_and_cross_card_copy() {
+        check_shared_finished_document(crate::config::TerminalMode::Block, false);
+    }
+
+    #[cfg(forge_shared_terminal)]
+    #[test]
+    #[ignore = "requires an isolated native GTK display and candidate environment"]
+    fn shared_finished_output_preserves_search_filter_and_cross_card_copy() {
+        check_shared_finished_document(crate::config::TerminalMode::Block, true);
+    }
+
+    #[cfg(forge_shared_terminal)]
+    #[test]
+    #[ignore = "requires an isolated native GTK display and candidate environment"]
+    fn shared_finished_chat_preserves_capsule_search_filter_and_copy() {
+        check_shared_finished_document(crate::config::TerminalMode::Chat, true);
+    }
+
+    #[cfg(forge_shared_terminal)]
+    #[test]
+    #[ignore = "requires an isolated native GTK display and candidate environment"]
+    fn shared_live_block_and_chat_keep_the_owned_shell() {
+        use super::super::find::FindSearchResult;
+        use crate::config::{Config, TerminalMode};
+        use gtk::prelude::*;
+        use std::time::{Duration, Instant};
+        use vte4::TerminalExt;
+
+        jterm_core::child_env::capture_inherited_environment().expect("test child environment");
+        gtk::init().expect("GTK display");
+        assert_eq!(
+            std::env::var("JTERM_SHARED_LIVE_OUTPUT").as_deref(),
+            Ok("1")
+        );
+
+        let shell = r#"
+            stty -echo
+            printf '\033]133;A\007$ \033]133;B\007'
+            IFS= read -r start
+            printf '\r\n\033]133;C;cmdline_url=live-witness\007shared live row\n'
+            IFS= read -r fullscreen
+            printf '\033[?1049hfull screen witness\n'
+            IFS= read -r finish
+            printf '\033[?1049l\033]133;D;0\007\033]133;A\007$ \033]133;B\007'
+            IFS= read -r next
+            printf '\r\n\033]133;C;cmdline_url=next\007same shell %s\n' "$next"
+            printf '\033]133;D;0\007\033]133;A\007$ \033]133;B\007'
+            IFS= read -r shutdown
+        "#;
+        let wait_for = |what: &str, condition: &dyn Fn() -> bool| {
+            let context = gtk::glib::MainContext::default();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                while context.iteration(false) {}
+                if condition() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            eprintln!("timed out while waiting for {what}");
+            false
+        };
+        for mode in [TerminalMode::Block, TerminalMode::Chat] {
+            let mut config = Config::safe_defaults();
+            config.terminal_mode = mode.clone();
+            config.preserve_live_scrollback = false;
+            let view = super::super::TermView::new_with_spawner(
+                &config,
+                &mode,
+                &["sh".into()],
+                None,
+                None,
+                &[],
+                |_, _, _, _| crate::pty::OwnedPty::spawn(&["/bin/sh", "-c", shell], None, &[]),
+            )
+            .expect("spawn real PTY shell");
+            let window = gtk::Window::builder()
+                .default_width(920)
+                .default_height(680)
+                .child(&view.widget())
+                .build();
+            window.present();
+            assert!(wait_for("live shell prompt", &|| view
+                .active_vte
+                .is_mapped()
+                && view.bstate.get()
+                    == super::super::BlockState::AwaitingCommand));
+            let label = view
+                .active
+                .borrow()
+                .shared_live_widget()
+                .expect("live output widget");
+            assert!(!label.is_mapped());
+            view.pty.write_bytes(b"start\r").expect("send held command");
+            assert!(
+                wait_for("shared active row", &|| label.is_mapped()),
+                "{mode:?}: capture {:?}, cursor {:?}, native {:?}",
+                view.active.borrow().output_text_prefix(128),
+                view.active_vte.cursor_position(),
+                view.active_vte.text_format(vte4::Format::Text)
+            );
+            assert_eq!(label.text(), "shared live row");
+            assert!(label.width() > 0 && label.height() > 0);
+            assert!(matches!(
+                view.find_in_blocks("shared live row", false),
+                FindSearchResult::Matches(_)
+            ));
+            assert!(wait_for("existing active find renderer", &|| !label.is_mapped()));
+            view.clear_find();
+
+            view.pty
+                .write_bytes(b"fullscreen\r")
+                .expect("same shell enters alternate screen");
+            assert!(wait_for("mapped alternate screen", &|| !label.is_mapped()
+                && view.bstate.get() == super::super::BlockState::AltScreen
+                && view
+                    .active_vte
+                    .text_format(vte4::Format::Text)
+                    .is_some_and(|text| text.contains("full screen witness"))));
+            view.pty
+                .write_bytes(b"finish\r")
+                .expect("same shell exits alternate screen");
+            assert!(wait_for("first completed card", &|| view
+                .finished_blocks
+                .borrow()
+                .len()
+                == 1));
+            assert!(!label.is_mapped());
+            view.pty
+                .write_bytes(b"continued\r")
+                .expect("send next command to same shell");
+            assert!(wait_for("same shell's next card", &|| view
+                .finished_blocks
+                .borrow()
+                .len()
+                == 2));
+            assert!(view.block_data.borrow()[1]
+                .output
+                .contains("same shell continued"));
+            view.pty.kill();
+            window.close();
+        }
+    }
+
+    #[cfg(forge_shared_terminal)]
+    fn check_shared_finished_document(mode: crate::config::TerminalMode, document_output: bool) {
+        use super::super::find::{CrossBlockSearchOptions, FindNavigationResult, FindSearchResult};
+        use gtk::prelude::*;
+        use std::time::{Duration, Instant};
+
+        gtk::init().expect("GTK display");
+        assert_eq!(
+            std::env::var("JTERM_SHARED_FINISHED_COMMANDS").as_deref(),
+            Ok("1")
+        );
+        assert_eq!(
+            std::env::var("JTERM_SHARED_FINISHED_OUTPUT").as_deref() == Ok("1"),
+            document_output
+        );
+        let mut config = crate::config::Config::safe_defaults();
+        config.terminal_mode = mode.clone();
+        let view = super::super::TermView::new_with_spawner(
+            &config,
+            &mode,
+            &["sh".into()],
+            None,
+            None,
+            &[],
+            |_, _, _, _| {
+                crate::pty::OwnedPty::for_live_display_tests(crate::pty::PtyForeground::Shell)
+            },
+        )
+        .unwrap();
+        let window = gtk::Window::builder()
+            .default_width(920)
+            .default_height(680)
+            .child(&view.widget())
+            .build();
+        window.present();
+        let settle = || {
+            let main = gtk::glib::MainContext::default();
+            let deadline = Instant::now() + Duration::from_millis(350);
+            while Instant::now() < deadline {
+                while main.iteration(false) {}
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        settle();
+        view.pty.write_test_slave(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        settle();
+        view.pty.write_test_slave(b"echo needle needle\r\n\x1b]133;C;cmdline_url=echo%20needle%20needle\x07\x1b[1;31mdocument-body\x1b[0m\r\nrow two\r\nrow three\r\nrow four\r\nrow five\r\n\x1b[38;2;33;77;121mfindbody marker\x1b[0m\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        settle();
+        view.pty.write_test_slave(b"echo link\r\n\x1b]133;C;cmdline_url=echo%20link\x07https://example.test\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        settle();
+        view.pty.write_test_slave(b"echo color\r\n\x1b]133;C;cmdline_url=echo%20color\x07\x1b[5mblinking text\x1b[0m\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        settle();
+        view.pty.write_test_slave(b"echo https://example.test\r\n\x1b]133;C;cmdline_url=echo%20https%3A%2F%2Fexample.test\x07ordinary text\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        settle();
+        let (card_id, command, output, second) = {
+            let finished = view.finished_blocks.borrow();
+            assert_eq!(finished.len(), 4);
+            assert!(
+                finished[1].command_document.is_some(),
+                "URL checks the output gate"
+            );
+            assert!(
+                finished[3].command_vte.is_some(),
+                "URL in a command stays on VTE"
+            );
+            assert!(
+                finished[2].output_vte.is_some(),
+                "unsupported blinking output stays on VTE"
+            );
+            assert!(finished[1].output_vte.is_some(), "URL output stays on VTE");
+            let first = &finished[0];
+            assert!(first.command_vte.is_none());
+            assert_eq!(first.output_vte.is_none(), document_output);
+            let command = first
+                .command_document
+                .as_ref()
+                .expect("shared command view")
+                .widget()
+                .clone();
+            let second = finished[1]
+                .output_vte
+                .as_ref()
+                .expect("link remains native")
+                .clone();
+            (first.id, command, first.output_surface(), second)
+        };
+        assert!(command.is_mapped());
+        assert!(output.widget().is_mapped());
+        if mode == crate::config::TerminalMode::Chat {
+            assert!(command.width() > 0);
+            assert!(output.widget().width() > command.width());
+        }
+        assert_eq!(output.native().is_none(), document_output);
+        assert!(second.is_mapped());
+        assert!(!command.is_editable());
+        let buffer = command.buffer();
+        assert_eq!(
+            buffer.text(&buffer.start_iter(), &buffer.end_iter(), true),
+            "echo needle needle"
+        );
+        let selection = || {
+            buffer
+                .selection_bounds()
+                .map(|(start, end)| (start.offset(), end.offset()))
+        };
+        assert!(
+            matches!(view.find_in_blocks(r"nee(?:dle)", true), FindSearchResult::Matches(p) if p.total == 2)
+        );
+        assert_eq!(selection(), Some((5, 11)));
+        assert!(matches!(view.find_next(), FindNavigationResult::Progress(p) if p.current == 2));
+        assert_eq!(selection(), Some((12, 18)));
+        assert!(matches!(view.find_prev(), FindNavigationResult::Progress(p) if p.current == 1));
+        assert_eq!(selection(), Some((5, 11)));
+        assert!(view.focus_match_in_block(
+            card_id,
+            "needle",
+            CrossBlockSearchOptions::default(),
+            false,
+            1
+        ));
+        assert_eq!(selection(), Some((12, 18)));
+        view.copy_to_clipboard();
+        let copied = gtk::glib::MainContext::default()
+            .block_on(command.clipboard().read_text_future())
+            .unwrap()
+            .unwrap();
+        assert_eq!(copied, "needle");
+        view.clear_find();
+        assert!(selection().is_none());
+
+        if let TerminalTextSurface::Document(output) = &output {
+            assert_eq!(
+                TerminalTextSurface::Document(output.clone())
+                    .document_text()
+                    .as_deref(),
+                Some("document-body\nrow two\nrow three\nrow four\nrow five\nfindbody marker")
+            );
+            assert!(!output.is_editable());
+            assert!(view.set_block_collapsed(card_id, true));
+            settle();
+            assert!(!output.is_mapped());
+            assert!(
+                matches!(view.find_in_blocks("findbody", false), FindSearchResult::Matches(p) if p.total == 1)
+            );
+            settle();
+            assert!(output.is_mapped());
+            let capture = output.buffer();
+            assert!(capture
+                .start_iter()
+                .tags()
+                .iter()
+                .any(|tag| tag.weight() == 700));
+            let (start, end) = capture.selection_bounds().expect("exact output hit");
+            let bold_red = view.config.borrow().palette[9];
+            assert!(capture
+                .start_iter()
+                .tags()
+                .iter()
+                .any(|tag| tag.foreground_rgba() == Some(bold_red)));
+            let rgb = gtk::gdk::RGBA::new(33.0 / 255.0, 77.0 / 255.0, 121.0 / 255.0, 1.0);
+            let has_color = |iter: &gtk::TextIter| {
+                iter.tags()
+                    .iter()
+                    .any(|tag| tag.foreground_rgba() == Some(rgb))
+            };
+            assert!(
+                has_color(&start),
+                "retained truecolor must reach the GTK tag"
+            );
+            assert_eq!(capture.text(&start, &end, true), "findbody");
+            view.copy_to_clipboard();
+            let copied = gtk::glib::MainContext::default()
+                .block_on(output.clipboard().read_text_future())
+                .unwrap()
+                .unwrap();
+            assert_eq!(copied, "findbody");
+            view.clear_find();
+
+            let toggle = view.finished_blocks.borrow()[0].toggle_filter.clone();
+            toggle();
+            settle();
+            fn find_filter(widget: &gtk::Widget) -> Option<gtk::SearchEntry> {
+                if let Ok(entry) = widget.clone().downcast::<gtk::SearchEntry>() {
+                    return Some(entry);
+                }
+                let mut child = widget.first_child();
+                while let Some(node) = child {
+                    if let Some(found) = find_filter(&node) {
+                        return Some(found);
+                    }
+                    child = node.next_sibling();
+                }
+                None
+            }
+            let card = view.finished_blocks.borrow()[0].widget().clone();
+            let filter = find_filter(card.upcast_ref()).expect("output filter");
+            filter.set_text("marker");
+            settle();
+            assert_eq!(
+                output
+                    .buffer()
+                    .text(&capture.start_iter(), &capture.end_iter(), true),
+                "findbody marker"
+            );
+            assert!(has_color(&capture.start_iter()), "filter retains color");
+            assert!(view.finished_blocks.borrow()[0]
+                .full_output
+                .borrow()
+                .contains("document-body"));
+            assert!(!view.finished_blocks.borrow()[0].is_collapsed());
+            toggle();
+            settle();
+            assert_eq!(
+                output
+                    .buffer()
+                    .text(&capture.start_iter(), &capture.end_iter(), true),
+                "document-body\nrow two\nrow three\nrow four\nrow five\nfindbody marker"
+            );
+        }
+
+        let cross = &view.cross_selection;
+        let surfaces = cross.ordered_vtes();
+        let first = TerminalTextSurface::Document(command);
+        let last = TerminalTextSurface::Native(second);
+        let (start, end) = drag_surface_indices(&surfaces, &first, &last).unwrap();
+        cross.paint_range(&surfaces, start, end);
+        let copied = cross.copy_text().unwrap().unwrap();
+        assert!(copied.starts_with("echo needle needle\n"), "{copied:?}");
+        let body = copied
+            .find("document-body")
+            .expect("selected native output");
+        let following = copied
+            .find("https://example.test")
+            .expect("selected native command");
+        assert!(body < following, "{copied:?}");
+        window.close();
+    }
 
     #[test]
     fn streaming_selection_writer_refuses_overflow_and_expiry_without_partial_append() {
@@ -734,7 +1198,7 @@ mod tests {
     ) {
         use super::gtk::prelude::*;
 
-        *cross.start_vte.borrow_mut() = Some(active.downgrade());
+        *cross.start_vte.borrow_mut() = Some(active.upcast_ref::<gtk::Widget>().downgrade());
         cross.claimed.set(true);
         let weak = std::rc::Rc::downgrade(cross);
         let replayed = std::rc::Rc::new(std::cell::Cell::new(0));
@@ -833,7 +1297,7 @@ mod tests {
 
         if let Ok(driver) = std::env::var("FORGE_XTEST_DRIVER") {
             window.set_title(Some("forge-cross-selection-qa"));
-            let start = card.output_vte.compute_bounds(&window).unwrap();
+            let start = card.output_vte_for_test().compute_bounds(&window).unwrap();
             let end = active.compute_bounds(&window).unwrap();
             let pointer_replayed = Rc::new(RefCell::new(Vec::new()));
             let pointer_replayed_cb = pointer_replayed.clone();
@@ -887,7 +1351,7 @@ mod tests {
                     "real cross drag must not overwrite CLIPBOARD"
                 );
                 assert!(
-                    cross.surface_selected(&card.output_vte),
+                    cross.surface_selected(card.output_vte_for_test()),
                     "real drag owns the origin output"
                 );
                 assert!(
@@ -906,7 +1370,7 @@ mod tests {
             }
         }
 
-        card.output_vte.select_all();
+        card.output_vte_for_test().select_all();
         pump();
         assert!(cross.has_text_selection());
         let copied = cross
@@ -921,11 +1385,19 @@ mod tests {
 
         // A drag's anchor must survive a preceding surface disappearing from
         // the mapped list (the same transition virtualization/folding causes).
-        *cross.start_vte.borrow_mut() = Some(card.output_vte.downgrade());
+        *cross.start_vte.borrow_mut() = Some(
+            card.output_vte_for_test()
+                .upcast_ref::<gtk::Widget>()
+                .downgrade(),
+        );
         let before = cross.ordered_vtes();
-        let before_indices = drag_surface_indices(&before, &card.output_vte, &active)
-            .expect("both drag endpoints are initially mapped");
-        card.command_vte.set_visible(false);
+        let before_indices = drag_surface_indices(
+            &before,
+            &TerminalTextSurface::Native(card.output_vte_for_test().clone()),
+            &TerminalTextSurface::Native(active.clone()),
+        )
+        .expect("both drag endpoints are initially mapped");
+        card.command_vte_for_test().set_visible(false);
         // Hiding command chrome queues a geometry refit and a VTE re-feed.
         // Let that complete before exercising selection on the new layout.
         settle();
@@ -935,9 +1407,14 @@ mod tests {
             .borrow()
             .as_ref()
             .and_then(|origin| origin.upgrade())
+            .and_then(TerminalTextSurface::from_widget)
             .expect("origin still exists");
-        let after_indices = drag_surface_indices(&after, &anchor, &active)
-            .expect("hiding an earlier surface must preserve the endpoints");
+        let after_indices = drag_surface_indices(
+            &after,
+            &anchor,
+            &TerminalTextSurface::Native(active.clone()),
+        )
+        .expect("hiding an earlier surface must preserve the endpoints");
         assert_eq!(after_indices.0 + 1, before_indices.0);
         let primary = active.primary_clipboard();
         let clipboard = active.clipboard();
@@ -945,7 +1422,7 @@ mod tests {
         clipboard.set_text("clipboard sentinel");
         cross.paint_range(&after, after_indices.0, after_indices.1);
         settle();
-        assert!(cross.surface_selected(&card.output_vte));
+        assert!(cross.surface_selected(card.output_vte_for_test()));
         assert!(cross.surface_selected(&active));
         let style_changes = Rc::new(Cell::new(0));
         let observed_styles = style_changes.clone();
@@ -998,7 +1475,7 @@ mod tests {
                 .as_deref(),
             Some("clipboard sentinel")
         );
-        assert!(!card.command_vte.has_selection());
+        assert!(!card.command_vte_for_test().has_selection());
 
         let replayed = Rc::new(RefCell::new(Vec::new()));
         let replayed_cb = replayed.clone();
@@ -1057,7 +1534,7 @@ mod tests {
             // Filtering/alt-screen/widget teardown can unmap while history is
             // borrowed. Replay must wait until that GTK callback has unwound.
             let _history = cross.finished_blocks.borrow();
-            card.output_vte.set_visible(false);
+            card.output_vte_for_test().set_visible(false);
             assert!(
                 unmap_writable.borrow().is_empty(),
                 "unmap must not synchronously re-enter command finalization"
@@ -1066,7 +1543,11 @@ mod tests {
         pump();
         assert_eq!(&*unmap_writable.borrow(), &[true]);
         assert_eq!(
-            drag_surface_indices(&cross.ordered_vtes(), &anchor, &active),
+            drag_surface_indices(
+                &cross.ordered_vtes(),
+                &anchor,
+                &TerminalTextSurface::Native(active.clone())
+            ),
             None
         );
 
@@ -1074,11 +1555,14 @@ mod tests {
         // silently return the remaining subset of the old selection.
         cross.selected_surfaces.borrow_mut().extend([
             super::SelectedSurface {
-                terminal: card.output_vte.downgrade(),
+                widget: card
+                    .output_vte_for_test()
+                    .upcast_ref::<gtk::Widget>()
+                    .downgrade(),
                 handlers: Vec::new(),
             },
             super::SelectedSurface {
-                terminal: active.downgrade(),
+                widget: active.upcast_ref::<gtk::Widget>().downgrade(),
                 handlers: Vec::new(),
             },
         ]);
@@ -1136,7 +1620,7 @@ mod tests {
         // Exercise the installed controller's cancellation path, not only
         // the endpoint helper: an evicted VTE must release a parked live feed.
         let evicted = vte4::Terminal::new();
-        *cross.start_vte.borrow_mut() = Some(evicted.downgrade());
+        *cross.start_vte.borrow_mut() = Some(evicted.upcast_ref::<gtk::Widget>().downgrade());
         cross.claimed.set(true);
         let flushed = Rc::new(RefCell::new(Vec::new()));
         let flushed_cb = flushed.clone();
@@ -1144,7 +1628,7 @@ mod tests {
             .feed_hold
             .set_flush(move |bytes| flushed_cb.borrow_mut().extend(bytes));
         cross.feed_hold.begin_drag();
-        cross.clear_other_selections(Some(&active));
+        cross.clear_other_selections(Some(&TerminalTextSurface::Native(active.clone())));
         assert!(
             cross.feed_hold.try_buffer(b"parked tail"),
             "the click observer cannot undo a new drag hold"
@@ -1210,17 +1694,26 @@ mod tests {
         let cross = &view.cross_selection;
         let bounds = active.compute_bounds(&view.root).unwrap();
         let (x, y) = (f64::from(bounds.x()) + 4.0, f64::from(bounds.y()) + 4.0);
-        assert_eq!(cross.vte_at(&view.root, x, y), Some(active.clone()));
+        assert_eq!(
+            cross.vte_at(&view.root, x, y),
+            Some(TerminalTextSurface::Native(active.clone()))
+        );
         assert!(!active.is_ancestor(&view.block_scroll));
-        cross.paint_range(std::slice::from_ref(&card.output_vte), 0, 0);
-        assert!(cross.surface_selected(&card.output_vte));
+        cross.paint_range(
+            &[TerminalTextSurface::Native(
+                card.output_vte_for_test().clone(),
+            )],
+            0,
+            0,
+        );
+        assert!(cross.surface_selected(card.output_vte_for_test()));
         let controllers = view.root.observe_controllers();
         let click = (0..controllers.n_items())
             .filter_map(|i| controllers.item(i))
             .find_map(|controller| controller.downcast::<gtk4::GestureClick>().ok())
             .unwrap();
         click.emit_by_name::<()>("pressed", &[&1_i32, &x, &y]);
-        assert!(!cross.surface_selected(&card.output_vte));
+        assert!(!cross.surface_selected(card.output_vte_for_test()));
         active.select_all();
         let copied = cross.copy_text().unwrap().unwrap();
         assert!(copied.contains("live-input"));
