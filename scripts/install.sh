@@ -569,11 +569,11 @@ else
     case "${BACKEND}" in
         nix)
             require_command nix
-            run_in_repo nix develop --command cargo build --release --locked
+            run_in_repo nix develop --command cargo build --release --features shared-terminal --locked
             ;;
         cargo)
             require_command cargo
-            run_in_repo cargo build --release --locked
+            run_in_repo cargo build --release --features shared-terminal --locked
             ;;
     esac
 

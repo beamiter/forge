@@ -36,11 +36,12 @@
                 "jagent-0.7.0" = "sha256-2PO6UiTrhwa2JUBznPTXFV42KxJ3H8qctBTg7WNxZfA=";
                 # git+https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa569540091524d637a7115b64c587b9177a55b
                 "companion-core-0.1.0" = "sha256-yQQw/Viz2gzouHRdutU6TtVL3yqDI7koYbN/leWsf7I=";
-                # git+https://github.com/beamiter/jterm_core.git?rev=e4a5411bf8e25851406580801ed0eb80de20cb70#e4a5411bf8e25851406580801ed0eb80de20cb70
-                "jterm_core-0.2.0" = "sha256-8kSt1fIQqzvTW5d2eeM3ro/0fyQldrJnwFSCP5Iltf8=";
+                # git+https://github.com/beamiter/jterm_core.git?rev=92b8d7ac7be16fef4874e1178a17e4f2d0f96934#92b8d7ac7be16fef4874e1178a17e4f2d0f96934
+                "jterm_core-0.2.0" = "sha256-W66JsILgRfY5Uf3WiQCslGiZdr/wDWmEO9idhQoMOXI=";
               };
             };
             strictDeps = true;
+            buildFeatures = [ "shared-terminal" ];
 
             preBuild = "python3 tools/check-process-bundle.py && python3 tools/check-host-bundle.py";
 
