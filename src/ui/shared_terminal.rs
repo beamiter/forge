@@ -1,7 +1,7 @@
 use gtk4::{pango, prelude::*};
 #[cfg(target_os = "linux")]
 use jterm_gtk_view::RuntimeShell;
-use jterm_gtk_view::{LinkActions, Pty, TerminalPane, Theme};
+use jterm_gtk_view::{CursorColors, LinkActions, Pty, TerminalPane, Theme};
 use std::rc::Rc;
 
 use crate::{config::Config, keybindings::Action, pty::OwnedPty};
@@ -57,6 +57,10 @@ impl SharedTerminal {
             foreground: config.foreground,
             background: config.background,
             palette: config.palette,
+            cursor: Some(CursorColors {
+                foreground: config.cursor_foreground,
+                background: config.cursor,
+            }),
         };
         let links = Self::links();
         #[cfg(target_os = "linux")]
@@ -347,6 +351,10 @@ impl SharedPane {
             foreground: config.foreground,
             background: config.background,
             palette: config.palette,
+            cursor: Some(CursorColors {
+                foreground: config.cursor_foreground,
+                background: config.cursor,
+            }),
         }
     }
 

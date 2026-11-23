@@ -1,11 +1,13 @@
-use super::{LiveCommitSink, OwnedPty, SelectionFeedHold, SubmissionSurface};
+use super::{
+    developer_block, DynamicColors, LiveCommitSink, OwnedPty, SelectionFeedHold, SubmissionSurface,
+};
 use crate::{
-    config::Config,
+    config::{Config, TerminalMode},
     ui::shared_terminal::{SharedPane, SharedTerminal},
 };
 use gtk4::prelude::*;
 use jterm_gtk_view::{
-    EmbeddedTerminal, FindFrame, FindMatch, FindRegion, FindSnapshot, Pty, PtyExit,
+    EmbeddedTerminal, FindFrame, FindMatch, FindRegion, FindSnapshot, Pty, PtyExit, Theme,
     TranscriptAnchor, TranscriptView,
 };
 use std::{
@@ -24,6 +26,7 @@ pub(super) struct SharedActiveTerminal {
     input: Rc<OnceCell<InputBinding>>,
     directory_report: OnceCell<DirectoryReport>,
     resize_error: Rc<Cell<Option<io::ErrorKind>>>,
+    mode: TerminalMode,
 }
 
 pub(super) struct Transport {
@@ -94,7 +97,7 @@ impl SharedActiveTerminal {
     pub(super) fn new(
         config: &Config,
         pty: Rc<OwnedPty>,
-        unified: bool,
+        mode: &TerminalMode,
     ) -> Result<Rc<Self>, String> {
         let input = Rc::new(OnceCell::new());
         let resize_error = Rc::new(Cell::new(None));
@@ -107,7 +110,7 @@ impl SharedActiveTerminal {
             },
             cols,
             rows,
-            SharedPane::theme(config, config.default_font_scale),
+            Self::theme(config, config.default_font_scale, mode),
             |message, _| message.to_owned(),
             SharedTerminal::links(),
         )?;
@@ -121,7 +124,9 @@ impl SharedActiveTerminal {
             .update_property(&[gtk4::accessible::Property::Description(
                 "Shared active terminal",
             )]);
-        let transcript = unified.then(|| TranscriptView::new(terminal.clone()));
+        let transcript = mode
+            .is_unified()
+            .then(|| TranscriptView::new(terminal.clone()));
         Ok(Rc::new(Self {
             terminal,
             transcript,
@@ -130,7 +135,29 @@ impl SharedActiveTerminal {
             widget,
             input,
             resize_error,
+            mode: mode.clone(),
         }))
+    }
+
+    fn theme(config: &Config, scale: f64, mode: &TerminalMode) -> Theme {
+        let mut theme = SharedPane::theme(config, scale);
+        match mode {
+            TerminalMode::Block => {
+                theme.foreground = developer_block::terminal_foreground();
+                theme.background = developer_block::terminal_background();
+            }
+            TerminalMode::Chat => {
+                let (foreground, background, cursor) = crate::terminal::chat_terminal_colors();
+                theme.foreground = foreground;
+                theme.background = background;
+                theme.cursor = Some(jterm_gtk_view::CursorColors {
+                    foreground: config.cursor_foreground,
+                    background: cursor,
+                });
+            }
+            _ => {}
+        }
+        theme
     }
 
     pub(super) fn transcript(&self) -> Option<&TranscriptView<Transport>> {
@@ -263,10 +290,31 @@ impl SharedActiveTerminal {
     pub(super) fn update_theme(&self, config: &Config, scale: f64) {
         self.terminal
             .pane()
-            .set_theme(SharedPane::theme(config, scale));
+            .set_theme(Self::theme(config, scale, &self.mode));
         self.terminal
             .pane()
             .set_history_row_limit(config.terminal_scrollback_lines as usize);
+    }
+
+    pub(super) fn output_colors(&self) -> DynamicColors {
+        let rgba = |(r, g, b)| {
+            gtk4::gdk::RGBA::new(
+                f32::from(r) / 255.0,
+                f32::from(g) / 255.0,
+                f32::from(b) / 255.0,
+                1.0,
+            )
+        };
+        self.terminal.inspect(|terminal| {
+            let Some((_, colors)) = terminal.paint_colors() else {
+                return DynamicColors::default();
+            };
+            DynamicColors {
+                foreground: colors.foreground_override().map(rgba),
+                background: colors.background_override().map(rgba),
+                cursor: None,
+            }
+        })
     }
 
     pub(super) fn drawn_rows(&self) -> u16 {

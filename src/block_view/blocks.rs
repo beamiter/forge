@@ -2255,7 +2255,7 @@ pub(crate) fn apply_finished_card_density(
 }
 
 pub(super) fn chat_snapshot_foreground() -> gtk4::gdk::RGBA {
-    gtk4::gdk::RGBA::new(0.145, 0.204, 0.294, 1.0)
+    crate::terminal::chat_terminal_colors().0
 }
 
 impl FinishedBlock {

@@ -8122,6 +8122,13 @@ impl ReaderCtx {
             ParserEvent::ClipboardSet(text) => self.on_clipboard_set(text),
             ParserEvent::ClipboardQuery => self.on_clipboard_query(),
             ParserEvent::ColorQuery(kind) => self.on_color_query(*kind),
+            ParserEvent::LiveColorQuery(bytes) => {
+                if state == BlockState::AwaitingCommand && !self.prompt_anchor_ready_rc.get() {
+                    self.feed_after_prompt(bytes);
+                } else {
+                    self.backend.feed_live(bytes);
+                }
+            }
             ParserEvent::ColorSet { kind, spec } => self.on_color_set(*kind, spec),
             ParserEvent::ColorReset(kind) => self.on_color_reset(*kind),
             ParserEvent::EraseDisplay => self.on_erase_display(),
@@ -8311,6 +8318,29 @@ impl ReaderCtx {
         }
     }
 
+    fn feed_after_prompt(&self, bytes: &[u8]) {
+        // At OSC B, pre-B bytes settle before the post-B bytes move the cursor.
+        let parked_bytes = self.post_prompt_bytes_rc.borrow().len();
+        match post_prompt_feed(
+            self.prompt_anchor_ready_rc.get(),
+            self.post_prompt_fence_released_rc.get(),
+            parked_bytes,
+            bytes.len(),
+            MAX_RAW_OUTPUT_BYTES,
+        ) {
+            PostPromptFeed::Live => self.backend.feed_live(bytes),
+            PostPromptFeed::ReleaseThenFeed => {
+                release_post_prompt_fence(
+                    &|deferred| self.backend.feed_live(deferred),
+                    &self.post_prompt_bytes_rc,
+                    &self.post_prompt_fence_released_rc,
+                );
+                self.backend.feed_live(bytes);
+            }
+            PostPromptFeed::Park => self.post_prompt_bytes_rc.borrow_mut().append(bytes),
+        }
+    }
+
     fn on_bytes(&self, bytes: &[u8], state: BlockState) {
         // No shell integration seen yet: once real output flows,
         // stream everything into the live VTE (raw fallback).
@@ -8342,37 +8372,7 @@ impl ReaderCtx {
                     self.reviewed_submission_tainted_rc.set(true);
                 }
                 if !self.prompt_anchor_ready_rc.get() {
-                    // Establish a real feed fence at OSC B:
-                    // prompt bytes already queued into VTE
-                    // settle first, then these post-B bytes
-                    // (bracketed-paste mode, suggestion
-                    // repaint, or a shell-side prefill) are
-                    // replayed against the fixed anchor.
-                    // Take the ring length in its own
-                    // statement: a borrow inside the match
-                    // scrutinee would still be live in the
-                    // arm that borrows it mutably.
-                    let parked_bytes = self.post_prompt_bytes_rc.borrow().len();
-                    match post_prompt_feed(
-                        self.prompt_anchor_ready_rc.get(),
-                        self.post_prompt_fence_released_rc.get(),
-                        parked_bytes,
-                        bytes.len(),
-                        MAX_RAW_OUTPUT_BYTES,
-                    ) {
-                        PostPromptFeed::Live => self.backend.feed_live(bytes),
-                        PostPromptFeed::ReleaseThenFeed => {
-                            release_post_prompt_fence(
-                                &|deferred| self.backend.feed_live(deferred),
-                                &self.post_prompt_bytes_rc,
-                                &self.post_prompt_fence_released_rc,
-                            );
-                            self.backend.feed_live(bytes);
-                        }
-                        PostPromptFeed::Park => {
-                            self.post_prompt_bytes_rc.borrow_mut().append(bytes)
-                        }
-                    }
+                    self.feed_after_prompt(bytes);
                     self.backend.mark_scroll_dirty();
                     false
                 } else {
@@ -10613,10 +10613,16 @@ impl RenderBackend for BlockBackend {
         // hooks over time. Hand it an owned snapshot rather than holding the
         // pane's live config Ref across that boundary.
         let finished_config = self.config_for_cb.borrow().clone();
+        let dynamic_colors = self.dynamic_colors_rc.get();
+        #[cfg(forge_shared_terminal)]
+        let dynamic_colors = self
+            .shared_active
+            .as_ref()
+            .map_or(dynamic_colors, |terminal| terminal.output_colors());
         let mut precomputed = FinishedBlockPrecomputed::documents(
             &finished_config,
             record.command_source == CommandTextSource::ShellReported
-                && self.dynamic_colors_rc.get().foreground.is_none(),
+                && dynamic_colors.foreground.is_none(),
             payload.output_notice().is_none(),
         );
         precomputed.output_rows = Some(output_rows);
@@ -10653,7 +10659,7 @@ impl RenderBackend for BlockBackend {
         // A block finishing after an app recolored the
         // terminal must not pop in with static theme
         // colors next to the recolored live VTE.
-        apply_dynamic_colors_to_finished(&finished, self.dynamic_colors_rc.get());
+        apply_dynamic_colors_to_finished(&finished, dynamic_colors);
         finished
             .widget()
             .insert_before(&self.block_list_rc, Some(self.active_rc.borrow().widget()));
@@ -15080,9 +15086,7 @@ impl TermView {
         let pty = Rc::new(spawn(&argv, cwd, &env_extra, request_shell_token)?);
         #[cfg(forge_shared_terminal)]
         let shared_active = shared_active_requested
-            .then(|| {
-                shared_active::SharedActiveTerminal::new(config, pty.clone(), mode.is_unified())
-            })
+            .then(|| shared_active::SharedActiveTerminal::new(config, pty.clone(), mode))
             .transpose()
             .map_err(io::Error::other)?;
         let shell_integration_token = pty
@@ -16617,10 +16621,13 @@ impl TermView {
             let mouse_reporting_rc = mouse_reporting_mode.clone();
             let bracketed_paste_rc = bracketed_paste.clone();
             let config_for_cb = config_shared.clone();
-            let parser = Rc::new(RefCell::new(Parser::with_config(ParserConfig {
+            let parser = Parser::with_config(ParserConfig {
                 mouse_reporting: config.mouse_reporting_enabled,
                 focus_reporting: config.focus_reporting_enabled,
-            })));
+            });
+            #[cfg(forge_shared_terminal)]
+            let parser = parser.with_live_terminal_colors(shared_active.is_some());
+            let parser = Rc::new(RefCell::new(parser));
             let block_data_for_cb = block_data_rc.clone();
             let finished_blocks_for_cb = finished_blocks_rc.clone();
             let widget_pool_for_cb = widget_pool.clone();

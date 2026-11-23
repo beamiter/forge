@@ -179,14 +179,13 @@ pub(super) fn terminal_foreground() -> gtk4::gdk::RGBA {
     gtk4::gdk::RGBA::new(213.0 / 255.0, 222.0 / 255.0, 236.0 / 255.0, 1.0)
 }
 
+pub(super) fn terminal_background() -> gtk4::gdk::RGBA {
+    gtk4::gdk::RGBA::new(14.0 / 255.0, 22.0 / 255.0, 33.0 / 255.0, 1.0)
+}
+
 pub(super) fn terminal_colors(terminal: &Terminal) {
     terminal.set_color_foreground(&terminal_foreground());
-    terminal.set_color_background(&gtk4::gdk::RGBA::new(
-        14.0 / 255.0,
-        22.0 / 255.0,
-        33.0 / 255.0,
-        1.0,
-    ));
+    terminal.set_color_background(&terminal_background());
 }
 
 /// Compact native status metadata. Callers supply only an observed outcome;
