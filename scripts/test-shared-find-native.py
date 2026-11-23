@@ -65,7 +65,7 @@ def run(binary, root, mode):
         directory = root / key
         directory.mkdir(mode=0o700)
         env[key] = str(directory)
-    env.update(GDK_BACKEND='x11', GSK_RENDERER='cairo', GTK_A11Y='atspi',
+    env.update(GDK_BACKEND='x11', GSK_RENDERER='cairo', GTK_A11Y='atspi', GTK_IM_MODULE='simple',
                JTERM_SHARED_ACTIVE_TERMINAL='1', JTERM_SHARED_TRANSCRIPT='1')
 
     with application(binary, config, env, root / 'forge.log', restore=False) as process:
@@ -96,7 +96,16 @@ def run(binary, root, mode):
             xdotool('key', '--clearmodifiers', 'ctrl+shift+f')
         wait_for('application Find with search focus', entry)
         type_query('shared-find-probe')
-        wait_for('first of two matches', lambda: status('1 of 2'))
+        wait_for('literal text in the focused Find entry',
+                 lambda: (focused := entry()) and accessible_text(focused) == 'shared-find-probe')
+        try:
+            wait_for('first of two matches', lambda: status('1 of 2'))
+        except RuntimeError:
+            labels = [node.get_name() for node in application_nodes(pid)
+                      if node.get_state_set().contains(Atspi.StateType.SHOWING)
+                      and node.get_role() == Atspi.Role.STATUS_BAR]
+            print(f'Visible Find status in {mode}: {labels!r}', flush=True)
+            raise
         xdotool('key', '--clearmodifiers', 'Return')
         wait_for('second match on the mounted terminal', lambda: status('2 of 2') and (
             ('shared-find-probe archived' if mode == 'unified' else 'shared-find-probe live') in screen_text()

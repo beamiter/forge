@@ -61,7 +61,12 @@ class PreviewWiring(unittest.TestCase):
         self.assertIn("owner.as_ref().filter(|owner| owner.pinned)", targets)
         self.assertIn(".and_then(Weak::upgrade)", targets)
         self.assertIn(".filter(|view| view.widget().is_mapped())", targets)
-        self.assertRegex(targets, r"return match view \{\s*Some\(view\) => \(Some\(view\.vte\(\)\.clone\(\)\), Some\(view\)\),\s*None => \(None, None\),\s*\};")
+        self.assertRegex(
+            targets,
+            r"return match view \{\s*"
+            r"Some\(view\) => \(view\.legacy_terminal\(\)\.cloned\(\), Some\(view\)\),\s*"
+            r"None => \(None, None\),\s*\};",
+        )
         self.assertIn("(self.current_terminal(), self.current_term_view())", targets)
         self.assertNotRegex(targets, r"borrow_mut|search_find|search_set|select_range|select_all|clipboard|grab_focus|clear_find|search_apply")
         self.assertEqual(code.count("owner.capture_search_preview()?"), 1)
