@@ -407,10 +407,15 @@ impl UiState {
             crate::config::TerminalMode::Vte => {
                 #[cfg(all(forge_shared_terminal, target_os = "linux"))]
                 if initial_commands.is_empty() && std::env::var_os("FORGE_SAFE_MODE").is_none() {
+                    let sid = session_id
+                        .filter(|sid| jterm_core::execution_journal::is_valid_jsh_session_id(sid))
+                        .map(str::to_owned)
+                        .unwrap_or_else(generate_session_id);
                     let shared = super::shared_terminal::SharedPane::open(
                         &self.config.borrow(),
                         &self.shell_argv.borrow(),
                         working_directory,
+                        &sid,
                     );
                     if let Some(view) = shared {
                         if let Some(error) = view.launch_error() {
@@ -422,12 +427,6 @@ impl UiState {
                             root.set_widget_name(&name);
                         }
                         leaf.attach_to(&root);
-                        let sid = session_id
-                            .filter(|sid| {
-                                jterm_core::execution_journal::is_valid_jsh_session_id(sid)
-                            })
-                            .map(str::to_owned)
-                            .unwrap_or_else(generate_session_id);
                         leaf.set_session_id(&sid);
                         leaf.set_remote(false);
                         self.install_pane_rearrange(&leaf);

@@ -90,7 +90,7 @@ impl SharedTerminal {
                         .ok_or("shared runtime child has no process id")?;
                     runtime_guard = Some(crate::gtk_process::Guard::capture(
                         pid,
-                        Some(std::path::Path::new(&argv[0])),
+                        RuntimeShell::candidate_program(argv),
                     ));
                     TerminalPane::with_runtime(runtime, theme, status, links, close)?
                 } else {
@@ -172,11 +172,9 @@ impl SharedTerminal {
     pub(crate) fn close_blocker(&self) -> Option<String> {
         #[cfg(target_os = "linux")]
         if let (Some(runtime), Some(guard)) = (self.pane.runtime(), &self.runtime_guard) {
-            return runtime
-                .exit_code()
-                .is_none()
-                .then(|| guard.blocker(true, None))
-                .flatten();
+            // Shutdown stops the runtime before its reader can publish an exit code.
+            runtime.child_pid()?;
+            return guard.blocker(true, None);
         }
         self.pane.pty().and_then(|pty| pty.close_blocker(true))
     }
@@ -198,7 +196,7 @@ impl SharedTerminal {
         if let (Some(runtime), Some(guard)) = (self.pane.runtime(), &self.runtime_guard) {
             let runtime = Rc::clone(runtime);
             let probe = guard.withdrawal_work_probe();
-            return Box::new(move || runtime.exit_code().is_none() && probe());
+            return Box::new(move || runtime.child_pid().is_some() && probe());
         }
         self.pane
             .pty()
@@ -231,11 +229,17 @@ pub(crate) struct SharedPane {
 
 #[cfg(target_os = "linux")]
 impl SharedPane {
-    pub(crate) fn open(config: &Config, argv: &[String], cwd: Option<&str>) -> Option<Rc<Self>> {
+    pub(crate) fn open(
+        config: &Config,
+        argv: &[String],
+        cwd: Option<&str>,
+        session_id: &str,
+    ) -> Option<Rc<Self>> {
         let home = std::env::var("HOME").ok();
-        let runtime = RuntimeShell::spawn_candidate(
+        let runtime = RuntimeShell::spawn_session_candidate(
             argv,
             cwd.or(home.as_deref()),
+            session_id,
             crate::host::is_flatpak(),
             crate::host::working_directory_available,
             || {
@@ -251,7 +255,7 @@ impl SharedPane {
                 .child_pid()
                 .ok_or("shared shell has no live process id")?;
             let guard =
-                crate::gtk_process::Guard::capture(pid, Some(std::path::Path::new(&argv[0])));
+                crate::gtk_process::Guard::capture(pid, RuntimeShell::candidate_program(argv));
             let (widget, pane) = TerminalPane::with_runtime_embedded(
                 runtime,
                 Self::theme(config, config.default_font_scale),

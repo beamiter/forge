@@ -1893,6 +1893,7 @@ impl UiState {
                 &self.config.borrow(),
                 shell_argv,
                 working_directory.as_deref(),
+                &sid,
             )
             .map(PaneLeaf::Shared)
         } else {
