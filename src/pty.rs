@@ -73,6 +73,8 @@ const CHILD_REAP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_
 const CHILD_REAP_ESCALATION_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub struct OwnedPty {
+    #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+    shared_session: Option<jterm_gtk_view::PreparedPtySession>,
     master: std::sync::Arc<std::sync::Mutex<Option<OwnedFd>>>,
     /// Terminal input is written by a dedicated worker. A full PTY kernel buffer
     /// therefore backpressures that worker rather than GTK's main thread.
@@ -396,6 +398,21 @@ impl fmt::Display for PtyWriteError {
 
 impl std::error::Error for PtyWriteError {}
 
+#[cfg(all(forge_shared_terminal, target_os = "linux"))]
+fn shared_write_error(error: jterm_gtk_view::WriteError, bytes: usize) -> PtyWriteError {
+    use jterm_gtk_view::WriteError;
+    match error {
+        WriteError::Full { .. } => PtyWriteError::QueueFull { bytes },
+        WriteError::TooLarge {
+            max_message_bytes, ..
+        } => PtyWriteError::TooLarge {
+            bytes,
+            limit: max_message_bytes,
+        },
+        WriteError::Closed => PtyWriteError::Closed { bytes },
+    }
+}
+
 /// Policy for the PTY write boundary.
 ///
 /// `FirstLineOnly` preserves forge's behaviour: without DECSET 2004 a
@@ -599,6 +616,18 @@ fn filter_and_enqueue_input_with<T>(
     modes: PasteModes,
     observe: impl FnOnce(&[u8], bool) -> T,
 ) -> Result<T, PtyWriteError> {
+    filter_and_queue_input(guard, data, modes, observe, |bytes| {
+        try_enqueue_input(sender, bytes)
+    })
+}
+
+fn filter_and_queue_input<T>(
+    guard: &mut InputGuard,
+    data: &[u8],
+    modes: PasteModes,
+    observe: impl FnOnce(&[u8], bool) -> T,
+    enqueue: impl FnOnce(Vec<u8>) -> Result<(), PtyWriteError>,
+) -> Result<T, PtyWriteError> {
     // Core's `InputGuard` exposes its frame state but no setter, so a rollback
     // reconstructs an equivalent guard from the one-bit state.
     let before_in_frame = guard.in_frame();
@@ -618,7 +647,7 @@ fn filter_and_enqueue_input_with<T>(
         });
     }
     let observed = observe(&safe_data, before_in_frame);
-    let result = try_enqueue_input(sender, safe_data);
+    let result = enqueue(safe_data);
     if result.is_err() {
         // Queue admission is the commit point. A rejected opener/closer must
         // not alter how the next independent write is sanitized.
@@ -721,7 +750,7 @@ impl OwnedPty {
     }
 
     pub fn spawn(argv: &[&str], cwd: Option<&str>, env_extra: &[(&str, &str)]) -> io::Result<Self> {
-        Self::spawn_inner(argv, cwd, env_extra, false)
+        Self::spawn_inner(argv, cwd, env_extra, false, false)
     }
 
     /// Spawn an interactive shell and, when requested, give its startup
@@ -733,7 +762,17 @@ impl OwnedPty {
         env_extra: &[(&str, &str)],
         enable_shell_token: bool,
     ) -> io::Result<Self> {
-        Self::spawn_inner(argv, cwd, env_extra, enable_shell_token)
+        Self::spawn_inner(argv, cwd, env_extra, enable_shell_token, false)
+    }
+
+    #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+    pub(crate) fn spawn_shared(
+        argv: &[&str],
+        cwd: Option<&str>,
+        env_extra: &[(&str, &str)],
+        enable_shell_token: bool,
+    ) -> io::Result<Self> {
+        Self::spawn_inner(argv, cwd, env_extra, enable_shell_token, true)
     }
 
     fn spawn_inner(
@@ -741,7 +780,10 @@ impl OwnedPty {
         cwd: Option<&str>,
         env_extra: &[(&str, &str)],
         enable_shell_token: bool,
+        use_shared_session: bool,
     ) -> io::Result<Self> {
+        #[cfg(not(all(forge_shared_terminal, target_os = "linux")))]
+        let _ = use_shared_session;
         let argv_owned: Vec<String> = argv.iter().map(|value| (*value).to_string()).collect();
         let argv_owned = crate::agent_cli::inline_argv(&argv_owned);
         let host_bridge = crate::host::is_flatpak();
@@ -926,25 +968,46 @@ impl OwnedPty {
                         return Err(error);
                     }
                 };
-                let writer_fd = match master.try_clone() {
-                    Ok(fd) => fd,
-                    Err(error) => return Err(abort_spawn(&lifecycle, error)),
+                let guard =
+                    crate::gtk_process::Guard::capture(child.as_raw(), Some(executable.as_path()));
+                #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+                let (master, shared_session) = if use_shared_session {
+                    let reap = Arc::clone(&guard);
+                    let session = jterm_gtk_view::PreparedPtySession::start(
+                        master,
+                        Arc::clone(&lifecycle),
+                        TERMINAL_ESCALATION,
+                        move |child| reap.poll_reap(child),
+                        PTY_INPUT_QUEUE_CAPACITY * MAX_PTY_INPUT_MESSAGE_BYTES,
+                        PTY_INPUT_QUEUE_CAPACITY,
+                    )?;
+                    (None, Some(session))
+                } else {
+                    (Some(master), None)
                 };
-                let (input_tx, input_dispatch) = match spawn_fd_writer(writer_fd) {
-                    Ok(tx) => tx,
-                    Err(error) => return Err(abort_spawn(&lifecycle, error)),
+                #[cfg(not(all(forge_shared_terminal, target_os = "linux")))]
+                let master = Some(master);
+                let (input_tx, input_dispatch) = if let Some(master) = &master {
+                    let (sender, dispatch) = master
+                        .try_clone()
+                        .and_then(spawn_fd_writer)
+                        .map_err(|error| abort_spawn(&lifecycle, error))?;
+                    (Some(sender), dispatch)
+                } else {
+                    (None, Arc::default())
                 };
+                let reader_cancel_eventfd =
+                    master.as_ref().and_then(|_| create_reader_cancel_eventfd());
                 Ok(OwnedPty {
-                    master: std::sync::Arc::new(std::sync::Mutex::new(Some(master))),
-                    input_tx: std::sync::Mutex::new(Some(input_tx)),
+                    #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+                    shared_session,
+                    master: std::sync::Arc::new(std::sync::Mutex::new(master)),
+                    input_tx: std::sync::Mutex::new(input_tx),
                     input_dispatch,
-                    guard: crate::gtk_process::Guard::capture(
-                        child.as_raw(),
-                        Some(executable.as_path()),
-                    ),
+                    guard,
                     lifecycle,
                     reader_cancelled: Arc::new(AtomicBool::new(false)),
-                    reader_cancel_eventfd: create_reader_cancel_eventfd(),
+                    reader_cancel_eventfd,
                     input_guard: std::sync::Mutex::new(InputGuard::new()),
                     input_error_reported: AtomicBool::new(false),
                     resize_error_reported: AtomicI32::new(0),
@@ -982,6 +1045,10 @@ impl OwnedPty {
     /// The descriptor remains owned by this `OwnedPty`; callers only borrow the
     /// integer long enough for non-mutating probes such as `tcgetpgrp(3)`.
     pub fn master_fd_raw(&self) -> i32 {
+        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+        if let Some(session) = &self.shared_session {
+            return session.inspect_fd(|fd| fd).unwrap_or(-1);
+        }
         self.master
             .lock()
             .ok()
@@ -998,6 +1065,11 @@ impl OwnedPty {
             .map_err(|_| io::Error::other("writer gate poisoned"))?;
         if state.closed || state.pending != 0 {
             return Err(io::Error::other("writer is not idle"));
+        }
+        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+        if self.shared_session.is_some() {
+            state.nonblocking = true;
+            return Ok(());
         }
         let master = self
             .master
@@ -1029,6 +1101,12 @@ impl OwnedPty {
     }
 
     pub(crate) fn foreground_token(&self) -> Option<PtyForegroundToken> {
+        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+        if let Some(session) = &self.shared_session {
+            return session
+                .inspect_fd(|fd| self.foreground_token_at(fd))
+                .flatten();
+        }
         let master = self.master.lock().ok()?;
         self.foreground_token_at(master.as_ref()?.as_raw_fd())
     }
@@ -1066,6 +1144,17 @@ impl OwnedPty {
         let guard = self.input_guard.try_lock().map_err(|_| unavailable)?;
         if guard.in_frame() {
             return Err(unavailable);
+        }
+        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+        if let Some(session) = &self.shared_session {
+            return if session.try_write_control(byte, |group| {
+                expected == Some(PtyForegroundToken(group)) && validate()
+            }) {
+                self.input_error_reported.store(false, Ordering::Relaxed);
+                Ok(())
+            } else {
+                Err(unavailable)
+            };
         }
         let master = self.master.try_lock().map_err(|_| unavailable)?;
         let fd = master
@@ -1138,6 +1227,17 @@ impl OwnedPty {
         self.write_bytes_with(data, |_, _| ())
     }
 
+    #[cfg(forge_shared_terminal)]
+    pub(crate) fn write_protocol_reply(&self, data: &[u8]) -> Result<(), PtyWriteError> {
+        #[cfg(target_os = "linux")]
+        if let Some(session) = &self.shared_session {
+            return session
+                .write_reply(data)
+                .map_err(|error| shared_write_error(error, data.len()));
+        }
+        self.write_bytes(data)
+    }
+
     /// Queue bytes and report the editor semantics that actually crossed the
     /// central PTY filter. Native VTE commits use this so multiline truncation,
     /// automatic paste framing, and marker removal cannot leave their local
@@ -1161,6 +1261,25 @@ impl OwnedPty {
         let modes = PasteModes {
             bracketed: self.shell_bracketed_paste(),
         };
+        // Hold the guard through queue admission so the paste state commits
+        // atomically with the filtered bytes.
+        let mut guard = self
+            .input_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+        if let Some(session) = &self.shared_session {
+            let result = filter_and_queue_input(&mut guard, data, modes, observe, |bytes| {
+                let len = bytes.len();
+                session
+                    .write_input(bytes)
+                    .map_err(|error| shared_write_error(error, len))
+            });
+            if result.is_ok() {
+                self.input_error_reported.store(false, Ordering::Relaxed);
+            }
+            return result;
+        }
         let input_tx = self
             .input_tx
             .lock()
@@ -1169,13 +1288,6 @@ impl OwnedPty {
         let Some(input_tx) = input_tx else {
             return Err(PtyWriteError::Closed { bytes: data.len() });
         };
-        // A poisoned guard would mean another thread panicked mid-filter; keep
-        // the choke point rather than letting writes bypass it. Hold it through
-        // queue admission so the frame state commits atomically with the bytes.
-        let mut guard = self
-            .input_guard
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut state = self
             .input_dispatch
             .lock()
@@ -1209,6 +1321,14 @@ impl OwnedPty {
     /// Apply one size without waiting for another master-fd user. The lock
     /// remains held through ioctl, so close cannot recycle the descriptor.
     pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
+        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+        if let Some(session) = &self.shared_session {
+            let result = session.resize(cols, rows);
+            if result.is_ok() {
+                self.resize_error_reported.store(0, Ordering::Relaxed);
+            }
+            return result;
+        }
         self.resize_with(cols, rows, |fd, ws| {
             // SAFETY: the locked OwnedFd remains alive and ws is initialized.
             if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, ws) } == -1 {
@@ -1284,6 +1404,11 @@ impl OwnedPty {
     }
 
     pub fn kill(&self) {
+        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+        if let Some(session) = &self.shared_session {
+            session.stop();
+            return;
+        }
         request_reader_cancel(
             &self.reader_cancelled,
             self.reader_cancel_eventfd.as_deref(),
@@ -1300,6 +1425,22 @@ impl OwnedPty {
         if let Ok(mut sender) = self.input_tx.lock() {
             sender.take();
         }
+    }
+
+    pub(crate) fn start_stamped_reader(
+        &self,
+        mut callback: impl FnMut(Vec<u8>, Option<std::time::Instant>) + 'static,
+        on_exit: impl FnOnce(PtyExit) + 'static,
+    ) -> io::Result<()> {
+        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+        if let Some(session) = &self.shared_session {
+            return session.attach(callback, on_exit);
+        }
+        self.start_reader(
+            move |bytes| callback(bytes, Some(std::time::Instant::now())),
+            on_exit,
+        );
+        Ok(())
     }
 
     /// Start an async reader. A bounded channel transfers 32 KiB chunks to the
@@ -1914,6 +2055,8 @@ impl OwnedPty {
             Err(error) => return Err(abort_spawn(&lifecycle, error)),
         };
         Ok(OwnedPty {
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+            shared_session: None,
             master: std::sync::Arc::new(std::sync::Mutex::new(Some(master))),
             input_tx: std::sync::Mutex::new(Some(input_tx)),
             input_dispatch,
@@ -2154,16 +2297,7 @@ fn prepare_test_slave(slave: &OwnedFd) {
 
 impl Drop for OwnedPty {
     fn drop(&mut self) {
-        request_reader_cancel(
-            &self.reader_cancelled,
-            self.reader_cancel_eventfd.as_deref(),
-        );
-        self.close_master_fd();
-        self.close_input_writer();
-        // A pane closed explicitly already started this; `terminate` reports
-        // that and does nothing. Whatever runs the ladder also reaps the
-        // child, and the lifecycle's own drop is the backstop if nothing did.
-        self.lifecycle.terminate(TERMINAL_ESCALATION);
+        self.kill();
     }
 }
 

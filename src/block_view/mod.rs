@@ -12065,11 +12065,11 @@ impl RenderBackend for UnifiedBackend {
 
 impl ReaderCtx {
     /// Exactly one source sequence per nonempty real PTY read, before parking.
-    fn process_fresh_read(&self, data: &[u8]) {
+    fn process_fresh_read(&self, data: &[u8], read_at: Option<std::time::Instant>) {
         if data.is_empty() {
             return;
         }
-        let origin = self.watch_reader.fresh_origin(std::time::Instant::now());
+        let origin = read_at.and_then(|at| self.watch_reader.fresh_origin(at));
         if self.selection_feed_hold.try_buffer(data) {
             return;
         }
@@ -12115,7 +12115,7 @@ impl ReaderCtx {
     /// `live_vte` is passed in rather than read back off the backend:
     /// `ReaderCtx` itself no longer names widget types, and the selection
     /// hold's VTE hooks are wiring, not lifecycle dispatch.
-    fn install(self, pty: &Rc<OwnedPty>, live_vte: &Terminal) {
+    fn install(self, pty: &Rc<OwnedPty>, live_vte: &Terminal) -> io::Result<()> {
         // Selection-hold triggers that live on the VTE itself (selection
         // cleared, user typed). Wired before the pipeline closure below
         // captures the shared ctx — and before the view connects its own
@@ -12129,9 +12129,9 @@ impl ReaderCtx {
 
         ctx.install_watch_hold();
         let exit_ctx = ctx.clone();
-        pty.start_reader(
-            move |data: Vec<u8>| {
-                ctx.process_fresh_read(&data);
+        pty.start_stamped_reader(
+            move |data, read_at| {
+                ctx.process_fresh_read(&data, read_at);
             },
             move |status| {
                 exit_ctx.selection_feed_hold.flush_then(|| {
@@ -12144,7 +12144,7 @@ impl ReaderCtx {
                     }
                 });
             },
-        );
+        )
     }
 }
 
@@ -15004,8 +15004,24 @@ impl TermView {
             cwd,
             session_id,
             initial_commands,
-            OwnedPty::spawn_with_shell_token,
+            |argv, cwd, env, token| {
+                #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+                if Self::shared_active_requested(mode) {
+                    return OwnedPty::spawn_shared(argv, cwd, env, token);
+                }
+                OwnedPty::spawn_with_shell_token(argv, cwd, env, token)
+            },
         )
+    }
+
+    #[cfg(forge_shared_terminal)]
+    fn shared_active_requested(mode: &crate::config::TerminalMode) -> bool {
+        (matches!(
+            mode,
+            crate::config::TerminalMode::Block | crate::config::TerminalMode::Chat
+        ) && std::env::var_os("JTERM_SHARED_ACTIVE_TERMINAL").is_some_and(|value| value == "1"))
+            || (mode.is_unified()
+                && std::env::var_os("JTERM_SHARED_TRANSCRIPT").is_some_and(|value| value == "1"))
     }
 
     /// Constructor boundary with an injectable PTY spawner.
@@ -15056,15 +15072,7 @@ impl TermView {
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect();
         #[cfg(forge_shared_terminal)]
-        let shared_active_requested = matches!(
-            mode,
-            crate::config::TerminalMode::Block | crate::config::TerminalMode::Chat
-        ) && std::env::var_os("JTERM_SHARED_ACTIVE_TERMINAL")
-            .is_some_and(|value| value == "1");
-        #[cfg(forge_shared_terminal)]
-        let shared_active_requested = shared_active_requested
-            || (mode.is_unified()
-                && std::env::var_os("JTERM_SHARED_TRANSCRIPT").is_some_and(|value| value == "1"));
+        let shared_active_requested = Self::shared_active_requested(mode);
         #[cfg(forge_shared_terminal)]
         if shared_active_requested {
             env_extra.extend(jterm_gtk_view::INTERACTIVE_CHILD_ENV);
@@ -16842,7 +16850,7 @@ impl TermView {
                 verified_submission: verified_submission.clone(),
                 selection_feed_hold: selection_feed_hold.clone(),
             }
-            .install(&pty, &active_vte);
+            .install(&pty, &active_vte)?;
         }
         let render_backend = render_backend_for_view
             .borrow_mut()
@@ -30860,7 +30868,8 @@ mod tests {
 
         /// Exercise the exact production read/hold/parser/coalescer path.
         fn feed_raw(&self, bytes: &[u8]) {
-            self.ctx.process_fresh_read(bytes);
+            self.ctx
+                .process_fresh_read(bytes, Some(std::time::Instant::now()));
         }
 
         /// The running command's engine-owned raw-output ring.
