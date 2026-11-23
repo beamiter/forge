@@ -11217,6 +11217,11 @@ fn settle_shared_prompt_anchor(
     }
 }
 
+enum PendingUnifiedImage {
+    Vte(unified_images::PendingImage),
+    #[cfg(forge_shared_terminal)]
+    Shared(jterm_gtk_view::PendingInlineImage),
+}
 /// The continuous Unified renderer owns a single full-size terminal surface.
 /// Prompts, command output and alternate-screen applications share its PTY.
 /// The renderer binds admitted command phases to that surface's source rows.
@@ -11273,10 +11278,35 @@ struct UnifiedBackend {
     _image_layer_slot_owner: Rc<RefCell<Option<unified_images::UnifiedImageLayer>>>,
     kitty_assembler: RefCell<kitty_graphics::Assembler>,
     /// Decoded result parked until the engine has written the protocol reply.
-    kitty_pending_admission: RefCell<Option<unified_images::PendingImage>>,
+    kitty_pending_admission: RefCell<Option<PendingUnifiedImage>>,
 }
 
 impl UnifiedBackend {
+    fn kitty_cursor(&self) -> (i64, i64) {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            return terminal.kitty_cursor().unwrap_or((-1, -1));
+        }
+        self.vte.cursor_position()
+    }
+
+    fn prepare_inline_image(
+        &self,
+        texture: gtk4::gdk::Texture,
+        encoded_source_bytes: usize,
+        requested: Option<kitty_graphics::DisplayPlacement>,
+    ) -> Option<PendingUnifiedImage> {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            return terminal
+                .prepare_inline_image(texture, encoded_source_bytes, requested?)
+                .map(PendingUnifiedImage::Shared);
+        }
+        self.image_layer
+            .prepare(texture, encoded_source_bytes, requested)
+            .map(PendingUnifiedImage::Vte)
+    }
+
     #[cfg(forge_shared_terminal)]
     fn transcript(&self) -> Option<&jterm_gtk_view::TranscriptView<shared_active::Transport>> {
         self.shared_active.as_ref()?.transcript()
@@ -11830,37 +11860,32 @@ impl RenderBackend for UnifiedBackend {
     fn exit_fullscreen(&self) {}
 
     fn kitty_feed(&self, payload: &[u8]) -> kitty_graphics::FeedStatus {
-        #[cfg(forge_shared_terminal)]
-        if self.shared_active.is_some() {
-            return kitty_graphics::FeedStatus::Skipped;
-        }
         self.kitty_pending_admission.borrow_mut().take();
         let outcome = self
             .kitty_assembler
             .borrow_mut()
-            .feed_at(payload, self.vte.cursor_position());
+            .feed_at(payload, self.kitty_cursor());
         self.image_layer.set_row_epoch(self.chrome.row_epoch());
         match outcome {
             kitty_graphics::Outcome::Complete {
                 texture,
                 encoded_source_backing_bytes,
                 placement,
-            } => match self
-                .image_layer
-                .prepare(texture, encoded_source_backing_bytes, placement)
-            {
-                Some(pending) => {
-                    self.kitty_assembler.borrow_mut().commit_display_id();
-                    *self.kitty_pending_admission.borrow_mut() = Some(pending);
-                    kitty_graphics::FeedStatus::Complete
-                }
-                None => {
-                    log::debug!(
+            } => {
+                match self.prepare_inline_image(texture, encoded_source_backing_bytes, placement) {
+                    Some(pending) => {
+                        self.kitty_assembler.borrow_mut().commit_display_id();
+                        *self.kitty_pending_admission.borrow_mut() = Some(pending);
+                        kitty_graphics::FeedStatus::Complete
+                    }
+                    None => {
+                        log::debug!(
                         "unified: refusing Kitty placement without bounded in-viewport geometry"
                     );
-                    kitty_graphics::FeedStatus::Skipped
+                        kitty_graphics::FeedStatus::Skipped
+                    }
                 }
-            },
+            }
             outcome => outcome.status(),
         }
     }
@@ -11879,8 +11904,22 @@ impl RenderBackend for UnifiedBackend {
         let Some(pending) = self.kitty_pending_admission.borrow_mut().take() else {
             return;
         };
-        let zone_reopen = self.zone_marker.borrow().open_bytes();
-        self.image_layer.admit(pending, zone_reopen.as_deref());
+        match pending {
+            PendingUnifiedImage::Vte(pending) => {
+                let zone_reopen = self.zone_marker.borrow().open_bytes();
+                self.image_layer.admit(pending, zone_reopen.as_deref());
+            }
+            #[cfg(forge_shared_terminal)]
+            PendingUnifiedImage::Shared(pending) => {
+                if !self
+                    .shared_active
+                    .as_ref()
+                    .is_some_and(|terminal| terminal.admit_inline_image(pending))
+                {
+                    log::debug!("Unified image reservation expired before admission");
+                }
+            }
+        }
     }
 
     fn reset_kitty_pipeline(&self) {
