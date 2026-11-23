@@ -25,8 +25,8 @@ companion-host = { version = "0.1.0", path = "vendor/companion-host" }
 companion-process = { version = "0.1.0", path = "vendor/companion-process" }
 eva-character-atlas = { version = "0.1.0", git = "https://github.com/beamiter/jcompanion.git", rev = "9aa569540091524d637a7115b64c587b9177a55b" }
 # Published shared family source, identical for Cargo, Nix, Flatpak and tests.
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "5cf7041fa9f87020400f32b0c0f048ac8173d8d6" }
-jterm_gtk_view = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "5cf7041fa9f87020400f32b0c0f048ac8173d8d6", optional = true }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "53c87a891bf6d42b4d0fec4cf303c710ae768d7e" }
+jterm_gtk_view = { version = "0.1.0", git = "https://github.com/beamiter/jterm_core.git", rev = "53c87a891bf6d42b4d0fec4cf303c710ae768d7e", optional = true }
 jagent = { version = "0.7.0", git = "https://github.com/beamiter/jagent.git", rev = "f269c3c6afafcf9b6d60b3cccd741649fdb74576" }
 log = { version = "0.4", features = ["std"] }
 crossbeam-channel = "0.5"
@@ -53,7 +53,7 @@ gtk4 = { version = "0.11.4", features = ["v4_14"] }
 libadwaita = { version = "0.9.2", features = ["v1_5"] }
 
 [dev-dependencies]
-jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "5cf7041fa9f87020400f32b0c0f048ac8173d8d6" }
+jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "53c87a891bf6d42b4d0fec4cf303c710ae768d7e" }
 env_logger = "0.11"
 
 [profile.dev]
