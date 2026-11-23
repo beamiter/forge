@@ -800,7 +800,8 @@ impl ChatPresentation {
         }
         let destination = if docked { &composer } else { anchor };
         let already_mounted = clip.parent().as_ref() == Some(destination.upcast_ref());
-        let restore_focus = !already_mounted && active.active_vte.has_focus();
+        let live = active.focus_widget();
+        let restore_focus = !already_mounted && live.has_focus();
         if !already_mounted {
             if self.reparenting.replace(true) {
                 return destination.clone();
@@ -876,7 +877,7 @@ impl ChatPresentation {
         // Restore only after the destination is visible/mapped. Moving a
         // background pane must not turn mapping into permission to focus it.
         if restore_focus {
-            active.active_vte.grab_focus();
+            live.grab_focus();
         }
         destination.clone()
     }
@@ -936,7 +937,7 @@ pub(super) fn command_columns(command: &str, recorded: i64) -> i64 {
 
 /// Find Chat's real canvas through the current native hierarchy. The live VTE
 /// may be docked or in the transcript; both converge on this same canvas.
-pub(super) fn viewport_height_for(vte: &Terminal) -> Option<i32> {
+pub(super) fn viewport_height_for(vte: &impl IsA<gtk4::Widget>) -> Option<i32> {
     let mut parent = vte.parent();
     let mut block_alt_screen = false;
     while let Some(widget) = parent {
@@ -977,7 +978,10 @@ pub(super) fn viewport_height_for(vte: &Terminal) -> Option<i32> {
                 // Use the same budget while Running so docking alone cannot
                 // resize readline or a completion menu.
                 if let Some(controls) = dock.last_child() {
-                    height -= controls.measure(Orientation::Vertical, widget.width()).1;
+                    let width = widget
+                        .width()
+                        .max(controls.measure(Orientation::Horizontal, -1).0);
+                    height -= controls.measure(Orientation::Vertical, width).1;
                 }
                 if let Some(history) = widget.first_child() {
                     height -= history.measure(Orientation::Vertical, widget.width()).0;

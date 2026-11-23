@@ -81,6 +81,8 @@ mod scroll_transfer;
 pub(crate) mod search_preview;
 mod selection_folding;
 mod selection_hold;
+#[cfg(forge_shared_terminal)]
+mod shared_active;
 pub(crate) use selection_folding::FoldSelectionResult;
 pub(crate) mod shortcut_hints;
 pub(crate) mod watch_batch;
@@ -7540,6 +7542,10 @@ trait RenderBackend {
     fn live_surface_answers_query(&self, _query: KeyboardProtocolQuery) -> bool {
         false
     }
+    /// Whether native replies arrive through the legacy key commit signal.
+    fn replies_through_commit(&self) -> bool {
+        true
+    }
     /// Rebase the prompt anchor captured at PromptEnd (`provisional`, with
     /// the surface row count `anchor_rows` recorded beside it) onto the
     /// surface as it stands at CommandStart. Anchor cells are in the
@@ -7756,6 +7762,8 @@ struct BlockBackend {
     active_rc: Rc<RefCell<ActiveBlock>>,
     /// The live VTE — every byte is fed here; alt-screen toggles feed it 1049h/l.
     active_vte: Terminal,
+    #[cfg(forge_shared_terminal)]
+    shared_active: Option<Rc<shared_active::SharedActiveTerminal>>,
     block_list_rc: gtk4::Box,
     block_scroll_rc: ScrolledWindow,
     jump_fab: gtk4::Button,
@@ -9469,7 +9477,9 @@ impl ReaderCtx {
                     &self.post_prompt_fence_released_rc,
                 );
             }
-            if query == KeyboardProtocolQuery::CursorPosition {
+            if query == KeyboardProtocolQuery::CursorPosition
+                && self.backend.replies_through_commit()
+            {
                 self.cpr_outstanding_rc
                     .set(self.cpr_outstanding_rc.get().saturating_add(1));
                 self.cpr_queries_rc
@@ -9893,6 +9903,11 @@ impl RenderBackend for BlockBackend {
 
     fn feed_live(&self, bytes: &[u8]) {
         #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            terminal.feed(bytes);
+            return;
+        }
+        #[cfg(forge_shared_terminal)]
         if let Ok(active) = self.active_rc.try_borrow() {
             if let Some(widget) = active.shared_live_widget() {
                 widget.set_visible(false);
@@ -9921,10 +9936,23 @@ impl RenderBackend for BlockBackend {
     /// output, or the find box — was interrupted whenever any other pane's
     /// shell reached a prompt.
     fn focus_live_deferred(&self) {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            restore_live_focus_deferred(terminal.screen());
+            return;
+        }
         restore_live_focus_deferred(&self.active_vte);
     }
 
     fn sync_geometry_to_pty(&self) {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            (self.layout_active_surface)();
+            self.pty_winsize
+                .reassert(&self.pty_for_init, terminal.grid_size());
+            self.pty_winsize.arm_settle();
+            return;
+        }
         sync_active_to_pty(
             &self.layout_active_surface,
             &self.active_vte,
@@ -10314,6 +10342,49 @@ impl RenderBackend for BlockBackend {
     }
 
     fn schedule_anchor_settle(&self, args: AnchorSettleArgs) {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            let Some((col, row)) = terminal.cursor() else {
+                args.post_prompt_fence_released.set(true);
+                return;
+            };
+            args.prompt_end_pos.set((col, row));
+            args.prompt_anchor_rows
+                .set(i64::from(terminal.grid_size().1));
+            args.post_prompt_fence_released.set(true);
+            let Some(prefix) = terminal.capture((0, row), (col, row)) else {
+                return;
+            };
+            *args.prompt_anchor_prefix.borrow_mut() = prefix;
+            args.prompt_anchor_ready.set(true);
+            if !args.init_commands.borrow().is_empty() {
+                glib::idle_add_local_once(move || {
+                    if args.prompt_anchor_generation.get() != args.anchor_generation
+                        || !prompt_anchor_may_settle(
+                            args.bstate.get(),
+                            args.idle_input_dirty.get(),
+                            args.pty_synced.get(),
+                            args.submission_pending.get(),
+                            args.pending_typeahead.get(),
+                        )
+                    {
+                        return;
+                    }
+                    if let Some(command) = args.init_commands.borrow_mut().pop_front() {
+                        let suggestion =
+                            click_cursor::suggestion_rgb(&args.config.borrow().palette);
+                        if let Err(error) =
+                            args.verified_submission.begin(&command, None, suggestion)
+                        {
+                            log::warn!(
+                                "initial command was not queued at an unverified prompt: {error}"
+                            );
+                        }
+                    }
+                });
+            }
+            return;
+        }
         schedule_anchor_settle_on(
             &self.active_vte,
             &self.prompt_anchor_tick_id_rc,
@@ -10323,6 +10394,10 @@ impl RenderBackend for BlockBackend {
     }
 
     fn cursor_and_rows(&self) -> ((i64, i64), i64) {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            return (terminal.cursor_position(), terminal.row_count());
+        }
         (
             self.active_vte.cursor_position(),
             self.active_vte.row_count(),
@@ -10342,10 +10417,26 @@ impl RenderBackend for BlockBackend {
     }
 
     fn live_surface_answers_query(&self, query: KeyboardProtocolQuery) -> bool {
+        #[cfg(forge_shared_terminal)]
+        if self.shared_active.is_some() {
+            return true;
+        }
         vte_answers_query_natively(query)
     }
 
+    fn replies_through_commit(&self) -> bool {
+        #[cfg(forge_shared_terminal)]
+        if self.shared_active.is_some() {
+            return false;
+        }
+        true
+    }
+
     fn command_capture_anchor(&self, provisional: (i64, i64), anchor_rows: i64) -> (i64, i64) {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            return terminal.prompt_anchor(provisional, anchor_rows);
+        }
         let rows = self.active_vte.row_count();
         let anchor = prompt_anchor_for_surface(
             self.rebase_prompt_on_row_delta,
@@ -10362,6 +10453,10 @@ impl RenderBackend for BlockBackend {
     }
 
     fn live_column_count(&self) -> i64 {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            return i64::from(terminal.grid_size().0);
+        }
         self.active_vte.column_count()
     }
 
@@ -10372,6 +10467,10 @@ impl RenderBackend for BlockBackend {
         end_row: i64,
         end_col: i64,
     ) -> Option<String> {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            return terminal.capture((start_col, start_row), (end_col, end_row));
+        }
         capture_vte_text_range(&self.active_vte, start_row, start_col, end_row, end_col)
     }
 
@@ -11877,6 +11976,8 @@ struct PtyWinsize {
     /// Bumped only when a publish really changed the size: the PromptEnd
     /// anchor reads any bump as "the prompt was reflowed by a resize".
     generation: Rc<Cell<u64>>,
+    #[cfg(forge_shared_terminal)]
+    shared_active: Option<Weak<shared_active::SharedActiveTerminal>>,
     /// Arms the settle tick; installed once the tick exists.
     arm: RefCell<Option<Rc<dyn Fn()>>>,
     /// Test hook: a test that pins the child's winsize to a capture's grid
@@ -11893,6 +11994,8 @@ impl PtyWinsize {
             resize_attempt: Cell::new(((0, 0), 0)),
             resize_retry_pending: Cell::new(false),
             generation,
+            #[cfg(forge_shared_terminal)]
+            shared_active: None,
             arm: RefCell::new(None),
             #[cfg(test)]
             frozen: Cell::new(false),
@@ -11934,7 +12037,13 @@ impl PtyWinsize {
         if !changed && !force && !self.resize_retry_pending.get() {
             return false;
         }
-        match pty.resize(sample.0, sample.1) {
+        let resize = || pty.resize(sample.0, sample.1);
+        #[cfg(forge_shared_terminal)]
+        let resize = || match self.shared_active.as_ref().and_then(Weak::upgrade) {
+            Some(terminal) => terminal.resize(sample.0, sample.1),
+            None => resize(),
+        };
+        match resize() {
             Ok(()) => {
                 self.resize_attempt.set((sample, 0));
                 self.resize_retry_pending.set(false);
@@ -13676,16 +13785,20 @@ impl LiveCommitSink {
             self.pty
                 .report_write_error("could not queue terminal report", error);
         } else {
-            record_protocol_reply_input(
-                block_state,
-                &self.typed_cmd_fidelity,
-                &self.idle_input_dirty,
-                &self.pty_synced,
-                &self.submission_pending,
-                &self.pending_typeahead,
-                &self.accepted_input_generation,
-            );
+            self.account_report(block_state);
         }
+    }
+
+    fn account_report(&self, block_state: BlockState) {
+        record_protocol_reply_input(
+            block_state,
+            &self.typed_cmd_fidelity,
+            &self.idle_input_dirty,
+            &self.pty_synced,
+            &self.submission_pending,
+            &self.pending_typeahead,
+            &self.accepted_input_generation,
+        );
     }
 
     fn write_rewritten(&self, encoded: &[u8]) -> bool {
@@ -14729,6 +14842,16 @@ impl TermView {
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect();
+        #[cfg(forge_shared_terminal)]
+        let shared_active_requested = matches!(
+            mode,
+            crate::config::TerminalMode::Block | crate::config::TerminalMode::Chat
+        ) && std::env::var_os("JTERM_SHARED_ACTIVE_TERMINAL")
+            .is_some_and(|value| value == "1");
+        #[cfg(forge_shared_terminal)]
+        if shared_active_requested {
+            env_extra.extend(jterm_gtk_view::INTERACTIVE_CHILD_ENV);
+        }
         let session_id_owned = session_id.map(str::to_owned);
         if let Some(ref sid) = session_id_owned {
             if is_jsh {
@@ -14744,6 +14867,11 @@ impl TermView {
         let request_shell_token = shell_argv_supports_agent_ids(shell_argv);
         let pty_child_is_shell = pty_child_is_shell(shell_argv);
         let pty = Rc::new(spawn(&argv, cwd, &env_extra, request_shell_token)?);
+        #[cfg(forge_shared_terminal)]
+        let shared_active = shared_active_requested
+            .then(|| shared_active::SharedActiveTerminal::new(config, pty.clone()))
+            .transpose()
+            .map_err(io::Error::other)?;
         let shell_integration_token = pty
             .shell_integration_token()
             .unwrap_or_default()
@@ -14823,10 +14951,23 @@ impl TermView {
             config,
             live_raw_output.clone(),
         )));
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &shared_active {
+            active.borrow_mut().attach_shared_active(terminal.clone());
+        }
         let active_vte = active.borrow().active_vte.clone();
-        let input_feedback = input_feedback::InputFeedback::new(&active_vte);
+        let input_feedback = input_feedback::InputFeedback::new(&active.borrow().focus_widget());
         if docked_input {
             active_vte.add_css_class("docked-live-terminal");
+        }
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &shared_active {
+            terminal.screen().add_css_class("docked-live-terminal");
+            terminal.screen().add_css_class(if block_mode {
+                "developer-live-terminal"
+            } else {
+                "chat-live-terminal"
+            });
         }
         if chat_mode {
             active_vte.add_css_class("chat-live-terminal");
@@ -15110,6 +15251,10 @@ impl TermView {
         let pty_resize_generation = Rc::new(Cell::new(0u64));
         let running_cmd = Rc::new(RefCell::new(String::new()));
         let mut pty_winsize = PtyWinsize::new(pty_resize_generation.clone());
+        #[cfg(forge_shared_terminal)]
+        {
+            pty_winsize.shared_active = shared_active.as_ref().map(Rc::downgrade);
+        }
         pty_winsize.inline_resize = Some(InlineResize::new(
             &active.borrow().resize_surface,
             bstate.clone(),
@@ -15318,6 +15463,8 @@ impl TermView {
         // full live VTE. PTY rows are NOT taken from this visual height; see
         // `pty_grid_size`, which always reports the full viewport to the child.
         let block_layout_active_surface: Rc<dyn Fn()> = {
+            #[cfg(forge_shared_terminal)]
+            let shared_geometry = (Rc::downgrade(&pty_winsize), Rc::downgrade(&pty));
             let chat_presentation = chat_presentation.clone();
             let integration = ftcs_seen.clone();
             let holder = active.borrow().widget().downgrade();
@@ -15388,6 +15535,27 @@ impl TermView {
                 } else {
                     holder
                 };
+                #[cfg(forge_shared_terminal)]
+                if let Ok(active) = active_block.try_borrow() {
+                    if let Some(terminal) = &active.shared_active {
+                        holder.set_visible(true);
+                        let height = chat::viewport_height_for(terminal.screen())
+                            .unwrap_or_else(|| scroll.vadjustment().page_size() as i32);
+                        if let Some(grid) = active.layout_shared_active(
+                            terminal,
+                            scroll.width(),
+                            height,
+                            bstate.get(),
+                        ) {
+                            if let (Some(winsize), Some(pty)) =
+                                (shared_geometry.0.upgrade(), shared_geometry.1.upgrade())
+                            {
+                                winsize.publish(&pty, grid);
+                            }
+                        }
+                        return;
+                    }
+                }
                 let cell_h = (vte.char_height() as i32).max(1);
                 let Some(viewport_rows) = viewport_rows_for(&vte, &scroll) else {
                     return;
@@ -15722,6 +15890,56 @@ impl TermView {
             });
         }
         let title_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &shared_active {
+            let layout = layout_active_surface.clone();
+            let scroll = block_scroll.downgrade();
+            let debouncer = scroll_debouncer.clone();
+            let generation = contents_generation.clone();
+            let leave_pending = active.borrow().alt_leave_pending();
+            let title_callbacks = title_callbacks.clone();
+            let bell_callbacks = bell_callbacks.clone();
+            let queued = Rc::new(Cell::new(false));
+            terminal.on_event(move |event| match event {
+                jterm_gtk_view::PaneEvent::Output => {
+                    generation.set(generation.get().wrapping_add(1));
+                    leave_pending.set(false);
+                    if !queued.replace(true) {
+                        let (queued, layout, scroll, debouncer) = (
+                            queued.clone(),
+                            layout.clone(),
+                            scroll.clone(),
+                            debouncer.clone(),
+                        );
+                        glib::idle_add_local_once(move || {
+                            queued.set(false);
+                            layout();
+                            if let Some(scroll) = scroll.upgrade() {
+                                debouncer.pin_to_bottom_deferred(&scroll);
+                            }
+                        });
+                    }
+                }
+                jterm_gtk_view::PaneEvent::TitleChanged(title) => {
+                    let title = jterm_core::review_input::safe_inline_display(&title, 512);
+                    for callback in title_callbacks.borrow().iter() {
+                        callback(&title);
+                    }
+                }
+                jterm_gtk_view::PaneEvent::Bell => {
+                    for callback in bell_callbacks.borrow().iter() {
+                        callback();
+                    }
+                }
+                jterm_gtk_view::PaneEvent::Exited(_) => {}
+            });
+            let terminal = Rc::downgrade(terminal);
+            exited_callbacks.borrow_mut().push(Box::new(move |status| {
+                if let Some(terminal) = terminal.upgrade() {
+                    terminal.exited(status);
+                }
+            }));
+        }
         let activity_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
         let human_input_callbacks: HumanInputCallbacks = Rc::new(RefCell::new(vec![]));
         {
@@ -15797,12 +16015,18 @@ impl TermView {
         let agent_execution_lost_callbacks: AgentExecutionLostCallbacks =
             Rc::new(RefCell::new(vec![]));
         let pty_synced: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let submission_surface: Rc<dyn SubmissionSurface> = Rc::new(VteSubmissionSurface {
+            vte: active_vte.clone(),
+            rebase_on_row_delta: rebase_prompt_on_row_delta,
+        });
+        #[cfg(forge_shared_terminal)]
+        let submission_surface: Rc<dyn SubmissionSurface> = match &shared_active {
+            Some(terminal) => terminal.clone(),
+            None => submission_surface,
+        };
         let verified_submission = VerifiedSubmissionCtx {
             input_feedback: input_feedback.clone(),
-            surface: Rc::new(VteSubmissionSurface {
-                vte: active_vte.clone(),
-                rebase_on_row_delta: rebase_prompt_on_row_delta,
-            }),
+            surface: submission_surface,
             bstate: bstate.clone(),
             pty: pty.clone(),
             typed_cmd: typed_cmd.clone(),
@@ -16238,6 +16462,8 @@ impl TermView {
                     rebase_prompt_on_row_delta,
                     active_rc,
                     active_vte: active_vte_rc,
+                    #[cfg(forge_shared_terminal)]
+                    shared_active: shared_active.clone(),
                     block_list_rc,
                     block_scroll_rc,
                     jump_fab: jump_fab.clone(),
@@ -16853,6 +17079,11 @@ impl TermView {
             alt_escape: alt_escape.clone(),
             cpr_outstanding: cpr_outstanding.clone(),
         };
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &shared_active {
+            terminal.bind_input(live_commit.clone(), selection_feed_hold.clone());
+            selection_feed_hold.install_text_view_hooks(terminal.screen());
+        }
         {
             let live_commit = live_commit.clone();
             active_vte.connect_commit(move |_, text, _size| {
@@ -17733,6 +17964,11 @@ impl TermView {
         chat: Option<&chat::ChatPresentation>,
         prompt_resize_reanchor: Option<Rc<PromptResizeReanchor>>,
     ) {
+        #[cfg(forge_shared_terminal)]
+        if self.active.borrow().shared_active.is_some() {
+            self.install_shared_resize_tick(chat);
+            return;
+        }
         let pty_for_resize = self.pty.clone();
         let winsize_for_resize = Rc::downgrade(&self.pty_winsize);
         let scroll_for_resize = self.block_scroll.downgrade();
@@ -17868,6 +18104,60 @@ impl TermView {
         // The permanent tick this replaces started polling at install time;
         // the first armed poll likewise waits for the first mapped frame and
         // applies the initial geometry before standing down.
+        arm();
+    }
+
+    #[cfg(forge_shared_terminal)]
+    fn install_shared_resize_tick(&self, chat: Option<&chat::ChatPresentation>) {
+        let screen = self.focus_widget();
+        let screen_for_tick = screen.downgrade();
+        let backend = Rc::downgrade(&self.render_backend);
+        let winsize = Rc::downgrade(&self.pty_winsize);
+        let active = Rc::new(Cell::new(false));
+        let grace = Rc::new(Cell::new(0));
+        let arm: Rc<dyn Fn()> = Rc::new(move || {
+            grace.set(RESIZE_TICK_GRACE_POLLS);
+            let Some(screen) = screen_for_tick.upgrade() else {
+                return;
+            };
+            if active.replace(true) {
+                return;
+            }
+            let (backend, winsize, active, grace) = (
+                backend.clone(),
+                winsize.clone(),
+                active.clone(),
+                grace.clone(),
+            );
+            screen.add_tick_callback(move |_, _| {
+                let (Some(backend), Some(winsize)) = (backend.upgrade(), winsize.upgrade()) else {
+                    active.set(false);
+                    return glib::ControlFlow::Break;
+                };
+                let before = winsize.sent.get();
+                backend.layout_active_surface();
+                let settling = before != winsize.sent.get() || winsize.resize_retry_pending.get();
+                if resize_tick_continues(settling, &grace) {
+                    glib::ControlFlow::Continue
+                } else {
+                    active.set(false);
+                    glib::ControlFlow::Break
+                }
+            });
+        });
+        for adjustment in [
+            self.block_scroll.vadjustment(),
+            self.block_scroll.hadjustment(),
+        ] {
+            let arm = arm.clone();
+            adjustment.connect_page_size_notify(move |_| arm());
+        }
+        if let Some(chat) = chat {
+            chat.connect_resize(arm.clone());
+        }
+        let on_map = arm.clone();
+        screen.connect_map(move |_| on_map());
+        self.pty_winsize.set_settle_arm(Some(arm.clone()));
         arm();
     }
 
@@ -18673,12 +18963,28 @@ impl TermView {
         &self.active_vte
     }
 
+    pub(crate) fn focus_widget(&self) -> gtk4::Widget {
+        self.active.borrow().focus_widget()
+    }
+
+    pub(crate) fn legacy_terminal(&self) -> Option<&Terminal> {
+        #[cfg(forge_shared_terminal)]
+        if self.active.borrow().shared_active.is_some() {
+            return None;
+        }
+        Some(&self.active_vte)
+    }
+
     pub fn cwd(&self) -> String {
         self.current_cwd.borrow().clone()
     }
 
     pub fn grab_focus(&self) {
-        focus_terminal(&self.active_vte);
+        if let Some(vte) = self.legacy_terminal() {
+            focus_terminal(vte);
+        } else {
+            self.focus_widget().grab_focus();
+        }
     }
 
     /// Copy selected text to clipboard.
@@ -18695,6 +19001,14 @@ impl TermView {
     /// only" modifier (Alt+Ctrl+Shift+C) when a whole block is selected.
     pub fn copy_to_clipboard_with_modifier(&self, alt_held: bool) {
         log::debug!(">>> TermView::copy_to_clipboard called (alt={})", alt_held);
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = self.active.borrow().shared_active.clone() {
+            if terminal.screen().buffer().has_selection() {
+                terminal.copy();
+                self.selection_feed_hold.flush_now();
+                return;
+            }
+        }
 
         // Native and cross-block text selections are collected in document order:
         // command VTE, output VTE, then the live input surface.
@@ -18802,6 +19116,11 @@ impl TermView {
     }
 
     pub fn paste_from_clipboard(&self) {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = self.active.borrow().shared_active.clone() {
+            terminal.paste();
+            return;
+        }
         let clipboard = self.active_vte.clipboard();
         let request = self.clipboard_paste_request();
         let feedback = self.input_feedback.clone();
@@ -19920,6 +20239,11 @@ impl TermView {
         self.dynamic_colors.set(Default::default());
         let config = self.config.borrow();
         apply_terminal_theme(&self.active_vte, &config);
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = self.active.borrow().shared_active.clone() {
+            terminal.update_theme(&config, self.active_vte.font_scale());
+            self.pty_winsize.arm_settle();
+        }
         let developer = self.root.has_css_class("developer-block-canvas");
         if developer {
             developer_block::terminal_colors(&self.active_vte);

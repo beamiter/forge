@@ -332,7 +332,7 @@ impl SharedPane {
         }))
     }
 
-    fn theme(config: &Config, scale: f64) -> Theme {
+    pub(crate) fn theme(config: &Config, scale: f64) -> Theme {
         let mut font = crate::font::terminal_font_description(&config.font_desc, config);
         if font.size() > 0 && scale.is_finite() && scale > 0.0 {
             let size = (f64::from(font.size()) * scale).round();

@@ -15,6 +15,8 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+#[cfg(forge_shared_terminal)]
+use gtk4::prelude::{TextBufferExt, TextViewExt};
 use jterm_core::terminal_report::classify_terminal_report;
 use vte4::TerminalExt;
 
@@ -159,6 +161,20 @@ impl SelectionFeedHold {
                 if commit_releases_hold(text.as_bytes(), cpr_outstanding.get() > 0) {
                     hold.flush_now();
                 }
+            }
+        });
+    }
+
+    #[cfg(forge_shared_terminal)]
+    pub(crate) fn install_text_view_hooks(self: &Rc<Self>, view: &gtk4::TextView) {
+        let weak = Rc::downgrade(self);
+        view.buffer().connect_has_selection_notify(move |buffer| {
+            let Some(hold) = weak.upgrade() else { return };
+            if buffer.has_selection() {
+                hold.begin_drag();
+                hold.end_drag(true);
+            } else {
+                hold.selection_cleared();
             }
         });
     }

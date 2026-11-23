@@ -4969,6 +4969,8 @@ pub(crate) struct ActiveBlock {
     shared_live_output: Option<jterm_gtk_view::LiveOutputView>,
     #[cfg(forge_shared_terminal)]
     shared_live_foreground: Cell<gtk4::gdk::RGBA>,
+    #[cfg(forge_shared_terminal)]
+    pub(super) shared_active: Option<Rc<super::shared_active::SharedActiveTerminal>>,
     vte_overlay: gtk4::Overlay,
     /// Sole measured child of the clip: its height IS the live card's height.
     live_spacer: gtk4::Box,
@@ -5298,6 +5300,8 @@ impl ActiveBlock {
             shared_live_output,
             #[cfg(forge_shared_terminal)]
             shared_live_foreground,
+            #[cfg(forge_shared_terminal)]
+            shared_active: None,
             active_vte,
             developer_header,
             vte_overlay,
@@ -5502,9 +5506,103 @@ impl ActiveBlock {
         )
     }
 
-    /// The column count the live VTE is wrapping at — the single source of truth
+    #[cfg(forge_shared_terminal)]
+    pub(super) fn attach_shared_active(
+        &mut self,
+        terminal: Rc<super::shared_active::SharedActiveTerminal>,
+    ) {
+        if let Some(projection) = self.shared_live_output.take() {
+            self.vte_overlay.remove_overlay(projection.widget());
+        }
+        self.vte_overlay.set_child(Some(&terminal.widget));
+        self.live_scrollbar
+            .set_adjustment(Some(terminal.scrollback()));
+        self.shared_active = Some(terminal);
+    }
+
+    #[cfg(forge_shared_terminal)]
+    pub(super) fn layout_shared_active(
+        &self,
+        terminal: &super::shared_active::SharedActiveTerminal,
+        viewport_width: i32,
+        viewport_height: i32,
+        state: BlockState,
+    ) -> Option<(u16, u16)> {
+        if viewport_width <= 1 || viewport_height <= 1 || !self.widget.is_mapped() {
+            return None;
+        }
+        let (left, top, cell_width, cell_height) = terminal.cell_metrics();
+        // The history insertion slot stays allocated while the visible
+        // surface is moved to the composer or its fullscreen seat.
+        let width = self.widget.width().min(viewport_width);
+        if width <= 1 {
+            return None;
+        }
+        self.live_scrollbar.set_visible(true);
+        let reserved = self.live_scrollbar.measure(Orientation::Horizontal, -1).1;
+        let (width, gutter) = chat_live_width_budget(width, left * 2 + cell_width, reserved);
+        let rail = terminal.scrollback();
+        let scrollable =
+            gutter > 0 && rail.upper() - rail.lower() > rail.page_size() + f64::EPSILON;
+        self.live_scrollbar.set_visible(gutter > 0);
+        self.live_scrollbar
+            .set_opacity(if scrollable { 1.0 } else { 0.0 });
+        self.live_scrollbar.set_can_target(scrollable);
+        self.live_scrollbar.set_can_focus(scrollable);
+        self.live_scrollbar
+            .update_state(&[gtk4::accessible::State::Hidden(!scrollable)]);
+        let header = if self.developer_header.is_some() {
+            super::developer_block::HEADER_HEIGHT + 2
+        } else {
+            0
+        };
+        let grid = terminal.fit_grid(width, viewport_height.saturating_sub(header));
+        let visible_rows = if matches!(
+            state,
+            BlockState::Idle | BlockState::RawFallback | BlockState::AltScreen
+        ) || self.preserve_live_scrollback()
+        {
+            grid.1
+        } else if matches!(
+            state,
+            BlockState::CollectingOutput | BlockState::PostCommand
+        ) {
+            let rows = self
+                .live_extent_rows
+                .get()
+                .max(i64::from(terminal.drawn_rows()));
+            self.live_extent_rows.set(rows);
+            rows.clamp(1, i64::from(grid.1)) as u16
+        } else {
+            terminal.drawn_rows().clamp(1, grid.1)
+        };
+        let geometry = (
+            width,
+            live_rows_height_px(cell_height, i64::from(grid.1), top * 2),
+            live_rows_height_px(cell_height, i64::from(visible_rows), top * 2),
+        );
+        if self.live_geometry.replace(geometry) != geometry {
+            self.vte_overlay.set_size_request(geometry.0, geometry.1);
+            self.live_spacer.set_height_request(geometry.2);
+        }
+        Some(grid)
+    }
+
+    pub(super) fn focus_widget(&self) -> gtk4::Widget {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            return terminal.screen().clone().upcast();
+        }
+        self.active_vte.clone().upcast()
+    }
+
+    /// The column count the live terminal is wrapping at — the single source of truth
     /// for pre-wrapping finished blocks so they align with what the user watched.
     pub(crate) fn grid_cols(&self) -> usize {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            return usize::from(terminal.grid_size().0).max(20);
+        }
         (self.active_vte.column_count().max(20)) as usize
     }
 
@@ -5714,6 +5812,15 @@ impl ActiveBlock {
         self.live_cursor_origin.set(None);
         self.live_cursor_high.set(0);
         self.alt_leave_pending.set(false);
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            terminal.feed(if preserve_scrollback {
+                b"\x1b[0m"
+            } else {
+                b"\x1bc"
+            });
+            return;
+        }
         if preserve_scrollback {
             self.active_vte.feed(b"\x1b[0m");
         } else {
@@ -5737,7 +5844,7 @@ impl ActiveBlock {
     }
 
     pub(crate) fn grab_focus(&self) {
-        self.active_vte.grab_focus();
+        self.focus_widget().grab_focus();
     }
 
     pub(crate) fn set_live_organism_visible(&self, visible: bool) {

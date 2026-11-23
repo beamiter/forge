@@ -51,7 +51,7 @@ impl PaneLeaf {
     /// generic widget-tree traversal cannot reliably identify this terminal.
     pub(crate) fn terminal(&self) -> Option<&Terminal> {
         match self {
-            Self::Block(view) => Some(view.vte()),
+            Self::Block(view) => view.legacy_terminal(),
             Self::Vte(view) => Some(view.vte()),
             #[cfg(all(forge_shared_terminal, target_os = "linux"))]
             Self::Shared(_) => None,
@@ -60,7 +60,7 @@ impl PaneLeaf {
 
     pub(crate) fn focus_widget(&self) -> gtk4::Widget {
         match self {
-            Self::Block(view) => view.vte().clone().upcast(),
+            Self::Block(view) => view.focus_widget(),
             Self::Vte(view) => view.vte().clone().upcast(),
             #[cfg(all(forge_shared_terminal, target_os = "linux"))]
             Self::Shared(view) => view.focus_widget(),
