@@ -20482,6 +20482,14 @@ impl TermView {
         self.navigate_to_record_id(record_id, false)
     }
 
+    pub(crate) fn set_live_scrollback_limit(&self, lines: u32) {
+        self.config.borrow_mut().terminal_scrollback_lines = lines;
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = self.active.borrow().shared_active.as_ref() {
+            terminal.set_history_row_limit(lines as usize);
+        }
+    }
+
     /// Apply updated theme colors to the block widgets and the live VTE.
     pub fn apply_theme(&self) {
         self.dynamic_colors.set(Default::default());

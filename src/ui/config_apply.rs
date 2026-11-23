@@ -828,8 +828,11 @@ impl UiState {
         self.for_each_terminal(|term| {
             term.set_scrollback_lines(lines as i64);
         });
-        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
         for leaf in self.configuration_leaves() {
+            if let Some(view) = leaf.block_view() {
+                view.set_live_scrollback_limit(lines);
+            }
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
             if let PaneLeaf::Shared(view) = leaf {
                 if let Some(pane) = view.terminal_pane() {
                     pane.set_history_row_limit(lines as usize);
