@@ -765,9 +765,7 @@ pub fn run() -> glib::ExitCode {
             choose_shell_argv(config.shell.as_deref())
         }));
         if !launch.safe_mode {
-            config.terminal_mode = config
-                .terminal_mode
-                .public_presentation_for_shell(&shell_argv.borrow());
+            config.prepare_workspace_terminal(&shell_argv.borrow());
         }
 
         let window_opacity = Rc::new(Cell::new(config.window_opacity));

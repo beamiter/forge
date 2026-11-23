@@ -870,6 +870,7 @@ pub struct Config {
     /// Commands to feed to new shells on startup (comma-separated).
     pub(crate) startup_commands: Option<String>,
     pub(crate) terminal_mode: TerminalMode,
+    pub(crate) terminal_mode_preference: Option<TerminalMode>,
     /// Where the tab bar is shown (left sidebar vs top bar).
     pub(crate) tab_placement: TabPlacement,
     /// Which single view the sidebar shows (tab list vs file tree).
@@ -1019,6 +1020,24 @@ pub struct Config {
 }
 
 impl Config {
+    /// Select the workspace backend for this launch and retain the saved preference.
+    pub(crate) fn prepare_workspace_terminal(&mut self, shell: &[String]) {
+        let preference = self.terminal_mode_for_save().clone();
+        self.terminal_mode = preference.public_presentation_for_shell(shell);
+        self.terminal_mode_preference = (preference != self.terminal_mode).then_some(preference);
+    }
+
+    pub(crate) fn terminal_mode_for_save(&self) -> &TerminalMode {
+        self.terminal_mode_preference
+            .as_ref()
+            .unwrap_or(&self.terminal_mode)
+    }
+
+    pub(crate) fn set_terminal_mode(&mut self, mode: TerminalMode) {
+        self.terminal_mode = mode;
+        self.terminal_mode_preference = None;
+    }
+
     /// Replace the complete configuration with an isolated, built-in VTE
     /// profile. This deliberately ignores both the user's file and FORGE_*
     /// appearance/behavior overrides, making safe mode useful for diagnosis.
@@ -1048,6 +1067,7 @@ impl Config {
             shell: None,
             startup_commands: None,
             terminal_mode: TerminalMode::Vte,
+            terminal_mode_preference: None,
             tab_placement: TabPlacement::Sidebar,
             sidebar_view: SidebarView::Tabs,
             // Recovery mode must never initiate update/network work.
@@ -3177,6 +3197,7 @@ fn resolve_file_config(
         shell,
         startup_commands,
         terminal_mode,
+        terminal_mode_preference: None,
         tab_placement,
         sidebar_view: SidebarView::parse(
             &fc.sidebar_view

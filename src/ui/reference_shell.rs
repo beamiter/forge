@@ -1968,7 +1968,7 @@ pub(crate) fn install(
                 }) {
                     return;
                 }
-                ui.config.borrow_mut().terminal_mode = mode.clone();
+                ui.config.borrow_mut().set_terminal_mode(mode.clone());
                 ui.persist_config();
                 ui.execute_action(crate::keybindings::Action::NewTab);
             }

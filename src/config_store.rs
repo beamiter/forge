@@ -978,7 +978,7 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
     );
     table.insert(
         "terminal_mode".into(),
-        toml::Value::String(config.terminal_mode.as_str().to_string()),
+        toml::Value::String(config.terminal_mode_for_save().as_str().to_string()),
     );
     table.insert(
         "tab_placement".into(),
@@ -1979,6 +1979,23 @@ mod tests {
         assert!(!table.contains_key("ascii_organism_motion"));
         assert_eq!(revision, revision_at(&path).unwrap());
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn runtime_fallback_keeps_the_configured_terminal_preference() {
+        use crate::config::TerminalMode;
+
+        let mut config = default_config();
+        config.set_terminal_mode(TerminalMode::Vte);
+        config.prepare_workspace_terminal(&[]);
+        assert_eq!(config.terminal_mode, TerminalMode::Block);
+        let mut table = toml::Table::new();
+        apply_config_to_table(&config, &mut table);
+        assert_eq!(table["terminal_mode"].as_str(), Some("vte"));
+
+        config.set_terminal_mode(TerminalMode::Block);
+        apply_config_to_table(&config, &mut table);
+        assert_eq!(table["terminal_mode"].as_str(), Some("block"));
     }
 
     #[test]

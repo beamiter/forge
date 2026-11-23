@@ -5257,10 +5257,12 @@ impl UiState {
 
         let ui = self.clone();
         terminal_mode_row.connect_selected_notify(move |row| {
-            ui.config.borrow_mut().terminal_mode = match row.selected() {
-                1 => crate::config::TerminalMode::Chat,
-                _ => crate::config::TerminalMode::Block,
-            };
+            ui.config
+                .borrow_mut()
+                .set_terminal_mode(match row.selected() {
+                    1 => crate::config::TerminalMode::Chat,
+                    _ => crate::config::TerminalMode::Block,
+                });
             ui.persist_config();
         });
 

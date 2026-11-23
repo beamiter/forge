@@ -1095,9 +1095,7 @@ impl UiState {
         // New panes/tabs immediately use a changed shell; all other config is
         // replaced as one coherent snapshot instead of retaining stale fields.
         let shell = choose_shell_argv(new_config.shell.as_deref());
-        new_config.terminal_mode = new_config
-            .terminal_mode
-            .public_presentation_for_shell(&shell);
+        new_config.prepare_workspace_terminal(&shell);
         *self.shell_argv.borrow_mut() = shell;
         *self.config.borrow_mut() = new_config;
 
