@@ -73,7 +73,7 @@ impl View {
 }
 #[derive(Clone)]
 struct Leaf {
-    terminal: Terminal,
+    terminal: Option<Terminal>,
     view: Option<View>,
 }
 impl Leaf {
@@ -85,13 +85,21 @@ impl Leaf {
             terminal: terminal.clone(),
             config: Rc::new(RefCell::new(config.clone())),
         });
-        Self { terminal, view }
+        Self {
+            terminal: Some(terminal),
+            view,
+        }
     }
     fn block_view(&self) -> Option<&View> {
         self.view.as_ref()
     }
-    fn terminal(&self) -> &Terminal {
-        &self.terminal
+    fn terminal(&self) -> Option<&Terminal> {
+        self.terminal.as_ref()
+    }
+
+    fn required_vte(&self) -> &Terminal {
+        self.terminal()
+            .expect("fixture's VTE pane lost its terminal")
     }
 }
 #[derive(Clone, Default)]
@@ -202,7 +210,7 @@ fn font_zoom_burst_updates_all_panes_with_fixed_chrome_in_one_idle() {
     assert!(ui.css.borrow().contains("12.5pt"));
     assert_eq!(ui.config.borrow().chrome_font_scale, 1.0);
     for leaf in ui.configuration_leaves() {
-        assert_eq!(leaf.terminal().scale.get(), 1.2);
+        assert_eq!(leaf.required_vte().scale.get(), 1.2);
         if let Some(view) = leaf.block_view() {
             assert_eq!(view.config.borrow().default_font_scale, 1.2);
         }
@@ -222,8 +230,8 @@ fn settings_change_and_new_panes_share_current_scaled_size() {
     let late = Leaf::new(&ui.config.borrow(), true);
     ui.leaves.borrow_mut().push(late);
     for leaf in ui.configuration_leaves() {
-        assert_eq!(leaf.terminal().size.get(), 17 * 1024);
-        assert_eq!(leaf.terminal().scale.get(), 1.5);
+        assert_eq!(leaf.required_vte().size.get(), 17 * 1024);
+        assert_eq!(leaf.required_vte().scale.get(), 1.5);
         if let Some(view) = leaf.block_view() {
             assert_eq!(view.config.borrow().font_desc, "Monospace 17px");
         }
@@ -233,7 +241,7 @@ fn settings_change_and_new_panes_share_current_scaled_size() {
     glib::run_timers();
     assert!(ui.css.borrow().contains("17px"));
     for leaf in ui.configuration_leaves() {
-        assert_eq!(leaf.terminal().scale.get(), 1.0);
+        assert_eq!(leaf.required_vte().scale.get(), 1.0);
     }
 }
 
@@ -252,8 +260,8 @@ fn explicit_reload_scale_refreshes_chrome_without_a_queued_sweep() {
     assert!(ui.css.borrow().contains("24px"));
     assert_eq!(ui.pending_font_scale.get(), None);
     for leaf in ui.configuration_leaves() {
-        assert_eq!(leaf.terminal().size.get(), 18 * 1024);
-        assert_eq!(leaf.terminal().scale.get(), 0.75);
+        assert_eq!(leaf.required_vte().size.get(), 18 * 1024);
+        assert_eq!(leaf.required_vte().scale.get(), 0.75);
     }
 }
 
@@ -263,7 +271,7 @@ fn chrome_burst_never_walks_terminals_and_mixed_bursts_save_both_groups() {
     let writes: Vec<_> = ui
         .configuration_leaves()
         .iter()
-        .map(|leaf| leaf.terminal().scale_writes.get())
+        .map(|leaf| leaf.required_vte().scale_writes.get())
         .collect();
     for scale in [1.1, 1.2, 1.5] {
         ui.apply_font_group_scale(font_zoom::FontGroup::Chrome, scale);
@@ -274,7 +282,7 @@ fn chrome_burst_never_walks_terminals_and_mixed_bursts_save_both_groups() {
     assert_eq!(ui.paints.get(), 2);
     assert!(ui.css.borrow().contains("18.75pt"));
     for (leaf, before) in ui.configuration_leaves().iter().zip(writes) {
-        assert_eq!(leaf.terminal().scale_writes.get(), before);
+        assert_eq!(leaf.required_vte().scale_writes.get(), before);
     }
     ui.apply_font_scale(0.75);
     ui.apply_font_group_scale(font_zoom::FontGroup::Chrome, 2.0);
@@ -316,4 +324,27 @@ fn actual_settings_callback_bodies_keep_other_group_size_and_units() {
     let saved = ui.saved.borrow();
     assert_eq!(saved.last().unwrap().chrome_font_size, "19.25px");
     assert_eq!(saved.last().unwrap().font_desc, main_before);
+}
+
+#[test]
+fn a_leaf_without_vte_does_not_interrupt_font_updates_to_siblings() {
+    let ui = UiState::new();
+    ui.leaves.borrow_mut().insert(
+        1,
+        Leaf {
+            terminal: None,
+            view: None,
+        },
+    );
+    ui.config.borrow_mut().font_desc = "Monospace 16".into();
+    ui.apply_font_all();
+    ui.set_font_scale_all(1.25);
+    let leaves = ui.configuration_leaves();
+    assert!(leaves[1].terminal().is_none());
+    for index in [0, 2, 3] {
+        let terminal = leaves[index].required_vte();
+        assert_eq!(terminal.size.get(), 16 * 1024);
+        assert_eq!(terminal.scale.get(), 1.25);
+    }
+    assert!(ui.css.borrow().contains("20pt"));
 }

@@ -339,6 +339,35 @@ impl Notebook {
 mod ui {
     use super::*;
     use block_view::TermView;
+
+    // A page root and its active focus widget are distinct. A native shared
+    // pane can supply a focus widget without supplying a VTE search terminal.
+    pub struct PaneNode(PaneLeaf);
+    #[derive(Clone)]
+    pub struct PaneLeaf(gtk4::Widget);
+
+    impl PaneNode {
+        pub fn from_widget(page: &gtk4::Widget) -> Option<Self> {
+            let focus = match page.0 {
+                0 => gtk4::Widget(100),
+                1 => gtk4::Widget(101),
+                3 => gtk4::Widget(103), // shared pane, no VTE terminal
+                _ => return None,
+            };
+            Some(Self(PaneLeaf(focus)))
+        }
+
+        pub fn active_leaf(&self) -> Option<PaneLeaf> {
+            Some(self.0.clone())
+        }
+    }
+
+    impl PaneLeaf {
+        pub fn focus_widget(&self) -> gtk4::Widget {
+            self.0.clone()
+        }
+    }
+
     #[derive(Clone)]
     pub struct UiState {
         search_bar: SearchBar,
@@ -351,7 +380,7 @@ mod ui {
         terminals: Vec<vte4::Terminal>,
         views: Vec<Option<Rc<TermView>>>,
         tab_focus_generation: Rc<Cell<u64>>,
-        terminal_focus_requests: Rc<RefCell<Vec<(vte4::Terminal, u32)>>>,
+        terminal_focus_requests: Rc<RefCell<Vec<(gtk4::Widget, u32)>>>,
         current_terminal_focuses: Rc<Cell<usize>>,
     }
     impl UiState {
@@ -376,7 +405,7 @@ mod ui {
             self.tab_focus_generation.set(generation);
             generation
         }
-        fn request_tab_terminal_focus(&self, terminal: vte4::Terminal, page_num: u32) {
+        fn request_tab_terminal_focus(&self, terminal: gtk4::Widget, page_num: u32) {
             self.invalidate_tab_focus_requests();
             self.terminal_focus_requests
                 .borrow_mut()
@@ -679,13 +708,28 @@ mod ui {
         switch_page(&ui, 1);
         let requests = ui.terminal_focus_requests.borrow();
         assert_eq!(requests.len(), 1);
-        assert!(requests[0].0 == ui.terminals[1]);
-        assert_eq!(requests[0].1, 1);
+        assert_eq!(requests.as_slice(), &[(gtk4::Widget(101), 1)]);
         assert_eq!(view.revealed.get(), 1);
         assert_eq!(ui.tab_focus_generation.get(), 1);
         assert_eq!(ui.search_entry.focus_count.get(), 0);
         assert!(ui.search_owner.borrow().is_none());
         assert!(ui.terminals.iter().all(|t| t.installed.borrow().is_none()));
+    }
+
+    #[test]
+    fn closed_search_switch_focuses_shared_pane_without_a_vte_terminal() {
+        let ui = setup();
+        ui.search_bar.set_search_mode(false);
+        let page = gtk4::Widget(3);
+        assert!(ui.terminal_in_page(&page).is_none());
+        switch_page(&ui, page.0);
+        assert_eq!(
+            ui.terminal_focus_requests.borrow().as_slice(),
+            &[(gtk4::Widget(103), 3)],
+        );
+        assert_eq!(ui.tab_focus_generation.get(), 1);
+        assert_eq!(ui.search_entry.focus_count.get(), 0);
+        assert!(ui.search_owner.borrow().is_none());
     }
 
     #[test]
