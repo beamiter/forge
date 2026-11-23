@@ -4,21 +4,25 @@ use crate::{
     ui::shared_terminal::{SharedPane, SharedTerminal},
 };
 use gtk4::prelude::*;
-use jterm_gtk_view::{EmbeddedTerminal, Pty, PtyExit};
+use jterm_gtk_view::{EmbeddedTerminal, Pty, PtyExit, TranscriptView};
 use std::{
     cell::{Cell, OnceCell},
     io,
     rc::Rc,
 };
 
+type DirectoryReport = Box<dyn Fn(&str)>;
+
 pub(super) struct SharedActiveTerminal {
     terminal: Rc<EmbeddedTerminal<Transport>>,
+    transcript: Option<TranscriptView<Transport>>,
     pub(super) widget: gtk4::Widget,
     input: Rc<OnceCell<InputBinding>>,
+    directory_report: OnceCell<DirectoryReport>,
     resize_error: Rc<Cell<Option<io::ErrorKind>>>,
 }
 
-struct Transport {
+pub(super) struct Transport {
     pty: Rc<OwnedPty>,
     input: Rc<OnceCell<InputBinding>>,
     resize_error: Rc<Cell<Option<io::ErrorKind>>>,
@@ -83,7 +87,11 @@ impl Pty for Transport {
 }
 
 impl SharedActiveTerminal {
-    pub(super) fn new(config: &Config, pty: Rc<OwnedPty>) -> Result<Rc<Self>, String> {
+    pub(super) fn new(
+        config: &Config,
+        pty: Rc<OwnedPty>,
+        unified: bool,
+    ) -> Result<Rc<Self>, String> {
         let input = Rc::new(OnceCell::new());
         let resize_error = Rc::new(Cell::new(None));
         let (cols, rows) = super::child_winsize_or_initial((0, 0));
@@ -108,12 +116,27 @@ impl SharedActiveTerminal {
             .update_property(&[gtk4::accessible::Property::Description(
                 "Shared active terminal",
             )]);
+        let transcript = unified.then(|| TranscriptView::new(terminal.clone()));
         Ok(Rc::new(Self {
             terminal,
+            transcript,
+            directory_report: OnceCell::new(),
             widget,
             input,
             resize_error,
         }))
+    }
+
+    pub(super) fn transcript(&self) -> Option<&TranscriptView<Transport>> {
+        self.transcript.as_ref()
+    }
+
+    pub(super) fn toggle_transcript_search(&self) -> bool {
+        if self.transcript.is_none() {
+            return false;
+        }
+        self.terminal.pane().toggle_history_search();
+        true
     }
 
     pub(super) fn bind_input(&self, sink: LiveCommitSink, hold: Rc<SelectionFeedHold>) {
@@ -136,7 +159,22 @@ impl SharedActiveTerminal {
         self.terminal.pane().paste();
     }
 
+    pub(super) fn on_directory_uri(&self, report: impl Fn(&str) + 'static) {
+        assert!(self.directory_report.set(Box::new(report)).is_ok());
+    }
+
     pub(super) fn feed(&self, bytes: &[u8]) {
+        if let Some(report) = self.directory_report.get() {
+            // The block parser admits OSC 7 as an individual ST-terminated
+            // packet, retaining its boundary during coalescing.
+            let uri = bytes
+                .strip_prefix(b"\x1b]7;")
+                .and_then(|payload| payload.strip_suffix(b"\x1b\\"))
+                .and_then(|payload| std::str::from_utf8(payload).ok());
+            if let Some(uri) = uri {
+                report(uri);
+            }
+        }
         if let Err(error) = self.terminal.ingest(bytes) {
             log::warn!("Could not process active terminal output: {error}");
         }

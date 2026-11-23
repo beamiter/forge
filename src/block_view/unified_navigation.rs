@@ -1,9 +1,8 @@
-//! Explicit navigation for the persistent terminal. Adjustment coordinates
-//! come only from VTE and authenticated zone proofs, never metadata row guesses.
+//! Explicit navigation for the continuous terminal. The mounted renderer
+//! supplies scroll coordinates for retained command zones.
 use super::UnifiedZoneStore;
 use gtk4::{glib, prelude::*};
 use std::{cell::Cell, rc::Rc};
-use vte4::Terminal;
 
 const NAVIGATION_EPSILON: f64 = 0.01;
 const FOLLOW_SLACK_ROWS: f64 = 1.0;
@@ -134,7 +133,8 @@ pub(super) fn copyable_command(command: &str) -> bool {
 /// Rc data contains no strong VTE, backend or TermView reference. Native
 /// signals schedule one idle refresh through a Weak navigation strip.
 pub(super) struct NavigationBindings {
-    pub(super) terminal: Terminal,
+    pub(super) terminal: gtk4::Widget,
+    pub(super) adjustment: Option<gtk4::Adjustment>,
     pub(super) fullscreen: Rc<Cell<bool>>,
     pub(super) reading: Rc<Cell<bool>>,
     pub(super) unread: Rc<Cell<u32>>,
@@ -271,6 +271,7 @@ impl NavigationBar {
     pub(super) fn observe(self: &Rc<Self>, bindings: NavigationBindings) {
         let NavigationBindings {
             terminal,
+            adjustment,
             fullscreen,
             reading,
             unread,
@@ -279,13 +280,13 @@ impl NavigationBar {
             records,
         } = bindings;
         let weak = Rc::downgrade(self);
-        let weak_terminal = terminal.downgrade();
+        let weak_adjustment = adjustment.as_ref().map(|adj| adj.downgrade());
         let fullscreen_for_refresh = fullscreen.clone();
         let reading_for_refresh = reading.clone();
         let unread_for_refresh = unread.clone();
         let cursor_for_refresh = cursor.clone();
         *self.refresh.borrow_mut() = Some(Rc::new(move || {
-            let (Some(bar), Some(terminal)) = (weak.upgrade(), weak_terminal.upgrade()) else {
+            let Some(bar) = weak.upgrade() else {
                 return;
             };
             let fullscreen = fullscreen_for_refresh.get() || bar.suspended.get();
@@ -293,8 +294,9 @@ impl NavigationBar {
             if fullscreen {
                 return;
             }
-            let ready = terminal
-                .vadjustment()
+            let ready = weak_adjustment
+                .as_ref()
+                .and_then(|adjustment| adjustment.upgrade())
                 .and_then(|adjustment| {
                     sync_reading(&adjustment, &reading_for_refresh, &unread_for_refresh)
                 })
@@ -369,7 +371,7 @@ impl NavigationBar {
             bar.live
                 .set_sensitive(ready && (reading || current.is_some() || unread > 0));
         }));
-        if let Some(adjustment) = terminal.vadjustment() {
+        if let Some(adjustment) = adjustment {
             let fullscreen_for_range = fullscreen.clone();
             let reading_for_range = reading.clone();
             let unread_for_range = unread.clone();
@@ -470,8 +472,9 @@ impl super::TermView {
             .map(|record| record.id())
             .collect();
         let value = self
-            .active_vte
-            .vadjustment()
+            .active
+            .borrow()
+            .surface_adjustment()
             .map_or(f64::NAN, |adjustment| adjustment.value());
         let plan = command_step(
             &ids,
@@ -506,7 +509,12 @@ impl super::TermView {
             return false;
         }
         if self.root.is_mapped() {
-            super::focus_terminal(&self.active_vte);
+            let focus = self.active.borrow().focus_widget();
+            if focus == *self.active_vte.upcast_ref::<gtk4::Widget>() {
+                super::focus_terminal(&self.active_vte);
+            } else {
+                focus.grab_focus();
+            }
         }
         true
     }
@@ -522,7 +530,7 @@ impl super::TermView {
         self.unread_count.set(0);
         self.jump_fab.set_visible(false);
         let previous = self.programmatic_scroll.replace(true);
-        if let Some(adjustment) = self.active_vte.vadjustment() {
+        if let Some(adjustment) = self.active.borrow().surface_adjustment() {
             adjustment
                 .set_value((adjustment.upper() - adjustment.page_size()).max(adjustment.lower()));
         }

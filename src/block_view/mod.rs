@@ -7314,6 +7314,11 @@ trait RenderBackend {
     /// Open/reassert the prompt zone selected by the engine at FTCS `A`.
     /// Block has no persistent marker surface, so this is a no-op by default.
     fn begin_prompt_zone(&self, _zone_id: u64) {}
+    fn end_prompt_zone(&self) {}
+    fn restore_prompt_zone(&self, id: u64) {
+        self.begin_prompt_zone(id);
+    }
+    fn end_command_zone(&self, _zone_id: Option<u64>) {}
     /// Close the A→C marker before command output begins. Backends without
     /// marker-based row discovery leave the default no-op in place.
     fn close_prompt_zone(&self, _zone_id: Option<u64>) {}
@@ -8474,7 +8479,7 @@ impl ReaderCtx {
                     // prefix was interpreted, so reassert on the restored
                     // screen. A post-C command zone is closed and never
                     // reopened here.
-                    self.backend.begin_prompt_zone(id);
+                    self.backend.restore_prompt_zone(id);
                 }
                 self.backend.exit_fullscreen();
                 self.backend.exit_alt_screen_chrome();
@@ -8551,6 +8556,9 @@ impl ReaderCtx {
             state == BlockState::PostCommand || is_background,
         );
         self.engine.borrow_mut().pending_zone = Some(PendingZone::Prompt(zone_plan.prompt_id));
+        if let Some(id) = zone_plan.completed_record_id {
+            self.backend.end_command_zone(Some(id));
+        }
         self.backend.begin_prompt_zone(zone_plan.prompt_id);
         // Finalize the previous command (deferred from CommandEnd),
         // or turn commandless async output into a first-class block.
@@ -8844,6 +8852,7 @@ impl ReaderCtx {
         if self.bstate_rc.get() != BlockState::CollectingPrompt {
             return;
         }
+        self.backend.end_prompt_zone();
         let prompt_had_bytes = {
             let mut engine = self.engine.borrow_mut();
             let prompt_had_bytes = !engine.prompt_buf.is_empty();
@@ -9251,7 +9260,7 @@ impl ReaderCtx {
             // mouse reporting off either.
             self.reset_mouse_reporting();
             if let Some(id) = prompt_zone_to_reopen_after_alt(restored_state, pending_zone) {
-                self.backend.begin_prompt_zone(id);
+                self.backend.restore_prompt_zone(id);
             }
             self.backend.exit_fullscreen();
             self.backend.exit_alt_screen_chrome();
@@ -9259,6 +9268,11 @@ impl ReaderCtx {
             emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
             self.backend.layout_active_surface();
         }
+        let completed_zone = match self.engine.borrow().pending_zone {
+            Some(PendingZone::Command(id)) => Some(id),
+            _ => None,
+        };
+        self.backend.end_command_zone(completed_zone);
         let (command_cwd, duration_ms) = {
             let mut engine = self.engine.borrow_mut();
             #[cfg(forge_shared_terminal)]
@@ -9352,7 +9366,7 @@ impl ReaderCtx {
         let leave = format!("\x1b[?{mode}l");
         self.backend.feed_live(leave.as_bytes());
         if let Some(id) = prompt_zone_to_reopen_after_alt(restored_state, pending_zone) {
-            self.backend.begin_prompt_zone(id);
+            self.backend.restore_prompt_zone(id);
         }
         self.backend.exit_fullscreen();
         self.backend.exit_alt_screen_chrome();
@@ -10344,45 +10358,7 @@ impl RenderBackend for BlockBackend {
     fn schedule_anchor_settle(&self, args: AnchorSettleArgs) {
         #[cfg(forge_shared_terminal)]
         if let Some(terminal) = &self.shared_active {
-            let Some((col, row)) = terminal.cursor() else {
-                args.post_prompt_fence_released.set(true);
-                return;
-            };
-            args.prompt_end_pos.set((col, row));
-            args.prompt_anchor_rows
-                .set(i64::from(terminal.grid_size().1));
-            args.post_prompt_fence_released.set(true);
-            let Some(prefix) = terminal.capture((0, row), (col, row)) else {
-                return;
-            };
-            *args.prompt_anchor_prefix.borrow_mut() = prefix;
-            args.prompt_anchor_ready.set(true);
-            if !args.init_commands.borrow().is_empty() {
-                glib::idle_add_local_once(move || {
-                    if args.prompt_anchor_generation.get() != args.anchor_generation
-                        || !prompt_anchor_may_settle(
-                            args.bstate.get(),
-                            args.idle_input_dirty.get(),
-                            args.pty_synced.get(),
-                            args.submission_pending.get(),
-                            args.pending_typeahead.get(),
-                        )
-                    {
-                        return;
-                    }
-                    if let Some(command) = args.init_commands.borrow_mut().pop_front() {
-                        let suggestion =
-                            click_cursor::suggestion_rgb(&args.config.borrow().palette);
-                        if let Err(error) =
-                            args.verified_submission.begin(&command, None, suggestion)
-                        {
-                            log::warn!(
-                                "initial command was not queued at an unverified prompt: {error}"
-                            );
-                        }
-                    }
-                });
-            }
+            settle_shared_prompt_anchor(terminal, args);
             return;
         }
         schedule_anchor_settle_on(
@@ -11197,21 +11173,54 @@ fn feed_with_zone_marker(
     feed(bytes);
 }
 
-/// The Unified-mode implementation of [`RenderBackend`]: one long-lived,
-/// full-size [`vte4::Terminal`] with no block chrome at all.
-///
-/// Everything the Block surface does *between* commands — clearing the live
-/// VTE, growing and shrinking it between compact and full layouts, mounting a
-/// finished-block widget, hiding those widgets for an alt-screen app — is
-/// absent by construction here: the surface is already full-size, already
-/// continuous, and never loses a row. The methods that exist only to drive
-/// that churn are therefore honest no-ops, each documented at its body.
-///
-/// The PTY, the parser and the whole reader lifecycle are unchanged; this
-/// type only answers the same 24 trait methods differently.
+#[cfg(forge_shared_terminal)]
+fn settle_shared_prompt_anchor(
+    terminal: &shared_active::SharedActiveTerminal,
+    args: AnchorSettleArgs,
+) {
+    let Some((col, row)) = terminal.cursor() else {
+        args.post_prompt_fence_released.set(true);
+        return;
+    };
+    args.prompt_end_pos.set((col, row));
+    args.prompt_anchor_rows
+        .set(i64::from(terminal.grid_size().1));
+    args.post_prompt_fence_released.set(true);
+    let Some(prefix) = terminal.capture((0, row), (col, row)) else {
+        return;
+    };
+    *args.prompt_anchor_prefix.borrow_mut() = prefix;
+    args.prompt_anchor_ready.set(true);
+    if !args.init_commands.borrow().is_empty() {
+        glib::idle_add_local_once(move || {
+            if args.prompt_anchor_generation.get() != args.anchor_generation
+                || !prompt_anchor_may_settle(
+                    args.bstate.get(),
+                    args.idle_input_dirty.get(),
+                    args.pty_synced.get(),
+                    args.submission_pending.get(),
+                    args.pending_typeahead.get(),
+                )
+            {
+                return;
+            }
+            if let Some(command) = args.init_commands.borrow_mut().pop_front() {
+                let suggestion = click_cursor::suggestion_rgb(&args.config.borrow().palette);
+                if let Err(error) = args.verified_submission.begin(&command, None, suggestion) {
+                    log::warn!("initial command was not queued at an unverified prompt: {error}");
+                }
+            }
+        });
+    }
+}
+
+/// The continuous Unified renderer owns a single full-size terminal surface.
+/// Prompts, command output and alternate-screen applications share its PTY.
+/// The renderer binds admitted command phases to that surface's source rows.
 struct UnifiedBackend {
-    /// The single surface. Prompt, echo, command output and alt-screen apps
-    /// all render here, in order, and nothing ever clears it.
+    #[cfg(forge_shared_terminal)]
+    shared_active: Option<Rc<shared_active::SharedActiveTerminal>>,
+    /// The native surface for panes using the legacy renderer.
     vte: Terminal,
     /// The live holder around that surface. Its block chrome is inert in this
     /// mode, but it also owns the ASCII organism's live-body overlay, which is
@@ -11264,12 +11273,56 @@ struct UnifiedBackend {
     kitty_pending_admission: RefCell<Option<unified_images::PendingImage>>,
 }
 
+impl UnifiedBackend {
+    #[cfg(forge_shared_terminal)]
+    fn transcript(&self) -> Option<&jterm_gtk_view::TranscriptView<shared_active::Transport>> {
+        self.shared_active.as_ref()?.transcript()
+    }
+
+    fn replay_zone_contents(
+        &self,
+        record: &CompletedCommandRecord,
+        snapshot: Option<&ZoneOutputSnapshot>,
+        _max_zones: usize,
+    ) {
+        let text = snapshot.map(|snapshot| snapshot.plain.as_str());
+        let truncated = snapshot.is_some_and(|snapshot| snapshot.truncated);
+        #[cfg(forge_shared_terminal)]
+        if let Some(transcript) = self.transcript() {
+            let [prompt, input, output] = zone_history::replay_sections(record, text, truncated);
+            transcript.begin_restored_prompt(record.id);
+            self.feed_live(&prompt);
+            transcript.end_prompt();
+            self.feed_live(&input);
+            transcript.begin_output(Some(record.id));
+            self.feed_live(&output);
+            transcript.end_output(Some(record.id), _max_zones);
+            return;
+        }
+        self.chrome.begin_zone(record.id, &self.vte);
+        self.zone_marker.borrow_mut().begin_zone(record.id);
+        self.feed_live(&zone_history::replay_bytes(record, text, truncated));
+        self.zone_marker.borrow_mut().close_zone(Some(record.id));
+        self.vte.feed(ZONE_MARKER_CLOSE);
+    }
+}
+
 impl RenderBackend for UnifiedBackend {
     fn feed_live(&self, bytes: &[u8]) {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            terminal.feed(bytes);
+            return;
+        }
         feed_vte_with_zone_marker(&self.vte, &self.zone_marker, bytes);
     }
 
     fn begin_prompt_zone(&self, zone_id: u64) {
+        #[cfg(forge_shared_terminal)]
+        if let Some(transcript) = self.transcript() {
+            transcript.begin_prompt(zone_id);
+            return;
+        }
         // Capture the pre-marker cursor row. Chrome does not infer a mapping
         // from cursor-to-grid slack; a later visible canonical marker proves
         // the exact adjustment→ring projection or drawing remains hidden.
@@ -11286,7 +11339,37 @@ impl RenderBackend for UnifiedBackend {
         }
     }
 
+    fn restore_prompt_zone(&self, id: u64) {
+        #[cfg(forge_shared_terminal)]
+        if self.transcript().is_some() {
+            return;
+        }
+        self.begin_prompt_zone(id);
+    }
+
+    fn end_prompt_zone(&self) {
+        #[cfg(forge_shared_terminal)]
+        if let Some(transcript) = self.transcript() {
+            transcript.end_prompt();
+        }
+    }
+
+    fn end_command_zone(&self, _zone_id: Option<u64>) {
+        #[cfg(forge_shared_terminal)]
+        if let Some(transcript) = self.transcript() {
+            transcript.end_output(
+                _zone_id,
+                self.config_for_cb.borrow().max_visible_blocks as usize,
+            );
+        }
+    }
+
     fn close_prompt_zone(&self, zone_id: Option<u64>) {
+        #[cfg(forge_shared_terminal)]
+        if let Some(transcript) = self.transcript() {
+            transcript.begin_output(zone_id);
+            return;
+        }
         self.zone_marker.borrow_mut().close_zone(zone_id);
         // Close unconditionally on every accepted C. Besides ending our own
         // marker, this prevents a guest PS1 OSC 8 from leaking into command
@@ -11344,10 +11427,18 @@ impl RenderBackend for UnifiedBackend {
     /// Same pane-focus invariant as the block backend: a background pane must
     /// not pull focus back to its live surface just because a prompt arrived.
     fn focus_live_deferred(&self) {
-        restore_live_focus_deferred(&self.vte);
+        restore_live_focus_deferred(&self.active_rc.borrow().focus_widget());
     }
 
     fn sync_geometry_to_pty(&self) {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            self.layout_active_surface();
+            self.pty_winsize
+                .reassert(&self.pty_for_init, terminal.grid_size());
+            self.pty_winsize.arm_settle();
+            return;
+        }
         sync_active_to_pty(
             &self.layout_active_surface,
             &self.vte,
@@ -11375,6 +11466,10 @@ impl RenderBackend for UnifiedBackend {
     }
 
     fn scroll_to_record(&self, block_id: u64) -> bool {
+        #[cfg(forge_shared_terminal)]
+        if let Some(transcript) = self.transcript() {
+            return transcript.reveal_zone(block_id);
+        }
         // Chrome only answers with a row it proved at the current epoch; any
         // doubt is `None` and this jump honestly fails.
         let Some(value) = self.chrome.proven_zone_scroll_value(&self.vte, block_id) else {
@@ -11389,6 +11484,10 @@ impl RenderBackend for UnifiedBackend {
     }
 
     fn can_scroll_to_record(&self, block_id: u64) -> bool {
+        #[cfg(forge_shared_terminal)]
+        if let Some(transcript) = self.transcript() {
+            return transcript.zone_scroll_row(block_id).is_some();
+        }
         // The same proof, read only: a search hit is labelled reachable
         // exactly when chrome can already name the row it would scroll to.
         self.chrome
@@ -11397,6 +11496,10 @@ impl RenderBackend for UnifiedBackend {
     }
 
     fn record_scroll_value(&self, block_id: u64) -> Option<f64> {
+        #[cfg(forge_shared_terminal)]
+        if let Some(transcript) = self.transcript() {
+            return transcript.zone_scroll_row(block_id).map(|row| row as f64);
+        }
         self.chrome.proven_zone_scroll_value(&self.vte, block_id)
     }
 
@@ -11405,6 +11508,14 @@ impl RenderBackend for UnifiedBackend {
         max_bytes: usize,
         deadline_exhausted: &mut dyn FnMut() -> bool,
     ) -> BackendSearchBatch {
+        #[cfg(forge_shared_terminal)]
+        if self.transcript().is_some() {
+            return BackendSearchBatch {
+                surfaces: Vec::new(),
+                incomplete: true,
+                native_fallback: None,
+            };
+        }
         let native_fallback = || BackendNativeSearchFallback {
             block_id: 0,
             block_index: 0,
@@ -11525,30 +11636,15 @@ impl RenderBackend for UnifiedBackend {
         if zones.is_empty() {
             return 0;
         }
-        // Replay is display-only: the bytes go straight to VTE, never through
-        // the parser, so a restored zone cannot be mistaken for a command this
-        // session ran. The marker frames come from this pane's own injector
-        // under freshly issued ids, so chrome addresses restored rows exactly
-        // as it addresses live ones.
-        self.vte.feed(&zone_history::replay_banner(zones.len()));
+        // Replay is display-only. The surface paints a saved projection and
+        // receives fresh zone identities without invoking the shell lifecycle.
+        self.feed_live(&zone_history::replay_banner(zones.len()));
         let max_zones = self.config_for_cb.borrow().max_visible_blocks as usize;
         let mut restored = 0;
         for zone in zones {
             let id = next_block_id();
             let (record, snapshot) = zone.into_live(id);
-            self.chrome.begin_zone(id, &self.vte);
-            {
-                let mut marker = self.zone_marker.borrow_mut();
-                marker.begin_zone(id);
-            }
-            let bytes = zone_history::replay_bytes(
-                &record,
-                snapshot.as_ref().map(|snapshot| snapshot.plain.as_str()),
-                snapshot.as_ref().is_some_and(|snapshot| snapshot.truncated),
-            );
-            feed_vte_with_zone_marker(&self.vte, &self.zone_marker, &bytes);
-            self.zone_marker.borrow_mut().close_zone(Some(id));
-            self.vte.feed(ZONE_MARKER_CLOSE);
+            self.replay_zone_contents(&record, snapshot.as_ref(), max_zones);
             self.chrome
                 .record_completed(unified_chrome::ZoneChromeRecord {
                     id: record.id,
@@ -11566,6 +11662,10 @@ impl RenderBackend for UnifiedBackend {
                 store.enforce_snapshot_budget(MAX_TOTAL_SNAPSHOT_BYTES);
                 drop(store);
                 prune_retired_bookmarks(&mut self.bookmarks.borrow_mut(), &retired);
+                #[cfg(forge_shared_terminal)]
+                if let Some(transcript) = self.transcript() {
+                    transcript.retire(&retired);
+                }
                 self.chrome.retire_ids(&retired);
             }
             restored += 1;
@@ -11589,6 +11689,13 @@ impl RenderBackend for UnifiedBackend {
     }
 
     fn scroll_surface_lines(&self, lines: i32) -> bool {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            let adj = terminal.scrollback();
+            let bottom = (adj.upper() - adj.page_size()).max(adj.lower());
+            adj.set_value((adj.value() + f64::from(lines)).clamp(adj.lower(), bottom));
+            return true;
+        }
         let Some(adj) = self.vte.vadjustment() else {
             return true;
         };
@@ -11648,6 +11755,10 @@ impl RenderBackend for UnifiedBackend {
             retired
         };
         prune_retired_bookmarks(&mut self.bookmarks.borrow_mut(), &retired_record_ids);
+        #[cfg(forge_shared_terminal)]
+        if let Some(transcript) = self.transcript() {
+            transcript.retire(&retired_record_ids);
+        }
         self.chrome.retire_ids(&retired_record_ids);
         self.chrome.enforce_limit(max_zones);
         self.chrome
@@ -11716,6 +11827,10 @@ impl RenderBackend for UnifiedBackend {
     fn exit_fullscreen(&self) {}
 
     fn kitty_feed(&self, payload: &[u8]) -> kitty_graphics::FeedStatus {
+        #[cfg(forge_shared_terminal)]
+        if self.shared_active.is_some() {
+            return kitty_graphics::FeedStatus::Skipped;
+        }
         self.kitty_pending_admission.borrow_mut().take();
         let outcome = self
             .kitty_assembler
@@ -11779,6 +11894,11 @@ impl RenderBackend for UnifiedBackend {
     }
 
     fn schedule_anchor_settle(&self, args: AnchorSettleArgs) {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            settle_shared_prompt_anchor(terminal, args);
+            return;
+        }
         // The same fence, on the same terms: the pass is layout-agnostic, so
         // Unified needs no variant of it (see `schedule_anchor_settle_on`).
         let zone_marker = self.zone_marker.clone();
@@ -11791,6 +11911,13 @@ impl RenderBackend for UnifiedBackend {
     }
 
     fn cursor_and_rows(&self) -> ((i64, i64), i64) {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            return (
+                terminal.cursor().unwrap_or((-1, -1)),
+                i64::from(terminal.grid_size().1),
+            );
+        }
         (self.vte.cursor_position(), self.vte.row_count())
     }
 
@@ -11812,7 +11939,19 @@ impl RenderBackend for UnifiedBackend {
     }
 
     fn live_surface_answers_query(&self, query: KeyboardProtocolQuery) -> bool {
+        #[cfg(forge_shared_terminal)]
+        if self.shared_active.is_some() {
+            return true;
+        }
         vte_answers_query_natively(query)
+    }
+
+    fn replies_through_commit(&self) -> bool {
+        #[cfg(forge_shared_terminal)]
+        if self.shared_active.is_some() {
+            return false;
+        }
+        true
     }
 
     /// The identity, through the shared policy. The provisional anchor was
@@ -11829,6 +11968,10 @@ impl RenderBackend for UnifiedBackend {
     }
 
     fn grid_cols(&self) -> i64 {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            return i64::from(terminal.grid_size().0).max(20);
+        }
         // Same floor as `ActiveBlock::grid_cols`: the engine uses this for
         // height/width estimates that must not divide by a degenerate width
         // before the surface is allocated.
@@ -11836,6 +11979,10 @@ impl RenderBackend for UnifiedBackend {
     }
 
     fn live_column_count(&self) -> i64 {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            return i64::from(terminal.grid_size().0);
+        }
         self.vte.column_count()
     }
 
@@ -11846,6 +11993,10 @@ impl RenderBackend for UnifiedBackend {
         end_row: i64,
         end_col: i64,
     ) -> Option<String> {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            return terminal.capture((start_col, start_row), (end_col, end_row));
+        }
         capture_vte_text_range(&self.vte, start_row, start_col, end_row, end_col)
     }
 }
@@ -14849,6 +15000,10 @@ impl TermView {
         ) && std::env::var_os("JTERM_SHARED_ACTIVE_TERMINAL")
             .is_some_and(|value| value == "1");
         #[cfg(forge_shared_terminal)]
+        let shared_active_requested = shared_active_requested
+            || (mode.is_unified()
+                && std::env::var_os("JTERM_SHARED_TRANSCRIPT").is_some_and(|value| value == "1"));
+        #[cfg(forge_shared_terminal)]
         if shared_active_requested {
             env_extra.extend(jterm_gtk_view::INTERACTIVE_CHILD_ENV);
         }
@@ -14869,7 +15024,9 @@ impl TermView {
         let pty = Rc::new(spawn(&argv, cwd, &env_extra, request_shell_token)?);
         #[cfg(forge_shared_terminal)]
         let shared_active = shared_active_requested
-            .then(|| shared_active::SharedActiveTerminal::new(config, pty.clone()))
+            .then(|| {
+                shared_active::SharedActiveTerminal::new(config, pty.clone(), mode.is_unified())
+            })
             .transpose()
             .map_err(io::Error::other)?;
         let shell_integration_token = pty
@@ -15420,6 +15577,8 @@ impl TermView {
         // its own closure rather than a branch inside the Block one so the
         // Block layout stays byte-for-byte what it was.
         let unified_layout_active_surface: Rc<dyn Fn()> = {
+            #[cfg(forge_shared_terminal)]
+            let shared_geometry = (Rc::downgrade(&pty_winsize), Rc::downgrade(&pty));
             let holder = active.borrow().widget().downgrade();
             let vte = active_vte.downgrade();
             let scroll = block_scroll.downgrade();
@@ -15434,6 +15593,25 @@ impl TermView {
                 let Some(active_block) = active_for_layout.upgrade() else {
                     return;
                 };
+                #[cfg(forge_shared_terminal)]
+                if let Ok(active) = active_block.try_borrow() {
+                    if let Some(terminal) = &active.shared_active {
+                        holder.set_visible(true);
+                        if let Some(grid) = active.layout_shared_active(
+                            terminal,
+                            scroll.width(),
+                            scroll.height(),
+                            BlockState::RawFallback,
+                        ) {
+                            if let (Some(winsize), Some(pty)) =
+                                (shared_geometry.0.upgrade(), shared_geometry.1.upgrade())
+                            {
+                                winsize.publish(&pty, grid);
+                            }
+                        }
+                        return;
+                    }
+                }
                 let cell_h = (vte.char_height() as i32).max(1);
                 let Some(viewport_rows) = viewport_rows_for(&vte, &scroll) else {
                     return;
@@ -16165,27 +16343,32 @@ impl TermView {
         let current_cwd: Rc<RefCell<String>> = Rc::new(RefCell::new(cwd.unwrap_or("").to_string()));
         let menu_keybindings = shortcut_hints::MenuKeybindings::default();
 
-        // CWD updates come from VTE's native OSC 7 signal (the parser passes
-        // OSC 7 through unchanged, see parser.rs). Title updates likewise come
-        // from VTE's window-title-changed (OSC 0/2).
         {
             let cwd_cbs = cwd_callbacks.clone();
-            let current_cwd_for_signal = current_cwd.clone();
+            let current_cwd = current_cwd.clone();
+            let report = Rc::new(move |uri: &str| {
+                let file = gtk4::gio::File::for_uri(uri);
+                if let Some(path) = file
+                    .path()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .filter(|s| !s.is_empty())
+                {
+                    *current_cwd.borrow_mut() = path.clone();
+                    let display_path =
+                        jterm_core::review_input::safe_inline_display(&path, 4 * 1024);
+                    for callback in cwd_cbs.borrow().iter() {
+                        callback(&display_path);
+                    }
+                }
+            });
+            #[cfg(forge_shared_terminal)]
+            if let Some(terminal) = &shared_active {
+                let report = report.clone();
+                terminal.on_directory_uri(move |uri| report(uri));
+            }
             active_vte.connect_current_directory_uri_notify(move |terminal| {
                 if let Some(uri) = terminal.current_directory_uri() {
-                    let file = gtk4::gio::File::for_uri(uri.as_str());
-                    if let Some(path) = file
-                        .path()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .filter(|s| !s.is_empty())
-                    {
-                        *current_cwd_for_signal.borrow_mut() = path.clone();
-                        let display_path =
-                            jterm_core::review_input::safe_inline_display(&path, 4 * 1024);
-                        for cb in cwd_cbs.borrow().iter() {
-                            cb(&display_path);
-                        }
-                    }
+                    report(uri.as_str());
                 }
             });
         }
@@ -16432,8 +16615,13 @@ impl TermView {
                     chrome.image_row_projection(),
                 );
                 *image_layer_slot.borrow_mut() = Some(image_layer.clone());
-                active_rc.borrow().unified_chrome_surface.set_visible(true);
+                active_rc
+                    .borrow()
+                    .unified_chrome_surface
+                    .set_visible(active_vte_rc.parent().is_some());
                 Rc::new(UnifiedBackend {
+                    #[cfg(forge_shared_terminal)]
+                    shared_active: shared_active.clone(),
                     vte: active_vte_rc,
                     active_rc,
                     block_scroll_rc,
@@ -16705,8 +16893,10 @@ impl TermView {
         // viewport. Native value and range changes exclusively own Unified's
         // reading state; the separate navigation row replaces the jump FAB.
         if let Some(navigation) = &unified_navigation {
+            let adjustment = active.borrow().surface_adjustment();
             navigation.observe(unified_navigation::NavigationBindings {
-                terminal: active_vte.clone(),
+                terminal: active.borrow().focus_widget(),
+                adjustment,
                 fullscreen: fullscreen.clone(),
                 reading: user_scrolled_up.clone(),
                 unread: unread_count.clone(),
@@ -18957,6 +19147,15 @@ impl TermView {
     /// property, so callers must use this descriptor instead.
     pub fn pty_fd_i32(&self) -> i32 {
         self.pty.master_fd_raw()
+    }
+
+    #[cfg(forge_shared_terminal)]
+    pub(crate) fn toggle_transcript_search(&self) -> bool {
+        self.active
+            .borrow()
+            .shared_active
+            .as_ref()
+            .is_some_and(|terminal| terminal.toggle_transcript_search())
     }
 
     pub fn vte(&self) -> &Terminal {

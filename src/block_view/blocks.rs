@@ -5588,6 +5588,14 @@ impl ActiveBlock {
         Some(grid)
     }
 
+    pub(super) fn surface_adjustment(&self) -> Option<gtk4::Adjustment> {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            return Some(terminal.scrollback().clone());
+        }
+        self.active_vte.vadjustment()
+    }
+
     pub(super) fn focus_widget(&self) -> gtk4::Widget {
         #[cfg(forge_shared_terminal)]
         if let Some(terminal) = &self.shared_active {
