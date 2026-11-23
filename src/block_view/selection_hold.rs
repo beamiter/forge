@@ -171,8 +171,7 @@ impl SelectionFeedHold {
         view.buffer().connect_has_selection_notify(move |buffer| {
             let Some(hold) = weak.upgrade() else { return };
             if buffer.has_selection() {
-                hold.begin_drag();
-                hold.end_drag(true);
+                hold.hold_output();
             } else {
                 hold.selection_cleared();
             }
@@ -183,6 +182,10 @@ impl SelectionFeedHold {
     /// Idempotent — a drag that grows into the live VTE calls this per motion.
     pub(crate) fn begin_drag(&self) {
         self.dragging.set(true);
+        self.hold_output();
+    }
+
+    fn hold_output(&self) {
         if !self.holding.replace(true) {
             self.notify_watch(true);
         }

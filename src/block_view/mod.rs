@@ -16368,6 +16368,9 @@ impl TermView {
             let hold_badge = gtk4::Label::new(Some("Ⅱ  Output paused — selection"));
             hold_badge.add_css_class("feed-hold-badge");
             hold_badge.set_accessible_role(gtk4::AccessibleRole::Status);
+            hold_badge.update_property(&[gtk4::accessible::Property::Label(
+                "Output paused while text is selected",
+            )]);
             hold_badge.set_tooltip_text(Some(
                 "Streaming output is held so your selection survives. Copy it, \
                  type, or click elsewhere to resume.",
@@ -17967,6 +17970,8 @@ impl TermView {
             selection_feed_hold.clone(),
             bstate.clone(),
             mouse_reporting_mode.clone(),
+            #[cfg(forge_shared_terminal)]
+            shared_active.clone(),
         );
 
         let term_view = TermView {
@@ -19247,33 +19252,23 @@ impl TermView {
     /// only" modifier (Alt+Ctrl+Shift+C) when a whole block is selected.
     pub fn copy_to_clipboard_with_modifier(&self, alt_held: bool) {
         log::debug!(">>> TermView::copy_to_clipboard called (alt={})", alt_held);
-        #[cfg(forge_shared_terminal)]
-        if let Some(terminal) = self.active.borrow().shared_active.clone() {
-            if terminal.screen().buffer().has_selection() {
-                terminal.copy();
-                self.selection_feed_hold.flush_now();
-                return;
-            }
-        }
-
-        // Native and cross-block text selections are collected in document order:
-        // command VTE, output VTE, then the live input surface.
+        // Collect visible selections in document order, ending at the active terminal.
         match self.cross_selection.copy_text() {
             Ok(Some(text)) => {
                 log::debug!(
                     ">>> TermView copy: got {} chars from visible text selection",
                     text.len()
                 );
-                self.active_vte.clipboard().set_text(&text);
+                self.root.clipboard().set_text(&text);
                 // The selection is captured; resume any feed parked to keep it
                 // alive while the command kept streaming.
                 self.selection_feed_hold.flush_now();
                 return;
             }
             Err(error) => {
-                log::warn!("refused oversized cross-VTE clipboard copy: {error}");
+                log::warn!("could not copy selected terminal text: {error}");
                 show_clipboard_failure(
-                    &self.active_vte,
+                    &self.root,
                     "Copy failed",
                     &format!("{error}. Nothing was copied."),
                 );

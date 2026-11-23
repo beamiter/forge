@@ -199,8 +199,8 @@ impl SharedActiveTerminal {
         self.terminal.scrollback_adjustment()
     }
 
-    pub(super) fn copy(&self) {
-        self.terminal.pane().copy();
+    pub(super) fn embedded(&self) -> &EmbeddedTerminal<Transport> {
+        &self.terminal
     }
 
     pub(super) fn paste(&self) {

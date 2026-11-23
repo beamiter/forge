@@ -80,8 +80,17 @@ def run(binary, root, mode):
         def entry(state=Atspi.StateType.FOCUSED):
             return first_named(pid, 'Find in terminal history', state)
 
+        def visible_status():
+            return [node for node in application_nodes(pid)
+                    if node.get_state_set().contains(Atspi.StateType.SHOWING)
+                    and node.get_role() == Atspi.Role.STATUS_BAR]
+
         def status(count):
-            return entry() and first_named(pid, count)
+            # GTK 4.14 exposes a status label's content through AT-SPI Text
+            # even when the status node has an empty accessible name.
+            return entry() and any(node.get_name() == count
+                                   or (node.get_text_iface() and accessible_text(node) == count)
+                                   for node in visible_status())
 
         wait_for('the live transcript', lambda: 'shared-find-probe live' in screen_text())
         leader = int((root / 'leader').read_text())
@@ -101,9 +110,8 @@ def run(binary, root, mode):
         try:
             wait_for('first of two matches', lambda: status('1 of 2'))
         except RuntimeError:
-            labels = [node.get_name() for node in application_nodes(pid)
-                      if node.get_state_set().contains(Atspi.StateType.SHOWING)
-                      and node.get_role() == Atspi.Role.STATUS_BAR]
+            labels = [(node.get_name(), accessible_text(node) if node.get_text_iface() else None)
+                      for node in visible_status()]
             print(f'Visible Find status in {mode}: {labels!r}', flush=True)
             raise
         xdotool('key', '--clearmodifiers', 'Return')
