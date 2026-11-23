@@ -1669,10 +1669,14 @@ mod tests {
                     .output_vte_for_test()
                     .upcast_ref::<gtk::Widget>()
                     .downgrade(),
+                #[cfg(forge_shared_terminal)]
+                retained_text: None,
                 handlers: Vec::new(),
             },
             super::SelectedSurface {
                 widget: active.upcast_ref::<gtk::Widget>().downgrade(),
+                #[cfg(forge_shared_terminal)]
+                retained_text: None,
                 handlers: Vec::new(),
             },
         ]);

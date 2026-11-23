@@ -336,7 +336,7 @@ impl SharedPane {
         }))
     }
 
-    pub(crate) fn theme(config: &Config, scale: f64) -> Theme {
+    pub(crate) fn scaled_font(config: &Config, scale: f64) -> pango::FontDescription {
         let mut font = crate::font::terminal_font_description(&config.font_desc, config);
         if font.size() > 0 && scale.is_finite() && scale > 0.0 {
             let size = (f64::from(font.size()) * scale).round();
@@ -346,8 +346,12 @@ impl SharedPane {
                 font.set_size(size as i32);
             }
         }
+        font
+    }
+
+    pub(crate) fn theme(config: &Config, scale: f64) -> Theme {
         Theme {
-            font,
+            font: Self::scaled_font(config, scale),
             foreground: config.foreground,
             background: config.background,
             palette: config.palette,

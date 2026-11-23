@@ -296,6 +296,12 @@ impl SharedActiveTerminal {
             .set_history_row_limit(config.terminal_scrollback_lines as usize);
     }
 
+    pub(super) fn update_font(&self, config: &Config) {
+        self.terminal
+            .pane()
+            .set_font(&SharedPane::scaled_font(config, config.default_font_scale));
+    }
+
     pub(super) fn output_colors(&self) -> DynamicColors {
         let rgba = |(r, g, b)| {
             gtk4::gdk::RGBA::new(

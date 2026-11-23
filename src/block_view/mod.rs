@@ -20556,6 +20556,8 @@ impl TermView {
         // Update config and regenerate CSS with new font
         self.config.borrow_mut().font_desc = desc.to_string();
         install_block_css(&self.config.borrow());
+        #[cfg(forge_shared_terminal)]
+        self.update_shared_live_font();
     }
 
     /// Update font scale for VTE terminal and block view CSS.
@@ -20574,6 +20576,18 @@ impl TermView {
         // this configuration cost one display-wide swap between them, not one
         // each.
         install_block_css(&self.config.borrow());
+        #[cfg(forge_shared_terminal)]
+        self.update_shared_live_font();
+    }
+
+    #[cfg(forge_shared_terminal)]
+    fn update_shared_live_font(&self) {
+        let terminal = self.active.borrow().shared_active.clone();
+        if let Some(terminal) = terminal {
+            terminal.update_font(&self.config.borrow());
+            self.render_backend.layout_active_surface();
+            self.pty_winsize.arm_settle();
+        }
     }
 
     /// Read-only acceptance telemetry. It never reconciles the index, moves
