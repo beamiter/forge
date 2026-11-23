@@ -503,10 +503,10 @@ impl UiState {
         let leaves = node.leaves();
         !leaves.is_empty()
             && leaves.iter().all(|leaf| {
-                self.agent_session_tabs.borrow().values().any(|bound| {
-                    leaf.terminal()
-                        .is_some_and(|terminal| bound.upgrade().as_ref() == Some(terminal))
-                })
+                self.agent_session_tabs
+                    .borrow()
+                    .values()
+                    .any(|bound| bound.upgrade() == Some(leaf.root_widget()))
             })
     }
 

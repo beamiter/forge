@@ -1499,7 +1499,7 @@ pub fn run() -> glib::ExitCode {
             session_sidebar,
             workspace_navigation,
             agent_workspace_expander,
-            agent_session_tabs: RefCell::new(HashMap::new()),
+            agent_session_tabs: Rc::new(RefCell::new(HashMap::new())),
             agent_session_library,
             tab_counter: tab_counter.clone(),
             font_scale: font_scale.clone(),

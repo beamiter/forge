@@ -474,6 +474,7 @@ impl UiState {
             return;
         }
         let leaf_root = pane_leaf_root_of(term_widget).unwrap_or_else(|| term_widget.clone());
+        self.forget_agent_session_tab(&leaf_root);
         if let Some(leaf) = PaneLeaf::from_widget(&leaf_root) {
             if leaf.task_role().is_some() {
                 match exit_code {
@@ -545,6 +546,7 @@ impl UiState {
         // terminal as closed (a running validation becomes Cancelled, never
         // silently Passed) before the leaves are torn down.
         for leaf in &pane_leaves {
+            self.forget_agent_session_tab(&leaf.root_widget());
             if leaf.task_role().is_some() {
                 self.note_task_terminal_closed(leaf);
             }
@@ -1358,11 +1360,7 @@ impl UiState {
         })
     }
 
-    /// Launch an explicit argv in a named tab, in conventional VTE mode.
-    ///
-    /// Used for one-shot helper processes such as the jsh installer: they emit
-    /// no shell-integration sequences, so Block mode would have nothing to
-    /// build blocks from, and the tab deserves a better name than argv[0].
+    /// Select an existing CLI attachment or open its approved host relay.
     pub(crate) fn add_agent_session_tab(&self, request: super::agent_sessions::ResumeRequest) {
         self.show_terminal_workspace();
         let key = request.runtime_key.clone();
@@ -1370,13 +1368,11 @@ impl UiState {
             .agent_session_tabs
             .borrow()
             .get(&key)
-            .and_then(|terminal| terminal.upgrade());
-        if let Some(terminal) = existing {
-            let hidden_by_zoom = self
-                .zoom_state
-                .borrow()
-                .as_ref()
-                .is_some_and(|state| terminal.is_ancestor(&state.swap.original_page));
+            .and_then(|root| root.upgrade());
+        if let Some(root) = existing {
+            let hidden_by_zoom = self.zoom_state.borrow().as_ref().is_some_and(|state| {
+                root == state.swap.original_page || root.is_ancestor(&state.swap.original_page)
+            });
             if hidden_by_zoom {
                 let zoom = self.zoom_state.borrow_mut().take();
                 if let Some(zoom) = zoom {
@@ -1386,12 +1382,14 @@ impl UiState {
             if let Some(page) = (0..self.notebook.n_pages()).find(|index| {
                 self.notebook
                     .nth_page(Some(*index))
-                    .is_some_and(|page| terminal.is_ancestor(&page))
+                    .is_some_and(|page| root == page || root.is_ancestor(&page))
             }) {
-                self.notebook.set_current_page(Some(page));
-                terminal.grab_focus();
-                let _ = request.completion.send(Ok(()));
-                return;
+                if let Some(leaf) = PaneLeaf::from_widget(&root) {
+                    self.notebook.set_current_page(Some(page));
+                    leaf.focus_widget().grab_focus();
+                    let _ = request.completion.send(Ok(()));
+                    return;
+                }
             }
         }
         self.agent_session_tabs.borrow_mut().remove(&key);
@@ -1401,72 +1399,82 @@ impl UiState {
             ));
             return;
         };
-        let launch = plan.clone();
-        let mut argv = vec![launch.program];
-        argv.extend(launch.args);
-        let completion = request.completion.clone();
-        let settled = Rc::new(Cell::new(false));
-        let successful = settled.clone();
-        let terminal = self.add_native_terminal_tab(TabLaunch {
-            working_directory: Some(launch.cwd.to_string_lossy().into_owned()),
-            tab_name: Some(request.title),
-            session_id: None,
-            initial_commands: crate::terminal::InitialCommands::default(),
-            argv_override: Some(argv),
-            remote: None,
-            terminal_mode: crate::config::TerminalMode::Vte,
-            task: None,
-        });
-        crate::block_view::install_inline_cli_reading(&terminal);
-        self.agent_session_tabs
-            .borrow_mut()
-            .insert(key.clone(), terminal.downgrade());
-        self.apply_tab_filter(self.tab_search_entry.text().as_str());
-        // Resolve against the newly created leaf, never whichever tab is
-        // current when an asynchronous spawn failure eventually arrives.
-        if let Some(leaf) = self
-            .notebook
-            .current_page()
-            .and_then(|index| self.notebook.nth_page(Some(index)))
-            .and_then(|page| PaneNode::from_widget(&page))
-            .and_then(|node| {
-                node.leaves()
-                    .into_iter()
-                    .find(|leaf| leaf.terminal() == Some(&terminal))
-            })
-        {
-            if let PaneLeaf::Vte(view) = &leaf {
-                view.connect_launched(move || {
-                    if !successful.replace(true) {
-                        let _ = completion.send(Ok(()));
-                    }
-                });
-                let root = leaf.root_widget().downgrade();
-                let owner = self.unified_navigation_owner.borrow().clone();
-                view.connect_launch_failed(move |message| {
-                    if !settled.replace(true) {
-                        let _ = request.completion.send(Err(message.to_owned()));
-                        if let (Some(ui), Some(root)) = (owner.upgrade(), root.upgrade()) {
-                            ui.handle_terminal_exited(&root);
-                        }
-                    }
-                });
+        let leaf = self.add_hosted_attachment_tab(request.title, plan.clone());
+        let root = leaf.root_widget();
+        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+        if let PaneLeaf::Shared(view) = &leaf {
+            if let Some(error) = view.launch_error() {
+                self.handle_terminal_exited(&root);
+                let _ = request.completion.send(Err(error.to_owned()));
+                return;
             }
         }
-        let owner = self.unified_navigation_owner.borrow().clone();
-        terminal.connect_child_exited(move |terminal, _| {
-            if let Some(ui) = owner.upgrade() {
-                let mut sessions = ui.agent_session_tabs.borrow_mut();
-                if sessions
-                    .get(&key)
-                    .and_then(|bound| bound.upgrade())
-                    .as_ref()
-                    == Some(terminal)
-                {
-                    sessions.remove(&key);
+        self.agent_session_tabs
+            .borrow_mut()
+            .insert(key, root.downgrade());
+        self.sync_agent_session_tab_bindings();
+        self.apply_tab_filter(self.tab_search_entry.text().as_str());
+        if let PaneLeaf::Vte(view) = &leaf {
+            crate::block_view::install_inline_cli_reading(view.vte());
+            let completion = request.completion.clone();
+            let settled = Rc::new(Cell::new(false));
+            let successful = settled.clone();
+            view.connect_launched(move || {
+                if !successful.replace(true) {
+                    let _ = completion.send(Ok(()));
                 }
-            }
-        });
+            });
+            let root = root.downgrade();
+            let owner = self.unified_navigation_owner.borrow().clone();
+            view.connect_launch_failed(move |message| {
+                if !settled.replace(true) {
+                    let _ = request.completion.send(Err(message.to_owned()));
+                    if let (Some(ui), Some(root)) = (owner.upgrade(), root.upgrade()) {
+                        ui.handle_terminal_exited(&root);
+                    }
+                }
+            });
+        } else {
+            let _ = request.completion.send(Ok(()));
+        }
+    }
+
+    fn forget_agent_session_tab(&self, root: &gtk4::Widget) {
+        let changed = {
+            let mut sessions = self.agent_session_tabs.borrow_mut();
+            let count = sessions.len();
+            sessions.retain(|_, bound| bound.upgrade().is_some_and(|bound| &bound != root));
+            sessions.len() != count
+        };
+        if changed {
+            self.sync_agent_session_tab_bindings();
+        }
+    }
+
+    pub(super) fn sync_agent_session_tab_bindings(&self) {
+        self.session_sidebar
+            .set_existing(self.agent_session_tabs.borrow().keys().cloned().collect());
+    }
+
+    pub(super) fn add_hosted_attachment_tab(
+        &self,
+        title: String,
+        launch: jterm_core::agent_sessions::SessionLaunch,
+    ) -> PaneLeaf {
+        let argv = std::iter::once(launch.program).chain(launch.args).collect();
+        self.mount_terminal_tab(
+            TabLaunch {
+                working_directory: Some(launch.cwd.to_string_lossy().into_owned()),
+                tab_name: Some(title),
+                session_id: None,
+                initial_commands: crate::terminal::InitialCommands::default(),
+                argv_override: Some(argv),
+                remote: None,
+                terminal_mode: crate::config::TerminalMode::Vte,
+                task: None,
+            },
+            true,
+        )
     }
 
     pub(crate) fn add_named_tab_with_argv(&self, tab_name: &str, argv: Vec<String>) -> Terminal {
@@ -1859,6 +1867,10 @@ impl UiState {
     }
 
     fn add_tab_with_argv(&self, launch: TabLaunch) -> PaneLeaf {
+        self.mount_terminal_tab(launch, false)
+    }
+
+    fn mount_terminal_tab(&self, launch: TabLaunch, hosted_attachment: bool) -> PaneLeaf {
         let TabLaunch {
             working_directory,
             tab_name,
@@ -1884,23 +1896,30 @@ impl UiState {
 
         // Create terminal view based on configured mode
         #[cfg(all(forge_shared_terminal, target_os = "linux"))]
-        let shared = if allow_local_recovery
-            && initial_commands.as_slice().is_empty()
-            && matches!(terminal_mode, crate::config::TerminalMode::Vte)
-            && std::env::var_os("FORGE_SAFE_MODE").is_none()
-        {
-            super::shared_terminal::SharedPane::open(
-                &self.config.borrow(),
-                shell_argv,
-                working_directory.as_deref(),
-                &sid,
-            )
+        let shared = {
+            use super::shared_terminal::SharedPane;
+            let config = self.config.borrow();
+            if std::env::var_os("FORGE_SAFE_MODE").is_some() {
+                None
+            } else if hosted_attachment {
+                working_directory
+                    .as_deref()
+                    .and_then(|cwd| SharedPane::open_hosted_attachment(&config, shell_argv, cwd))
+            } else if allow_local_recovery
+                && initial_commands.as_slice().is_empty()
+                && matches!(terminal_mode, crate::config::TerminalMode::Vte)
+            {
+                SharedPane::open(&config, shell_argv, working_directory.as_deref(), &sid)
+            } else {
+                None
+            }
             .map(PaneLeaf::Shared)
-        } else {
-            None
         };
         #[cfg(not(all(forge_shared_terminal, target_os = "linux")))]
-        let shared: Option<PaneLeaf> = None;
+        let shared: Option<PaneLeaf> = {
+            let _ = hosted_attachment;
+            None
+        };
         let view_type = shared.unwrap_or_else(|| {
             match &terminal_mode {
                 // Unified renders inside the same `TermView` (the OSC 133

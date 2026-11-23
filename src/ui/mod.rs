@@ -8,7 +8,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
-use vte4::Terminal;
 
 use crate::config::{Config, SidebarView, TabPlacement, Theme};
 use crate::keybindings::KeybindingMap;
@@ -346,7 +345,7 @@ pub(crate) struct UiState {
     pub(crate) workspace_navigation: workspace_navigation::Navigation,
     pub(crate) agent_workspace_expander: gtk4::Expander,
     pub(crate) agent_session_tabs:
-        RefCell<HashMap<agent_sessions::RuntimeIdentity, gtk4::glib::WeakRef<Terminal>>>,
+        Rc<RefCell<HashMap<agent_sessions::RuntimeIdentity, gtk4::glib::WeakRef<gtk4::Widget>>>>,
     pub(crate) agent_session_library: Rc<RefCell<jterm_core::agent_sessions::SessionLibraryStore>>,
     pub(crate) tab_counter: Rc<Cell<u32>>,
     pub(crate) font_scale: Rc<Cell<f64>>,

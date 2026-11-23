@@ -34,15 +34,15 @@ pub(crate) fn install(ui: &Rc<UiState>) {
         }
         let bridge = bridge.as_ref().unwrap();
         let mut identities = Vec::new();
-        for (key, terminal) in ui.agent_session_tabs.borrow().iter() {
-            let Some(terminal) = terminal.upgrade() else {
+        for (key, bound) in ui.agent_session_tabs.borrow().iter() {
+            let Some(root) = bound.upgrade() else {
                 continue;
             };
             let pane = (0..ui.notebook.n_pages())
                 .filter_map(|index| ui.notebook.nth_page(Some(index)))
                 .filter_map(|page| PaneNode::from_widget(&page))
                 .flat_map(|node| node.leaves())
-                .find(|leaf| leaf.terminal() == Some(&terminal))
+                .find(|leaf| leaf.root_widget() == root)
                 .and_then(|leaf| leaf.session_id());
             let Some(pane) = pane else {
                 continue;

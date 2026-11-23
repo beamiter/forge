@@ -250,13 +250,47 @@ impl SharedPane {
                 )
             },
         );
+        Self::from_runtime(config, argv, runtime, false)
+    }
+
+    pub(crate) fn open_hosted_attachment(
+        config: &Config,
+        argv: &[String],
+        cwd: &str,
+    ) -> Option<Rc<Self>> {
+        let runtime = RuntimeShell::spawn_hosted_attachment(
+            argv,
+            std::path::Path::new(cwd),
+            crate::host::is_flatpak(),
+            || {
+                SharedTerminal::runtime_environment(
+                    argv,
+                    config.vim9.auto_gui,
+                    &jterm_gtk_view::INTERACTIVE_CHILD_ENV,
+                )
+            },
+        );
+        Self::from_runtime(config, argv, runtime, true)
+    }
+
+    fn from_runtime(
+        config: &Config,
+        argv: &[String],
+        runtime: Result<Option<Rc<RuntimeShell>>, String>,
+        hosted_attachment: bool,
+    ) -> Option<Rc<Self>> {
         let open = |runtime: Rc<RuntimeShell>| {
             let pid = runtime
                 .child_pid()
                 .ok_or("shared shell has no live process id")?;
             let guard =
                 crate::gtk_process::Guard::capture(pid, RuntimeShell::candidate_program(argv));
-            let (widget, pane) = TerminalPane::with_runtime_embedded(
+            let mount = if hosted_attachment {
+                TerminalPane::with_hosted_attachment
+            } else {
+                TerminalPane::with_runtime_embedded
+            };
+            let (widget, pane) = mount(
                 runtime,
                 Self::theme(config, config.default_font_scale),
                 jterm_core::review_input::safe_inline_display,

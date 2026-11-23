@@ -1394,17 +1394,8 @@ impl UiState {
                 return;
             }
         };
-        let argv = std::iter::once(launch.program).chain(launch.args).collect();
-        let Some(leaf) = self.add_task_terminal_tab(
-            &terminal.label,
-            argv,
-            Some(launch.cwd.to_string_lossy().into_owned()),
-            Vec::new(),
-            TaskTerminalRole::Validation,
-            None,
-        ) else {
-            return;
-        };
+        let leaf = self.add_hosted_attachment_tab(terminal.label, launch);
+        leaf.set_task_role(TaskTerminalRole::Validation);
         leaf.set_task_session_id(&session_id);
         unsafe {
             leaf.root_widget().set_data(HOSTED_VALIDATION_VIEW, true);
