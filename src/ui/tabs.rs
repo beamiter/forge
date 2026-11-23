@@ -460,6 +460,12 @@ impl UiState {
         self.handle_terminal_exited_with_code(term_widget, None);
     }
 
+    pub(super) fn show_pty_exit_tail(&self, tail: jterm_core::exit_status::ExitTail) {
+        if let Some(notice) = tail.notice() {
+            self.task_toast(notice);
+        }
+    }
+
     /// Exit handling with the observed child status when the caller has one.
     ///
     /// A task terminal's exit is authoritative task evidence; the task model
@@ -2038,13 +2044,14 @@ impl UiState {
                 let term_view_for_exit = Rc::downgrade(term_view);
                 let root_for_exit = term_view.widget().downgrade();
                 let tab_num_for_exit = tab_num;
-                term_view.connect_exited(move |code| {
+                term_view.connect_exited(move |status| {
                     let Some(term_view) = term_view_for_exit.upgrade() else {
                         return;
                     };
                     let Some(root) = root_for_exit.upgrade() else {
                         return;
                     };
+                    ui_for_exit.show_pty_exit_tail(status.tail);
                     let _ = term_view.save_history();
                     let current_tab_num = tab_num_for_widget(&root).unwrap_or(tab_num_for_exit);
                     let is_split = root
@@ -2059,7 +2066,7 @@ impl UiState {
                                     == *term_view.vte().upcast_ref::<gtk4::Widget>()
                             });
                     if is_remote && !is_split {
-                        ui_for_exit.handle_tab_exit(current_tab_num, code, &root);
+                        ui_for_exit.handle_tab_exit(current_tab_num, status.code, &root);
                     } else {
                         if is_remote {
                             ui_for_exit
@@ -2068,7 +2075,7 @@ impl UiState {
                                 .remove(&current_tab_num);
                             ui_for_exit.clear_tab_conn_status(current_tab_num);
                         }
-                        ui_for_exit.handle_terminal_exited_with_code(&root, Some(code));
+                        ui_for_exit.handle_terminal_exited_with_code(&root, Some(status.code));
                     }
                 });
 
@@ -3033,8 +3040,9 @@ impl UiState {
                 }
                 jterm_gtk_view::PaneEvent::TitleChanged(_) => ui.update_shared_tab_title(&root),
                 jterm_gtk_view::PaneEvent::Bell => ui.ring_tab_bell(&root, &last_bell),
-                jterm_gtk_view::PaneEvent::Exited(code) => {
-                    ui.handle_terminal_exited_with_code(&root, Some(code))
+                jterm_gtk_view::PaneEvent::Exited(status) => {
+                    ui.show_pty_exit_tail(status.tail);
+                    ui.handle_terminal_exited_with_code(&root, Some(status.code))
                 }
             }
         });

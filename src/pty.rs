@@ -1,4 +1,5 @@
 use gtk4::glib;
+use jterm_core::exit_status::{ExitTail, PtyExit};
 use jterm_core::runtime_wake::WakeSink;
 use nix::libc;
 use nix::pty::{openpty, OpenptyResult};
@@ -7,7 +8,7 @@ use std::ffi::CString;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read as _, Write as _};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{mpsc, Arc};
@@ -24,7 +25,7 @@ use jterm_gtk_view::PtyEvent as PtyMsg;
 #[cfg(not(forge_shared_terminal))]
 enum PtyMsg {
     Data(Vec<u8>),
-    Exit(i32),
+    Exit(PtyExit),
 }
 
 /// Which process group currently owns the PTY foreground.
@@ -1308,7 +1309,7 @@ impl OwnedPty {
     pub fn start_reader<F, E>(&self, callback: F, on_exit: E)
     where
         F: FnMut(Vec<u8>) + 'static,
-        E: FnOnce(i32) + 'static,
+        E: FnOnce(PtyExit) + 'static,
     {
         let reader_fd = match self
             .master
@@ -1428,7 +1429,7 @@ impl OwnedPty {
         on_exit: E,
     ) where
         F: FnMut(Vec<u8>) + 'static,
-        E: FnOnce(i32) + 'static,
+        E: FnOnce(PtyExit) + 'static,
     {
         spawn_reader_thread(
             reader_fd,
@@ -1527,16 +1528,23 @@ fn spawn_reader_thread(
             let mut file = std::fs::File::from(reader_fd);
             let fd = file.as_raw_fd();
             let mut buf = [0u8; PTY_READ_CHUNK_BYTES];
+            let mut tail = ExitTail::Complete;
             loop {
                 if reader_cancelled.load(Ordering::Acquire) {
                     break;
                 }
                 if guard.ready_to_reap(&lifecycle) {
-                    crate::gtk_process::drain_tail(&mut file, |data| {
-                        let sent = tx.send(PtyMsg::Data(data)).is_ok();
-                        if sent { notify.wake(); }
-                        sent
-                    });
+                    tail = jterm_core::pty_reader::drain_ready_exit_tail(
+                        file.as_fd(),
+                        |data| {
+                            let sent = tx.send(PtyMsg::Data(data)).is_ok();
+                            if sent {
+                                notify.wake();
+                            }
+                            sent
+                        },
+                        || reader_cancelled.load(Ordering::Acquire),
+                    ).unwrap_or_default();
                     break;
                 }
                 match poll_pty_or_reader_cancel(
@@ -1578,7 +1586,7 @@ fn spawn_reader_thread(
             }
 
             let code = wait_for_child_exit(&lifecycle, &guard);
-            if tx.send(PtyMsg::Exit(code)).is_ok() {
+            if tx.send(PtyMsg::Exit(PtyExit { code, tail })).is_ok() {
                 notify.wake();
             }
         })
@@ -1588,7 +1596,7 @@ fn spawn_reader_thread(
         // child must not merely be signaled: without the reap below it would
         // stay a zombie for the life of the process.
         failure_lifecycle.force_kill_and_reap();
-        if failure_tx.try_send(PtyMsg::Exit(1)).is_ok() {
+        if failure_tx.try_send(PtyMsg::Exit(1.into())).is_ok() {
             failure_notify.wake();
         }
     }

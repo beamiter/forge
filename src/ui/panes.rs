@@ -286,13 +286,14 @@ impl UiState {
         let ui_for_exit = UiState::clone(self);
         let view_for_exit = Rc::downgrade(&view);
         let root_for_exit = view.widget().downgrade();
-        view.connect_exited(move |_| {
+        view.connect_exited(move |status| {
             let Some(view) = view_for_exit.upgrade() else {
                 return;
             };
             let Some(root) = root_for_exit.upgrade() else {
                 return;
             };
+            ui_for_exit.show_pty_exit_tail(status.tail);
             let _ = view.save_history();
             ui_for_exit.handle_terminal_exited(&root);
         });
