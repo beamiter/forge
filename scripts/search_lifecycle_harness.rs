@@ -160,6 +160,7 @@ mod block_view {
         pub cleared: Rc<Cell<usize>>,
         pub revealed: Rc<Cell<usize>>,
         pub terminal: vte4::Terminal,
+        pub shared: bool,
         pub root: MappedWidget,
         pub focused: Rc<Cell<usize>>,
     }
@@ -178,14 +179,15 @@ mod block_view {
                 cleared: Default::default(),
                 revealed: Default::default(),
                 terminal: Default::default(),
+                shared: false,
                 root: MappedWidget(Rc::new(Cell::new(true))),
                 focused: Default::default(),
             }
         }
     }
     impl TermView {
-        pub fn vte(&self) -> &vte4::Terminal {
-            &self.terminal
+        pub fn legacy_terminal(&self) -> Option<&vte4::Terminal> {
+            (!self.shared).then_some(&self.terminal)
         }
         pub fn widget(&self) -> &MappedWidget {
             &self.root
@@ -545,6 +547,28 @@ mod ui {
         assert!(ui.terminals[0].installed.borrow().is_none());
         assert_eq!(*ui.terminals[1].installed.borrow(), Some("edited".into()));
         assert_eq!(sibling.queries.borrow().as_slice(), ["edited"]);
+    }
+
+    #[test]
+    fn pane_find_does_not_install_a_native_regex_for_a_shared_view() {
+        let mut ui = setup();
+        let owner = Rc::new(TermView {
+            terminal: ui.terminals[0].clone(),
+            shared: true,
+            ..TermView::default()
+        });
+        ui.views[0] = Some(owner.clone());
+        ui.current.set(1);
+        ui.search_entry.set_text("missing from the shared transcript");
+        ui.show_search_for(&owner);
+        ui.search_next();
+        ui.search_prev();
+        assert_eq!(owner.queries.borrow().as_slice(), ["missing from the shared transcript"]);
+        assert_eq!(ui.search_status.0.borrow().as_str(), "No matches");
+        assert!(ui
+            .terminals
+            .iter()
+            .all(|term| term.installed.borrow().is_none()));
     }
 
     #[test]

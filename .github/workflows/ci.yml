@@ -97,6 +97,13 @@ jobs:
           core=$(python3 scripts/shared-core-path.py)
           bash "$core/crates/jterm_gtk_view/tests/test-native-cards.sh" \
             forge "$RUNNER_TEMP/shared-terminal-wayland/cards"
+      - name: Verify application Find on the shared GTK surfaces
+        if: ${{ !cancelled() }}
+        run: |
+          core=$(python3 scripts/shared-core-path.py)
+          dbus-run-session -- xvfb-run -a --server-args='-screen 0 1440x1100x24 -nolisten tcp' \
+            env PYTHONPATH="$core/crates/jterm_gtk_view/tests" \
+            /usr/bin/python3 -B scripts/test-shared-find-native.py target/release/forge
       - name: Preserve native protocol and fixture logs
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
@@ -393,6 +400,7 @@ jobs:
           GDK_BACKEND: x11
           GSK_RENDERER: cairo
           GTK_A11Y: none
+          JTERM_SHARED_RUNTIME: "0"
         run: |
           set -Eeuo pipefail
           vim_bin="$(command -v "${JTERM_VIM9_BIN:-${VIM9_TEST_VIM:-vim}}")"
@@ -458,6 +466,9 @@ jobs:
 
       - name: Check independent native font groups
         if: ${{ !cancelled() }}
+        env:
+          JTERM_SHARED_FINISHED_COMMANDS: "0"
+          JTERM_SHARED_FINISHED_OUTPUT: "0"
         run: |
           set -Eeuo pipefail
           test_name=block_view::font_sync_tests::font_groups_stay_independent_across_native_panes_and_late_rows

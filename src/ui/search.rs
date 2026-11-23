@@ -101,13 +101,9 @@ impl UiState {
     }
 
     pub(super) fn show_search_for(&self, view: &Rc<TermView>) {
-        #[cfg(forge_shared_terminal)]
-        if view.toggle_transcript_search() {
-            return;
-        }
         self.cancel_pending_search();
         self.clear_search_owner();
-        let mut owner = SearchOwner::new(Some(view.vte()), Some(view));
+        let mut owner = SearchOwner::new(view.legacy_terminal(), Some(view));
         owner.pinned = true;
         *self.search_owner.borrow_mut() = Some(owner);
         self.search_bar.set_search_mode(true);
@@ -125,7 +121,7 @@ impl UiState {
                 .filter(|view| view.widget().is_mapped());
             // A closed/hidden captured pane must not fall back to its sibling.
             return match view {
-                Some(view) => (Some(view.vte().clone()), Some(view)),
+                Some(view) => (view.legacy_terminal().cloned(), Some(view)),
                 None => (None, None),
             };
         }
@@ -134,14 +130,6 @@ impl UiState {
 
     pub(crate) fn toggle_search(&self) {
         let visible = self.search_bar.is_search_mode();
-        #[cfg(forge_shared_terminal)]
-        if !visible
-            && self
-                .current_term_view()
-                .is_some_and(|view| view.toggle_transcript_search())
-        {
-            return;
-        }
         let pinned = visible
             && self
                 .search_owner

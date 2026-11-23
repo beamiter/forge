@@ -233,6 +233,55 @@ struct LiveFindStamp {
     origin: Option<i64>,
 }
 
+#[cfg(forge_shared_terminal)]
+#[derive(Clone)]
+struct SharedFind {
+    terminal: Rc<super::shared_active::SharedActiveTerminal>,
+    frame: jterm_gtk_view::FindFrame,
+    hits: Rc<[jterm_gtk_view::FindMatch]>,
+}
+
+#[cfg(forge_shared_terminal)]
+impl SharedFind {
+    fn scan(
+        terminal: Rc<super::shared_active::SharedActiveTerminal>,
+        screen_only: bool,
+        expression: &regex::Regex,
+        budget: &mut FindScanBudget,
+        limit: usize,
+    ) -> Option<(Self, bool)> {
+        let snapshot =
+            terminal.find_snapshot(screen_only, budget.remaining_bytes(), &mut || {
+                budget.time_exhausted()
+            })?;
+        let mut hits = Vec::new();
+        let mut incomplete = snapshot.incomplete;
+        'windows: for window in snapshot.windows {
+            budget.consume_bytes(window.text().len());
+            for found in expression.find_iter(window.text()) {
+                if let Some(hit) = window.match_at(found.range()) {
+                    hits.push(hit);
+                    if hits.len() == limit {
+                        break 'windows;
+                    }
+                    if hits.len().is_multiple_of(128) && budget.time_exhausted() {
+                        incomplete = true;
+                        break 'windows;
+                    }
+                }
+            }
+        }
+        Some((
+            Self {
+                terminal,
+                frame: snapshot.frame,
+                hits: hits.into(),
+            },
+            incomplete,
+        ))
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct FindState {
     /// An asynchronous exact step failed; the next action must rebuild rather
@@ -240,6 +289,7 @@ pub(crate) struct FindState {
     invalidated: bool,
     replay_repair: Option<Rc<FindReplayRepair>>,
     query: Option<FindQuery>,
+    searches_blocks: Option<bool>,
     pub(crate) surfaces: Vec<FindSurface>,
     cursor: FindCursor,
     total: usize,
@@ -254,6 +304,8 @@ pub(crate) struct FindState {
     highlighted_commands: Vec<gtk4::TextView>,
     #[cfg(forge_shared_terminal)]
     command_pattern: Option<regex::Regex>,
+    #[cfg(forge_shared_terminal)]
+    shared: Option<SharedFind>,
     live_anchor: Option<LiveAnchor>,
     live_stamp: Option<LiveFindStamp>,
     /// Highlights installed by the flat cross-block palette do not participate
@@ -1452,8 +1504,18 @@ impl TermView {
     }
 
     fn live_find_is_current(&self) -> bool {
-        let expected = self.find_state.borrow().live_stamp;
-        expected.is_none_or(|stamp| stamp == self.live_find_stamp())
+        let state = self.find_state.borrow();
+        #[cfg(forge_shared_terminal)]
+        if state
+            .shared
+            .as_ref()
+            .is_some_and(|find| !find.terminal.find_is_current(&find.frame))
+        {
+            return false;
+        }
+        state
+            .live_stamp
+            .is_none_or(|stamp| stamp == self.live_find_stamp())
     }
 
     pub(crate) fn cross_block_record_kind(&self, block_id: u64) -> CrossBlockRecordKind {
@@ -1535,14 +1597,8 @@ impl TermView {
     ) -> FindSearchResult {
         self.release_unified_navigation_cursor();
         self.clear_find();
-        if query.is_empty() {
-            return FindSearchResult::NoMatches;
-        }
-        // An alternate-screen app owns the pane and the finished cards are
-        // hidden under it: counting their hits reported matches the user
-        // could not see, and shadowed the app's own screen. Report none, so
-        // the find bar searches the live terminal the user is looking at.
-        if !find_searches_blocks(self.bstate.get()) {
+        let searches_blocks = find_searches_blocks(self.bstate.get());
+        if query.is_empty() || (!searches_blocks && self.legacy_terminal().is_some()) {
             return FindSearchResult::NoMatches;
         }
         let pattern = if use_regex {
@@ -1583,10 +1639,16 @@ impl TermView {
         let mut match_limited = false;
         let mut scan_limited = false;
         let mut scan_budget = FindScanBudget::new();
-        let completed_batch = {
+        let completed_batch = if searches_blocks {
             let mut deadline_exhausted = || scan_budget.time_exhausted();
             self.render_backend
                 .completed_search_surfaces(scan_budget.remaining_bytes(), &mut deadline_exhausted)
+        } else {
+            super::BackendSearchBatch {
+                surfaces: Vec::new(),
+                incomplete: false,
+                native_fallback: None,
+            }
         };
         let completed_owns_live_surface = completed_batch
             .surfaces
@@ -1694,18 +1756,56 @@ impl TermView {
             }
         }
 
-        // The still-running command's output is searchable too (document
-        // order: it sits below every finished block). VTE's own highlighter
-        // paints and steps these hits, so they are counted from the live
-        // current-command range in VTE's own buffer: the count must equal
-        // the native steps, including when older scrollback is retained.
+        let running = matches!(
+            self.bstate.get(),
+            super::BlockState::CollectingOutput | super::BlockState::PostCommand
+        );
+        #[cfg(forge_shared_terminal)]
+        let shared_find = if !match_limited && !scan_limited {
+            let terminal = self.active.borrow().shared_active.clone();
+            terminal
+                .filter(|terminal| running || !searches_blocks || terminal.transcript().is_some())
+                .and_then(|terminal| {
+                    live_observed = true;
+                    let limit = FIND_MATCH_LIMIT.saturating_sub(total);
+                    let Some((find, incomplete)) =
+                        SharedFind::scan(terminal, !searches_blocks, &re, &mut scan_budget, limit)
+                    else {
+                        scan_limited = true;
+                        return None;
+                    };
+                    let count = find.hits.len();
+                    match_limited = count >= limit;
+                    scan_limited = !match_limited && incomplete;
+                    if count > 0 {
+                        surfaces.push(FindSurface {
+                            block_id: 0,
+                            block_index: 0,
+                            is_output: true,
+                            is_live: true,
+                            count,
+                            vte_cursor: None,
+                            pending_replay: None,
+                            complete: !(match_limited || scan_limited),
+                            initial_wrap: false,
+                            wrap_before: None,
+                            render_stamp: super::blocks::NEUTRAL_RENDER_STAMP,
+                        });
+                        total += count;
+                        find.terminal.highlight_find(&find.frame, find.hits.clone());
+                    }
+                    Some(find)
+                })
+        } else {
+            None
+        };
+        // VTE steps the still-running command's hits by native ordinal. Count
+        // from its current-command range even if older scrollback is retained.
         if !match_limited
             && !scan_limited
             && !completed_owns_live_surface
-            && matches!(
-                self.bstate.get(),
-                super::BlockState::CollectingOutput | super::BlockState::PostCommand
-            )
+            && running
+            && self.legacy_terminal().is_some()
         {
             live_observed = true;
             let live_rows = self.active_vte.vadjustment().map(|adjustment| {
@@ -1812,7 +1912,12 @@ impl TermView {
                 use_regex,
                 case_sensitive,
             });
+            state.searches_blocks = Some(searches_blocks);
             state.live_stamp = live_observed.then_some(live_stamp_at_start);
+            #[cfg(forge_shared_terminal)]
+            {
+                state.shared = shared_find;
+            }
             return FindSearchResult::NoMatches;
         }
         let capped = match_limited || scan_limited;
@@ -1825,6 +1930,7 @@ impl TermView {
                 use_regex,
                 case_sensitive,
             });
+            st.searches_blocks = Some(searches_blocks);
             st.cursor = FindCursor::default();
             st.total = total;
             st.capped = capped;
@@ -1834,6 +1940,7 @@ impl TermView {
             {
                 st.highlighted_commands = highlighted_commands;
                 st.command_pattern = Some(re.clone());
+                st.shared = shared_find;
             }
             st.live_anchor = live_anchor;
             st.live_stamp = live_stamp;
@@ -2165,13 +2272,14 @@ impl TermView {
         if std::mem::take(&mut self.find_state.borrow_mut().invalidated) {
             return FindNavigationResult::Invalidated;
         }
-        // A pass built over the cards before an alternate-screen app took the
-        // pane must not step through hidden cards; invalidating makes the find
-        // bar rebuild it, which now lands on the live screen.
-        if !find_searches_blocks(self.bstate.get()) {
-            if find_progress(&self.find_state.borrow()).is_none() {
-                return FindNavigationResult::Inactive;
-            }
+        // The alternate screen changes which text is reachable by this query.
+        let searches_blocks = find_searches_blocks(self.bstate.get());
+        let scope_changed = self
+            .find_state
+            .borrow()
+            .searches_blocks
+            .is_some_and(|before| before != searches_blocks);
+        if scope_changed {
             self.clear_find();
             return FindNavigationResult::Invalidated;
         }
@@ -2268,6 +2376,27 @@ impl TermView {
             };
             (surface.clone(), state.query.clone(), state.cursor)
         };
+        #[cfg(forge_shared_terminal)]
+        {
+            let shared = self.find_state.borrow().shared.clone();
+            if let Some(find) = shared {
+                if surface.is_live && surface.block_id == 0 {
+                    if !find.terminal.show_find(&find.frame, find.hits, occurrence) {
+                        return FindFocusResult::Invalidated;
+                    }
+                    let state = self.find_state.borrow();
+                    return if state.query == query_at_start
+                        && state.cursor == cursor_at_start
+                        && state.surfaces.get(surface_index) == Some(&surface)
+                    {
+                        FindFocusResult::Selected
+                    } else {
+                        FindFocusResult::Invalidated
+                    };
+                }
+                find.terminal.highlight_find(&find.frame, find.hits);
+            }
+        }
         let (vte, current_render_stamp) = if surface.is_live && surface.block_id == 0 {
             (self.active_vte.clone(), None)
         } else {
@@ -2441,6 +2570,14 @@ impl TermView {
         let Some(surface) = st.surfaces.get(st.cursor.surface) else {
             return;
         };
+        #[cfg(forge_shared_terminal)]
+        if surface.is_live
+            && st.shared.as_ref().is_some_and(|find| {
+                st.searches_blocks == Some(false) || find.terminal.transcript().is_some()
+            })
+        {
+            return;
+        }
         let widget: gtk4::Widget = if surface.is_live && surface.block_id == 0 {
             self.active.borrow().widget().clone().upcast()
         } else {
@@ -2868,6 +3005,10 @@ pub(super) fn clear_find_state(
     active_vte: &vte4::Terminal,
 ) {
     let state = std::mem::take(&mut *find_state.borrow_mut());
+    #[cfg(forge_shared_terminal)]
+    if let Some(find) = state.shared {
+        find.terminal.clear_find();
+    }
     #[cfg(forge_shared_terminal)]
     for command in state.highlighted_commands {
         jterm_gtk_view::clear_finished_text_matches(&command);

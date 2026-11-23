@@ -324,12 +324,22 @@ for test_name in "${tests[@]}"; do
         fixture_im_module=simple
         fixture_g_debug="${fixture_g_debug:+${fixture_g_debug},}fatal-warnings"
     fi
+    card_backend=()
+    case "$test_name" in
+        block_view::tests::delayed_clipboard_paste_restores_original_history_only_after_admission|\
+        block_view::tests::deferred_live_focus_never_steals_new_pane_find_or_history_ownership|\
+        block_view::cross_selection::tests::chat_selection_root_reaches_the_docked_native_composer|\
+        block_view::font_sync_tests::font_groups_stay_independent_across_native_panes_and_late_rows)
+            # These fixtures inspect the native VTE command/output widgets.
+            card_backend=(JTERM_SHARED_FINISHED_COMMANDS=0 JTERM_SHARED_FINISHED_OUTPUT=0)
+            ;;
+    esac
     # A wedged fixture must fail explicitly and leave the remaining cases runnable.
     if G_DEBUG="$fixture_g_debug" GTK_IM_MODULE="$fixture_im_module" GTK_A11Y="$a11y_backend" \
         timeout --signal=TERM --kill-after=10s 120s \
         dbus-run-session "${dbus_run_args[@]}" -- \
         xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
-        cargo test --lib --all-features --locked "${test_name}" -- \
+        env "${card_backend[@]}" cargo test --lib --all-features --locked "${test_name}" -- \
         --ignored --exact --nocapture; then
         passed_count=$((passed_count + 1))
     else

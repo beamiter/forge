@@ -9941,7 +9941,18 @@ impl RenderBackend for BlockBackend {
     }
 
     fn reset_active_surface(&self, preserve_scrollback: bool) {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            terminal.reset_output();
+        }
         self.active_rc.borrow().reset_active(preserve_scrollback);
+    }
+
+    fn close_prompt_zone(&self, _zone_id: Option<u64>) {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            terminal.begin_output();
+        }
     }
 
     /// Preserve the pane-focus invariant: a background pane receiving a prompt
@@ -11545,7 +11556,7 @@ impl RenderBackend for UnifiedBackend {
         if self.transcript().is_some() {
             return BackendSearchBatch {
                 surfaces: Vec::new(),
-                incomplete: true,
+                incomplete: false,
                 native_fallback: None,
             };
         }
@@ -19192,15 +19203,6 @@ impl TermView {
     /// property, so callers must use this descriptor instead.
     pub fn pty_fd_i32(&self) -> i32 {
         self.pty.master_fd_raw()
-    }
-
-    #[cfg(forge_shared_terminal)]
-    pub(crate) fn toggle_transcript_search(&self) -> bool {
-        self.active
-            .borrow()
-            .shared_active
-            .as_ref()
-            .is_some_and(|terminal| terminal.toggle_transcript_search())
     }
 
     pub fn vte(&self) -> &Terminal {
