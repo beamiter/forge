@@ -10402,10 +10402,13 @@ impl RenderBackend for BlockBackend {
 
     fn replies_through_commit(&self) -> bool {
         #[cfg(forge_shared_terminal)]
-        if self.shared_active.is_some() {
-            return false;
+        {
+            self.shared_active.is_none()
         }
-        true
+        #[cfg(not(forge_shared_terminal))]
+        {
+            true
+        }
     }
 
     fn command_capture_anchor(&self, provisional: (i64, i64), anchor_rows: i64) -> (i64, i64) {
@@ -11948,10 +11951,13 @@ impl RenderBackend for UnifiedBackend {
 
     fn replies_through_commit(&self) -> bool {
         #[cfg(forge_shared_terminal)]
-        if self.shared_active.is_some() {
-            return false;
+        {
+            self.shared_active.is_none()
         }
-        true
+        #[cfg(not(forge_shared_terminal))]
+        {
+            true
+        }
     }
 
     /// The identity, through the shared policy. The provisional anchor was

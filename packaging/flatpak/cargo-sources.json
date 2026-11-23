@@ -15,7 +15,7 @@
         "type": "git",
         "url": "https://github.com/beamiter/jterm_core",
         "commit": "6a3cb048e89934c99b3bc35c6817a2e2f3c4b4dc",
-        "dest": "flatpak-cargo/git/jterm_core-c9fe92c"
+        "dest": "flatpak-cargo/git/jterm_core-6a3cb04"
     },
     {
         "type": "archive",
@@ -1257,7 +1257,7 @@
     {
         "type": "shell",
         "commands": [
-            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-c9fe92c/.\" \"cargo/vendor/jterm_core\""
+            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-6a3cb04/.\" \"cargo/vendor/jterm_core\""
         ]
     },
     {
@@ -1275,7 +1275,7 @@
     {
         "type": "shell",
         "commands": [
-            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-c9fe92c/crates/jterm_engine\" \"cargo/vendor/jterm_engine\""
+            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-6a3cb04/crates/jterm_engine\" \"cargo/vendor/jterm_engine\""
         ]
     },
     {
@@ -1293,7 +1293,7 @@
     {
         "type": "shell",
         "commands": [
-            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-c9fe92c/crates/jterm_gtk_view\" \"cargo/vendor/jterm_gtk_view\""
+            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-6a3cb04/crates/jterm_gtk_view\" \"cargo/vendor/jterm_gtk_view\""
         ]
     },
     {
@@ -1311,7 +1311,7 @@
     {
         "type": "shell",
         "commands": [
-            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-c9fe92c/crates/jterm_remote_client\" \"cargo/vendor/jterm_remote_client\""
+            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-6a3cb04/crates/jterm_remote_client\" \"cargo/vendor/jterm_remote_client\""
         ]
     },
     {
@@ -1329,7 +1329,7 @@
     {
         "type": "shell",
         "commands": [
-            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-c9fe92c/crates/jterm_runtime\" \"cargo/vendor/jterm_runtime\""
+            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-6a3cb04/crates/jterm_runtime\" \"cargo/vendor/jterm_runtime\""
         ]
     },
     {
