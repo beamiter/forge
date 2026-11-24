@@ -5625,8 +5625,52 @@ impl ActiveBlock {
         if visible > 0 {
             visible
         } else {
-            self.active_vte.height().max(0)
+            self.live_surface_size().1
         }
+    }
+
+    pub(super) fn live_surface_size(&self) -> (i32, i32) {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            return (
+                terminal.widget.width().max(0),
+                terminal.widget.height().max(0),
+            );
+        }
+        (
+            self.active_vte.width().max(0),
+            self.active_vte.height().max(0),
+        )
+    }
+
+    pub(super) fn live_cell_size(&self) -> (i32, i32) {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            let (_, _, width, height) = terminal.cell_metrics();
+            return (width, height);
+        }
+        (
+            self.active_vte.char_width() as i32,
+            self.active_vte.char_height() as i32,
+        )
+    }
+
+    #[cfg(forge_shared_terminal)]
+    pub(super) fn shared_organism_rect_is_blank(
+        &self,
+        terminal: &super::shared_active::SharedActiveTerminal,
+        x: f64,
+        y: f64,
+        width: i32,
+        height: i32,
+    ) -> bool {
+        if y + f64::from(height) > f64::from(self.live_visible_height_px()) {
+            return false;
+        }
+        terminal.embedded().painted_primary_rect_is_blank(
+            &self.vte_overlay,
+            gtk4::graphene::Rect::new(x as f32, y as f32, width as f32, height as f32),
+        )
     }
 
     /// Reset the live VTE for the next prompt (anvil block.rs:1028-1044). `reset`

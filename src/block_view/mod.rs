@@ -18495,8 +18495,15 @@ impl TermView {
             return false;
         }
         let active = self.active.borrow();
+        if active.live_organism_alt_screen() {
+            return false;
+        }
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &active.shared_active {
+            return active.shared_organism_rect_is_blank(terminal, x, y, width, height);
+        }
         let terminal = &active.active_vte;
-        if !terminal.is_mapped() || active.live_organism_alt_screen() {
+        if !terminal.is_mapped() {
             return false;
         }
         let cell_width = terminal.char_width().max(1) as f64;
@@ -18529,20 +18536,30 @@ impl TermView {
 
     pub(crate) fn live_organism_surface_metrics(&self) -> LiveOrganismSurfaceMetrics {
         let active = self.active.borrow();
-        let visible_height = active
-            .live_visible_height_px()
-            .min(active.active_vte.height().max(0));
+        let (width, height) = active.live_surface_size();
+        let visible_height = active.live_visible_height_px().min(height);
+        let (cell_width, cell_height) = active.live_cell_size();
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &active.shared_active {
+            let last_row = (visible_height / cell_height.max(1))
+                .saturating_sub(1)
+                .max(0);
+            let cursor = terminal.embedded().painted_primary_cursor_row();
+            return LiveOrganismSurfaceMetrics {
+                width,
+                height: visible_height,
+                cell_width: cell_width.max(1),
+                cell_height: cell_height.max(1),
+                right_gutter: LIVE_ORGANISM_RIGHT_GUTTER,
+                alt_screen: active.live_organism_alt_screen(),
+                cursor_row: cursor.map_or(last_row, |row| (row as i32).min(last_row)),
+            };
+        }
         LiveOrganismSurfaceMetrics {
-            // The surface starts hidden, so GTK may not allocate it yet.  The
-            // always-allocated VTE is the overlay's measured child and has the
-            // same clipped coordinate space once the surface is shown.
-            width: active.active_vte.width().max(0),
-            // The VTE keeps the whole viewport grid while a command runs; only
-            // the card's own height is on screen. Placing the body by the grid
-            // would drop it into the clipped rows.
+            width,
             height: visible_height,
-            cell_width: (active.active_vte.char_width() as i32).max(1),
-            cell_height: (active.active_vte.char_height() as i32).max(1),
+            cell_width: cell_width.max(1),
+            cell_height: cell_height.max(1),
             right_gutter: LIVE_ORGANISM_RIGHT_GUTTER,
             alt_screen: active.live_organism_alt_screen(),
             cursor_row: {
@@ -19623,7 +19640,7 @@ impl TermView {
         }
 
         let adj = self.block_scroll.vadjustment();
-        let cell_h = self.active_vte.char_height() as f64;
+        let cell_h = f64::from(self.active.borrow().live_cell_size().1);
         let step = if cell_h > 0.0 {
             cell_h
         } else {
