@@ -148,7 +148,7 @@ fn owns_focus(window: &gtk::Window, widget: &impl IsA<gtk::Widget>) -> bool {
 }
 
 fn geometry_diagnostic(view: &TermView) -> String {
-    let vte = &view.active_vte;
+    let vte = view.vte();
     let mut chain = Vec::new();
     let mut widget = Some(view.active.borrow().live_clip().upcast::<gtk::Widget>());
     for _ in 0..8 {
@@ -236,7 +236,7 @@ fn search_and_native_split_preserve_readline_draft_cursor_and_undo() {
         let identity = (
             original.0.pty.pid_i32(),
             original.0.pty.master_fd_raw(),
-            original.0.active_vte.clone(),
+            original.0.vte().clone(),
         );
         let original_columns = pty_columns(&original.0);
         assert!(original_columns > 0);
@@ -278,7 +278,7 @@ fn search_and_native_split_preserve_readline_draft_cursor_and_undo() {
             bar.set_search_mode(false);
             original.0.grab_focus();
             settle();
-            assert!(owns_focus(&window, &original.0.active_vte));
+            assert!(owns_focus(&window, original.0.vte()));
             assert_eq!(snapshot(&original.0, &scratch.0), before);
         }
 
@@ -308,25 +308,25 @@ fn search_and_native_split_preserve_readline_draft_cursor_and_undo() {
                 "split must resize the original live pane: mode={mode:?} original_state={:?} sibling_state={:?} old_width={width} current_width={} window_width={} split_position={} old_columns={original_columns} pty_columns={} vte_columns={} original_mapped={} sibling_mapped={} geometry={}",
                 original.0.bstate.get(), sibling.0.bstate.get(),
                 original.0.root.width(), window.width(), paned.position(),
-                pty_columns(&original.0), original.0.active_vte.column_count(),
+                pty_columns(&original.0), original.0.vte().column_count(),
                 original.0.root.is_mapped(), sibling.0.root.is_mapped(),
                 geometry_diagnostic(&original.0),
             );
             pump();
         }
         settle();
-        assert!(owns_focus(&window, &sibling.0.active_vte));
+        assert!(owns_focus(&window, sibling.0.vte()));
         assert_eq!(snapshot(&sibling.0, &scratch.0), (0, String::new()));
         send(&sibling.0, b"printf SIBLING");
         let sibling_before = snapshot(&sibling.0, &scratch.0);
         original.0.grab_focus();
         settle();
-        assert!(owns_focus(&window, &original.0.active_vte));
+        assert!(owns_focus(&window, original.0.vte()));
         assert_eq!(
             (
                 original.0.pty.pid_i32(),
                 original.0.pty.master_fd_raw(),
-                original.0.active_vte.clone()
+                original.0.vte().clone()
             ),
             identity
         );

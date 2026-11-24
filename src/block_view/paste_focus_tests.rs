@@ -56,12 +56,9 @@ fn delayed_clipboard_paste_preserves_newer_pane_search_and_empty_focus() {
         crate::config::TerminalMode::Chat,
     ] {
         let (first, second, find, window) = paste_focus_fixture(mode);
-        for owner in [
-            second.active_vte.clone().upcast::<gtk4::Widget>(),
-            find.upcast(),
-        ] {
+        for owner in [second.vte().clone().upcast::<gtk4::Widget>(), find.upcast()] {
             for clear_new_owner in [false, true] {
-                assert!(first.active_vte.grab_focus());
+                assert!(first.vte().grab_focus());
                 let request = first.clipboard_paste_request();
                 assert!(request.focus.is_some());
                 assert!(owner.grab_focus());
@@ -99,11 +96,11 @@ fn delayed_clipboard_paste_preserves_newer_pane_search_and_empty_focus() {
         first.connect_human_input(move |_| {
             assert!(callback_find.grab_focus());
         });
-        assert!(first.active_vte.grab_focus());
+        assert!(first.vte().grab_focus());
         let request = first.clipboard_paste_request();
         assert!(request.complete(Some("callback")).is_ok());
         let chosen = GtkWindowExt::focus(&window);
-        assert_ne!(chosen.as_ref(), Some(first.active_vte.upcast_ref()));
+        assert_ne!(chosen.as_ref(), Some(first.vte().upcast_ref()));
         drain_native_focus_idle();
         assert_eq!(GtkWindowExt::focus(&window), chosen);
         assert_paste_focus_payload(&first, &second, b"\x1b[200~callback\x1b[201~");
@@ -149,7 +146,7 @@ fn delayed_clipboard_paste_restores_original_history_only_after_admission() {
         // revive a retired request, even though the final snapshot is identical.
         assert!(history.grab_focus());
         let request = first.clipboard_paste_request();
-        assert!(first.active_vte.grab_focus());
+        assert!(first.vte().grab_focus());
         assert!(history.grab_focus());
         assert!(request.complete(Some("older")).is_ok());
         drain_native_focus_idle();
@@ -165,7 +162,7 @@ fn delayed_clipboard_paste_restores_original_history_only_after_admission() {
         );
         assert!(request.complete(Some("one\r\ntwo")).is_ok());
         drain_native_focus_idle();
-        assert!(first.active_vte.has_focus());
+        assert!(first.vte().has_focus());
         assert_paste_focus_payload(&first, &second, b"\x1b[200~one\ntwo\x1b[201~");
 
         // Re-encode against the delivery-time mode, not the captured request.
@@ -190,10 +187,10 @@ fn delayed_clipboard_paste_closed_or_hidden_target_cannot_reclaim_focus() {
         for close in [false, true] {
             for newer_owner in [false, true] {
                 let (first, second, _, window) = paste_focus_fixture(mode.clone());
-                assert!(first.active_vte.grab_focus());
+                assert!(first.vte().grab_focus());
                 let request = first.clipboard_paste_request();
                 if newer_owner {
-                    assert!(second.active_vte.grab_focus());
+                    assert!(second.vte().grab_focus());
                 } else {
                     GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
                 }

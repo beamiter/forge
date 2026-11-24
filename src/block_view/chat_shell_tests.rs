@@ -187,7 +187,7 @@ fn capture(view: &TermView, window: &gtk4::Window, out: &Path, stage: usize, lab
     settle();
     view.render_backend.sync_geometry_to_pty();
     settle();
-    let native = &view.active_vte;
+    let native = view.vte();
     assert!(native.is_mapped());
     let grid = pty_grid_size(native, &view.block_scroll);
     assert_eq!(winsize(view), grid);
@@ -338,9 +338,9 @@ fn run_real_bash_keyboard_and_clipboard(metadata: bool) {
         .name()
         .contains("Wayland"));
     let loaded = view
-        .active_vte
+        .vte()
         .pango_context()
-        .load_font(&view.active_vte.font().unwrap())
+        .load_font(&view.vte().font().unwrap())
         .unwrap();
     assert_eq!(
         loaded.describe().family().as_deref(),
@@ -356,16 +356,16 @@ fn run_real_bash_keyboard_and_clipboard(metadata: bool) {
     let root_focus = gtk4::prelude::GtkWindowExt::focus(&window);
     let focus_diagnostic = serde_json::json!({
         "pid": std::process::id(),
-        "native_mapped": view.active_vte.is_mapped(),
-        "native_visible": view.active_vte.is_visible(),
-        "native_focusable": view.active_vte.is_focusable(),
-        "native_can_focus": view.active_vte.can_focus(),
-        "native_sensitive": view.active_vte.is_sensitive(),
-        "native_has_focus": view.active_vte.has_focus(),
+        "native_mapped": view.vte().is_mapped(),
+        "native_visible": view.vte().is_visible(),
+        "native_focusable": view.vte().is_focusable(),
+        "native_can_focus": view.vte().can_focus(),
+        "native_sensitive": view.vte().is_sensitive(),
+        "native_has_focus": view.vte().has_focus(),
         "window_active": window.is_active(),
         "window_mapped": window.is_mapped(),
         "root_focus_type": root_focus.as_ref().map(|w| w.type_().name().to_string()),
-        "root_focus_is_native": root_focus.as_ref() == Some(view.active_vte.upcast_ref()),
+        "root_focus_is_native": root_focus.as_ref() == Some(view.vte().upcast_ref()),
     });
     std::fs::write(
         out.join("focus-native-before-assert.json"),
@@ -402,17 +402,17 @@ fn run_real_bash_keyboard_and_clipboard(metadata: bool) {
         }
     }
     wait(
-        || window.is_active() && view.active_vte.has_focus(),
+        || window.is_active() && view.vte().has_focus(),
         "native keyboard focus readiness",
     );
-    assert!(view.active_vte.has_focus());
+    assert!(view.vte().has_focus());
     assert!(window.is_active());
     let input_ready_tmp = out.join("input-ready.tmp");
     std::fs::write(
         &input_ready_tmp,
         serde_json::to_vec_pretty(&serde_json::json!({
             "window": [window.width(), window.height()],
-            "has_focus": view.active_vte.has_focus(),
+            "has_focus": view.vte().has_focus(),
             "window_active": window.is_active(),
         }))
         .unwrap(),
@@ -423,7 +423,7 @@ fn run_real_bash_keyboard_and_clipboard(metadata: bool) {
         || out.join("input-ready.ack").exists(),
         "owned compositor focus before input",
     );
-    assert!(view.active_vte.has_focus() && window.is_active());
+    assert!(view.vte().has_focus() && window.is_active());
     let shell_pid = view.pty.pid_i32();
     let mut records = Vec::new();
     let mut metrics = None;
@@ -466,7 +466,7 @@ fn run_real_bash_keyboard_and_clipboard(metadata: bool) {
                 view.bracketed_paste.get(),
                 "real Bash must enable bracketed paste"
             );
-            view.active_vte.clipboard().set_text(&command);
+            view.vte().clipboard().set_text(&command);
             // Real GDK asynchronous clipboard and production admission path.
             // This does not claim the application's global CtrlShiftV shortcut.
             let generation = view.accepted_input_generation.get();
@@ -487,7 +487,7 @@ fn run_real_bash_keyboard_and_clipboard(metadata: bool) {
         }
         view.grab_focus();
         settle();
-        assert!(view.active_vte.has_focus());
+        assert!(view.vte().has_focus());
         keys(&window, &["-P", "Return", "-p", "Return"], 1);
         wait(
             || target.exists(),

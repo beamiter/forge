@@ -617,7 +617,7 @@ pub(super) fn open(
     blocks: Rc<RefCell<VecDeque<BlockData>>>,
     selected: &HashSet<u64>,
     active_id: u64,
-    focus: &vte4::Terminal,
+    focus: &impl IsA<gtk4::Widget>,
 ) -> Option<gtk4::Window> {
     let owner = parent.root()?.downcast::<gtk4::Window>().ok()?;
     // Only remember an invoking action inside this card, never a live prompt
@@ -857,7 +857,7 @@ pub(super) fn open(
         }
     });
     window.add_controller(keys);
-    let focus = focus.downgrade();
+    let focus = focus.as_ref().downgrade();
     let owner = owner.downgrade();
     window.connect_close_request(move |_| {
         let focus = focus.clone();
@@ -1086,7 +1086,7 @@ mod tests {
             let before_selection = view.selected_block_ids.borrow().clone();
             let before_unread = view.unread_count.get();
             let before_grid = view.pty.test_slave_winsize();
-            let before_scroll = view.active_vte.vadjustment().unwrap().value();
+            let before_scroll = view.vte().vadjustment().unwrap().value();
             view.pty.drain_test_slave(Duration::from_millis(30));
             view.show_command_output_review().unwrap();
             settle();
@@ -1123,10 +1123,7 @@ mod tests {
             assert_eq!(*view.selected_block_ids.borrow(), before_selection);
             assert_eq!(view.unread_count.get(), before_unread);
             assert_eq!(view.pty.test_slave_winsize(), before_grid);
-            assert_eq!(
-                view.active_vte.vadjustment().unwrap().value(),
-                before_scroll
-            );
+            assert_eq!(view.vte().vadjustment().unwrap().value(), before_scroll);
             assert!(view
                 .pty
                 .drain_test_slave(Duration::from_millis(30))

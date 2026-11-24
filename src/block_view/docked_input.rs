@@ -9,8 +9,9 @@ pub(super) fn for_block(
     compact: bool,
 ) -> Rc<chat::ChatPresentation> {
     root.add_css_class("developer-docked-input");
-    active.active_vte.add_css_class("docked-live-terminal");
-    active.active_vte.add_css_class("developer-live-terminal");
+    let terminal = active.focus_widget();
+    terminal.add_css_class("docked-live-terminal");
+    terminal.add_css_class("developer-live-terminal");
     // The one clip has the same available width in its prompt and running
     // seats. Keep padding on the moved clip rather than on either parent.
     active.live_clip().set_margin_start(16);

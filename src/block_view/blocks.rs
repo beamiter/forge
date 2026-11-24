@@ -4887,7 +4887,6 @@ impl FinishedBlock {
     /// and active block, which only the owning `TermView` has.
     pub(super) fn connect_actions(
         &self,
-        vte: &Terminal,
         verified_submission: &super::VerifiedSubmissionCtx,
         config: &Rc<RefCell<Config>>,
         active: &Rc<RefCell<ActiveBlock>>,
@@ -4905,15 +4904,11 @@ impl FinishedBlock {
             *self.restore_live_focus.borrow_mut() = Some(restore);
         }
 
-        let vte_for_cmd = vte.downgrade();
         let cmd_for_copy = self.cmd_text.clone();
         let copy_is_exact = self.command_replay_is_exact.clone();
         let feedback = ButtonFeedback::new(&self.copy_cmd_btn);
         self.copy_cmd_btn.connect_clicked(move |btn| {
-            let Some(vte_for_cmd) = vte_for_cmd.upgrade() else {
-                return;
-            };
-            vte_for_cmd.clipboard().set_text(&cmd_for_copy);
+            btn.clipboard().set_text(&cmd_for_copy);
             feedback.flash(
                 btn,
                 "object-select-symbolic",
@@ -4925,22 +4920,18 @@ impl FinishedBlock {
             );
         });
 
-        let vte_for_out = vte.downgrade();
         // Copy the FULL output (ANSI stripped), not just the collapsed first-N
         // lines shown in output_buffer before "Show more" is clicked.
         let full_output_for_copy = self.full_output.clone();
         let stripped_output_for_copy = self.stripped_output.clone();
         let feedback = ButtonFeedback::new(&self.copy_output_btn);
         self.copy_output_btn.connect_clicked(move |btn| {
-            let Some(vte_for_out) = vte_for_out.upgrade() else {
-                return;
-            };
             let text = Self::with_cached_stripped_output(
                 &full_output_for_copy,
                 &stripped_output_for_copy,
                 |s| s.to_string(),
             );
-            vte_for_out.clipboard().set_text(&text);
+            btn.clipboard().set_text(&text);
             feedback.flash(btn, "object-select-symbolic", "Output copied");
         });
 
@@ -4983,14 +4974,13 @@ impl FinishedBlock {
 
 // ─── ActiveBlock ──────────────────────────────────────────────────────────────
 
-/// The live area: a single persistent input-enabled VTE pinned to the viewport
-/// height. The shell's prompt, the user's typing, and command
-/// output all render natively in this one VTE. When a command finishes, its
+/// The live area retains one input-capable terminal across the prompt,
+/// running command and fullscreen seats. When a command finishes, its
 /// accumulated output (`raw_output`) is snapshotted into a styled FinishedBlock
 /// stacked above this card.
 pub(crate) struct ActiveBlock {
     pub(crate) widget: gtk4::Box,
-    pub(crate) active_vte: Terminal,
+    pub(super) active_vte: Option<Terminal>,
     pub(super) developer_header: Option<super::developer_block::RunningHeader>,
     #[cfg(forge_shared_terminal)]
     pub(super) shared_active: Option<Rc<super::shared_active::SharedActiveTerminal>>,
@@ -5132,7 +5122,13 @@ fn live_rows_height_px(cell_h: i32, rows: i64, insets: i32) -> i32 {
 impl ActiveBlock {
     /// `pub(super)`: only `TermView::new` constructs the live block, and the
     /// ring parameter's type is itself private to `block_view`.
-    pub(super) fn new(config: &Config, raw_output: Rc<RefCell<BoundedByteRing>>) -> Self {
+    pub(super) fn new(
+        config: &Config,
+        raw_output: Rc<RefCell<BoundedByteRing>>,
+        #[cfg(forge_shared_terminal)] shared_active: Option<
+            Rc<super::shared_active::SharedActiveTerminal>,
+        >,
+    ) -> Self {
         let widget = gtk4::Box::new(Orientation::Vertical, 0);
         widget.add_css_class("block-active");
         if config.block_compact {
@@ -5156,17 +5152,28 @@ impl ActiveBlock {
         } else {
             None
         };
-        let active_vte = create_active_terminal(config);
-        if developer_header.is_some() {
-            super::developer_block::terminal_colors(&active_vte);
-        }
-        active_vte.set_hexpand(true);
-        active_vte.set_vexpand(false);
+        let create_legacy = || {
+            let terminal = create_active_terminal(config);
+            if developer_header.is_some() {
+                super::developer_block::terminal_colors(&terminal);
+            }
+            terminal.set_hexpand(true);
+            terminal.set_vexpand(false);
+            terminal
+        };
+        #[cfg(forge_shared_terminal)]
+        let active_vte = shared_active.is_none().then(create_legacy);
+        #[cfg(not(forge_shared_terminal))]
+        let active_vte = Some(create_legacy());
         let vte_overlay = gtk4::Overlay::new();
         vte_overlay.set_hexpand(true);
         vte_overlay.set_vexpand(false);
 
-        vte_overlay.set_child(Some(&active_vte));
+        vte_overlay.set_child(active_vte.as_ref());
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &shared_active {
+            vte_overlay.set_child(Some(&terminal.widget));
+        }
 
         let live_organism_surface = gtk4::Fixed::new();
         live_organism_surface.set_hexpand(true);
@@ -5209,8 +5216,12 @@ impl ActiveBlock {
         vte_overlay.set_measure_overlay(&unified_chrome_surface, false);
         vte_overlay.set_clip_overlay(&unified_chrome_surface, true);
 
-        let live_scrollbar =
-            gtk4::Scrollbar::new(Orientation::Vertical, active_vte.vadjustment().as_ref());
+        let adjustment = active_vte.as_ref().and_then(ScrollableExt::vadjustment);
+        #[cfg(forge_shared_terminal)]
+        let adjustment = shared_active
+            .as_ref()
+            .map_or(adjustment, |terminal| Some(terminal.scrollback().clone()));
+        let live_scrollbar = gtk4::Scrollbar::new(Orientation::Vertical, adjustment.as_ref());
         live_scrollbar.add_css_class("block-output-scrollbar");
         live_scrollbar.set_tooltip_text(Some("Scroll within the running output"));
         live_scrollbar.set_halign(gtk4::Align::End);
@@ -5261,9 +5272,9 @@ impl ActiveBlock {
         // Same adjustment-driven visibility as the finished-block scrollbar:
         // the adjustment is the one place that always knows whether the live
         // buffer has scrolled past the viewport.
-        if let Some(adj) = active_vte.vadjustment() {
+        if let (Some(adj), Some(terminal)) = (&adjustment, &active_vte) {
             let scrollbar = live_scrollbar.downgrade();
-            let terminal = active_vte.downgrade();
+            let terminal = terminal.downgrade();
             let clip = live_clip.downgrade();
             let sync_visibility = move |adj: &gtk4::Adjustment| {
                 let (Some(scrollbar), Some(terminal), Some(clip)) =
@@ -5274,27 +5285,29 @@ impl ActiveBlock {
                 let overflows = adj.upper() - adj.lower() > adj.page_size() + f64::EPSILON;
                 sync_live_scrollbar_visibility(&terminal, &scrollbar, &clip, overflows);
             };
-            sync_visibility(&adj);
+            sync_visibility(adj);
             adj.connect_changed(sync_visibility);
         }
 
         // `realize` is too early: the VTE's IM context does not have a mapped
         // surface yet. Taking logical focus there can suppress the real
         // focus-in fcitx/ibus need. `map` is the first valid point to focus.
-        let first_map = Cell::new(true);
-        active_vte.connect_map(move |terminal| {
-            if !(terminal.has_css_class("chat-live-terminal")
-                || terminal.has_css_class("docked-live-terminal"))
-                || first_map.replace(false)
-            {
-                crate::terminal::focus_terminal_without_viewport_reveal(terminal);
-            }
-        });
+        if let Some(terminal) = &active_vte {
+            let first_map = Cell::new(true);
+            terminal.connect_map(move |terminal| {
+                if !(terminal.has_css_class("chat-live-terminal")
+                    || terminal.has_css_class("docked-live-terminal"))
+                    || first_map.replace(false)
+                {
+                    crate::terminal::focus_terminal_without_viewport_reveal(terminal);
+                }
+            });
+        }
 
         ActiveBlock {
             widget,
             #[cfg(forge_shared_terminal)]
-            shared_active: None,
+            shared_active,
             active_vte,
             developer_header,
             vte_overlay,
@@ -5334,15 +5347,19 @@ impl ActiveBlock {
         )
     }
 
-    #[cfg(forge_shared_terminal)]
-    pub(super) fn attach_shared_active(
-        &mut self,
-        terminal: Rc<super::shared_active::SharedActiveTerminal>,
-    ) {
-        self.vte_overlay.set_child(Some(&terminal.widget));
-        self.live_scrollbar
-            .set_adjustment(Some(terminal.scrollback()));
-        self.shared_active = Some(terminal);
+    #[cfg(test)]
+    pub(super) fn new_legacy(config: &Config, raw_output: Rc<RefCell<BoundedByteRing>>) -> Self {
+        Self::new(
+            config,
+            raw_output,
+            #[cfg(forge_shared_terminal)]
+            None,
+        )
+    }
+
+    // Used only by paths that have already selected the legacy surface.
+    pub(super) fn legacy_surface(&self) -> &Terminal {
+        self.active_vte.as_ref().expect("legacy live terminal")
     }
 
     #[cfg(forge_shared_terminal)]
@@ -5418,7 +5435,9 @@ impl ActiveBlock {
         if let Some(terminal) = &self.shared_active {
             return Some(terminal.scrollback().clone());
         }
-        self.active_vte.vadjustment()
+        self.active_vte
+            .as_ref()
+            .and_then(ScrollableExt::vadjustment)
     }
 
     pub(super) fn focus_widget(&self) -> gtk4::Widget {
@@ -5426,7 +5445,7 @@ impl ActiveBlock {
         if let Some(terminal) = &self.shared_active {
             return terminal.screen().clone().upcast();
         }
-        self.active_vte.clone().upcast()
+        self.legacy_surface().clone().upcast()
     }
 
     /// The column count the live terminal is wrapping at — the single source of truth
@@ -5436,7 +5455,7 @@ impl ActiveBlock {
         if let Some(terminal) = &self.shared_active {
             return usize::from(terminal.grid_size().0).max(20);
         }
-        (self.active_vte.column_count().max(20)) as usize
+        self.legacy_surface().column_count().max(20) as usize
     }
 
     /// Give the live terminal a `grid_rows`-tall grid and show `visible_rows`
@@ -5463,23 +5482,23 @@ impl ActiveBlock {
         // width so Enter never reflows the physical grid, and never expand the
         // terminal beyond either real viewport. True window resizes reallocate
         // that anchor and therefore still change the grid normally.
-        let clip_width =
-            if self.active_vte.has_css_class("chat-live-terminal") && self.widget.width() > 0 {
-                clip_width.min(self.widget.width())
-            } else {
-                clip_width
-            };
-        let gutter = if self.active_vte.has_css_class("chat-live-terminal")
-            || self.active_vte.has_css_class("docked-live-terminal")
+        let terminal = self.legacy_surface();
+        let clip_width = if terminal.has_css_class("chat-live-terminal") && self.widget.width() > 0
         {
-            let overflows = self
-                .active_vte
+            clip_width.min(self.widget.width())
+        } else {
+            clip_width
+        };
+        let gutter = if terminal.has_css_class("chat-live-terminal")
+            || terminal.has_css_class("docked-live-terminal")
+        {
+            let overflows = terminal
                 .vadjustment()
                 .is_some_and(|adj| adj.upper() - adj.lower() > adj.page_size() + f64::EPSILON);
             // GTK's native natural width includes the current theme's CSS
             // margins; no fixed pixel constant or font-dependent guess.
             sync_live_scrollbar_visibility(
-                &self.active_vte,
+                terminal,
                 &self.live_scrollbar,
                 &self.live_clip,
                 overflows,
@@ -5488,7 +5507,7 @@ impl ActiveBlock {
             0
         };
         let width_px = clip_width.saturating_sub(gutter).max(0);
-        let insets = terminal_vertical_insets(&self.active_vte);
+        let insets = terminal_vertical_insets(terminal);
         let visible_px = live_rows_height_px(cell_h, visible_rows, insets);
         if width_px <= 0 {
             // Before the first allocation there is no width to hand out, but
@@ -5515,11 +5534,11 @@ impl ActiveBlock {
     #[cfg(test)]
     pub(super) fn test_tiny_chat_allocations(&self) -> Vec<serde_json::Value> {
         let original = (self.live_clip.width(), self.live_clip.height());
-        let rows = self.active_vte.row_count();
-        let cell = self.active_vte.char_height() as i32;
+        let rows = self.legacy_surface().row_count();
+        let cell = self.legacy_surface().char_height() as i32;
         let visible_rows = (original.1 / cell).max(1) as i64;
-        let wide_columns = self.active_vte.column_count();
-        let minimum = self.active_vte.measure(Orientation::Horizontal, -1).0;
+        let wide_columns = self.legacy_surface().column_count();
+        let minimum = self.legacy_surface().measure(Orientation::Horizontal, -1).0;
         let mut reports = Vec::new();
         // Drive GTK's actual child allocation directly: a normal toplevel may
         // enforce a larger minimum, which would make a tiny-window test vacuous.
@@ -5534,24 +5553,27 @@ impl ActiveBlock {
             let (requested, gutter) = chat_live_width_budget(width, minimum, natural);
             assert_eq!(self.vte_overlay.width_request(), requested);
             assert_eq!(self.live_geometry.get().0, requested);
-            let bounds = self.active_vte.compute_bounds(&self.live_clip).unwrap();
+            let bounds = self
+                .legacy_surface()
+                .compute_bounds(&self.live_clip)
+                .unwrap();
             assert!(bounds.width() <= requested.max(minimum) as f32 + 1e-6);
-            assert!(self.active_vte.column_count() > 0);
+            assert!(self.legacy_surface().column_count() > 0);
             if gutter == 0 {
                 assert_eq!(self.live_scrollbar.opacity(), 0.0);
                 assert!(!self.live_scrollbar.can_target());
                 assert!(!self.live_scrollbar.can_focus());
                 assert!(!self.live_scrollbar.grab_focus());
-                assert!(self.active_vte.column_count() < wide_columns);
+                assert!(self.legacy_surface().column_count() < wide_columns);
                 assert_eq!(self.live_clip.overflow(), gtk4::Overflow::Hidden);
             } else {
                 assert_eq!(width, original.0);
-                assert_eq!(self.active_vte.column_count(), wide_columns);
+                assert_eq!(self.legacy_surface().column_count(), wide_columns);
             }
             reports.push(serde_json::json!({
                 "clip_width": self.live_clip.width(), "request": requested,
                 "native_width": bounds.width(), "native_minimum": minimum,
-                "columns": self.active_vte.column_count(), "gutter": gutter,
+                "columns": self.legacy_surface().column_count(), "gutter": gutter,
                 "scope": "direct GTK child allocation; partial cells clipped at tiny widths"
             }));
         }
@@ -5630,10 +5652,8 @@ impl ActiveBlock {
                 terminal.widget.height().max(0),
             );
         }
-        (
-            self.active_vte.width().max(0),
-            self.active_vte.height().max(0),
-        )
+        let terminal = self.legacy_surface();
+        (terminal.width().max(0), terminal.height().max(0))
     }
 
     pub(super) fn live_cell_size(&self) -> (i32, i32) {
@@ -5642,10 +5662,8 @@ impl ActiveBlock {
             let (_, _, width, height) = terminal.cell_metrics();
             return (width, height);
         }
-        (
-            self.active_vte.char_width() as i32,
-            self.active_vte.char_height() as i32,
-        )
+        let terminal = self.legacy_surface();
+        (terminal.char_width() as i32, terminal.char_height() as i32)
     }
 
     #[cfg(forge_shared_terminal)]
@@ -5694,11 +5712,12 @@ impl ActiveBlock {
             terminal.output().reset_prompt(preserve_scrollback);
             return;
         }
+        let terminal = self.legacy_surface();
         if preserve_scrollback {
-            self.active_vte.feed(b"\x1b[0m");
+            terminal.feed(b"\x1b[0m");
         } else {
-            self.active_vte.reset(true, true);
-            self.active_vte.feed(b"\x1b[H\x1b[2J\x1b[3J");
+            terminal.reset(true, true);
+            terminal.feed(b"\x1b[H\x1b[2J\x1b[3J");
         }
     }
 
@@ -5946,12 +5965,12 @@ mod tests {
         use gtk4::prelude::*;
         use vte4::TerminalExt;
         gtk4::init().expect("gtk init");
-        let active = super::ActiveBlock::new(
+        let active = super::ActiveBlock::new_legacy(
             &crate::config::Config::safe_defaults(),
             Rc::new(RefCell::new(super::BoundedByteRing::new(1024))),
         );
-        active.active_vte.add_css_class("ssh-inset-fixture");
-        let display = gtk4::prelude::WidgetExt::display(&active.active_vte);
+        active.legacy_surface().add_css_class("ssh-inset-fixture");
+        let display = gtk4::prelude::WidgetExt::display(active.legacy_surface());
         let provider = gtk4::CssProvider::new();
         gtk4::style_context_add_provider_for_display(
             &display,
@@ -5977,19 +5996,19 @@ mod tests {
                 ".ssh-inset-fixture {{ padding: {padding}px; border: 0; margin: 0; }}"
             ));
             settle();
-            let insets = super::terminal_vertical_insets(&active.active_vte);
+            let insets = super::terminal_vertical_insets(active.legacy_surface());
             assert_eq!(insets, 2 * padding);
-            let cell_h = active.active_vte.char_height() as i32;
+            let cell_h = active.legacy_surface().char_height() as i32;
             for visible_rows in [6, 12, 24] {
                 active.set_live_geometry(cell_h, 24, visible_rows);
                 settle();
                 assert_eq!(
-                    active.active_vte.row_count(),
+                    active.legacy_surface().row_count(),
                     24,
                     "CSS must not create or remove a PTY grid row"
                 );
                 let origin = active
-                    .active_vte
+                    .legacy_surface()
                     .compute_point(&active.live_clip(), &gtk4::graphene::Point::new(0.0, 0.0))
                     .expect("shared clip ancestor");
                 assert!(
@@ -6684,7 +6703,7 @@ mod tests {
         // The live input cell carries density as a class; its height comes
         // from `BLOCK_ACTIVE_COMPACT_VCHROME_PX` via that class.
         let raw_output = Rc::new(RefCell::new(super::BoundedByteRing::new(1024)));
-        let live = super::ActiveBlock::new(&config, raw_output);
+        let live = super::ActiveBlock::new_legacy(&config, raw_output);
         assert!(!live.widget().has_css_class("block-compact"));
         live.set_compact(true);
         assert!(live.widget().has_css_class("block-compact"));

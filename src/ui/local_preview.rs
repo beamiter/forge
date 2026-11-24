@@ -55,7 +55,7 @@ fn host_owns_click(terminal: &vte4::Terminal) -> bool {
         if let Some(leaf) = PaneLeaf::from_widget(&widget) {
             return match leaf {
                 PaneLeaf::Block(view) => {
-                    view.vte() == terminal && view.host_owns_local_preview_click()
+                    view.legacy_terminal() == Some(terminal) && view.host_owns_local_preview_click()
                 }
                 _ => false, // VTE exposes no trusted mouse-mode query.
             };

@@ -1497,8 +1497,8 @@ impl TermView {
     fn live_find_stamp(&self) -> LiveFindStamp {
         LiveFindStamp {
             contents_generation: self.contents_generation.get(),
-            rows: self.active_vte.row_count(),
-            columns: self.active_vte.column_count(),
+            rows: self.render_backend.cursor_and_rows().1,
+            columns: self.render_backend.live_column_count(),
             origin: self.active.borrow().live_cursor_origin().get(),
         }
     }
@@ -1801,14 +1801,12 @@ impl TermView {
         };
         // VTE steps the still-running command's hits by native ordinal. Count
         // from its current-command range even if older scrollback is retained.
-        if !match_limited
-            && !scan_limited
-            && !completed_owns_live_surface
-            && running
-            && self.legacy_terminal().is_some()
+        if let Some(terminal) = self
+            .legacy_terminal()
+            .filter(|_| !match_limited && !scan_limited && !completed_owns_live_surface && running)
         {
             live_observed = true;
-            let live_rows = self.active_vte.vadjustment().map(|adjustment| {
+            let live_rows = terminal.vadjustment().map(|adjustment| {
                 let (view_row, from_row) = live_search_rows(
                     adjustment.lower(),
                     adjustment.upper(),
@@ -1825,24 +1823,22 @@ impl TermView {
                 if scan_budget.time_exhausted()
                     || live_dump_exceeds_budget(
                         upper - view_row as f64,
-                        self.active_vte.column_count(),
+                        terminal.column_count(),
                         scan_budget.remaining_bytes(),
                     )
                 {
                     return None;
                 }
-                let text = self
-                    .active_vte
+                let text = terminal
                     .text_range_format(
                         vte4::Format::Text,
                         from_row,
                         0,
                         upper as i64 - 1,
-                        self.active_vte.column_count(),
+                        terminal.column_count(),
                     )
                     .0?;
-                let skip =
-                    live_rows_skipped(&self.active_vte, &re, view_row, from_row, &mut scan_budget)?;
+                let skip = live_rows_skipped(terminal, &re, view_row, from_row, &mut scan_budget)?;
                 if skip >= FIND_MATCH_LIMIT {
                     return None;
                 }
@@ -1864,13 +1860,13 @@ impl TermView {
             };
             let live = bounded_match_count(&re, &live_text, FIND_MATCH_LIMIT.saturating_sub(total));
             if live.count > 0 {
-                self.active_vte.search_set_regex(Some(&vte_re), 0);
-                self.active_vte.search_set_wrap_around(false);
+                terminal.search_set_regex(Some(&vte_re), 0);
+                terminal.search_set_wrap_around(false);
                 if !highlighted_terminals
                     .iter()
-                    .any(|terminal| terminal == &self.active_vte)
+                    .any(|highlighted| highlighted == terminal)
                 {
-                    highlighted_terminals.push(self.active_vte.clone());
+                    highlighted_terminals.push(terminal.clone());
                 }
                 surfaces.push(FindSurface {
                     block_id: 0,
@@ -2088,7 +2084,7 @@ impl TermView {
         let weak = Rc::downgrade(&repair);
         let state = Rc::downgrade(&self.find_state);
         let blocks = Rc::downgrade(&self.finished_blocks);
-        let active_vte = self.active_vte.downgrade();
+        let active_vte = self.legacy_terminal().map(vte4::Terminal::downgrade);
         *repair.contents_handler.borrow_mut() =
             Some(terminal.connect_contents_changed(move |terminal| {
                 let Some(repair) = weak.upgrade() else {
@@ -2211,12 +2207,10 @@ impl TermView {
                     // Never leave a partial earlier occurrence painted while the
                     // counter still names the requested hit. The normal next
                     // user action can rebuild the retired pass.
-                    if let Some(active_vte) = active_vte.upgrade() {
-                        clear_find_state(&state, &active_vte);
-                        state.borrow_mut().invalidated = true;
-                    } else {
-                        terminal.unselect_all();
-                    }
+                    let active_vte = active_vte.as_ref().and_then(gtk4::glib::WeakRef::upgrade);
+                    clear_find_state(&state, active_vte.as_ref());
+                    terminal.unselect_all();
+                    state.borrow_mut().invalidated = true;
                     return;
                 }
                 let Ok(mut state) = state.try_borrow_mut() else {
@@ -2398,7 +2392,10 @@ impl TermView {
             }
         }
         let (vte, current_render_stamp) = if surface.is_live && surface.block_id == 0 {
-            (self.active_vte.clone(), None)
+            let Some(terminal) = self.legacy_terminal() else {
+                return FindFocusResult::Invalidated;
+            };
+            (terminal.clone(), None)
         } else {
             let Some(target) = self
                 .render_backend
@@ -2949,7 +2946,7 @@ impl TermView {
 
     /// Remove all find highlights and reset the find cursor (call on close).
     pub fn clear_find(&self) {
-        clear_find_state(self.find_state.as_ref(), &self.active_vte);
+        clear_find_state(self.find_state.as_ref(), self.legacy_terminal());
     }
 
     /// Stable ids of failed completed records (exit_code != 0).
@@ -3002,7 +2999,7 @@ pub(super) fn find_searches_blocks(state: super::BlockState) -> bool {
 
 pub(super) fn clear_find_state(
     find_state: &std::cell::RefCell<FindState>,
-    active_vte: &vte4::Terminal,
+    active_vte: Option<&vte4::Terminal>,
 ) {
     let state = std::mem::take(&mut *find_state.borrow_mut());
     #[cfg(forge_shared_terminal)]
@@ -3025,7 +3022,9 @@ pub(super) fn clear_find_state(
     }
     // The UI's no-record fallback installs a regex directly on the live VTE,
     // outside `FindState`; always clear it before a new structured pass too.
-    active_vte.search_set_regex(None::<&vte4::Regex>, 0);
+    if let Some(terminal) = active_vte {
+        terminal.search_set_regex(None::<&vte4::Regex>, 0);
+    }
 }
 
 /// Completion/reset changes the searched document while the user's Find bar
@@ -3033,14 +3032,14 @@ pub(super) fn clear_find_state(
 /// instead of falling through to a native search whose regex was just removed.
 pub(super) fn invalidate_live_find_state(
     find_state: &std::cell::RefCell<FindState>,
-    active_vte: &vte4::Terminal,
+    active_vte: Option<&vte4::Terminal>,
 ) {
     let active = {
         let state = find_state.borrow();
         state.query.is_some()
             || state.invalidated
             || state.live_stamp.is_some()
-            || active_vte.search_get_regex().is_some()
+            || active_vte.is_some_and(|terminal| terminal.search_get_regex().is_some())
     };
     clear_find_state(find_state, active_vte);
     find_state.borrow_mut().invalidated = active;

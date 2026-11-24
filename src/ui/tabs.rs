@@ -879,7 +879,7 @@ impl UiState {
                 let strip = strip_label.clone();
                 let custom = custom_title.clone();
                 let ui_for_bar = UiState::clone(self);
-                let terminal_for_pwd = view.vte().downgrade();
+                let view_for_pwd = Rc::downgrade(view);
                 view.connect_cwd_changed(move |dir| {
                     // The bottom bar follows the focused pane's cwd; repaint
                     // before the tab-title guards, which do not apply to it.
@@ -890,9 +890,9 @@ impl UiState {
                     if identity.widget_name() != expected_name || custom.get() {
                         return;
                     }
-                    let reported = terminal_for_pwd
+                    let reported = view_for_pwd
                         .upgrade()
-                        .and_then(|terminal| terminal.window_title())
+                        .and_then(|view| view.window_title())
                         .unwrap_or_default();
                     let title = jterm_core::title_bar::tab_label(
                         &reported,
@@ -2072,10 +2072,7 @@ impl UiState {
                             .zoom_state
                             .borrow()
                             .as_ref()
-                            .is_some_and(|state| {
-                                state.zoomed_terminal
-                                    == *term_view.vte().upcast_ref::<gtk4::Widget>()
-                            });
+                            .is_some_and(|state| state.zoomed_terminal == term_view.focus_widget());
                     if is_remote && !is_split {
                         ui_for_exit.handle_tab_exit(current_tab_num, status.code, &root);
                     } else {
@@ -2246,7 +2243,7 @@ impl UiState {
                 let identity_for_pwd = view_type.root_widget().downgrade();
                 let expected_name_for_pwd = format!("tab-{tab_num}");
                 let ui_for_bar = UiState::clone(self);
-                let terminal_for_pwd = term_view.vte().downgrade();
+                let view_for_pwd = Rc::downgrade(term_view);
                 term_view.connect_cwd_changed(move |dir| {
                     ui_for_bar.refresh_bottom_bar();
                     let Some(identity) = identity_for_pwd.upgrade() else {
@@ -2256,9 +2253,9 @@ impl UiState {
                     {
                         return;
                     }
-                    let reported = terminal_for_pwd
+                    let reported = view_for_pwd
                         .upgrade()
-                        .and_then(|terminal| terminal.window_title())
+                        .and_then(|view| view.window_title())
                         .unwrap_or_default();
                     let new_title = jterm_core::title_bar::tab_label(
                         &reported,

@@ -560,7 +560,7 @@ impl ChatPresentation {
         // the numeric value can change while the child's transform stays old.
         // Coalesce one idle after that stack returns; there is no polling tick.
         let reveal_pending = Rc::new(Cell::new(false));
-        let terminal = active.active_vte.downgrade();
+        let terminal = active.active_vte.as_ref().map(vte4::Terminal::downgrade);
         let editor = composer_viewport.downgrade();
         let reveal_editor: Rc<dyn Fn()> = Rc::new(move || {
             if reveal_pending.replace(true) {
@@ -571,7 +571,10 @@ impl ChatPresentation {
             let editor = editor.clone();
             glib::idle_add_local_once(move || {
                 pending.set(false);
-                if let (Some(terminal), Some(editor)) = (terminal.upgrade(), editor.upgrade()) {
+                if let (Some(terminal), Some(editor)) = (
+                    terminal.as_ref().and_then(glib::WeakRef::upgrade),
+                    editor.upgrade(),
+                ) {
                     if terminal.is_mapped() && terminal.is_ancestor(&editor) {
                         reveal_editor_caret(&terminal, &editor);
                     }
@@ -582,8 +585,10 @@ impl ChatPresentation {
         composer_viewport
             .vadjustment()
             .connect_changed(move |_| reveal());
-        let reveal = reveal_editor.clone();
-        active.active_vte.connect_cursor_moved(move |_| reveal());
+        if let Some(terminal) = &active.active_vte {
+            let reveal = reveal_editor.clone();
+            terminal.connect_cursor_moved(move |_| reveal());
+        }
         dock.append(&composer_viewport);
         let block_input_hint = if root.has_css_class("developer-block-canvas") {
             let hint = gtk4::Label::new(Some("Input belongs to the running command"));
@@ -597,7 +602,7 @@ impl ChatPresentation {
         } else {
             None
         };
-        let terminal = active.active_vte.downgrade();
+        let terminal = active.focus_widget().downgrade();
         let (controls, status) = crate::ui::reference_shell::composer_controls(move || {
             if let Some(terminal) = terminal.upgrade() {
                 terminal.grab_focus();
@@ -1362,8 +1367,9 @@ mod tests {
         use vte4::TerminalExt;
         gtk4::init().expect("gtk init");
         let config = crate::config::Config::safe_defaults();
-        let live = ActiveBlock::new(&config, Rc::new(RefCell::new(BoundedByteRing::new(1024))));
-        let terminal = live.active_vte.clone();
+        let live =
+            ActiveBlock::new_legacy(&config, Rc::new(RefCell::new(BoundedByteRing::new(1024))));
+        let terminal = live.legacy_surface().clone();
         terminal.add_css_class("chat-live-terminal");
         super::super::install_block_css(&config);
         let root = gtk4::Box::new(Orientation::Vertical, 0);
@@ -1380,7 +1386,8 @@ mod tests {
         chat.connect_resize(Rc::new(move || observed.set(observed.get() + 1)));
         let anchor: gtk4::Widget = live.widget().clone().upcast();
         let original_parent = anchor.parent();
-        let block = ActiveBlock::new(&config, Rc::new(RefCell::new(BoundedByteRing::new(1024))));
+        let block =
+            ActiveBlock::new_legacy(&config, Rc::new(RefCell::new(BoundedByteRing::new(1024))));
         let panes = gtk4::Box::new(Orientation::Horizontal, 0);
         panes.append(&root);
         panes.append(block.widget());
@@ -1432,9 +1439,9 @@ mod tests {
             Some(command.text().as_str())
         );
         live.set_live_geometry(terminal.char_height() as i32, 24, 3);
-        block.set_live_geometry(block.active_vte.char_height() as i32, 24, 3);
+        block.set_live_geometry(block.legacy_surface().char_height() as i32, 24, 3);
         settle();
-        assert!(block.active_vte.grab_focus());
+        assert!(block.legacy_surface().grab_focus());
         for surface in [
             ChatSurface::Prompt,
             ChatSurface::Running,
@@ -1460,12 +1467,12 @@ mod tests {
             }
             settle();
             assert!(
-                block.active_vte.has_focus(),
+                block.legacy_surface().has_focus(),
                 "mapped background Chat must not steal focus"
             );
             assert!(terminal.is_mapped());
             assert_eq!(anchor.parent(), original_parent);
-            assert_eq!(live.active_vte, terminal);
+            assert_eq!(live.legacy_surface(), &terminal);
             assert_eq!(
                 live.live_clip().parent().as_ref(),
                 Some(target.upcast_ref())

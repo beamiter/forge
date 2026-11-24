@@ -59,13 +59,13 @@ fn resize_reanchor_does_not_absorb_shell_side_prefill() {
         view.pty_resize_generation.get() > resize_epoch,
         "real native geometry must publish a new PTY resize epoch"
     );
-    assert_ne!(view.active_vte.row_count(), anchor_rows);
+    assert_ne!(view.vte().row_count(), anchor_rows);
     assert_eq!(view.prompt_end_pos.get(), anchor);
     assert_eq!(view.prompt_anchor_rows.get(), anchor_rows);
     assert_eq!(view.prompt_anchor_resize_generation.get(), resize_epoch);
     assert_eq!(view.command_prompt_status(), CommandPromptStatus::HasInput);
     assert_eq!(
-        view.active_vte
+        view.vte()
             .text_format(vte4::Format::Text)
             .unwrap()
             .matches("shell_prefill_keep")
@@ -100,7 +100,7 @@ fn block_dock_keeps_one_native_surface_and_physical_grid() {
     window.add_css_class("forge-window");
     window.add_css_class("reference-shell");
     window.present();
-    let native = view.active_vte.clone();
+    let native = view.vte().clone();
     let anchor = view.active.borrow().widget().clone();
     view.ftcs_seen.set(true);
 
@@ -137,8 +137,7 @@ fn block_dock_keeps_one_native_surface_and_physical_grid() {
                 .as_ref()
                 .unwrap()
                 .begin("native allocation fixture");
-            view.active_vte
-                .feed(b"actual native VTE fixture output\r\n");
+            view.vte().feed(b"actual native VTE fixture output\r\n");
         }
         view.render_backend.sync_geometry_to_pty();
         settle();
@@ -149,7 +148,7 @@ fn block_dock_keeps_one_native_surface_and_physical_grid() {
             same_window_grid = Some(grid);
         }
         assert_eq!(grid, pty_grid_size(&native, &view.block_scroll));
-        assert_eq!(view.active_vte, native);
+        assert_eq!(view.vte(), &native);
         assert!(!view.root.has_css_class("term-chat-root"));
         assert_eq!(anchor.parent().as_ref(), Some(view.block_list.upcast_ref()));
         let clip = view.active.borrow().live_clip();

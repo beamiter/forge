@@ -113,7 +113,7 @@ fn task_button_held_enter_never_submits_to_focused_terminal() {
             "xdotool must activate the native test window"
         );
         assert!(
-            view.active_vte.has_focus(),
+            view.vte().has_focus(),
             "the live VTE must actually receive focus"
         );
         if !bytes.is_empty() {

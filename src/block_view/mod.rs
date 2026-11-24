@@ -2091,7 +2091,10 @@ fn show_clipboard_failure(parent: &impl IsA<gtk4::Widget>, heading: &str, detail
     dialog.show(parent.as_ref());
 }
 
-fn publish_bounded_clipboard(terminal: &Terminal, text: Result<String, ClipboardTextTooLarge>) {
+fn publish_bounded_clipboard(
+    terminal: &impl IsA<gtk4::Widget>,
+    text: Result<String, ClipboardTextTooLarge>,
+) {
     match text {
         Ok(text) => terminal.clipboard().set_text(&text),
         Err(error) => {
@@ -3523,8 +3526,10 @@ fn clear_finished_block_selection(
     sync_finished_block_selection(finished, selected_block_ids, selected_block_id);
 }
 
-fn clear_vte_text_selections(finished: &[FinishedBlock], active_vte: &Terminal) {
-    active_vte.unselect_all();
+fn clear_text_selections(finished: &[FinishedBlock], active: &gtk4::Widget) {
+    if let Some(surface) = TerminalTextSurface::from_widget(active.clone()) {
+        surface.clear_selection();
+    }
     for block in finished {
         if let Some(command) = block.command_surface() {
             command.clear_selection();
@@ -3966,7 +3971,7 @@ fn delete_finished_blocks(
     block_data: &Rc<RefCell<VecDeque<BlockData>>>,
     block_list: &gtk4::Box,
     find_state: &Rc<RefCell<FindState>>,
-    active_vte: &Terminal,
+    active_vte: Option<&Terminal>,
     refs: BlockRemovalRefs<'_>,
 ) -> Option<u64> {
     // Snapshot before removing: `remove_finished_block` drops the metadata, and
@@ -4132,7 +4137,7 @@ fn remove_finished_block(
     block_data: &Rc<RefCell<VecDeque<BlockData>>>,
     block_list: &gtk4::Box,
     find_state: &Rc<RefCell<FindState>>,
-    active_vte: &Terminal,
+    active_vte: Option<&Terminal>,
     refs: BlockRemovalRefs<'_>,
 ) -> Option<u64> {
     if !finished_blocks
@@ -4319,6 +4324,10 @@ fn popdown_if_alive(popover: &glib::WeakRef<gtk4::Popover>) {
 }
 
 impl BlockBackend {
+    fn legacy_surface(&self) -> &Terminal {
+        self.active_vte.as_ref().expect("legacy live terminal")
+    }
+
     /// Install the right-click context menu on a finished block.
     ///
     /// Reached from the live-finalize path directly and from the two rebuild
@@ -4342,7 +4351,7 @@ impl BlockBackend {
         // the expected case.
         let finished_blocks_for_menu = Rc::downgrade(&self.finished_blocks_for_cb);
         let block_list_for_menu = self.block_list_rc.downgrade();
-        let vte_for_copy = self.active_vte.downgrade();
+        let live_for_menu = self.active_rc.borrow().focus_widget().downgrade();
         let active_for_rerun_menu = Rc::downgrade(&self.active_rc);
         let bracketed_paste_for_menu = self.bracketed_paste_rc.clone();
         let verified_submission_for_menu = self.verified_submission_for_rerun.clone();
@@ -4385,7 +4394,7 @@ impl BlockBackend {
             let selected = selected_ids_for_menu.clone();
             let active = selected_for_menu.clone();
             let anchor = anchor_for_menu.clone();
-            let live = vte_for_copy.clone();
+            let live = live_for_menu.clone();
             Rc::new(move || {
                 if let Some(window) = slot.borrow().upgrade() {
                     window.present();
@@ -4436,7 +4445,7 @@ impl BlockBackend {
             let Some(finished_blocks) = finished_blocks_for_menu.upgrade() else {
                 return;
             };
-            let Some(vte_for_copy) = vte_for_copy.upgrade() else {
+            let Some(live_for_menu) = live_for_menu.upgrade() else {
                 return;
             };
             let Some(finished_widget) = finished_widget_for_menu.upgrade() else {
@@ -4459,7 +4468,7 @@ impl BlockBackend {
             }
             {
                 let finished = finished_blocks.borrow();
-                clear_vte_text_selections(&finished, &vte_for_copy);
+                clear_text_selections(&finished, &live_for_menu);
                 activate_finished_block_selection(
                     &finished,
                     &selected_ids_for_menu,
@@ -4543,7 +4552,7 @@ impl BlockBackend {
                 let popover_c = popover.downgrade();
                 let block_data_for_copy = block_data_for_export.clone();
                 let selected_ids_for_copy = selected_ids_for_menu.clone();
-                let vte_for_action = vte_for_copy.downgrade();
+                let vte_for_action = live_for_menu.downgrade();
                 item.connect_clicked(move |_| {
                     popdown_if_alive(&popover_c);
                     let Some(vte_for_action) = vte_for_action.upgrade() else {
@@ -4675,7 +4684,7 @@ impl BlockBackend {
                     let selected_for_retry = selected_for_menu.clone();
                     let anchor_for_retry = anchor_for_menu.clone();
                     let active_for_retry = active_for_rerun_menu.clone();
-                    let vte_for_retry = vte_for_copy.downgrade();
+                    let vte_for_retry = live_for_menu.downgrade();
                     let clicked_cmd_for_retry = clicked_cmd.clone();
                     item.connect_clicked(move |_| {
                         popdown_if_alive(&popover_c);
@@ -4772,7 +4781,7 @@ impl BlockBackend {
                 let popover_c = popover.downgrade();
                 let block_data_for_copy = block_data_for_export.clone();
                 let selected_ids_for_copy = selected_ids_for_menu.clone();
-                let vte_for_action = vte_for_copy.downgrade();
+                let vte_for_action = live_for_menu.downgrade();
                 item.connect_clicked(move |_| {
                     popdown_if_alive(&popover_c);
                     let Some(vte_for_action) = vte_for_action.upgrade() else {
@@ -4798,7 +4807,7 @@ impl BlockBackend {
                 let popover_c = popover.downgrade();
                 let block_data_for_copy = block_data_for_export.clone();
                 let selected_ids_for_copy = selected_ids_for_menu.clone();
-                let vte_for_action = vte_for_copy.downgrade();
+                let vte_for_action = live_for_menu.downgrade();
                 item.connect_clicked(move |_| {
                     popdown_if_alive(&popover_c);
                     let Some(vte_for_action) = vte_for_action.upgrade() else {
@@ -4824,7 +4833,7 @@ impl BlockBackend {
                 let popover_c = popover.downgrade();
                 let block_data_for_copy = block_data_for_export.clone();
                 let selected_ids_for_copy = selected_ids_for_menu.clone();
-                let vte_for_action = vte_for_copy.downgrade();
+                let vte_for_action = live_for_menu.downgrade();
                 item.connect_clicked(move |_| {
                     popdown_if_alive(&popover_c);
                     let Some(vte_for_action) = vte_for_action.upgrade() else {
@@ -4917,7 +4926,7 @@ impl BlockBackend {
                 let verified_submission_for_run = verified_submission_for_menu.clone();
                 let config_for_run = config_for_menu.clone();
                 let active_for_run = active_for_rerun_menu.clone();
-                let error_bell_for_run = vte_for_copy.downgrade();
+                let error_bell_for_run = live_for_menu.downgrade();
                 let block_data_for_run = block_data_for_export.clone();
                 let command = finished_blocks_for_menu.upgrade().and_then(|finished| {
                     finished
@@ -5138,7 +5147,7 @@ impl BlockBackend {
                 let item = make_item("Export as JSON");
                 let popover_c = popover.downgrade();
                 let block_data_for_json = block_data_for_export.clone();
-                let vte_for_json = vte_for_copy.downgrade();
+                let vte_for_json = live_for_menu.downgrade();
                 let block_id_json = block_id;
                 item.connect_clicked(move |_| {
                     popdown_if_alive(&popover_c);
@@ -5158,7 +5167,7 @@ impl BlockBackend {
                 let item = make_item("Export as Markdown");
                 let popover_c = popover.downgrade();
                 let block_data_for_md = block_data_for_export.clone();
-                let vte_for_md = vte_for_copy.downgrade();
+                let vte_for_md = live_for_menu.downgrade();
                 let block_id_md = block_id;
                 item.connect_clicked(move |_| {
                     popdown_if_alive(&popover_c);
@@ -5186,7 +5195,7 @@ impl BlockBackend {
                 let visible_for_delete = visible_for_menu.clone();
                 let failure_marker_redraw_for_delete = failure_marker_redraw_for_menu.clone();
                 let find_state_for_delete = find_state_for_menu.clone();
-                let active_vte_for_delete = vte_for_copy.clone();
+                let terminal_for_delete = live_for_menu.downgrade();
                 let removed_blocks_for_delete = removed_blocks_for_menu.clone();
                 let block_id_del = block_id;
                 item.connect_clicked(move |_| {
@@ -5197,6 +5206,7 @@ impl BlockBackend {
                     ) else {
                         return;
                     };
+                    let terminal = terminal_for_delete.upgrade();
                     let _ = delete_finished_blocks(
                         &[block_id_del],
                         &removed_blocks_for_delete,
@@ -5204,7 +5214,9 @@ impl BlockBackend {
                         &block_data_for_delete,
                         &block_list_for_delete,
                         &find_state_for_delete,
-                        &active_vte_for_delete,
+                        terminal
+                            .as_ref()
+                            .and_then(|widget| widget.downcast_ref::<Terminal>()),
                         BlockRemovalRefs {
                             selection: BlockSelectionRefs {
                                 ids: &selected_ids_for_delete,
@@ -6391,7 +6403,7 @@ pub struct TermView {
     unread_count: Rc<Cell<u32>>,
     /// The single persistent live VTE (anvil model): prompt + typing + output all
     /// render here natively; finished commands snapshot into styled blocks above.
-    active_vte: Terminal,
+    active_vte: Option<Terminal>,
     /// Existing native contents clock, shared with prompt/layout observation.
     /// Search reads it; selection and scrolling never advance it.
     contents_generation: Rc<Cell<u64>>,
@@ -7785,7 +7797,7 @@ struct BlockBackend {
     menu_keybindings: shortcut_hints::MenuKeybindings,
     active_rc: Rc<RefCell<ActiveBlock>>,
     /// The live VTE — every byte is fed here; alt-screen toggles feed it 1049h/l.
-    active_vte: Terminal,
+    active_vte: Option<Terminal>,
     #[cfg(forge_shared_terminal)]
     shared_active: Option<Rc<shared_active::SharedActiveTerminal>>,
     block_list_rc: gtk4::Box,
@@ -9848,7 +9860,7 @@ impl DeferredLiveFocus {
 
     /// Clipboard requests may originate on this pane's completed history or
     /// its child menu. An unrelated search entry/pane grants no focus authority.
-    fn for_paste(target: &Terminal, pane: &gtk4::Box) -> Option<Self> {
+    fn for_paste(target: &gtk4::Widget, pane: &gtk4::Box) -> Option<Self> {
         let window = target.root().and_downcast::<gtk4::Window>()?;
         let owner = GtkWindowExt::focus(&window)?;
         if !target.is_mapped()
@@ -9946,7 +9958,9 @@ impl RenderBackend for BlockBackend {
     }
 
     fn feed_legacy(&self, bytes: &[u8]) {
-        self.active_vte.feed(bytes);
+        if let Some(terminal) = &self.active_vte {
+            terminal.feed(bytes);
+        }
     }
 
     fn install_block_context_menu(
@@ -9980,12 +9994,7 @@ impl RenderBackend for BlockBackend {
     /// output, or the find box — was interrupted whenever any other pane's
     /// shell reached a prompt.
     fn focus_live_deferred(&self) {
-        #[cfg(forge_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            restore_live_focus_deferred(terminal.screen());
-            return;
-        }
-        restore_live_focus_deferred(&self.active_vte);
+        restore_live_focus_deferred(&self.active_rc.borrow().focus_widget());
     }
 
     fn sync_geometry_to_pty(&self) {
@@ -9999,7 +10008,7 @@ impl RenderBackend for BlockBackend {
         }
         sync_active_to_pty(
             &self.layout_active_surface,
-            &self.active_vte,
+            self.legacy_surface(),
             &self.block_scroll_rc,
             &self.pty_for_init,
             &self.pty_winsize,
@@ -10392,7 +10401,7 @@ impl RenderBackend for BlockBackend {
             return;
         }
         schedule_anchor_settle_on(
-            &self.active_vte,
+            self.legacy_surface(),
             &self.prompt_anchor_tick_id_rc,
             Rc::new(|vte, bytes| vte.feed(bytes)),
             args,
@@ -10404,13 +10413,15 @@ impl RenderBackend for BlockBackend {
         if let Some(terminal) = &self.shared_active {
             return (terminal.cursor_position(), terminal.row_count());
         }
-        (
-            self.active_vte.cursor_position(),
-            self.active_vte.row_count(),
-        )
+        let terminal = self.legacy_surface();
+        (terminal.cursor_position(), terminal.row_count())
     }
 
     fn cursor_position_report(&self) -> (i64, i64) {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            return terminal.cursor_position();
+        }
         // Never turned into a reply: this backend leaves DSR 6 to the live VTE
         // (`live_surface_answers_query`), which answers in screen rows and in
         // stream order. The ring row here is NOT screen-relative and must not
@@ -10419,7 +10430,7 @@ impl RenderBackend for BlockBackend {
         // adjustment is no fix on libvte 0.76 either: that adjustment is
         // ring-relative (lower 0, value 0 with the cursor on ring row 188), so
         // `screen_relative_cpr_row(row, adj.value())` clamps to the last row.
-        self.active_vte.cursor_position()
+        self.legacy_surface().cursor_position()
     }
 
     fn live_surface_answers_query(&self, query: KeyboardProtocolQuery) -> bool {
@@ -10446,14 +10457,14 @@ impl RenderBackend for BlockBackend {
         if let Some(terminal) = &self.shared_active {
             return terminal.prompt_anchor(provisional, anchor_rows);
         }
-        let rows = self.active_vte.row_count();
+        let rows = self.legacy_surface().row_count();
         let anchor = prompt_anchor_for_surface(
             self.rebase_prompt_on_row_delta,
             provisional,
             anchor_rows,
             rows,
         );
-        log::debug!("command anchor: row_delta={} provisional={provisional:?} recorded_rows={anchor_rows} current_rows={rows} cursor={:?} resolved={anchor:?}", self.rebase_prompt_on_row_delta, self.active_vte.cursor_position());
+        log::debug!("command anchor: row_delta={} provisional={provisional:?} recorded_rows={anchor_rows} current_rows={rows} cursor={:?} resolved={anchor:?}", self.rebase_prompt_on_row_delta, self.legacy_surface().cursor_position());
         anchor
     }
 
@@ -10466,7 +10477,7 @@ impl RenderBackend for BlockBackend {
         if let Some(terminal) = &self.shared_active {
             return i64::from(terminal.grid_size().0);
         }
-        self.active_vte.column_count()
+        self.legacy_surface().column_count()
     }
 
     fn capture_text_range(
@@ -10480,7 +10491,13 @@ impl RenderBackend for BlockBackend {
         if let Some(terminal) = &self.shared_active {
             return terminal.capture((start_col, start_row), (end_col, end_row));
         }
-        capture_vte_text_range(&self.active_vte, start_row, start_col, end_row, end_col)
+        capture_vte_text_range(
+            self.legacy_surface(),
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+        )
     }
 
     /// Mount a finished command as a history block and reset the live surface.
@@ -10592,7 +10609,7 @@ impl RenderBackend for BlockBackend {
             // on every finalize, as this used to, dropped an active find each
             // time a background loop completed a command — which at the default
             // 200-block cap is every finalize that evicts nothing, i.e. most.
-            find::clear_find_state(self.find_state_for_cb.as_ref(), &self.active_vte);
+            find::clear_find_state(self.find_state_for_cb.as_ref(), self.active_vte.as_ref());
         }
         evict_finished_block_prefix(
             prebuild_retention_plan.evict_prefix,
@@ -10697,7 +10714,6 @@ impl RenderBackend for BlockBackend {
         let finished_widget = finished_clone.widget().clone();
 
         finished_clone.connect_actions(
-            &self.active_vte,
             &self.verified_submission_for_rerun,
             &self.config_for_cb,
             &self.active_rc,
@@ -10786,7 +10802,7 @@ impl RenderBackend for BlockBackend {
         if retention_plan.evict_prefix > 0 {
             // Same pairing as the pre-build pass: a card destroyed here may be
             // the one holding a highlight handle.
-            find::clear_find_state(self.find_state_for_cb.as_ref(), &self.active_vte);
+            find::clear_find_state(self.find_state_for_cb.as_ref(), self.active_vte.as_ref());
         }
         evict_finished_block_prefix(
             retention_plan.evict_prefix,
@@ -11263,7 +11279,7 @@ struct UnifiedBackend {
     #[cfg(forge_shared_terminal)]
     shared_active: Option<Rc<shared_active::SharedActiveTerminal>>,
     /// The native surface for panes using the legacy renderer.
-    vte: Terminal,
+    legacy: Option<LegacyUnifiedSurface>,
     /// The live holder around that surface. Its block chrome is inert in this
     /// mode, but it also owns the ASCII organism's live-body overlay, which is
     /// drawn *over* the terminal and is the organism's only surface here — so
@@ -11296,6 +11312,13 @@ struct UnifiedBackend {
     /// Pane-local runtime bookmark state shared with TermView and the picker.
     /// Only record-table retirement prunes ids; snapshot/chrome eviction does not.
     bookmarks: SharedBookmarks,
+    kitty_assembler: RefCell<kitty_graphics::Assembler>,
+    /// Decoded result parked until the engine has written the protocol reply.
+    kitty_pending_admission: RefCell<Option<PendingUnifiedImage>>,
+}
+
+struct LegacyUnifiedSurface {
+    vte: Terminal,
     /// Per-pane, fail-closed marker state. Its bytes are fed directly to VTE
     /// inside this backend, so they never enter prompt/command/output capture.
     zone_marker: Rc<RefCell<ZoneMarkerInjector>>,
@@ -11310,18 +11333,20 @@ struct UnifiedBackend {
     /// dropping this backend therefore breaks the chain and releases VTE,
     /// Fixed, textures and their retained pixel budget together.
     _image_layer_slot_owner: Rc<RefCell<Option<unified_images::UnifiedImageLayer>>>,
-    kitty_assembler: RefCell<kitty_graphics::Assembler>,
-    /// Decoded result parked until the engine has written the protocol reply.
-    kitty_pending_admission: RefCell<Option<PendingUnifiedImage>>,
 }
 
 impl UnifiedBackend {
+    // The caller has already dispatched to the shared transcript if present.
+    fn legacy_surface(&self) -> &LegacyUnifiedSurface {
+        self.legacy.as_ref().expect("legacy Unified terminal")
+    }
+
     fn kitty_cursor(&self) -> (i64, i64) {
         #[cfg(forge_shared_terminal)]
         if let Some(terminal) = &self.shared_active {
             return terminal.kitty_cursor().unwrap_or((-1, -1));
         }
-        self.vte.cursor_position()
+        self.legacy_surface().vte.cursor_position()
     }
 
     fn prepare_inline_image(
@@ -11336,7 +11361,8 @@ impl UnifiedBackend {
                 .prepare_inline_image(texture, encoded_source_bytes, requested?)
                 .map(PendingUnifiedImage::Shared);
         }
-        self.image_layer
+        self.legacy_surface()
+            .image_layer
             .prepare(texture, encoded_source_bytes, requested)
             .map(PendingUnifiedImage::Vte)
     }
@@ -11375,17 +11401,22 @@ impl UnifiedBackend {
             transcript.end_output(Some(record.id), _max_zones);
             return;
         }
-        self.chrome.begin_zone(record.id, &self.vte);
-        self.zone_marker.borrow_mut().begin_zone(record.id);
+        let legacy = self.legacy_surface();
+        legacy.chrome.begin_zone(record.id, &legacy.vte);
+        legacy.zone_marker.borrow_mut().begin_zone(record.id);
         self.feed_legacy(&zone_history::replay_bytes(record, text, truncated));
-        self.zone_marker.borrow_mut().close_zone(Some(record.id));
-        self.vte.feed(ZONE_MARKER_CLOSE);
+        legacy.zone_marker.borrow_mut().close_zone(Some(record.id));
+        legacy.vte.feed(ZONE_MARKER_CLOSE);
     }
 }
 
 impl RenderBackend for UnifiedBackend {
     fn feed_legacy(&self, bytes: &[u8]) {
-        feed_vte_with_zone_marker(&self.vte, &self.zone_marker, bytes);
+        feed_vte_with_zone_marker(
+            &self.legacy_surface().vte,
+            &self.legacy_surface().zone_marker,
+            bytes,
+        );
     }
 
     fn begin_prompt_zone(&self, zone_id: u64) {
@@ -11397,16 +11428,18 @@ impl RenderBackend for UnifiedBackend {
         // Capture the pre-marker cursor row. Chrome does not infer a mapping
         // from cursor-to-grid slack; a later visible canonical marker proves
         // the exact adjustment→ring projection or drawing remains hidden.
-        self.chrome.begin_zone(zone_id, &self.vte);
-        self.chrome
+        let legacy = self.legacy_surface();
+        legacy.chrome.begin_zone(zone_id, &legacy.vte);
+        legacy
+            .chrome
             .enforce_limit(self.config_for_cb.borrow().max_visible_blocks as usize);
         let open = {
-            let mut marker = self.zone_marker.borrow_mut();
+            let mut marker = legacy.zone_marker.borrow_mut();
             marker.begin_zone(zone_id);
             marker.open_bytes()
         };
         if let Some(open) = open {
-            self.vte.feed(&open);
+            legacy.vte.feed(&open);
         }
     }
 
@@ -11441,24 +11474,29 @@ impl RenderBackend for UnifiedBackend {
             transcript.begin_output(zone_id);
             return;
         }
-        self.zone_marker.borrow_mut().close_zone(zone_id);
+        let legacy = self.legacy_surface();
+        legacy.zone_marker.borrow_mut().close_zone(zone_id);
         // Close unconditionally on every accepted C. Besides ending our own
         // marker, this prevents a guest PS1 OSC 8 from leaking into command
         // output when marker generation was disabled or phases drifted.
-        self.vte.feed(ZONE_MARKER_CLOSE);
+        legacy.vte.feed(ZONE_MARKER_CLOSE);
     }
 
     fn erase_scrollback(&self) {
-        self.chrome.erase_scrollback(&self.vte);
-        self.image_layer.set_row_epoch(self.chrome.row_epoch());
+        if let Some(legacy) = &self.legacy {
+            legacy.chrome.erase_scrollback(&legacy.vte);
+            legacy.image_layer.set_row_epoch(legacy.chrome.row_epoch());
+        }
     }
 
     fn erase_display(&self) {
-        self.chrome.erase_display();
         self.kitty_assembler.borrow_mut().reset();
         self.kitty_pending_admission.borrow_mut().take();
-        self.image_layer.hard_reset();
-        self.image_layer.set_row_epoch(self.chrome.row_epoch());
+        if let Some(legacy) = &self.legacy {
+            legacy.chrome.erase_display();
+            legacy.image_layer.hard_reset();
+            legacy.image_layer.set_row_epoch(legacy.chrome.row_epoch());
+        }
     }
 
     fn hard_reset(&self) {
@@ -11468,13 +11506,18 @@ impl RenderBackend for UnifiedBackend {
         // metadata and output snapshots remain in `zones` for export/filter/
         // history palettes: snapshots come from the byte stream, not the
         // ring, so a reset cannot resurrect anything through them.
-        self.zone_marker.borrow_mut().close_zone(None);
-        self.chrome.clear_authority();
-        find::invalidate_live_find_state(self.find_state_for_cb.as_ref(), &self.vte);
+        find::invalidate_live_find_state(
+            self.find_state_for_cb.as_ref(),
+            self.legacy.as_ref().map(|legacy| &legacy.vte),
+        );
         self.kitty_assembler.borrow_mut().reset();
         self.kitty_pending_admission.borrow_mut().take();
-        self.image_layer.hard_reset();
-        self.image_layer.set_row_epoch(self.chrome.row_epoch());
+        if let Some(legacy) = &self.legacy {
+            legacy.zone_marker.borrow_mut().close_zone(None);
+            legacy.chrome.clear_authority();
+            legacy.image_layer.hard_reset();
+            legacy.image_layer.set_row_epoch(legacy.chrome.row_epoch());
+        }
     }
 
     /// Intentionally does NOT clear the screen — that per-prompt reset is
@@ -11512,7 +11555,7 @@ impl RenderBackend for UnifiedBackend {
         }
         sync_active_to_pty(
             &self.layout_active_surface,
-            &self.vte,
+            &self.legacy_surface().vte,
             &self.block_scroll_rc,
             &self.pty_for_init,
             &self.pty_winsize,
@@ -11543,14 +11586,18 @@ impl RenderBackend for UnifiedBackend {
         }
         // Chrome only answers with a row it proved at the current epoch; any
         // doubt is `None` and this jump honestly fails.
-        let Some(value) = self.chrome.proven_zone_scroll_value(&self.vte, block_id) else {
+        let legacy = self.legacy_surface();
+        let Some(value) = legacy
+            .chrome
+            .proven_zone_scroll_value(&legacy.vte, block_id)
+        else {
             return false;
         };
-        let Some(adjustment) = self.vte.vadjustment() else {
+        let Some(adjustment) = legacy.vte.vadjustment() else {
             return false;
         };
         adjustment.set_value(value);
-        self.vte.grab_focus();
+        legacy.vte.grab_focus();
         true
     }
 
@@ -11561,8 +11608,10 @@ impl RenderBackend for UnifiedBackend {
         }
         // The same proof, read only: a search hit is labelled reachable
         // exactly when chrome can already name the row it would scroll to.
-        self.chrome
-            .proven_zone_scroll_value(&self.vte, block_id)
+        let legacy = self.legacy_surface();
+        legacy
+            .chrome
+            .proven_zone_scroll_value(&legacy.vte, block_id)
             .is_some()
     }
 
@@ -11571,7 +11620,9 @@ impl RenderBackend for UnifiedBackend {
         if let Some(transcript) = self.transcript() {
             return transcript.zone_scroll_row(block_id).map(|row| row as f64);
         }
-        self.chrome.proven_zone_scroll_value(&self.vte, block_id)
+        self.legacy_surface()
+            .chrome
+            .proven_zone_scroll_value(&self.legacy_surface().vte, block_id)
     }
 
     fn completed_search_surfaces(
@@ -11587,12 +11638,13 @@ impl RenderBackend for UnifiedBackend {
                 native_fallback: None,
             };
         }
+        let legacy = self.legacy_surface();
         let native_fallback = || BackendNativeSearchFallback {
             block_id: 0,
             block_index: 0,
             is_output: true,
             is_live: true,
-            terminal: self.vte.clone(),
+            terminal: legacy.vte.clone(),
         };
         if max_bytes == 0 || deadline_exhausted() {
             return BackendSearchBatch {
@@ -11606,15 +11658,15 @@ impl RenderBackend for UnifiedBackend {
         // chrome proved at a coherent bottom-boundary epoch; reset, rewrap or
         // natural eviction clears it first. Treat unknown bounds as a partial
         // scan instead of asking VTE for a reused/stale row number.
-        let Some(bounds) = self.chrome.trusted_ring_bounds(&self.vte) else {
+        let Some(bounds) = legacy.chrome.trusted_ring_bounds(&legacy.vte) else {
             return BackendSearchBatch {
                 surfaces: Vec::new(),
                 incomplete: true,
                 native_fallback: Some(native_fallback()),
             };
         };
-        let (cursor_col, _cursor_row) = self.vte.cursor_position();
-        let columns = self.vte.column_count().max(cursor_col).max(1);
+        let (cursor_col, _cursor_row) = legacy.vte.cursor_position();
+        let columns = legacy.vte.column_count().max(cursor_col).max(1);
         let started = std::time::Instant::now();
         let captured_windows = {
             let capture_deadline_exhausted =
@@ -11627,7 +11679,13 @@ impl RenderBackend for UnifiedBackend {
                 max_bytes,
                 capture_deadline_exhausted,
                 |span| {
-                    capture_vte_text_range(&self.vte, span.start_row, 0, span.end_row, span.end_col)
+                    capture_vte_text_range(
+                        &legacy.vte,
+                        span.start_row,
+                        0,
+                        span.end_row,
+                        span.end_col,
+                    )
                 },
             )
         };
@@ -11680,7 +11738,7 @@ impl RenderBackend for UnifiedBackend {
                 windows,
                 scanned_bytes,
                 reset_cursor: true,
-                presentation: TerminalTextSurface::Native(self.vte.clone()),
+                presentation: TerminalTextSurface::Native(legacy.vte.clone()),
                 // Unified has one persistent surface with no per-record
                 // snapshot to re-feed, so it reports the neutral stamp and its
                 // cursor is never invalidated by this check.
@@ -11716,14 +11774,17 @@ impl RenderBackend for UnifiedBackend {
             let id = next_block_id();
             let (record, snapshot) = zone.into_live(id);
             self.replay_zone_contents(&record, snapshot.as_ref(), max_zones);
-            self.chrome
-                .record_completed(unified_chrome::ZoneChromeRecord {
-                    id: record.id,
-                    exit_code: record.exit_code,
-                    duration_ms: record.duration_ms,
-                    is_background: record.is_background,
-                    lifecycle_health: record.lifecycle_health(),
-                });
+            if let Some(legacy) = &self.legacy {
+                legacy
+                    .chrome
+                    .record_completed(unified_chrome::ZoneChromeRecord {
+                        id: record.id,
+                        exit_code: record.exit_code,
+                        duration_ms: record.duration_ms,
+                        is_background: record.is_background,
+                        lifecycle_health: record.lifecycle_health(),
+                    });
+            }
             {
                 let mut store = self.zones.borrow_mut();
                 let retired = record_unified_zone(&mut store, record, max_zones);
@@ -11737,11 +11798,15 @@ impl RenderBackend for UnifiedBackend {
                 if let Some(transcript) = self.transcript() {
                     transcript.retire(&retired);
                 }
-                self.chrome.retire_ids(&retired);
+                if let Some(legacy) = &self.legacy {
+                    legacy.chrome.retire_ids(&retired);
+                }
             }
             restored += 1;
         }
-        self.chrome.enforce_limit(max_zones);
+        if let Some(legacy) = &self.legacy {
+            legacy.chrome.enforce_limit(max_zones);
+        }
         restored
     }
 
@@ -11767,7 +11832,7 @@ impl RenderBackend for UnifiedBackend {
             adj.set_value((adj.value() + f64::from(lines)).clamp(adj.lower(), bottom));
             return true;
         }
-        let Some(adj) = self.vte.vadjustment() else {
+        let Some(adj) = self.legacy_surface().vte.vadjustment() else {
             return true;
         };
         let step = adj.step_increment().max(1.0);
@@ -11811,7 +11876,10 @@ impl RenderBackend for UnifiedBackend {
         record: &CompletedCommandRecord,
         payload: &dyn BlockRenderPayloadAccessor,
     ) {
-        find::invalidate_live_find_state(self.find_state_for_cb.as_ref(), &self.vte);
+        find::invalidate_live_find_state(
+            self.find_state_for_cb.as_ref(),
+            self.legacy.as_ref().map(|legacy| &legacy.vte),
+        );
         let max_zones = self.config_for_cb.borrow().max_visible_blocks as usize;
         // The engine keeps the raw ring alive through the whole finalize
         // fan-out, so this bounded read still sees the command's bytes.
@@ -11830,16 +11898,19 @@ impl RenderBackend for UnifiedBackend {
         if let Some(transcript) = self.transcript() {
             transcript.retire(&retired_record_ids);
         }
-        self.chrome.retire_ids(&retired_record_ids);
-        self.chrome.enforce_limit(max_zones);
-        self.chrome
-            .record_completed(unified_chrome::ZoneChromeRecord {
-                id: record.id,
-                exit_code: record.exit_code,
-                duration_ms: record.duration_ms,
-                is_background: record.is_background,
-                lifecycle_health: record.lifecycle_health(),
-            });
+        if let Some(legacy) = &self.legacy {
+            legacy.chrome.retire_ids(&retired_record_ids);
+            legacy.chrome.enforce_limit(max_zones);
+            legacy
+                .chrome
+                .record_completed(unified_chrome::ZoneChromeRecord {
+                    id: record.id,
+                    exit_code: record.exit_code,
+                    duration_ms: record.duration_ms,
+                    is_background: record.is_background,
+                    lifecycle_health: record.lifecycle_health(),
+                });
+        }
         if !record.is_background && self.user_scrolled_up.get() && !self.navigation.is_suspended() {
             self.unread_count
                 .set(self.unread_count.get().saturating_add(1));
@@ -11872,8 +11943,10 @@ impl RenderBackend for UnifiedBackend {
     fn enter_alt_screen_chrome(&self) {
         self.navigation.set_suspended(true);
         self.navigated_record_id.set(None);
-        self.chrome.set_alt_screen(true);
-        self.image_layer.set_alt_screen(true);
+        if let Some(legacy) = &self.legacy {
+            legacy.chrome.set_alt_screen(true);
+            legacy.image_layer.set_alt_screen(true);
+        }
         let active = self.active_rc.borrow();
         active.set_live_organism_visible(false);
         active.set_live_organism_alt_screen(true);
@@ -11884,8 +11957,10 @@ impl RenderBackend for UnifiedBackend {
     /// restores the primary screen content itself, and the organism heartbeat
     /// decides on its own frame whether the body may show again.
     fn exit_alt_screen_chrome(&self) {
-        self.chrome.set_alt_screen(false);
-        self.image_layer.set_alt_screen(false);
+        if let Some(legacy) = &self.legacy {
+            legacy.chrome.set_alt_screen(false);
+            legacy.image_layer.set_alt_screen(false);
+        }
         self.active_rc.borrow().set_live_organism_alt_screen(false);
         self.navigation.set_suspended(false);
     }
@@ -11903,7 +11978,9 @@ impl RenderBackend for UnifiedBackend {
             .kitty_assembler
             .borrow_mut()
             .feed_at(payload, self.kitty_cursor());
-        self.image_layer.set_row_epoch(self.chrome.row_epoch());
+        if let Some(legacy) = &self.legacy {
+            legacy.image_layer.set_row_epoch(legacy.chrome.row_epoch());
+        }
         match outcome {
             kitty_graphics::Outcome::Complete {
                 texture,
@@ -11944,8 +12021,9 @@ impl RenderBackend for UnifiedBackend {
         };
         match pending {
             PendingUnifiedImage::Vte(pending) => {
-                let zone_reopen = self.zone_marker.borrow().open_bytes();
-                self.image_layer.admit(pending, zone_reopen.as_deref());
+                let legacy = self.legacy_surface();
+                let zone_reopen = legacy.zone_marker.borrow().open_bytes();
+                legacy.image_layer.admit(pending, zone_reopen.as_deref());
             }
             #[cfg(forge_shared_terminal)]
             PendingUnifiedImage::Shared(pending) => {
@@ -11981,9 +12059,10 @@ impl RenderBackend for UnifiedBackend {
         }
         // The same fence, on the same terms: the pass is layout-agnostic, so
         // Unified needs no variant of it (see `schedule_anchor_settle_on`).
-        let zone_marker = self.zone_marker.clone();
+        let legacy = self.legacy_surface();
+        let zone_marker = legacy.zone_marker.clone();
         schedule_anchor_settle_on(
-            &self.vte,
+            &legacy.vte,
             &self.prompt_anchor_tick_id_rc,
             Rc::new(move |vte, bytes| feed_vte_with_zone_marker(vte, &zone_marker, bytes)),
             args,
@@ -11998,7 +12077,10 @@ impl RenderBackend for UnifiedBackend {
                 i64::from(terminal.grid_size().1),
             );
         }
-        (self.vte.cursor_position(), self.vte.row_count())
+        (
+            self.legacy_surface().vte.cursor_position(),
+            self.legacy_surface().vte.row_count(),
+        )
     }
 
     /// Screen-relative, as the protocol defines it. Not read for a reply while
@@ -12008,13 +12090,18 @@ impl RenderBackend for UnifiedBackend {
     /// cursor-restore misdraws in fzf, powerlevel10k and any ncurses app that
     /// saves and restores the position.
     fn cursor_position_report(&self) -> (i64, i64) {
-        let (col, row) = self.vte.cursor_position();
-        let top_row = gtk4::prelude::ScrollableExt::vadjustment(&self.vte)
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            return terminal.cursor_position();
+        }
+        let legacy = self.legacy_surface();
+        let (col, row) = legacy.vte.cursor_position();
+        let top_row = gtk4::prelude::ScrollableExt::vadjustment(&legacy.vte)
             .map(|adj| adj.value() as i64)
             .unwrap_or(0);
         (
             col,
-            screen_relative_cpr_row(row, top_row, self.vte.row_count()),
+            screen_relative_cpr_row(row, top_row, legacy.vte.row_count()),
         )
     }
 
@@ -12046,8 +12133,8 @@ impl RenderBackend for UnifiedBackend {
     /// delta is the wrong correction to apply. This pane's `SubmissionSurface`
     /// is constructed with the same policy bit, so the readiness probe and the
     /// verified-submission check agree with this.
-    fn command_capture_anchor(&self, provisional: (i64, i64), anchor_rows: i64) -> (i64, i64) {
-        prompt_anchor_for_surface(false, provisional, anchor_rows, self.vte.row_count())
+    fn command_capture_anchor(&self, provisional: (i64, i64), _anchor_rows: i64) -> (i64, i64) {
+        provisional
     }
 
     fn grid_cols(&self) -> i64 {
@@ -12058,7 +12145,7 @@ impl RenderBackend for UnifiedBackend {
         // Same floor as `ActiveBlock::grid_cols`: the engine uses this for
         // height/width estimates that must not divide by a degenerate width
         // before the surface is allocated.
-        self.vte.column_count().max(20)
+        self.legacy_surface().vte.column_count().max(20)
     }
 
     fn live_column_count(&self) -> i64 {
@@ -12066,7 +12153,7 @@ impl RenderBackend for UnifiedBackend {
         if let Some(terminal) = &self.shared_active {
             return i64::from(terminal.grid_size().0);
         }
-        self.vte.column_count()
+        self.legacy_surface().vte.column_count()
     }
 
     fn capture_text_range(
@@ -12080,7 +12167,13 @@ impl RenderBackend for UnifiedBackend {
         if let Some(terminal) = &self.shared_active {
             return terminal.capture((start_col, start_row), (end_col, end_row));
         }
-        capture_vte_text_range(&self.vte, start_row, start_col, end_row, end_col)
+        capture_vte_text_range(
+            &self.legacy_surface().vte,
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+        )
     }
 }
 
@@ -12136,15 +12229,17 @@ impl ReaderCtx {
     /// `live_vte` is passed in rather than read back off the backend:
     /// `ReaderCtx` itself no longer names widget types, and the selection
     /// hold's VTE hooks are wiring, not lifecycle dispatch.
-    fn install(self, pty: &Rc<OwnedPty>, live_vte: &Terminal) -> io::Result<()> {
+    fn install(self, pty: &Rc<OwnedPty>, live_vte: Option<&Terminal>) -> io::Result<()> {
         // Selection-hold triggers that live on the VTE itself (selection
         // cleared, user typed). Wired before the pipeline closure below
         // captures the shared ctx — and before the view connects its own
         // `commit` handler, which matters: GLib runs handlers in connection
         // order, so the hold's hook reads the CPR ledger before that handler
         // settles an answered query out of it.
-        self.selection_feed_hold
-            .install_vte_hooks(live_vte, self.cpr_outstanding_rc.clone());
+        if let Some(terminal) = live_vte {
+            self.selection_feed_hold
+                .install_vte_hooks(terminal, self.cpr_outstanding_rc.clone());
+        }
 
         let ctx = Rc::new(self);
 
@@ -14154,7 +14249,7 @@ struct KeyCtx {
     /// The live surface's commit path, told about every key press so it can
     /// kitty-encode the bytes VTE emits for it and join a split Alt chord.
     live_commit_for_key: LiveCommitSink,
-    active_vte_for_key: glib::WeakRef<Terminal>,
+    active_for_key: Weak<RefCell<ActiveBlock>>,
     running_cmd_for_key: Rc<RefCell<String>>,
     native_transcript_for_key: NativeTranscriptScroll,
     scroll_debouncer_for_key: ScrollDebouncer,
@@ -14187,7 +14282,7 @@ impl KeyCtx {
     fn connect(self, key_ctrl: &gtk4::EventControllerKey, scope: KeyScope) {
         let KeyCtx {
             live_commit_for_key,
-            active_vte_for_key,
+            active_for_key,
             running_cmd_for_key,
             native_transcript_for_key,
             scroll_debouncer_for_key,
@@ -14217,14 +14312,15 @@ impl KeyCtx {
             let Some(finished_blocks_for_key) = finished_blocks_for_key.upgrade() else {
                 return glib::Propagation::Proceed;
             };
+            let Some(active) = active_for_key.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            let live = active.borrow().focus_widget();
             // The root mount is a fallback for focus that clicked into history.
             // It must never take a key from the live surface, another pane
             // region, a text entry, a popover, or a button activation.
             if scope == KeyScope::StrandedFocus {
-                let Some(active_vte) = active_vte_for_key.upgrade() else {
-                    return glib::Propagation::Proceed;
-                };
-                if active_vte.has_focus() {
+                if live.has_focus() {
                     return glib::Propagation::Proceed;
                 }
                 let focused = root_for_key
@@ -14278,9 +14374,7 @@ impl KeyCtx {
                     display.as_ref(),
                 ));
             }
-            let Some(active_vte_for_key) = active_vte_for_key.upgrade() else {
-                return glib::Propagation::Proceed;
-            };
+            let legacy = live.downcast_ref::<Terminal>();
             // Focus stranded on a card while a program runs: an unbound Ctrl or
             // Alt chord is the program's (claude's Ctrl+O, codex's Ctrl+T,
             // Alt+B word motion) and would otherwise die on the card's
@@ -14293,8 +14387,8 @@ impl KeyCtx {
                 if scope == KeyScope::StrandedFocus
                     && stranded_focus_rescues_chord(bstate_for_key.get(), keyval, modifiers)
                 {
-                    focus_terminal(&active_vte_for_key);
-                    controller.forward(&active_vte_for_key);
+                    focus_terminal(&live);
+                    controller.forward(&live);
                     return glib::Propagation::Stop;
                 }
                 glib::Propagation::Proceed
@@ -14313,21 +14407,22 @@ impl KeyCtx {
             // readline buffer has been edited, Home/End belong to the shell so
             // users can move to the beginning/end of the visible command.
             let state = bstate_for_key.get();
-            if !ctrl
-                && !shift
-                && !alt
-                && !modifiers.intersects(
-                    gtk4::gdk::ModifierType::SUPER_MASK | gtk4::gdk::ModifierType::META_MASK,
-                )
-                && native_transcript_for_key.owns_session(&running_cmd_for_key.borrow())
-                && matches!(
-                    keyval,
-                    Key::Page_Up | Key::Page_Down | Key::KP_Page_Up | Key::KP_Page_Down
-                )
-            {
+            if let Some(terminal) = legacy.filter(|_| {
+                !ctrl
+                    && !shift
+                    && !alt
+                    && !modifiers.intersects(
+                        gtk4::gdk::ModifierType::SUPER_MASK | gtk4::gdk::ModifierType::META_MASK,
+                    )
+                    && native_transcript_for_key.owns_session(&running_cmd_for_key.borrow())
+                    && matches!(
+                        keyval,
+                        Key::Page_Up | Key::Page_Down | Key::KP_Page_Up | Key::KP_Page_Down
+                    )
+            }) {
                 live_commit_for_key.kitty_last_key.set(None);
                 native_transcript_for_key.page(
-                    &active_vte_for_key,
+                    terminal,
                     &block_scroll_for_key,
                     &scroll_debouncer_for_key,
                     matches!(keyval, Key::Page_Down | Key::KP_Page_Down),
@@ -14355,7 +14450,7 @@ impl KeyCtx {
                 && matches!(keyval, Key::Page_Up | Key::Page_Down)
             {
                 let adj = block_scroll_for_key.vadjustment();
-                let row = (active_vte_for_key.char_height() as f64).max(1.0);
+                let row = (active.borrow().live_cell_size().1 as f64).max(1.0);
                 let step = (adj.page_size() - 2.0 * row).max(row);
                 let delta = if keyval == Key::Page_Up { -step } else { step };
                 live_commit_for_key.kitty_last_key.set(None);
@@ -14381,7 +14476,7 @@ impl KeyCtx {
                     &block_scroll_for_key,
                     direction,
                 ) {
-                    clear_vte_text_selections(&finished, &active_vte_for_key);
+                    clear_text_selections(&finished, &live);
                     return glib::Propagation::Stop;
                 }
             }
@@ -14423,7 +14518,7 @@ impl KeyCtx {
                     &block_scroll_for_key,
                     direction,
                 ) {
-                    clear_vte_text_selections(&finished, &active_vte_for_key);
+                    clear_text_selections(&finished, &live);
                     return glib::Propagation::Stop;
                 }
             }
@@ -14454,7 +14549,7 @@ impl KeyCtx {
                     &block_scroll_for_key,
                     direction,
                 ) {
-                    clear_vte_text_selections(&finished, &active_vte_for_key);
+                    clear_text_selections(&finished, &live);
                     return glib::Propagation::Stop;
                 }
             }
@@ -14495,7 +14590,7 @@ impl KeyCtx {
                             &selected_block_id_for_key,
                             &selection_anchor_id_for_key,
                         );
-                        active_vte_for_key.grab_focus();
+                        live.grab_focus();
                         return glib::Propagation::Stop;
                     }
                     provenance_refusal.map_or_else(
@@ -14519,7 +14614,7 @@ impl KeyCtx {
                     selected_block_id_for_key.get(),
                     selection_refusal_hint(SelectionAction::Run, refusal),
                 );
-                active_vte_for_key.error_bell();
+                live.error_bell();
                 return glib::Propagation::Stop;
             }
 
@@ -14548,7 +14643,7 @@ impl KeyCtx {
                             &selected_block_id_for_key,
                             &selection_anchor_id_for_key,
                         );
-                        active_vte_for_key.grab_focus();
+                        live.grab_focus();
                         return glib::Propagation::Stop;
                     }
                     let command = {
@@ -14576,7 +14671,7 @@ impl KeyCtx {
                     // If the prompt is busy/dirty, bracketed paste is missing,
                     // or the selected text is unsafe, never pass the same key
                     // through to VTE where it could submit unrelated input.
-                    active_vte_for_key.error_bell();
+                    live.error_bell();
                     if selection_refusal_releases_selection(state) {
                         clear_finished_block_selection(
                             &finished,
@@ -14624,7 +14719,7 @@ impl KeyCtx {
                     &block_data_for_key,
                     &block_list_for_key,
                     &find_state_for_key,
-                    &active_vte_for_key,
+                    legacy,
                     BlockRemovalRefs {
                         selection: BlockSelectionRefs {
                             ids: &selected_block_ids_for_key,
@@ -14750,7 +14845,7 @@ impl KeyCtx {
                         .or_else(|| marked_idx.first().copied())
                 };
                 if let Some(idx) = target {
-                    clear_vte_text_selections(&finished, &active_vte_for_key);
+                    clear_text_selections(&finished, &live);
                     let new_id = finished.get(idx).map(|b| b.id);
                     replace_finished_block_selection(
                         &finished,
@@ -15181,10 +15276,6 @@ impl TermView {
         // blocks the whole subtree (including the VTE) from ever taking focus.
         block_scroll.set_focusable(false);
 
-        // Active block: a single persistent live VTE pinned at the bottom of the
-        // block list. Prompt + typing + output all render here natively (anvil
-        // model); finished commands snapshot into styled blocks above it.
-        //
         // The bounded raw-output ring is engine-owned shared state: the reader
         // engine appends/clears/reads it directly (never through the render
         // backend), and ActiveBlock holds this clone only so live-find can
@@ -15194,28 +15285,20 @@ impl TermView {
         let active = Rc::new(RefCell::new(ActiveBlock::new(
             config,
             live_raw_output.clone(),
+            #[cfg(forge_shared_terminal)]
+            shared_active.clone(),
         )));
-        #[cfg(forge_shared_terminal)]
-        if let Some(terminal) = &shared_active {
-            active.borrow_mut().attach_shared_active(terminal.clone());
-        }
         let active_vte = active.borrow().active_vte.clone();
-        let input_feedback = input_feedback::InputFeedback::new(&active.borrow().focus_widget());
+        let live_focus = active.borrow().focus_widget();
+        let input_feedback = input_feedback::InputFeedback::new(&live_focus);
         if docked_input {
-            active_vte.add_css_class("docked-live-terminal");
-        }
-        #[cfg(forge_shared_terminal)]
-        if let Some(terminal) = &shared_active {
-            terminal.screen().add_css_class("docked-live-terminal");
-            terminal.screen().add_css_class(if block_mode {
-                "developer-live-terminal"
-            } else {
-                "chat-live-terminal"
-            });
+            live_focus.add_css_class("docked-live-terminal");
         }
         if chat_mode {
-            active_vte.add_css_class("chat-live-terminal");
-            apply_terminal_theme(&active_vte, config);
+            live_focus.add_css_class("chat-live-terminal");
+            if let Some(terminal) = &active_vte {
+                apply_terminal_theme(terminal, config);
+            }
         }
 
         // Unified mode: same widget tree, same live VTE, no block chrome. The
@@ -15291,7 +15374,7 @@ impl TermView {
                     jump.emit_clicked();
                 }
             });
-            let terminal = active_vte.downgrade();
+            let terminal = live_focus.downgrade();
             search.connect_clicked(move |button| {
                 if let Some(terminal) = terminal.upgrade() {
                     terminal.grab_focus();
@@ -15459,7 +15542,9 @@ impl TermView {
         // pane's own drop cannot produce two escalations. Unlike a
         // conventional pane, this child was forked by forge itself and is
         // reaped here, which the shared lifecycle records.
-        crate::terminal::set_terminal_child_lifecycle(&active_vte, pty.lifecycle());
+        if let Some(terminal) = &active_vte {
+            crate::terminal::set_terminal_child_lifecycle(terminal, pty.lifecycle());
+        }
 
         // ── Register CSS ──────────────────────────────────────────────────
         install_block_css(config);
@@ -15471,7 +15556,9 @@ impl TermView {
         // the fallback authority; ordinary unintegrated shells stay untouched.
 
         let native_transcript_scroll = NativeTranscriptScroll::new(bstate.clone(), direct_cli);
-        native_transcript_scroll.install(&active_vte);
+        if let Some(terminal) = &active_vte {
+            native_transcript_scroll.install(terminal);
+        }
         let ftcs_seen = Rc::new(Cell::new(false));
 
         // Keystroke-shadow command line. The authoritative command text is read
@@ -15667,14 +15754,12 @@ impl TermView {
             #[cfg(forge_shared_terminal)]
             let shared_geometry = (Rc::downgrade(&pty_winsize), Rc::downgrade(&pty));
             let holder = active.borrow().widget().downgrade();
-            let vte = active_vte.downgrade();
+            let vte = active_vte.as_ref().map(Terminal::downgrade);
             let scroll = block_scroll.downgrade();
             let last_size_target: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((0, 0)));
             let active_for_layout = Rc::downgrade(&active);
             Rc::new(move || {
-                let (Some(holder), Some(vte), Some(scroll)) =
-                    (holder.upgrade(), vte.upgrade(), scroll.upgrade())
-                else {
+                let (Some(holder), Some(scroll)) = (holder.upgrade(), scroll.upgrade()) else {
                     return;
                 };
                 let Some(active_block) = active_for_layout.upgrade() else {
@@ -15699,6 +15784,9 @@ impl TermView {
                         return;
                     }
                 }
+                let Some(vte) = vte.as_ref().and_then(glib::WeakRef::upgrade) else {
+                    return;
+                };
                 let cell_h = (vte.char_height() as i32).max(1);
                 let Some(viewport_rows) = viewport_rows_for(&vte, &scroll) else {
                     return;
@@ -15733,7 +15821,7 @@ impl TermView {
             let chat_presentation = chat_presentation.clone();
             let integration = ftcs_seen.clone();
             let holder = active.borrow().widget().downgrade();
-            let vte = active_vte.downgrade();
+            let vte = active_vte.as_ref().map(Terminal::downgrade);
             let scroll = block_scroll.downgrade();
             let bstate = bstate.clone();
             let typed_cmd = typed_cmd.clone();
@@ -15767,9 +15855,6 @@ impl TermView {
             let active_for_layout = Rc::downgrade(&active);
             Rc::new(move || {
                 let Some(holder) = holder.upgrade() else {
-                    return;
-                };
-                let Some(vte) = vte.upgrade() else {
                     return;
                 };
                 let Some(scroll) = scroll.upgrade() else {
@@ -15821,6 +15906,9 @@ impl TermView {
                         return;
                     }
                 }
+                let Some(vte) = vte.as_ref().and_then(glib::WeakRef::upgrade) else {
+                    return;
+                };
                 let cell_h = (vte.char_height() as i32).max(1);
                 let Some(viewport_rows) = viewport_rows_for(&vte, &scroll) else {
                     return;
@@ -16092,7 +16180,7 @@ impl TermView {
         } else {
             block_layout_active_surface
         };
-        {
+        if let Some(active_vte) = &active_vte {
             // Reassert the viewport grid from the data path and follow the
             // bottom from here too — NOT from the vadjustment `changed` signal.
             //
@@ -16139,7 +16227,7 @@ impl TermView {
         // Bell signal is delivered natively by VTE — no need to scan the byte
         // stream for BEL ourselves (and disambiguate it from OSC string
         // terminators). VTE already does that disambiguation inside its parser.
-        {
+        if let Some(active_vte) = &active_vte {
             let bell_cbs = bell_callbacks.clone();
             active_vte.connect_bell(move |_| {
                 for cb in bell_cbs.borrow().iter() {
@@ -16267,14 +16355,18 @@ impl TermView {
         let agent_execution_lost_callbacks: AgentExecutionLostCallbacks =
             Rc::new(RefCell::new(vec![]));
         let pty_synced: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let submission_surface: Rc<dyn SubmissionSurface> = Rc::new(VteSubmissionSurface {
-            vte: active_vte.clone(),
-            rebase_on_row_delta: rebase_prompt_on_row_delta,
-        });
-        #[cfg(forge_shared_terminal)]
-        let submission_surface: Rc<dyn SubmissionSurface> = match &shared_active {
-            Some(terminal) => terminal.clone(),
-            None => submission_surface,
+        let submission_surface: Rc<dyn SubmissionSurface> = match &active_vte {
+            Some(terminal) => Rc::new(VteSubmissionSurface {
+                vte: terminal.clone(),
+                rebase_on_row_delta: rebase_prompt_on_row_delta,
+            }),
+            #[cfg(forge_shared_terminal)]
+            None => shared_active
+                .as_ref()
+                .expect("shared live terminal")
+                .clone(),
+            #[cfg(not(forge_shared_terminal))]
+            None => unreachable!("legacy live terminal"),
         };
         let verified_submission = VerifiedSubmissionCtx {
             input_feedback: input_feedback.clone(),
@@ -16443,14 +16535,16 @@ impl TermView {
                 let report = report.clone();
                 terminal.on_directory_uri(move |uri| report(uri));
             }
-            active_vte.connect_current_directory_uri_notify(move |terminal| {
-                if let Some(uri) = terminal.current_directory_uri() {
-                    report(uri.as_str());
-                }
-            });
+            if let Some(terminal) = &active_vte {
+                terminal.connect_current_directory_uri_notify(move |terminal| {
+                    if let Some(uri) = terminal.current_directory_uri() {
+                        report(uri.as_str());
+                    }
+                });
+            }
         }
 
-        {
+        if let Some(active_vte) = &active_vte {
             let title_cbs = title_callbacks.clone();
             active_vte.connect_window_title_changed(move |terminal| {
                 // An empty title is forwarded too: it is how a program hands
@@ -16493,7 +16587,7 @@ impl TermView {
             let selected = selected_block_id.clone();
             let anchor = selection_anchor_id.clone();
             let find_state = Rc::downgrade(&find_state);
-            let active_vte = active_vte.downgrade();
+            let active_vte = active_vte.as_ref().map(Terminal::downgrade);
             let visible = visible_indices.clone();
             let viewport = viewport.clone();
             let scroll = block_scroll.downgrade();
@@ -16562,10 +16656,9 @@ impl TermView {
                 if filtered_keep.is_none() {
                     return Some(now_bookmarked);
                 }
-                if let (Some(find_state), Some(active_vte)) =
-                    (find_state.upgrade(), active_vte.upgrade())
-                {
-                    find::clear_find_state(find_state.as_ref(), &active_vte);
+                if let Some(find_state) = find_state.upgrade() {
+                    let terminal = active_vte.as_ref().and_then(glib::WeakRef::upgrade);
+                    find::clear_find_state(find_state.as_ref(), terminal.as_ref());
                 }
                 redraw();
 
@@ -16668,41 +16761,48 @@ impl TermView {
             // everything above (PTY, parser, engine state, lifecycle cells) is
             // shared, and everything below dispatches through the trait.
             let backend: Rc<dyn RenderBackend> = if unified {
-                let zone_marker = Rc::new(RefCell::new(ZoneMarkerInjector::from_system_entropy()));
-                let image_layer_slot: Rc<RefCell<Option<unified_images::UnifiedImageLayer>>> =
-                    Rc::new(RefCell::new(None));
-                let chrome_authority = Rc::new(RefCell::new(
-                    unified_chrome::ZoneChromeAuthority::new(zone_marker.borrow().nonce()),
-                ));
-                let image_layer_for_retention = Rc::downgrade(&image_layer_slot);
-                let chrome = unified_chrome::UnifiedChrome::new(
-                    &active_vte_rc,
-                    &active_rc.borrow().unified_chrome_surface,
-                    chrome_authority,
-                    config_for_cb.clone(),
-                    Rc::new(move |proof| {
-                        if let Some(slot) = image_layer_for_retention.upgrade() {
-                            if let Some(layer) = slot.borrow().as_ref() {
-                                layer.retire_before(proof);
+                let legacy = active_vte_rc.map(|vte| {
+                    let zone_marker =
+                        Rc::new(RefCell::new(ZoneMarkerInjector::from_system_entropy()));
+                    let image_layer_slot: Rc<RefCell<Option<unified_images::UnifiedImageLayer>>> =
+                        Rc::new(RefCell::new(None));
+                    let chrome_authority = Rc::new(RefCell::new(
+                        unified_chrome::ZoneChromeAuthority::new(zone_marker.borrow().nonce()),
+                    ));
+                    let image_layer_for_retention = Rc::downgrade(&image_layer_slot);
+                    let chrome = unified_chrome::UnifiedChrome::new(
+                        &vte,
+                        &active_rc.borrow().unified_chrome_surface,
+                        chrome_authority,
+                        config_for_cb.clone(),
+                        Rc::new(move |proof| {
+                            if let Some(slot) = image_layer_for_retention.upgrade() {
+                                if let Some(layer) = slot.borrow().as_ref() {
+                                    layer.retire_before(proof);
+                                }
                             }
-                        }
-                    }),
-                );
-                let image_layer = unified_images::UnifiedImageLayer::new(
-                    &active_vte_rc,
-                    &active_rc.borrow().unified_image_surface,
-                    zone_marker.borrow().nonce(),
-                    chrome.image_row_projection(),
-                );
-                *image_layer_slot.borrow_mut() = Some(image_layer.clone());
-                active_rc
-                    .borrow()
-                    .unified_chrome_surface
-                    .set_visible(active_vte_rc.parent().is_some());
+                        }),
+                    );
+                    let image_layer = unified_images::UnifiedImageLayer::new(
+                        &vte,
+                        &active_rc.borrow().unified_image_surface,
+                        zone_marker.borrow().nonce(),
+                        chrome.image_row_projection(),
+                    );
+                    *image_layer_slot.borrow_mut() = Some(image_layer.clone());
+                    active_rc.borrow().unified_chrome_surface.set_visible(true);
+                    LegacyUnifiedSurface {
+                        vte,
+                        zone_marker,
+                        chrome,
+                        image_layer,
+                        _image_layer_slot_owner: image_layer_slot,
+                    }
+                });
                 Rc::new(UnifiedBackend {
                     #[cfg(forge_shared_terminal)]
                     shared_active: shared_active.clone(),
-                    vte: active_vte_rc,
+                    legacy,
                     active_rc,
                     block_scroll_rc,
                     layout_active_surface: layout_active_surface.clone(),
@@ -16717,10 +16817,6 @@ impl TermView {
                     unread_count: unread_count.clone(),
                     navigated_record_id: navigated_record_id.clone(),
                     bookmarks: block_bookmarks.clone(),
-                    zone_marker,
-                    chrome,
-                    image_layer,
-                    _image_layer_slot_owner: image_layer_slot,
                     kitty_assembler: RefCell::new(kitty_graphics::Assembler::new()),
                     kitty_pending_admission: RefCell::new(None),
                 })
@@ -16860,7 +16956,7 @@ impl TermView {
                 verified_submission: verified_submission.clone(),
                 selection_feed_hold: selection_feed_hold.clone(),
             }
-            .install(&pty, &active_vte)?;
+            .install(&pty, active_vte.as_ref())?;
         }
         let render_backend = render_backend_for_view
             .borrow_mut()
@@ -17029,7 +17125,8 @@ impl TermView {
             let scroll = block_scroll.clone();
             let user_scrolled = user_scrolled_up.clone();
             let unread = unread_count.clone();
-            let vte_for_fab = active_vte.downgrade();
+            let focus = live_focus.downgrade();
+            let active = Rc::downgrade(&active);
             let root_for_fab = root.downgrade();
             let debouncer = scroll_debouncer.clone();
             jump_fab.connect_clicked(move |button| {
@@ -17039,8 +17136,8 @@ impl TermView {
                     .upgrade()
                     .is_some_and(|root| focus_is_within(&root));
                 if refocus {
-                    if let Some(vte) = vte_for_fab.upgrade() {
-                        focus_terminal(&vte);
+                    if let Some(focus) = focus.upgrade() {
+                        focus_terminal(&focus);
                     }
                 }
                 // Virtualized blocks can grow after the synchronous jump, so
@@ -17050,7 +17147,10 @@ impl TermView {
                 button.set_visible(false);
                 // "Jump to latest" also means the latest of the live buffer:
                 // leave any scrolled-up position inside the running output.
-                if let Some(adj) = vte_for_fab.upgrade().and_then(|vte| vte.vadjustment()) {
+                if let Some(adj) = active
+                    .upgrade()
+                    .and_then(|active| active.borrow().surface_adjustment())
+                {
                     adj.set_value((adj.upper() - adj.page_size()).max(adj.lower()));
                 }
 
@@ -17069,7 +17169,7 @@ impl TermView {
             let hold_for_stop = selection_feed_hold.clone();
             let human_input_for_stop = human_input_callbacks.clone();
             let root_for_stop = root.downgrade();
-            let vte_for_stop = active_vte.downgrade();
+            let focus = live_focus.downgrade();
             sticky_stop_btn.connect_clicked(move |_| {
                 // Resume a parked feed first so the ^C echo and the command's
                 // shutdown output are visible immediately.
@@ -17081,8 +17181,8 @@ impl TermView {
                     .upgrade()
                     .is_some_and(|root| focus_is_within(&root))
                 {
-                    if let Some(vte) = vte_for_stop.upgrade() {
-                        focus_terminal(&vte);
+                    if let Some(focus) = focus.upgrade() {
+                        focus_terminal(&focus);
                     }
                 }
             });
@@ -17296,30 +17396,33 @@ impl TermView {
         // typed command line so the finalize path can style it into the block.
         // The same signal also carries libvte's own reports and the two halves
         // of an Alt chord; `LiveCommitSink` tells them apart.
-        let prompt_resize_reanchor = (block_mode || chat_mode).then(|| {
-            Rc::new(PromptResizeReanchor {
-                vte: active_vte.downgrade(),
-                pty: Rc::downgrade(&pty),
-                config: config_shared.clone(),
-                rebase_on_row_delta: rebase_prompt_on_row_delta,
-                bstate: bstate.clone(),
-                fullscreen: fullscreen.clone(),
-                dirty: idle_input_dirty.clone(),
-                submitted: submission_pending.clone(),
-                typeahead: pending_typeahead.clone(),
-                synced: pty_synced.clone(),
-                typed: typed_cmd.clone(),
-                ready: prompt_anchor_ready.clone(),
-                anchor: prompt_end_pos.clone(),
-                rows: prompt_anchor_rows.clone(),
-                anchor_resize: prompt_anchor_resize_generation.clone(),
-                resize: pty_resize_generation.clone(),
-                prefix: prompt_anchor_prefix.clone(),
-                identity_output: prompt_identity_output.clone(),
-                input_generation: accepted_input_generation.clone(),
-            })
-        });
-        if let Some(proof) = prompt_resize_reanchor.clone() {
+        let prompt_resize_reanchor = active_vte
+            .as_ref()
+            .filter(|_| docked_input)
+            .map(|terminal| {
+                Rc::new(PromptResizeReanchor {
+                    vte: terminal.downgrade(),
+                    pty: Rc::downgrade(&pty),
+                    config: config_shared.clone(),
+                    rebase_on_row_delta: rebase_prompt_on_row_delta,
+                    bstate: bstate.clone(),
+                    fullscreen: fullscreen.clone(),
+                    dirty: idle_input_dirty.clone(),
+                    submitted: submission_pending.clone(),
+                    typeahead: pending_typeahead.clone(),
+                    synced: pty_synced.clone(),
+                    typed: typed_cmd.clone(),
+                    ready: prompt_anchor_ready.clone(),
+                    anchor: prompt_end_pos.clone(),
+                    rows: prompt_anchor_rows.clone(),
+                    anchor_resize: prompt_anchor_resize_generation.clone(),
+                    resize: pty_resize_generation.clone(),
+                    prefix: prompt_anchor_prefix.clone(),
+                    identity_output: prompt_identity_output.clone(),
+                    input_generation: accepted_input_generation.clone(),
+                })
+            });
+        if let (Some(proof), Some(active_vte)) = (prompt_resize_reanchor.clone(), &active_vte) {
             let cpr = cpr_outstanding.clone();
             // Registered before input forwarding. Inspect only the still-empty
             // native editor, before this human commit can taint it or write PTY
@@ -17358,7 +17461,7 @@ impl TermView {
             terminal.bind_input(live_commit.clone(), selection_feed_hold.clone());
             selection_feed_hold.install_text_view_hooks(terminal.screen());
         }
-        {
+        if let Some(active_vte) = &active_vte {
             let live_commit = live_commit.clone();
             active_vte.connect_commit(move |_, text, _size| {
                 if live_commit.on_commit(text) == LiveCommitRoute::HeldAltEscape {
@@ -17372,11 +17475,11 @@ impl TermView {
 
         if let Some(chat) = &chat_presentation {
             if let Some(button) = chat.submit_button() {
-                let notify = paste_feedback::notifier(&active_vte);
+                let notify = paste_feedback::notifier(&live_focus);
                 let integrated = ftcs_seen.clone();
                 let sink = live_commit.clone();
                 let hold = selection_feed_hold.clone();
-                let vte = active_vte.downgrade();
+                let focus = live_focus.downgrade();
                 let prompt_generation = prompt_anchor_generation.clone();
                 let origin = {
                     let sink = sink.clone();
@@ -17412,11 +17515,11 @@ impl TermView {
                             || !ime_gate::blocked() && prompt_generation.get() == generation,
                         )
                     });
-                    if let Some(vte) = vte.upgrade() {
+                    if let Some(focus) = focus.upgrade() {
                         if !submitted {
-                            vte.error_bell();
+                            focus.error_bell();
                         }
-                        focus_terminal(&vte);
+                        focus_terminal(&focus);
                     }
                 });
             }
@@ -17436,7 +17539,7 @@ impl TermView {
                 let kitty = kitty_flags.clone();
                 let alt = alt_escape.clone();
                 let root = root.downgrade();
-                let vte = active_vte.downgrade();
+                let focus = live_focus.downgrade();
                 let feedback = input_feedback.clone();
                 chat.bind_stop(&button, move |target| {
                     let is_current = || {
@@ -17460,12 +17563,12 @@ impl TermView {
                     } else {
                         false
                     };
-                    if let Some(vte) = vte.upgrade() {
+                    if let Some(focus) = focus.upgrade() {
                         if !admitted {
-                            vte.error_bell();
+                            focus.error_bell();
                         }
                         if root.upgrade().is_some_and(|root| focus_is_within(&root)) {
-                            focus_terminal(&vte);
+                            focus_terminal(&focus);
                         }
                     }
                 });
@@ -17533,7 +17636,7 @@ impl TermView {
         // context and corrupt CJK composition. At a Block prompt it is still
         // consumed by the refocus.
         {
-            let active_vte_for_refocus = active_vte.clone();
+            let live_for_refocus = live_focus.downgrade();
             let bstate_for_refocus = bstate.clone();
             let scroll_debouncer_for_refocus = scroll_debouncer.clone();
             let block_scroll_for_refocus = block_scroll.clone();
@@ -17545,7 +17648,10 @@ impl TermView {
             let refocus_key = gtk4::EventControllerKey::new();
             refocus_key.set_propagation_phase(gtk4::PropagationPhase::Capture);
             refocus_key.connect_key_pressed(move |controller, keyval, _keycode, modifiers| {
-                if active_vte_for_refocus.has_focus()
+                let Some(live_for_refocus) = live_for_refocus.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                if live_for_refocus.has_focus()
                     || !stranded_focus_key_recovers(keyval, modifiers)
                     || selection_owns_key(selected_for_refocus.get().is_some(), keyval)
                 {
@@ -17563,7 +17669,7 @@ impl TermView {
                 ) {
                     return glib::Propagation::Proceed;
                 }
-                focus_terminal(&active_vte_for_refocus);
+                focus_terminal(&live_for_refocus);
                 reveal_live_input_now(
                     &scroll_debouncer_for_refocus,
                     &unread_for_refocus,
@@ -17572,7 +17678,7 @@ impl TermView {
                     &block_scroll_for_refocus,
                 );
                 if stranded_focus_forwards_key(bstate_for_refocus.get()) {
-                    controller.forward(&active_vte_for_refocus);
+                    controller.forward(&live_for_refocus);
                 }
                 glib::Propagation::Stop
             });
@@ -17595,7 +17701,7 @@ impl TermView {
 
             let key_ctx = KeyCtx {
                 live_commit_for_key: live_commit.clone(),
-                active_vte_for_key: active_vte.downgrade(),
+                active_for_key: Rc::downgrade(&active),
                 running_cmd_for_key: running_cmd.clone(),
                 native_transcript_for_key: native_transcript_scroll.clone(),
                 scroll_debouncer_for_key: scroll_debouncer.clone(),
@@ -17632,8 +17738,10 @@ impl TermView {
                 .connect(&stranded_ctrl, KeyScope::StrandedFocus);
             root.add_controller(stranded_ctrl);
 
-            key_ctx.connect(&key_ctrl, KeyScope::LiveSurface);
-            active_vte.add_controller(key_ctrl);
+            if let Some(terminal) = &active_vte {
+                key_ctx.connect(&key_ctrl, KeyScope::LiveSurface);
+                terminal.add_controller(key_ctrl);
+            }
         }
 
         // Clicking back into the live prompt is an explicit exit from historical
@@ -17660,47 +17768,49 @@ impl TermView {
                     }
                 }
             });
-            active_vte.add_controller(active_click);
+            live_focus.add_controller(active_click);
         }
 
         // A plain click in the live prompt places the shell's edit cursor
         // there, the way an editor would, instead of making the user walk an
         // arrow key across a long command.
-        click_cursor::install(
-            &active_vte,
-            click_cursor::ClickCursorCtx {
-                enabled: config.click_moves_cursor,
-                pty: Rc::clone(&pty),
-                cursor_move_allowed: {
-                    let typed_cmd_fidelity = typed_cmd_fidelity.clone();
-                    let submission_pending = submission_pending.clone();
-                    let pending_typeahead = pending_typeahead.clone();
-                    Rc::new(move || {
-                        !submission_pending.get()
-                            && !pending_typeahead.get()
-                            && typed_cmd_fidelity.get() != TypedShadowFidelity::ExactSubmitted
-                    })
+        if let Some(active_vte) = &active_vte {
+            click_cursor::install(
+                active_vte,
+                click_cursor::ClickCursorCtx {
+                    enabled: config.click_moves_cursor,
+                    pty: Rc::clone(&pty),
+                    cursor_move_allowed: {
+                        let typed_cmd_fidelity = typed_cmd_fidelity.clone();
+                        let submission_pending = submission_pending.clone();
+                        let pending_typeahead = pending_typeahead.clone();
+                        Rc::new(move || {
+                            !submission_pending.get()
+                                && !pending_typeahead.get()
+                                && typed_cmd_fidelity.get() != TypedShadowFidelity::ExactSubmitted
+                        })
+                    },
+                    cursor_move_accepted: {
+                        let typed_cmd_fidelity = typed_cmd_fidelity.clone();
+                        let pty_synced = pty_synced.clone();
+                        let idle_input_dirty = idle_input_dirty.clone();
+                        let accepted_input_generation = accepted_input_generation.clone();
+                        Rc::new(move || {
+                            typed_cmd_fidelity.set(TypedShadowFidelity::Inexact);
+                            pty_synced.set(true);
+                            idle_input_dirty.set(true);
+                            accepted_input_generation
+                                .set(accepted_input_generation.get().wrapping_add(1));
+                        })
+                    },
+                    prompt_end_pos: prompt_end_pos.clone(),
+                    bstate: bstate.clone(),
+                    mouse_mode: mouse_reporting_mode.clone(),
+                    fullscreen: fullscreen.clone(),
+                    suggestion_rgb: click_cursor::suggestion_rgb(&config.palette),
                 },
-                cursor_move_accepted: {
-                    let typed_cmd_fidelity = typed_cmd_fidelity.clone();
-                    let pty_synced = pty_synced.clone();
-                    let idle_input_dirty = idle_input_dirty.clone();
-                    let accepted_input_generation = accepted_input_generation.clone();
-                    Rc::new(move || {
-                        typed_cmd_fidelity.set(TypedShadowFidelity::Inexact);
-                        pty_synced.set(true);
-                        idle_input_dirty.set(true);
-                        accepted_input_generation
-                            .set(accepted_input_generation.get().wrapping_add(1));
-                    })
-                },
-                prompt_end_pos: prompt_end_pos.clone(),
-                bstate: bstate.clone(),
-                mouse_mode: mouse_reporting_mode.clone(),
-                fullscreen: fullscreen.clone(),
-                suggestion_rgb: click_cursor::suggestion_rgb(&config.palette),
-            },
-        );
+            );
+        }
 
         // Wheel handling inside an alt-screen + mouse-reporting app (claude's
         // fullscreen UI, opencode, vim, htop). forge synthesises the wheel
@@ -17717,7 +17827,7 @@ impl TermView {
         // - alt-screen + mouse mode + !scroll_reporting_enabled → swallow wheel
         //   (user has opted out of mouse-driven paging).
         // - otherwise → let the event bubble to block_scroll for normal scroll.
-        {
+        if let Some(active_vte) = &active_vte {
             // Track pointer position over the live VTE in cell coordinates so
             // wheel events emitted below can include accurate col/row.
             let pointer_cell: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((1, 1)));
@@ -17988,7 +18098,7 @@ impl TermView {
         let cross_selection = CrossSelection::install(
             selection_root,
             finished_blocks_rc.clone(),
-            active_vte.clone(),
+            TerminalTextSurface::from_widget(live_focus).expect("selectable live terminal"),
             selected_block_ids.clone(),
             selected_block_id.clone(),
             selection_anchor_id.clone(),
@@ -18250,7 +18360,8 @@ impl TermView {
         let scroll_for_resize = self.block_scroll.downgrade();
         let backend_for_resize = Rc::downgrade(&self.render_backend);
         let clip_for_resize = self.active.borrow().live_clip().downgrade();
-        let vte_for_resize = self.active_vte.downgrade();
+        let terminal = self.active_vte.as_ref().expect("legacy live terminal");
+        let vte_for_resize = terminal.downgrade();
         let last_pane: Rc<Cell<(i32, i32)>> = Rc::new(Cell::new((0, 0)));
         let tick_slot = self.resize_tick_id.clone();
         // Frames the tick keeps polling after an unchanged one. GTK runs tick
@@ -18356,8 +18467,7 @@ impl TermView {
         }
         {
             let arm = arm.clone();
-            self.active_vte
-                .connect_char_size_changed(move |_, _, _| arm());
+            terminal.connect_char_size_changed(move |_, _, _| arm());
         }
         {
             let arm = arm.clone();
@@ -18519,7 +18629,7 @@ impl TermView {
         if let Some(terminal) = &active.shared_active {
             return active.shared_organism_rect_is_blank(terminal, x, y, width, height);
         }
-        let terminal = &active.active_vte;
+        let terminal = active.legacy_surface();
         if !terminal.is_mapped() {
             return false;
         }
@@ -18580,13 +18690,14 @@ impl TermView {
             right_gutter: LIVE_ORGANISM_RIGHT_GUTTER,
             alt_screen: active.live_organism_alt_screen(),
             cursor_row: {
-                let (_, cursor_row) = active.active_vte.cursor_position();
-                let top_row = gtk4::prelude::ScrollableExt::vadjustment(&active.active_vte)
+                let terminal = active.legacy_surface();
+                let (_, cursor_row) = terminal.cursor_position();
+                let top_row = gtk4::prelude::ScrollableExt::vadjustment(terminal)
                     .map(|adjustment| adjustment.value().floor() as i64)
                     .unwrap_or(0);
-                let cell_height = active.active_vte.char_height().max(1);
-                let visible_rows = ((visible_height as i64) / cell_height)
-                    .clamp(1, active.active_vte.row_count().max(1));
+                let cell_height = terminal.char_height().max(1);
+                let visible_rows =
+                    ((visible_height as i64) / cell_height).clamp(1, terminal.row_count().max(1));
                 cursor_row
                     .saturating_sub(top_row)
                     .clamp(0, visible_rows.saturating_sub(1)) as i32
@@ -18790,7 +18901,6 @@ impl TermView {
             finished.set_filtered_out(!self.block_matches_filter(kind, finished.id));
         }
         finished.connect_actions(
-            &self.active_vte,
             &self.verified_submission,
             &self.config,
             &self.active,
@@ -18944,9 +19054,8 @@ impl TermView {
             "Copy shell integration command",
         )]);
         {
-            let clipboard_vte = self.active_vte.clone();
             copy.connect_clicked(move |button| {
-                clipboard_vte.clipboard().set_text(hint.load);
+                button.clipboard().set_text(hint.load);
                 button.set_label("Copied");
             });
         }
@@ -19168,23 +19277,31 @@ impl TermView {
                 // through a local VTE commit. Any cursor displacement from the
                 // authoritative PromptEnd anchor is therefore input until the
                 // next clean prompt proves otherwise.
-                let rows = self.active_vte.row_count();
+                let Some(terminal) = self.legacy_terminal() else {
+                    let suggestion = click_cursor::suggestion_rgb(&self.config.borrow().palette);
+                    return if self.verified_submission.history_editor_is_ready(suggestion) {
+                        CommandPromptStatus::Ready
+                    } else {
+                        CommandPromptStatus::HasInput
+                    };
+                };
+                let rows = terminal.row_count();
                 let anchor = self.current_prompt_anchor();
-                let cursor = self.active_vte.cursor_position();
+                let cursor = terminal.cursor_position();
                 let suffix_is_empty = (anchor.0 >= 0 && anchor.1 >= 0)
                     .then(|| {
                         let suggestion =
                             click_cursor::suggestion_rgb(&self.config.borrow().palette);
-                        click_cursor::verified_suffix_is_empty(&self.active_vte, suggestion)
+                        click_cursor::verified_suffix_is_empty(terminal, suggestion)
                     })
                     .flatten();
-                let anchor_to_cursor = visible_editor_text(&self.active_vte, anchor);
+                let anchor_to_cursor = visible_editor_text(terminal, anchor);
                 let layout_changed = self.prompt_anchor_rows.get() > 0
                     && rows > 0
                     && self.prompt_anchor_rows.get() != rows;
                 let local_resize_seen =
                     self.prompt_anchor_resize_generation.get() != self.pty_resize_generation.get();
-                let current_prefix = visible_row_prefix(&self.active_vte, cursor);
+                let current_prefix = visible_row_prefix(terminal, cursor);
                 let saved_prefix = self.prompt_anchor_prefix.borrow();
                 let prompt_prefix_matches = !saved_prefix.is_empty()
                     && current_prefix.as_deref() == Some(saved_prefix.as_str());
@@ -19261,8 +19378,9 @@ impl TermView {
         self.pty.master_fd_raw()
     }
 
-    pub fn vte(&self) -> &Terminal {
-        &self.active_vte
+    #[cfg(test)]
+    pub(crate) fn vte(&self) -> &Terminal {
+        self.legacy_terminal().expect("legacy terminal fixture")
     }
 
     pub(crate) fn focus_widget(&self) -> gtk4::Widget {
@@ -19270,15 +19388,21 @@ impl TermView {
     }
 
     pub(crate) fn legacy_terminal(&self) -> Option<&Terminal> {
-        #[cfg(forge_shared_terminal)]
-        if self.active.borrow().shared_active.is_some() {
-            return None;
-        }
-        Some(&self.active_vte)
+        self.active_vte.as_ref()
     }
 
     pub fn cwd(&self) -> String {
         self.current_cwd.borrow().clone()
+    }
+
+    pub(crate) fn window_title(&self) -> Option<String> {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = self.active.borrow().shared_active.as_ref() {
+            return terminal.embedded().pane().window_title();
+        }
+        self.legacy_terminal()?
+            .window_title()
+            .map(|title| title.to_string())
     }
 
     pub fn grab_focus(&self) {
@@ -19403,7 +19527,7 @@ impl TermView {
     fn clipboard_paste_request(&self) -> ClipboardPasteRequest {
         ClipboardPasteRequest {
             sink: self.paste_sink(),
-            focus: DeferredLiveFocus::for_paste(&self.active_vte, &self.root),
+            focus: DeferredLiveFocus::for_paste(&self.focus_widget(), &self.root),
         }
     }
 
@@ -19413,11 +19537,12 @@ impl TermView {
             terminal.paste();
             return;
         }
-        let clipboard = self.active_vte.clipboard();
+        let terminal = self.focus_widget();
+        let clipboard = terminal.clipboard();
         let request = self.clipboard_paste_request();
         let feedback = self.input_feedback.clone();
-        let notify = paste_feedback::notifier(&self.active_vte);
-        let active_vte = self.active_vte.downgrade();
+        let notify = paste_feedback::notifier(&terminal);
+        let active_vte = terminal.downgrade();
         clipboard.read_text_async(None::<&gtk4::gio::Cancellable>, move |result| {
             let Some(text) = paste_feedback::read_text(result, notify.as_ref()) else {
                 return;
@@ -19901,7 +20026,9 @@ impl TermView {
         // the empty replacement snapshot.
         self.history_load.discard_for_explicit_clear();
         self.clear_find();
-        self.active_vte.unselect_all();
+        if let Some(terminal) = &self.active_vte {
+            terminal.unselect_all();
+        }
 
         let widgets: Vec<gtk4::Box> = self
             .finished_blocks
@@ -20524,15 +20651,17 @@ impl TermView {
     pub fn apply_theme(&self) {
         self.dynamic_colors.set(Default::default());
         let config = self.config.borrow();
-        apply_terminal_theme(&self.active_vte, &config);
+        let developer = self.root.has_css_class("developer-block-canvas");
+        if let Some(terminal) = &self.active_vte {
+            apply_terminal_theme(terminal, &config);
+            if developer {
+                developer_block::terminal_colors(terminal);
+            }
+        }
         #[cfg(forge_shared_terminal)]
         if let Some(terminal) = self.active.borrow().shared_active.clone() {
-            terminal.update_theme(&config, self.active_vte.font_scale());
+            terminal.update_theme(&config, config.default_font_scale);
             self.pty_winsize.arm_settle();
-        }
-        let developer = self.root.has_css_class("developer-block-canvas");
-        if developer {
-            developer_block::terminal_colors(&self.active_vte);
         }
         for block in self.finished_blocks.borrow().iter() {
             #[cfg(forge_shared_terminal)]
@@ -20578,7 +20707,9 @@ impl TermView {
     /// into the config would persist a family list the user never chose.
     pub fn set_font(&self, desc: &str) {
         let font_desc = crate::font::terminal_font_description(desc, &self.config.borrow());
-        self.active_vte.set_font(Some(&font_desc));
+        if let Some(terminal) = &self.active_vte {
+            terminal.set_font(Some(&font_desc));
+        }
         for block in self.finished_blocks.borrow().iter() {
             if let Some(terminal) = &block.command_vte {
                 terminal.set_font(Some(&font_desc));
@@ -20608,7 +20739,9 @@ impl TermView {
     /// cards record the target and adopt it on their way back in (see
     /// `FinishedBlock::set_font_scale`).
     pub fn set_font_scale(&self, scale: f64) {
-        self.active_vte.set_font_scale(scale);
+        if let Some(terminal) = &self.active_vte {
+            terminal.set_font_scale(scale);
+        }
         for block in self.finished_blocks.borrow().iter() {
             block.set_font_scale(scale);
         }
@@ -20646,8 +20779,22 @@ impl TermView {
             Some(serde_json::json!({"record_id":record.id,"offset":adjustment.value()-prefix as f64}))
         });
         let finished = self.finished_blocks.borrow();
-        let native_font = self.active_vte.font().map(|requested| {
-            let loaded = self.active_vte.pango_context().load_font(&requested);
+        let focus = self.focus_widget();
+        let config = self.config.borrow();
+        let (requested, scale) = if let Some(terminal) = self.legacy_terminal() {
+            (terminal.font(), terminal.font_scale())
+        } else {
+            let scale = config.default_font_scale;
+            #[cfg(forge_shared_terminal)]
+            let requested = Some(crate::ui::shared_terminal::SharedPane::scaled_font(
+                &config, scale,
+            ));
+            #[cfg(not(forge_shared_terminal))]
+            let requested = None;
+            (requested, scale)
+        };
+        let native_font = requested.map(|requested| {
+            let loaded = focus.pango_context().load_font(&requested);
             let resolved = loaded.as_ref().map(|font| font.describe());
             let absolute = loaded
                 .as_ref()
@@ -20661,13 +20808,12 @@ impl TermView {
                 "resolved_size_absolute":resolved.as_ref().map(|font|font.is_size_absolute()),
                 "resolved_absolute":absolute.as_ref().map(ToString::to_string),
                 "resolved_absolute_pango_units":absolute.as_ref().map(|font|font.size()),
-                "scale":self.active_vte.font_scale(),
-                "gtk_scale_factor":self.active_vte.scale_factor(),
+                "scale":scale,
+                "gtk_scale_factor":focus.scale_factor(),
             })
         });
-        let native_geometry = {
+        let native_geometry = self.legacy_terminal().map(|vte| {
             let clip = self.active.borrow().live_clip();
-            let vte = &self.active_vte;
             let top = vte.vadjustment().map(|value| value.value()).unwrap_or(0.0);
             let calibrated_caret = chat::editor_caret_point(vte);
             let point = calibrated_caret.and_then(|(_, point)| vte.compute_point(&clip, &point));
@@ -20719,26 +20865,37 @@ impl TermView {
                 "editor":editor_geometry,
                 "composer_dock":dock_bounds,
             })
-        };
+        });
         let outputs: Vec<_> = finished.iter().filter(|card| card.output_vte.as_ref().is_some_and(|vte| vte.is_mapped())).map(|card| {
             let Some(terminal) = card.output_vte.as_ref() else { unreachable!("filtered above") };
             let adjustment = terminal.vadjustment();
             serde_json::json!({"id":card.id,"adjustment":adjustment.map(|a|(a.lower(),a.value(),a.upper(),a.page_size())),"exit_code":data.iter().find(|record|record.id==card.id).and_then(|record|record.exit_code),"duration_ms":data.iter().find(|record|record.id==card.id).and_then(|record|record.duration_ms),"height":card.widget().height(),"height_request":card.widget().height_request(),"estimated_height":data.iter().find(|record|record.id==card.id).map(|record|record.estimated_height),"developer":card.widget().has_css_class("developer-command-card"),"rows":terminal.row_count(),"columns":terminal.column_count(),"cell":[terminal.char_width(),terminal.char_height()]})
         }).collect();
+        let (cursor, rows) = self.render_backend.cursor_and_rows();
+        let columns = self.render_backend.live_column_count();
+        let cell = self.active.borrow().live_cell_size();
+        let live_has_selection = self.active_vte.as_ref().map_or_else(
+            || {
+                focus
+                    .downcast_ref::<gtk4::TextView>()
+                    .is_some_and(|view| view.buffer().has_selection())
+            },
+            |terminal| terminal.has_selection(),
+        );
         serde_json::json!({"frame_time":self.root.frame_clock().map(|clock|clock.frame_time()),
             "adjustment":[adjustment.lower(),adjustment.value(),adjustment.upper(),adjustment.page_size()],
             "reading_anchor":anchor,"index_stale":index.stale,"outputs":outputs,"record_count":data.len(),"visible_indices_cache_len":self.visible_indices.borrow().len(),
-            "follow":self.scroll_debouncer.reference_state(),"terminal_has_focus":self.active_vte.has_focus(),
-            "live_grid":[self.active_vte.column_count(),self.active_vte.row_count()],
+            "follow":self.scroll_debouncer.reference_state(),"terminal_has_focus":focus.has_focus(),
+            "live_grid":[columns,rows],
             "child_winsize":self.pty_winsize.child_winsize(),
             "live_clip_height":self.active.borrow().live_clip().height(),
-            "live_cell":[self.active_vte.char_width(),self.active_vte.char_height()],
+            "live_cell":cell,
             "live_font":native_font,
             "live_geometry":native_geometry,
-            "live_has_selection":self.active_vte.has_selection(),
+            "live_has_selection":live_has_selection,
             "block_state":format!("{:?}", self.bstate.get()),
             "prompt_anchor":self.current_prompt_anchor(),
-            "live_cursor":self.active_vte.cursor_position(),
+            "live_cursor":cursor,
             "input_guards":{"dirty":self.idle_input_dirty.get(),"submitted":self.submission_pending.get(),"typeahead":self.pending_typeahead.get(),"synced":self.pty_synced.get(),"shadow_empty":self.typed_cmd.borrow().trim().is_empty()},
             "prompt_status":format!("{:?}",self.command_prompt_status()),
             "native_focus_reveal":self.block_scroll.child().and_downcast::<gtk4::Viewport>().map(|viewport|viewport.is_scroll_to_focus())})
@@ -20811,8 +20968,8 @@ impl TermView {
     /// Collect a snapshot of internal runtime state for the debug dashboard.
     /// Returns labelled sections, each a list of (key, value) rows.
     pub fn debug_info(&self) -> Vec<(&'static str, Vec<(String, String)>)> {
-        let out_cols = self.active_vte.column_count();
-        let out_rows = self.active_vte.row_count();
+        let out_cols = self.render_backend.live_column_count();
+        let (_, out_rows) = self.render_backend.cursor_and_rows();
 
         let finished_len = self.finished_blocks.borrow().len();
         let block_data_len = self.block_data.borrow().len();
@@ -20954,7 +21111,7 @@ impl TermView {
             &self.block_data,
             &self.block_list,
             &self.find_state,
-            &self.active_vte,
+            self.legacy_terminal(),
             BlockRemovalRefs {
                 selection: BlockSelectionRefs {
                     ids: &self.selected_block_ids,
@@ -21111,7 +21268,7 @@ pub(crate) fn organism_settings_test_clean_prompt(view: &TermView) {
     ctx.submission_pending.set(false);
     ctx.pending_typeahead.set(false);
     ctx.prompt_end_pos.set(ctx.surface.cursor_position());
-    ctx.prompt_anchor_rows.set(view.active_vte.row_count());
+    ctx.prompt_anchor_rows.set(ctx.surface.row_count());
     ctx.prompt_anchor_ready.set(true);
     assert_eq!(
         view.organism_activity_knowledge(),
@@ -21565,7 +21722,7 @@ mod tests {
                 settle();
                 assert_eq!(view.bstate.get(), BlockState::AwaitingCommand);
                 assert!(
-                    view.active_vte.cursor_position().1 > view.active_vte.row_count(),
+                    view.vte().cursor_position().1 > view.vte().row_count(),
                     "prewarm must advance absolute ring coordinates beyond one grid"
                 );
                 let history_cards = view.finished_blocks.borrow().len();
@@ -21576,7 +21733,7 @@ mod tests {
                 let command = if wrapped {
                     format!(
                         "ssh root@{}",
-                        "h".repeat(view.active_vte.column_count() as usize + 20)
+                        "h".repeat(view.vte().column_count() as usize + 20)
                     )
                 } else {
                     "command ssh remote".to_string()
@@ -21597,7 +21754,7 @@ mod tests {
                 let winsize = view.pty.test_slave_winsize();
                 let replies = Rc::new(RefCell::new(Vec::<String>::new()));
                 let captured = replies.clone();
-                let signal = view.active_vte.connect_commit(move |_, text, _| {
+                let signal = view.vte().connect_commit(move |_, text, _| {
                     captured.borrow_mut().push(text.to_string());
                 });
                 let assert_cursor_visible = || {
@@ -21605,7 +21762,7 @@ mod tests {
                     // Ask VTE itself for the screen-relative cursor. This
                     // bypasses our parser's CPR implementation and avoids
                     // using the very origin calculation being tested.
-                    view.active_vte.feed(b"\x1b[6n");
+                    view.vte().feed(b"\x1b[6n");
                     settle();
                     let row = replies
                         .borrow()
@@ -21622,7 +21779,7 @@ mod tests {
                         .expect("native VTE cursor-position response");
                     let clip = view.active.borrow().live_clip();
                     let offset = view
-                        .active_vte
+                        .vte()
                         .compute_point(&clip, &gtk::graphene::Point::new(0.0, 0.0))
                         .expect("terminal is inside live clip");
                     // GTK4 compute_point maps the content origin, already
@@ -21630,21 +21787,20 @@ mod tests {
                     // Start alignment adds no internal top offset (vte.cc,
                     // widget_size_allocate / widget_snapshot). Its Scrollable
                     // interface has no get_border implementation to query.
-                    assert_eq!(view.active_vte.yalign(), vte4::Align::Start);
-                    let bottom =
-                        f64::from(offset.y()) + (row * view.active_vte.char_height()) as f64;
+                    assert_eq!(view.vte().yalign(), vte4::Align::Start);
+                    let bottom = f64::from(offset.y()) + (row * view.vte().char_height()) as f64;
                     assert!(
-                        row < view.active_vte.row_count(),
+                        row < view.vte().row_count(),
                         "fixture must exercise a compact card: row={row}, grid={}",
-                        view.active_vte.row_count()
+                        view.vte().row_count()
                     );
                     assert!(bottom <= f64::from(clip.height()),
                         "{mode:?} wrapped={wrapped} integrated={integrated}: cursor bottom {bottom} exceeds clip {}; row={row}, grid={}, offset={}, alignment=Start, cell_height={}, terminal_height={}, css_insets={}",
-                        clip.height(), view.active_vte.row_count(), offset.y(), view.active_vte.char_height(), view.active_vte.height(), super::blocks::terminal_vertical_insets(&view.active_vte));
+                        clip.height(), view.vte().row_count(), offset.y(), view.vte().char_height(), view.vte().height(), super::blocks::terminal_vertical_insets(view.vte()));
                     assert_eq!(view.bstate.get(), BlockState::CollectingOutput);
                     assert_eq!(view.finished_blocks.borrow().len(), history_cards);
                     assert_eq!(view.pty.test_slave_winsize(), winsize);
-                    assert_eq!(view.active_vte.row_count(), i64::from(winsize.1));
+                    assert_eq!(view.vte().row_count(), i64::from(winsize.1));
                 };
                 assert_cursor_visible();
                 for _ in 0..2 {
@@ -21667,7 +21823,7 @@ mod tests {
                 view.pty.write_test_slave(b"\r\nroot@remote ~\r\n");
                 settle();
                 assert_cursor_visible();
-                view.active_vte.disconnect(signal);
+                view.vte().disconnect(signal);
                 window.close();
                 settle();
             }
@@ -23541,14 +23697,14 @@ mod tests {
         settle();
         let extent = view.active.borrow().live_extent_rows();
         let running = extent.get();
-        let viewport = view.active_vte.row_count();
+        let viewport = view.vte().row_count();
         assert!(
             running > 0 && running < viewport / 2,
             "a short running card ({running} of {viewport} rows)"
         );
 
         let winsize = view.pty.test_slave_winsize();
-        let columns = view.active_vte.column_count();
+        let columns = view.vte().column_count();
         let resize_epoch = view.pty_resize_generation.get();
 
         view.pty.write_test_slave(b"\x1b[?1049h");
@@ -23561,8 +23717,8 @@ mod tests {
             resize_epoch,
             "no transient resize at 1049h"
         );
-        assert_eq!(view.active_vte.column_count(), columns);
-        assert_eq!(view.active_vte.row_count(), i64::from(winsize.1));
+        assert_eq!(view.vte().column_count(), columns);
+        assert_eq!(view.vte().row_count(), i64::from(winsize.1));
         let controls = chat_display_widget(view.root.upcast_ref(), "reference-composer-controls");
         assert!(
             !controls.is_mapped(),
@@ -23578,8 +23734,8 @@ mod tests {
             resize_epoch,
             "no transient resize at 1049l"
         );
-        assert_eq!(view.active_vte.column_count(), columns);
-        assert_eq!(view.active_vte.row_count(), i64::from(winsize.1));
+        assert_eq!(view.vte().column_count(), columns);
+        assert_eq!(view.vte().row_count(), i64::from(winsize.1));
         assert_eq!(
             extent.get(),
             running,
@@ -24266,7 +24422,7 @@ mod tests {
         inspectors()[0].close();
         settle();
         assert!(
-            view.active_vte.has_focus(),
+            view.vte().has_focus(),
             "unmounted history uses live fallback"
         );
         assert!(view
@@ -24419,10 +24575,10 @@ mod tests {
         view.pty
             .drain_test_slave(std::time::Duration::from_millis(50));
 
-        view.active_vte.grab_focus();
+        view.vte().grab_focus();
         settle();
-        assert!(view.active_vte.has_focus());
-        view.active_vte.feed(b"\x1b[?1004h");
+        assert!(view.vte().has_focus());
+        view.vte().feed(b"\x1b[?1004h");
         settle();
         assert_eq!(
             view.pty.drain_test_slave(PTY_REPLY_WAIT),
@@ -24438,7 +24594,7 @@ mod tests {
         elsewhere.grab_focus();
         settle();
         assert_eq!(view.pty.drain_test_slave(PTY_REPLY_WAIT), b"\x1b[O");
-        view.active_vte.grab_focus();
+        view.vte().grab_focus();
         settle();
         assert_eq!(view.pty.drain_test_slave(PTY_REPLY_WAIT), b"\x1b[I");
 
@@ -24527,7 +24683,9 @@ mod tests {
         gtk4::init().expect("gtk init");
         let config = crate::config::Config::safe_defaults();
         let raw_output = Rc::new(RefCell::new(super::BoundedByteRing::new(1024)));
-        let active = Rc::new(RefCell::new(super::ActiveBlock::new(&config, raw_output)));
+        let active = Rc::new(RefCell::new(super::ActiveBlock::new_legacy(
+            &config, raw_output,
+        )));
         let sticky = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
         let jump_fab = gtk4::Button::new();
         let chrome = |active: &Rc<RefCell<super::ActiveBlock>>| {
@@ -34335,14 +34493,14 @@ mod tests {
                 "narrow window was not actually allocated: requested {width}, got {}",
                 window.width()
             );
-            assert_eq!(view.active_vte.font_scale(), scale);
+            assert_eq!(view.vte().font_scale(), scale);
             eprintln!(
                 "allocated window={}x{}, font scale={scale}",
                 window.width(),
                 window.height()
             );
-            dock_limit.set(dock.height() + 2 * view.active_vte.char_height() as i32);
-            let cap = clip.height() + 2 * view.active_vte.char_height() as i32;
+            dock_limit.set(dock.height() + 2 * view.vte().char_height() as i32);
+            let cap = clip.height() + 2 * view.vte().char_height() as i32;
             assert!(
                 cap < view.root.height() * 3 / 4,
                 "fixture must distinguish compact and native"
@@ -34422,7 +34580,7 @@ mod tests {
         };
         settle();
         view.ftcs_seen.set(true);
-        let native = view.active_vte.clone();
+        let native = view.vte().clone();
         let anchor = view.active.borrow().widget().clone();
         let mut stable_grid = None;
         for state in [
@@ -34435,7 +34593,7 @@ mod tests {
             view.render_backend.sync_geometry_to_pty();
             settle();
             view.render_backend.sync_geometry_to_pty();
-            let grid = super::pty_grid_size(&view.active_vte, &view.block_scroll);
+            let grid = super::pty_grid_size(view.vte(), &view.block_scroll);
             if let Some(expected) = stable_grid {
                 assert_eq!(
                     grid, expected,
@@ -34456,7 +34614,7 @@ mod tests {
                     <= view.active.borrow().live_clip().width() as f32 + 1.0,
                 "the common grid must fit the real clip rather than hide right-hand columns"
             );
-            assert_eq!(view.active_vte, native);
+            assert_eq!(view.vte(), &native);
             assert_eq!(anchor.parent().as_ref(), Some(view.block_list.upcast_ref()));
             let clip = view.active.borrow().live_clip();
             let parent = clip.parent().unwrap();
@@ -34479,7 +34637,7 @@ mod tests {
             view.bstate.set(state);
             view.render_backend.sync_geometry_to_pty();
             settle();
-            assert_eq!(view.active_vte, native);
+            assert_eq!(view.vte(), &native);
             assert_eq!(anchor.parent().as_ref(), Some(view.block_list.upcast_ref()));
         }
         // Height-only resizes must wake the settling tick after it has gone
@@ -34493,7 +34651,7 @@ mod tests {
         ] {
             view.bstate.set(state);
             if state == BlockState::AltScreen {
-                view.active_vte.feed(b"\x1b[?1049h");
+                view.vte().feed(b"\x1b[?1049h");
             }
             view.render_backend.sync_geometry_to_pty();
             settle();
@@ -34514,12 +34672,9 @@ mod tests {
                 grown.1 > before.1,
                 "{state:?}: child rows follow taller pane"
             );
-            assert_eq!(
-                grown,
-                super::pty_grid_size(&view.active_vte, &view.block_scroll)
-            );
+            assert_eq!(grown, super::pty_grid_size(view.vte(), &view.block_scroll));
             if state != BlockState::AwaitingCommand {
-                assert_eq!(view.active_vte.row_count(), i64::from(grown.1));
+                assert_eq!(view.vte().row_count(), i64::from(grown.1));
             }
             window.set_default_size(640, 480);
             settle();
@@ -34528,9 +34683,9 @@ mod tests {
                 before,
                 "resize does not accumulate"
             );
-            assert_eq!(view.active_vte, native);
+            assert_eq!(view.vte(), &native);
             if state == BlockState::AltScreen {
-                view.active_vte.feed(b"\x1b[?1049l");
+                view.vte().feed(b"\x1b[?1049l");
             }
         }
         window.close();
@@ -34580,7 +34735,7 @@ mod tests {
                 assert!(count.get() >= 8);
             };
             settle();
-            let native = view.active_vte.clone();
+            let native = view.vte().clone();
             let replies = Rc::new(RefCell::new(Vec::<String>::new()));
             let seen = replies.clone();
             native.connect_commit(move |_, text, _| seen.borrow_mut().push(text.to_string()));
@@ -34615,7 +34770,7 @@ mod tests {
                     view.render_backend.sync_geometry_to_pty();
                     settle();
                     assert_eq!((window.width(), window.height()), (width, height));
-                    assert_eq!(native, view.active_vte);
+                    assert_eq!(&native, view.vte());
                     assert_eq!(
                         view.pty.test_slave_winsize(),
                         super::pty_grid_size(&native, &view.block_scroll)
@@ -34868,8 +35023,8 @@ mod tests {
                 .unwrap();
             view.pty.write_test_slave(b"selectable running output\r\n");
             chat_display_settle();
-            view.active_vte.select_all();
-            assert!(view.active_vte.has_selection());
+            view.vte().select_all();
+            assert!(view.vte().has_selection());
             let before = view.block_data.borrow().len();
             view.selection_feed_hold.begin_drag();
             view.selection_feed_hold.end_drag(true);
@@ -34906,7 +35061,7 @@ mod tests {
                     before,
                     "ancestor capture/end cannot flush the control's hold"
                 );
-                assert!(view.active_vte.has_selection());
+                assert!(view.vte().has_selection());
                 let controllers = stop.observe_controllers();
                 let press = (0..controllers.n_items())
                     .filter_map(|i| controllers.item(i))
@@ -35271,7 +35426,7 @@ mod tests {
         }
         assert_eq!(GtkWindowExt::focus(&window), focus_before);
         assert!(!view.scroll_debouncer.user_scrolled_up.get());
-        if let Some(live) = view.active_vte.vadjustment() {
+        if let Some(live) = view.vte().vadjustment() {
             assert!(
                 (live.value() - (live.upper() - live.page_size()).max(live.lower())).abs() < 1.0
             );
@@ -35340,7 +35495,7 @@ mod tests {
         let events = Rc::new(RefCell::new(Vec::new()));
         for (index, view) in views.iter().enumerate() {
             let events = events.clone();
-            view.active_vte
+            view.vte()
                 .connect_map(move |_| events.borrow_mut().push(format!("map:{index}")));
         }
         let views_for_switch = views.clone();
@@ -35359,7 +35514,7 @@ mod tests {
                         .borrow_mut()
                         .push(format!("search:{page}"))
                 },
-                || Some(view.active_vte.clone().upcast()),
+                || Some(view.vte().clone().upcast()),
                 |terminal| {
                     view.restore_tab_viewport();
                     generation.set(generation.get().wrapping_add(1));
@@ -35388,9 +35543,9 @@ mod tests {
         for page in [1_u32, 0] {
             notebook.set_current_page(Some(page));
             chat_display_settle();
-            assert!(views[page as usize].active_vte.is_mapped());
+            assert!(views[page as usize].vte().is_mapped());
             assert!(
-                views[page as usize].active_vte.has_focus(),
+                views[page as usize].vte().has_focus(),
                 "{mode:?}: ordinary switch must focus page {page}"
             );
         }
@@ -35398,8 +35553,7 @@ mod tests {
         // Populate the actual scroll surface, then record a native reader move.
         let view = &views[0];
         if view.unified_navigation.is_some() {
-            view.active_vte
-                .feed("history row\r\n".repeat(200).as_bytes());
+            view.vte().feed("history row\r\n".repeat(200).as_bytes());
         } else {
             let spacer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
             spacer.set_height_request(3000);
@@ -35407,7 +35561,7 @@ mod tests {
         }
         chat_display_settle();
         let adjustment = if view.unified_navigation.is_some() {
-            view.active_vte
+            view.vte()
                 .vadjustment()
                 .expect("native transcript adjustment")
         } else {
@@ -35426,8 +35580,8 @@ mod tests {
             eprintln!(
                 "tab-reader stage={stage} mode={mode:?} value={} upper={} page={} reading={} mapped={} focused={} native_focus_reveal={:?}",
                 adjustment.value(), adjustment.upper(), adjustment.page_size(),
-                view.user_scrolled_up.get(), view.active_vte.is_mapped(),
-                view.active_vte.has_focus(),
+                view.user_scrolled_up.get(), view.vte().is_mapped(),
+                view.vte().has_focus(),
                 view.block_scroll.child().and_downcast::<gtk4::Viewport>()
                     .map(|viewport| viewport.is_scroll_to_focus()),
             );
@@ -35439,11 +35593,10 @@ mod tests {
         }
         notebook.set_current_page(Some(1));
         chat_display_settle();
-        assert!(!view.active_vte.is_mapped());
+        assert!(!view.vte().is_mapped());
         trace_viewport("hidden-before-growth");
         if view.unified_navigation.is_some() {
-            view.active_vte
-                .feed("background row\r\n".repeat(100).as_bytes());
+            view.vte().feed("background row\r\n".repeat(100).as_bytes());
         } else {
             view.block_list
                 .first_child()
@@ -35524,7 +35677,7 @@ mod tests {
         );
         for page in [1_u32, 0] {
             assert!(
-                !views[page as usize].active_vte.is_mapped(),
+                !views[page as usize].vte().is_mapped(),
                 "destination must begin unmapped"
             );
             events.borrow_mut().clear();
@@ -35534,7 +35687,7 @@ mod tests {
                 "{mode:?}: switch must synchronously restore search"
             );
             chat_display_settle();
-            assert!(views[page as usize].active_vte.is_mapped());
+            assert!(views[page as usize].vte().is_mapped());
             let observed = events.borrow();
             assert!(
                 observed.contains(&format!("search:{page}")),
@@ -35578,14 +35731,14 @@ mod tests {
         notebook.set_current_page(Some(1));
         assert!(search_owns_focus());
         search.set_search_mode(false);
-        assert!(views[1].active_vte.grab_focus());
+        assert!(views[1].vte().grab_focus());
         chat_display_settle();
-        assert!(views[1].active_vte.has_focus());
+        assert!(views[1].vte().has_focus());
         notebook.set_current_page(Some(0));
         notebook.set_current_page(Some(1));
         chat_display_settle();
         assert!(
-            views[1].active_vte.has_focus(),
+            views[1].vte().has_focus(),
             "closing search must permit ordinary terminal focus"
         );
         window.close();
@@ -35621,8 +35774,8 @@ mod tests {
             assert_eq!(view.bstate.get(), BlockState::CollectingPrompt);
         }
         chat_display_settle();
-        assert!(view.active_vte.grab_focus());
-        assert!(view.active_vte.is_mapped());
+        assert!(view.vte().grab_focus());
+        assert!(view.vte().is_mapped());
         replay_native_focus_bytes(
             view,
             if alt_exit {
@@ -35632,7 +35785,7 @@ mod tests {
             },
         );
         assert_eq!(view.bstate.get(), BlockState::AwaitingCommand);
-        assert!(view.active_vte.has_focus());
+        assert!(view.vte().has_focus());
     }
 
     fn drain_native_focus_idle() {
@@ -35705,17 +35858,17 @@ mod tests {
                     if remap {
                         // A temporary mapping gap without a new owner must not
                         // turn legitimate prompt restoration into a no-op.
-                        view.active_vte.set_visible(false);
-                        assert!(!view.active_vte.is_mapped());
-                        view.active_vte.set_visible(true);
-                        assert!(view.active_vte.is_mapped());
+                        view.vte().set_visible(false);
+                        assert!(!view.vte().is_mapped());
+                        view.vte().set_visible(true);
+                        assert!(view.vte().is_mapped());
                         // Mapping may synchronously restore this same terminal.
                         // Reject any unrelated owner, then recreate the empty
                         // focus precondition so the queued idle must do the work.
                         let remapped_owner = GtkWindowExt::focus(&window);
                         assert!(
                             remapped_owner.as_ref().is_none_or(|owner| {
-                                owner == view.active_vte.upcast_ref::<gtk4::Widget>()
+                                owner == view.vte().upcast_ref::<gtk4::Widget>()
                             }),
                             "{mode:?}: remap selected another owner (alt_exit={alt_exit}): {remapped_owner:?}"
                         );
@@ -35727,7 +35880,7 @@ mod tests {
                     );
                     drain_native_focus_idle();
                     assert!(
-                        view.active_vte.has_focus(),
+                        view.vte().has_focus(),
                         "{mode:?}: empty focus must restore (alt_exit={alt_exit}, remap={remap})"
                     );
                 }
@@ -35772,7 +35925,7 @@ mod tests {
                 .clone();
             for alt_exit in [false, true] {
                 for (name, owner) in [
-                    ("pane", other.active_vte.clone().upcast::<gtk4::Widget>()),
+                    ("pane", other.vte().clone().upcast::<gtk4::Widget>()),
                     ("find", find.clone().upcast()),
                     ("history", history.clone().upcast()),
                 ] {
@@ -35781,7 +35934,7 @@ mod tests {
                         assert!(owner.is_mapped());
                         assert!(owner.grab_focus());
                         let new_owner = GtkWindowExt::focus(&window).unwrap();
-                        assert_ne!(new_owner, view.active_vte.clone().upcast::<gtk4::Widget>());
+                        assert_ne!(new_owner, view.vte().clone().upcast::<gtk4::Widget>());
                         if clear_new_owner {
                             GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
                         }
@@ -35834,7 +35987,7 @@ mod tests {
                 GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
                 view.root.set_visible(false);
                 drain_native_focus_idle();
-                assert!(!view.active_vte.has_focus(), "{mode:?}: hidden target");
+                assert!(!view.vte().has_focus(), "{mode:?}: hidden target");
                 view.root.set_visible(true);
 
                 queue_native_focus_transition(&view, alt_exit);
@@ -35845,8 +35998,8 @@ mod tests {
                 assert!(GtkWindowExt::focus(&window).is_none());
                 root.remove(&view.root);
                 drain_native_focus_idle();
-                assert!(view.active_vte.root().is_none());
-                assert!(!view.active_vte.has_focus(), "{mode:?}: detached target");
+                assert!(view.vte().root().is_none());
+                assert!(!view.vte().has_focus(), "{mode:?}: detached target");
                 root.append(&view.root);
 
                 queue_native_focus_transition(&view, alt_exit);
@@ -35936,11 +36089,10 @@ mod tests {
         chat_display_settle();
         chat.pty.write_test_slave(b"\x1b]133;A\x07$ \x1b]133;B\x07");
         chat_display_settle();
-        let live = chat.active_vte.clone();
+        let live = chat.vte().clone();
         let long_input = format!("{}tail-visible", "continued input\n".repeat(80));
         *chat.typed_cmd.borrow_mut() = long_input.clone();
-        chat.active_vte
-            .feed(long_input.replace('\n', "\r\n").as_bytes());
+        chat.vte().feed(long_input.replace('\n', "\r\n").as_bytes());
         chat.render_backend.sync_geometry_to_pty();
         chat_display_settle();
         let large = chat.pty.test_slave_winsize();
@@ -35962,7 +36114,7 @@ mod tests {
             long_input,
             "resize does not edit input"
         );
-        assert_eq!(chat.active_vte, live);
+        assert_eq!(chat.vte(), &live);
         let bounds = viewport.compute_bounds(&chat.root).unwrap();
         assert!(bounds.y() + bounds.height() <= chat.root.height() as f32 + 1.0);
         assert_eq!(viewport.overflow(), gtk4::Overflow::Hidden);
@@ -35980,23 +36132,23 @@ mod tests {
             );
         }
         assert!(
-            chat.active_vte
+            chat.vte()
                 .text_format(vte4::Format::Text)
                 .unwrap()
                 .contains("tail-visible"),
             "the end of multiline input stays visible after shrink"
         );
         // Real parser transitions retain the focused live surface.
-        assert!(chat.active_vte.grab_focus());
+        assert!(chat.vte().grab_focus());
         chat.pty
             .write_test_slave(b"\x1b]133;C;cmdline_url=same\x07");
         chat_display_settle();
-        assert!(chat.active_vte.has_focus());
+        assert!(chat.vte().has_focus());
         chat.pty
             .write_test_slave(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
         chat_display_settle();
-        assert!(chat.active_vte.has_focus());
-        assert!(block.active_vte.grab_focus());
+        assert!(chat.vte().has_focus());
+        assert!(block.vte().grab_focus());
         for _ in 0..2 {
             chat.pty
                 .write_test_slave(b"same\r\n\x1b]133;C;cmdline_url=same\x07");
@@ -36005,10 +36157,10 @@ mod tests {
                 .write_test_slave(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
             chat_display_settle();
             assert!(
-                block.active_vte.has_focus(),
+                block.vte().has_focus(),
                 "background Chat reparent cannot steal Block focus"
             );
-            assert!(!chat.active_vte.has_focus());
+            assert!(!chat.vte().has_focus());
         }
         window.close();
     }

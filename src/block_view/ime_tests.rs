@@ -78,9 +78,9 @@ fn native_ime_commit_cancel_and_independent_ptys() {
         (&first, &second, "ascii-a", b"a".as_slice()),
         (&second, &first, "ascii-b", b"b".as_slice()),
     ] {
-        assert!(owner.active_vte.grab_focus());
+        assert!(owner.vte().grab_focus());
         chat_display_settle();
-        assert!(owner.active_vte.has_focus());
+        assert!(owner.vte().has_focus());
         native_ime_keys("compose");
         assert!(
             owner
@@ -197,16 +197,13 @@ fn native_ime_send_button_preserves_composition() {
             assert!(status.success());
             chat_display_settle();
         };
-        assert!(owner.active_vte.grab_focus());
+        assert!(owner.vte().grab_focus());
         chat_display_settle();
         // Positive control: use the production gesture, capture and admission
         // callbacks rather than directly emitting clicked or commit.
         click();
         native_ime_expect(&owner.pty, b"\r");
-        assert!(
-            owner.active_vte.has_focus(),
-            "idle Send retains the input owner"
-        );
+        assert!(owner.vte().has_focus(), "idle Send retains the input owner");
         native_ime_keys("compose");
         assert!(owner
             .pty
@@ -221,7 +218,7 @@ fn native_ime_send_button_preserves_composition() {
             "Send cannot submit or alter an active composition"
         );
         assert!(
-            owner.active_vte.has_focus(),
+            owner.vte().has_focus(),
             "blocked Send keeps native candidate ownership"
         );
         native_ime_keys("commit");
@@ -250,14 +247,14 @@ fn native_ime_send_button_preserves_composition() {
     }
     // Hidden-but-live contexts must not be forgotten prematurely. Remapping
     // and native cancellation must recover without any application IM reset.
-    assert!(first.active_vte.grab_focus());
+    assert!(first.vte().grab_focus());
     native_ime_keys("compose");
     assert!(super::ime_gate::blocked());
     first.root.set_visible(false);
     chat_display_settle();
     first.root.set_visible(true);
     chat_display_settle();
-    assert!(first.active_vte.grab_focus());
+    assert!(first.vte().grab_focus());
     native_ime_keys("cancel");
     assert!(!first
         .pty
@@ -307,7 +304,7 @@ fn native_ime_initial_and_returning_stack_tab_keep_same_owner() {
             .default_height(600)
             .child(&stack)
             .build();
-        assert!(!view.active_vte.is_mapped());
+        assert!(!view.vte().is_mapped());
         stack.set_visible_child_name("terminal");
         view.grab_focus();
         window.present();
@@ -318,13 +315,13 @@ fn native_ime_initial_and_returning_stack_tab_keep_same_owner() {
                 assert!(other.is_mapped());
                 assert!(other.grab_focus());
                 chat_display_settle();
-                assert!(!view.active_vte.is_mapped());
+                assert!(!view.vte().is_mapped());
                 stack.set_visible_child_name("terminal");
                 view.grab_focus();
             }
             chat_display_settle();
             assert!(
-                view.active_vte.is_mapped() && view.active_vte.has_focus(),
+                view.vte().is_mapped() && view.vte().has_focus(),
                 "{mode:?}, returning={returning}: terminal must own focus after layout"
             );
             view.pty.drain_test_slave(Duration::from_millis(30));
@@ -389,7 +386,7 @@ fn native_ime_notebook_startup_and_return_use_production_focus_queues() {
         &window,
         generation.clone(),
         1,
-        first.active_vte.clone(),
+        first.vte().clone(),
         first_page,
         search.clone(),
     );
@@ -398,8 +395,8 @@ fn native_ime_notebook_startup_and_return_use_production_focus_queues() {
         baseline_controllers + 2
     );
 
-    let first_terminal = first.active_vte.clone();
-    let second_terminal = second.active_vte.clone();
+    let first_terminal = first.vte().clone();
+    let second_terminal = second.vte().clone();
     let switch_generation = generation.clone();
     notebook.connect_switch_page(move |notebook, _, page| {
         let request = switch_generation.get().wrapping_add(1);
@@ -428,8 +425,8 @@ fn native_ime_notebook_startup_and_return_use_production_focus_queues() {
     while context.iteration(false) {
         assert!(Instant::now() < deadline, "pre-map idles did not settle");
     }
-    assert!(!first.active_vte.is_mapped());
-    assert!(!first.active_vte.has_focus());
+    assert!(!first.vte().is_mapped());
+    assert!(!first.vte().has_focus());
     assert_eq!(generation.get(), 1);
     window.present();
 
@@ -446,9 +443,9 @@ fn native_ime_notebook_startup_and_return_use_production_focus_queues() {
             while context.iteration(false) && Instant::now() < deadline {}
             if window.is_active()
                 && notebook.current_page() == Some(page)
-                && owner.active_vte.is_mapped()
-                && owner.active_vte.has_focus()
-                && !other.active_vte.is_mapped()
+                && owner.vte().is_mapped()
+                && owner.vte().has_focus()
+                && !other.vte().is_mapped()
                 && window.observe_controllers().n_items() == baseline_controllers
             {
                 break;

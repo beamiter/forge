@@ -75,12 +75,12 @@ fn grid_matches_pty(view: &TermView) -> bool {
     let (columns, rows) = view.pty.test_slave_winsize();
     columns > 0
         && rows > 0
-        && i64::from(columns) == view.active_vte.column_count()
-        && i64::from(rows) == view.active_vte.row_count()
+        && i64::from(columns) == view.vte().column_count()
+        && i64::from(rows) == view.vte().row_count()
 }
 
 fn selected_text(view: &TermView) -> Option<String> {
-    view.active_vte
+    view.vte()
         .text_selected(vte4::Format::Text)
         .map(|text| text.to_string())
 }
@@ -194,7 +194,7 @@ fn unified_navigation_preserves_reading_identity_selection_and_tui() {
     assert_eq!(commands.len(), 4);
     let previous = commands[2].0;
     let latest = commands[3].0;
-    let adjustment = view.active_vte.vadjustment().expect("native adjustment");
+    let adjustment = view.vte().vadjustment().expect("native adjustment");
     assert!(adjustment.upper() - adjustment.page_size() > adjustment.lower() + 10.0);
     wait_until(
         || {
@@ -240,7 +240,7 @@ fn unified_navigation_preserves_reading_identity_selection_and_tui() {
 
     // Copy addresses the displayed record choice. A native selection remains
     // independently available to the ordinary selected-text copy action.
-    view.active_vte.select_all();
+    view.vte().select_all();
     let selection = selected_text(&view).expect("native selection");
     assert!(!selection.is_empty());
     bar.copy.emit_clicked();
@@ -248,13 +248,13 @@ fn unified_navigation_preserves_reading_identity_selection_and_tui() {
     assert_eq!(selected_text(&view).as_deref(), Some(selection.as_str()));
     assert_eq!(
         gtk::glib::MainContext::default()
-            .block_on(view.active_vte.clipboard().read_text_future())
+            .block_on(view.vte().clipboard().read_text_future())
             .expect("local clipboard provider")
             .as_deref(),
         Some(commands[3].1.as_str())
     );
     assert_no_input(&view);
-    view.active_vte.unselect_all();
+    view.vte().unselect_all();
     view.selection_feed_hold.flush_now();
 
     // Native value movement abandons the explicit command cursor. Further
@@ -324,7 +324,7 @@ fn unified_navigation_preserves_reading_identity_selection_and_tui() {
         .abs()
             < 0.01
     );
-    assert!(owns_focus(&window, &view.active_vte));
+    assert!(owns_focus(&window, view.vte()));
     assert_no_input(&view);
 
     // A completion invalidates the old native pass without pretending the

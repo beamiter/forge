@@ -566,7 +566,7 @@ impl TermView {
 
             let full_text =
                 block.with_stripped_output(|output| format!("{prompt_text}\n{cmd_text}\n{output}"));
-            let clipboard = self.active_vte.clipboard();
+            let clipboard = self.root.clipboard();
             clipboard.set_text(&full_text);
         }
     }

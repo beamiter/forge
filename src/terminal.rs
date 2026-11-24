@@ -59,11 +59,11 @@ pub(crate) fn terminal_child_pid(terminal: &Terminal) -> Option<i32> {
     terminal_child_lifecycle(terminal).map(|lifecycle| lifecycle.pid())
 }
 
-fn belongs_to_selected_notebook_page(terminal: &Terminal) -> bool {
+fn belongs_to_selected_notebook_page(widget: &impl IsA<gtk4::Widget>) -> bool {
+    let widget = widget.as_ref();
     // GTK4 Notebook keeps its pages inside an internal GtkStack, so walking
     // plain `parent()` links never lands on a widget that equals `nth_page`.
     // Resolve the Notebook ancestor first, then test page membership downward.
-    let widget = terminal.clone().upcast::<gtk4::Widget>();
     let Some(notebook) = widget
         .ancestor(gtk4::Notebook::static_type())
         .and_downcast::<gtk4::Notebook>()
@@ -73,7 +73,7 @@ fn belongs_to_selected_notebook_page(terminal: &Terminal) -> bool {
     notebook
         .current_page()
         .and_then(|page| notebook.nth_page(Some(page)))
-        .is_some_and(|selected| widget == selected || widget.is_ancestor(&selected))
+        .is_some_and(|selected| widget == &selected || widget.is_ancestor(&selected))
 }
 
 /// Automatic map/tab focus must not reveal a live child through retained
@@ -106,7 +106,8 @@ pub(crate) fn focus_terminal_without_viewport_reveal(terminal: &impl IsA<gtk4::W
 /// dialogs and freshly reparented panes can still restore focus after closing.
 /// Never logically focus an unmapped VTE: doing so can prevent its IM context
 /// from receiving a real focus-in when the widget is first mapped.
-pub(crate) fn focus_terminal(terminal: &Terminal) {
+pub(crate) fn focus_terminal(terminal: &impl IsA<gtk4::Widget>) {
+    let terminal = terminal.as_ref();
     let mapped = terminal.is_mapped();
     let on_page = belongs_to_selected_notebook_page(terminal);
     if mapped && on_page {

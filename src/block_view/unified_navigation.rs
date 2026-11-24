@@ -509,12 +509,7 @@ impl super::TermView {
             return false;
         }
         if self.root.is_mapped() {
-            let focus = self.active.borrow().focus_widget();
-            if focus == *self.active_vte.upcast_ref::<gtk4::Widget>() {
-                super::focus_terminal(&self.active_vte);
-            } else {
-                focus.grab_focus();
-            }
+            self.grab_focus();
         }
         true
     }
@@ -577,7 +572,7 @@ impl super::TermView {
             }
             command.to_owned()
         };
-        self.active_vte.clipboard().set_text(&command);
+        self.root.clipboard().set_text(&command);
         Ok(())
     }
 }

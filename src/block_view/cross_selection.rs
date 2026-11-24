@@ -211,7 +211,7 @@ impl CrossSelection {
     pub(super) fn install(
         selection_root: &impl IsA<gtk::Widget>,
         finished_blocks: Rc<RefCell<Vec<FinishedBlock>>>,
-        active_vte: vte4::Terminal,
+        active_surface: TerminalTextSurface,
         selected_block_ids: SelectedBlockIds,
         selected_block_id: Rc<Cell<Option<u64>>>,
         selection_anchor_id: Rc<Cell<Option<u64>>>,
@@ -224,12 +224,6 @@ impl CrossSelection {
         // common native ancestor so a new composer selection retires an older
         // cross-card owner. Ordinary Block still passes its original scroller.
         let block_scroll = selection_root.upcast_ref::<gtk::Widget>();
-        let active_surface = TerminalTextSurface::Native(active_vte);
-        #[cfg(forge_shared_terminal)]
-        let active_surface = match &shared_active {
-            Some(terminal) => TerminalTextSurface::Document(terminal.screen().clone()),
-            None => active_surface,
-        };
         let this = Rc::new(Self {
             finished_blocks,
             active_surface,
@@ -819,7 +813,7 @@ mod tests {
     #[ignore = "requires an isolated native GTK display and candidate environment"]
     fn shared_live_output_keeps_the_owned_shell_through_alternate_screen() {
         use super::super::find::{FindNavigationResult, FindSearchResult};
-        use super::super::{BlockState, TermView};
+        use super::super::{BlockState, CommandPromptStatus, TermView};
         use crate::config::{Config, TerminalMode};
         use gtk::prelude::*;
         use std::rc::Rc;
@@ -876,7 +870,7 @@ mod tests {
             let same_surface = || {
                 screen.is_mapped()
                     && screen.buffer() == buffer
-                    && !view.active_vte.is_mapped()
+                    && view.legacy_terminal().is_none()
                     && view
                         .active
                         .borrow()
@@ -918,6 +912,9 @@ mod tests {
                     && view.bstate.get() == BlockState::AwaitingCommand
             });
 
+            wait_for("shared prompt ready for reviewed input", &|| {
+                view.command_prompt_status() == CommandPromptStatus::Ready
+            });
             view.pty.write_bytes(b"start\r").expect("send held command");
             wait_for("all live output rows", &|| {
                 let output = text();
@@ -1560,7 +1557,7 @@ mod tests {
         let cross = CrossSelection::install(
             &scroll,
             Rc::new(RefCell::new(vec![card.clone()])),
-            active.clone(),
+            TerminalTextSurface::Native(active.clone()),
             selected,
             Rc::new(Cell::new(Some(41))),
             Rc::new(Cell::new(Some(41))),
@@ -1985,7 +1982,7 @@ mod tests {
         settle();
         view.pty.write_test_slave(b"live-input");
         settle();
-        let active = &view.active_vte;
+        let active = view.vte();
         let card = view.finished_blocks.borrow().last().unwrap().clone();
         let cross = &view.cross_selection;
         let bounds = active.compute_bounds(&view.root).unwrap();

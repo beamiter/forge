@@ -62,7 +62,7 @@ fn chat_native_unicode_render_geometry() {
         .type_()
         .name()
         .contains("Wayland"));
-    let native = view.active_vte.clone();
+    let native = view.vte().clone();
     // Actual resolved Pango face; a missing requested font must not silently pass.
     let loaded = native
         .pango_context()
@@ -121,7 +121,7 @@ fn chat_native_unicode_render_geometry() {
             view.render_backend.sync_geometry_to_pty();
             settle();
             assert_eq!(window.width(), width, "compositor must apply actual resize");
-            assert_eq!(native, view.active_vte);
+            assert_eq!(&native, view.vte());
             let grid = pty_grid_size(&native, &view.block_scroll);
             assert_eq!(view.pty.test_slave_winsize(), grid);
             assert_eq!(native.column_count(), i64::from(grid.0));

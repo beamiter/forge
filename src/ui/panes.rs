@@ -279,9 +279,10 @@ impl UiState {
         view.set_menu_keybindings(self.keybinding_map.clone());
         view.start_history_load();
 
-        let terminal = view.vte().clone();
-        setup_terminal_click_handler(&terminal);
-        self.setup_context_menu(&terminal);
+        if let Some(terminal) = view.legacy_terminal() {
+            setup_terminal_click_handler(terminal);
+            self.setup_context_menu(terminal);
+        }
 
         let ui_for_exit = UiState::clone(self);
         let view_for_exit = Rc::downgrade(&view);
