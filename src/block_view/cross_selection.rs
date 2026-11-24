@@ -1423,6 +1423,14 @@ mod tests {
 
         retained.cmd = "printf\tpreserved-tab".into();
         retained.cmd_markup = None;
+        let tabbed = super::super::FinishedBlock::from_retained(&retained, &config, 80);
+        assert!(tabbed.command_vte.is_none());
+        assert_eq!(
+            tabbed.command_surface().unwrap().document_text().as_deref(),
+            Some(retained.cmd.as_str())
+        );
+
+        retained.cmd = "printf\x07invalid-control".into();
         let fallback = super::super::FinishedBlock::from_retained(&retained, &config, 80);
         assert!(fallback.command_vte.is_some());
         assert_eq!(fallback.output_vte.is_none(), document_output);
