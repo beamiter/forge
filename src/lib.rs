@@ -2,6 +2,7 @@
 
 mod agent_cli;
 mod composer_geometry;
+#[cfg(test)]
 mod delimited_reference;
 mod gtk_presentation;
 mod gtk_process;

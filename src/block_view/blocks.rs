@@ -2872,7 +2872,7 @@ impl FinishedBlock {
                 &config.palette,
             )
             .inspect(|command| {
-                command.install_links(crate::ui::shared_terminal::SharedTerminal::links())
+                command.install_links(crate::ui::shared_terminal::SharedTerminal::document_links())
             })
         } else {
             None
@@ -2954,7 +2954,7 @@ impl FinishedBlock {
                         .widget()
                         .update_property(&[gtk4::accessible::Property::Label("Background output")]);
                 }
-                output.install_links(crate::ui::shared_terminal::SharedTerminal::links());
+                output.install_links(crate::ui::shared_terminal::SharedTerminal::document_links());
                 jterm_gtk_view::FinishedOutputView::new(
                     output,
                     fallback_viewport_cap,
