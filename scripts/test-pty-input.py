@@ -65,7 +65,7 @@ for name in ("PTY_INPUT_QUEUE_CAPACITY", "MAX_PTY_INPUT_MESSAGE_BYTES"):
 source = source.replace("/* FUNCTIONS */", "\n".join(item(pty, signature) for signature in [
     "fn boundary_paste_policy(", "fn try_enqueue_input(",
     "fn filter_and_enqueue_input(", "fn filter_and_enqueue_input_with<T>(",
-    "fn input_guard_with_frame(", "fn write_all_fd(",
+    "fn filter_and_queue_input<T>(", "fn input_guard_with_frame(", "fn write_all_fd(",
 ]))
 source = source.replace("/* TYPES */", "\n".join([
     "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\n" + item(pty, "pub enum PtyWriteError {"),

@@ -839,18 +839,18 @@ mod tests {
     #[test]
     #[ignore = "requires an isolated native GTK display and candidate environment"]
     fn shared_live_output_keeps_the_owned_shell_through_alternate_screen() {
-        use super::super::find::FindSearchResult;
+        use super::super::find::{FindNavigationResult, FindSearchResult};
+        use super::super::{BlockState, TermView};
         use crate::config::{Config, TerminalMode};
         use gtk::prelude::*;
+        use std::rc::Rc;
         use std::time::{Duration, Instant};
-        use vte4::TerminalExt;
 
         jterm_core::child_env::capture_inherited_environment().expect("test child environment");
         gtk::init().expect("GTK display");
-        assert_eq!(
-            std::env::var("JTERM_SHARED_LIVE_OUTPUT").as_deref(),
-            Ok("1")
-        );
+        for name in ["JTERM_SHARED_ACTIVE_TERMINAL", "JTERM_SHARED_TRANSCRIPT"] {
+            assert_eq!(std::env::var(name).as_deref(), Ok("1"));
+        }
 
         let shell = r#"
             stty -echo
@@ -866,19 +866,7 @@ mod tests {
             printf '\033]133;D;0\007\033]133;A\007$ \033]133;B\007'
             IFS= read -r shutdown
         "#;
-        let wait_for = |what: &str, condition: &dyn Fn() -> bool| {
-            let context = gtk::glib::MainContext::default();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while Instant::now() < deadline {
-                while context.iteration(false) {}
-                if condition() {
-                    return true;
-                }
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            eprintln!("timed out while waiting for {what}");
-            false
-        };
+        let argv = ["/bin/sh".into(), "-c".into(), shell.into()];
         for mode in [
             TerminalMode::Block,
             TerminalMode::Chat,
@@ -887,101 +875,151 @@ mod tests {
             let mut config = Config::safe_defaults();
             config.terminal_mode = mode.clone();
             config.preserve_live_scrollback = false;
-            let view = super::super::TermView::new_with_spawner(
-                &config,
-                &mode,
-                &["sh".into()],
-                None,
-                None,
-                &[],
-                |_, _, _, _| crate::pty::OwnedPty::spawn(&["/bin/sh", "-c", shell], None, &[]),
-            )
-            .expect("spawn real PTY shell");
+            let view = TermView::new(&config, &mode, &argv, None, None, &[])
+                .expect("spawn the production shared PTY");
+            let terminal = view
+                .active
+                .borrow()
+                .shared_active
+                .clone()
+                .expect("shared active renderer");
+            let screen = terminal.screen();
+            let buffer = screen.buffer();
+            let text = || buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
             let window = gtk::Window::builder()
                 .default_width(920)
                 .default_height(680)
                 .child(&view.widget())
                 .build();
+            let pid = view.pid_i32();
+            let fd = view.pty_fd_i32();
+            assert!(pid > 0 && fd >= 0);
+            let same_surface = || {
+                screen.is_mapped()
+                    && screen.buffer() == buffer
+                    && !view.active_vte.is_mapped()
+                    && view
+                        .active
+                        .borrow()
+                        .shared_active
+                        .as_ref()
+                        .is_some_and(|current| Rc::ptr_eq(current, &terminal))
+                    && view.pid_i32() == pid
+                    && view.pty_fd_i32() == fd
+            };
+            let wait_for = |what: &str, condition: &dyn Fn() -> bool| {
+                let context = gtk::glib::MainContext::default();
+                let deadline = Instant::now() + Duration::from_secs(6);
+                while Instant::now() < deadline {
+                    while context.iteration(false) {}
+                    if condition() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                panic!(
+                    "{mode:?}: timed out waiting for {what}; screen: {:?}",
+                    text()
+                );
+            };
+            let find_text = || {
+                let tag = buffer.tag_table().lookup("jterm-screen-find-current")?;
+                let mut start = buffer.start_iter();
+                if !start.has_tag(&tag) && !start.forward_to_tag_toggle(Some(&tag)) {
+                    return None;
+                }
+                let mut end = start;
+                end.forward_to_tag_toggle(Some(&tag));
+                Some(buffer.text(&start, &end, false).to_string())
+            };
             window.present();
-            assert!(wait_for("live shell prompt", &|| view
-                .active_vte
-                .is_mapped()
-                && view.bstate.get()
-                    == super::super::BlockState::AwaitingCommand));
-            let label = view
-                .active
-                .borrow()
-                .shared_live_widget()
-                .expect("live output widget");
-            assert!(!label.is_mapped());
+            wait_for("live shell prompt", &|| {
+                same_surface()
+                    && text().contains("$ ")
+                    && view.bstate.get() == BlockState::AwaitingCommand
+            });
+
             view.pty.write_bytes(b"start\r").expect("send held command");
-            assert!(
-                wait_for("shared active row", &|| label.is_mapped()),
-                "{mode:?}: capture {:?}, cursor {:?}, native {:?}",
-                view.active.borrow().output_text_prefix(128),
-                view.active_vte.cursor_position(),
-                view.active_vte.text_format(vte4::Format::Text)
-            );
-            let first = label
-                .first_child()
-                .unwrap()
-                .downcast::<gtk::Label>()
-                .unwrap();
-            let second = first
-                .next_sibling()
-                .unwrap()
-                .downcast::<gtk::Label>()
-                .unwrap();
-            assert_eq!(first.text(), "shared live row");
-            assert_eq!(second.text(), "second captured row");
-            assert!(second.is_mapped() && second.width() > first.width());
-            let unicode = second
-                .next_sibling()
-                .unwrap()
-                .downcast::<gtk::Label>()
-                .unwrap();
-            assert_eq!(unicode.text(), "wide 界 e\u{301}");
-            assert!(unicode.is_mapped() && unicode.width() > 0);
+            wait_for("all live output rows", &|| {
+                let output = text();
+                same_surface()
+                    && ["shared live row", "second captured row", "wide 界 e\u{301}"]
+                        .iter()
+                        .all(|row| output.lines().any(|line| line.trim_end() == *row))
+            });
             assert!(matches!(
-                view.find_in_blocks("shared live row", false),
-                FindSearchResult::Matches(_)
+                view.find_in_blocks("shared (?:live) row|second captured row", true),
+                FindSearchResult::Matches(p) if p.current == 1 && p.total == 2
             ));
-            assert!(wait_for("existing active find renderer", &|| !label.is_mapped()));
-            view.clear_find();
+            assert_eq!(find_text().as_deref(), Some("shared live row"));
+            assert!(
+                matches!(view.find_next(), FindNavigationResult::Progress(p) if p.current == 2)
+            );
+            assert_eq!(find_text().as_deref(), Some("second captured row"));
+            assert!(!buffer.has_selection());
 
             view.pty
                 .write_bytes(b"fullscreen\r")
                 .expect("same shell enters alternate screen");
-            assert!(wait_for("mapped alternate screen", &|| !label.is_mapped()
-                && view.bstate.get() == super::super::BlockState::AltScreen
-                && view
-                    .active_vte
-                    .text_format(vte4::Format::Text)
-                    .is_some_and(|text| text.contains("full screen witness"))));
+            wait_for("same shared surface in alternate screen", &|| {
+                same_surface()
+                    && view.bstate.get() == BlockState::AltScreen
+                    && text().contains("full screen witness")
+            });
+            assert_eq!(view.find_next(), FindNavigationResult::Invalidated);
+            assert!(matches!(
+                view.find_in_blocks("full screen witness", false),
+                FindSearchResult::Matches(p) if p.total == 1
+            ));
+            assert_eq!(find_text().as_deref(), Some("full screen witness"));
+            assert_eq!(
+                view.find_in_blocks("shared live row", false),
+                FindSearchResult::NoMatches
+            );
             view.pty
                 .write_bytes(b"finish\r")
                 .expect("same shell exits alternate screen");
-            assert!(wait_for("first completed command", &|| view
-                .render_backend
-                .records()
-                .len()
-                == 1));
-            assert!(!label.is_mapped());
+            wait_for("first completed command", &|| {
+                same_surface()
+                    && view.bstate.get() == BlockState::AwaitingCommand
+                    && view.render_backend.records().len() == 1
+            });
+            if let Some(transcript) = terminal.transcript() {
+                let id = view.render_backend.records().iter().next().unwrap().id();
+                wait_for("completed Unified zone", &|| {
+                    transcript
+                        .painted_zone_rows()
+                        .iter()
+                        .any(|row| row.id == id && row.heading && row.completed)
+                });
+            }
             view.pty
                 .write_bytes(b"continued\r")
                 .expect("send next command to same shell");
-            assert!(wait_for("same shell's next command", &|| view
+            wait_for("same shell's next command", &|| {
+                same_surface()
+                    && view.bstate.get() == BlockState::AwaitingCommand
+                    && view.render_backend.records().len() == 2
+            });
+            assert!(view
                 .render_backend
                 .records()
-                .len()
-                == 2));
-            let records = view.render_backend.records();
-            assert!(records
                 .iter()
                 .next_back()
                 .and_then(|record| record.output())
                 .is_some_and(|output| output.contains("same shell continued")));
-            drop(records);
+            if !mode.is_unified() {
+                view.select_all_blocks();
+                view.copy_to_clipboard_with_modifier(true);
+                let clipboard = window.clipboard();
+                let copied = gtk::glib::MainContext::default()
+                    .block_on(clipboard.read_text_future())
+                    .expect("read copied outputs")
+                    .expect("completed outputs on the clipboard");
+                let first = copied.find("shared live row").expect("first output");
+                let second = copied.find("same shell continued").expect("next output");
+                assert!(first < second, "copied outputs preserve command order");
+            }
             view.pty.kill();
             window.close();
         }

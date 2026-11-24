@@ -9927,12 +9927,6 @@ impl RenderBackend for BlockBackend {
     }
 
     fn feed_legacy(&self, bytes: &[u8]) {
-        #[cfg(forge_shared_terminal)]
-        if let Ok(active) = self.active_rc.try_borrow() {
-            if let Some(widget) = active.shared_live_widget() {
-                widget.set_visible(false);
-            }
-        }
         self.active_vte.feed(bytes);
     }
 
@@ -14953,10 +14947,6 @@ impl TermView {
         self.active
             .borrow()
             .set_preserve_live_scrollback(config.preserve_live_scrollback);
-        #[cfg(forge_shared_terminal)]
-        self.active
-            .borrow()
-            .set_shared_live_foreground(config.foreground);
     }
 
     /// Switch every card in this pane, and the live input cell, to the
@@ -16124,13 +16114,6 @@ impl TermView {
                 debouncer.pin_to_bottom_deferred(&scroll);
             });
         }
-
-        #[cfg(forge_shared_terminal)]
-        blocks::ActiveBlock::connect_shared_live_output(
-            &active,
-            bstate.clone(),
-            contents_generation.clone(),
-        );
 
         // True while an alt-screen app owns the viewport (finished blocks hidden).
         let fullscreen: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -19320,7 +19303,7 @@ impl TermView {
                     if let Err(error) = result {
                         log::warn!("refused oversized whole-Block clipboard copy: {error}");
                         show_clipboard_failure(
-                            &self.active_vte,
+                            &self.root,
                             "Copy failed",
                             &format!("{error}. Nothing was copied."),
                         );
@@ -19335,7 +19318,7 @@ impl TermView {
                         count,
                         text.len()
                     );
-                    self.active_vte.clipboard().set_text(&text);
+                    self.root.clipboard().set_text(&text);
                     return;
                 }
             }
@@ -19356,7 +19339,7 @@ impl TermView {
     /// own it.
     fn paste_sink(&self) -> PasteSink {
         PasteSink {
-            notify: paste_feedback::notifier(&self.active_vte),
+            notify: paste_feedback::notifier(&self.root),
             pty: self.pty.clone(),
             bracketed_paste: self.bracketed_paste.clone(),
             bstate: self.bstate.clone(),
