@@ -737,7 +737,7 @@ pub(crate) struct FinishedBlock {
     /// scrollback, reachable through `output_scrollbar`.
     pub(crate) output_vte: Option<vte4::Terminal>,
     #[cfg(forge_shared_terminal)]
-    pub(crate) output_document: Option<jterm_gtk_view::FinishedTextView>,
+    pub(crate) output_document: Option<jterm_gtk_view::FinishedOutputView>,
     #[cfg(forge_shared_terminal)]
     output_document_height: Rc<Cell<i32>>,
     /// Per-block scrollbar bound to `output_vte`'s private adjustment. Visible
@@ -2946,23 +2946,29 @@ impl FinishedBlock {
         let displayed_output: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         #[cfg(forge_shared_terminal)]
         let output_document = if precomputed.document_output
-            && command_document.is_some()
+            && (command_document.is_some() || is_background)
             && images.is_empty()
-            && output_rows <= i64::from(config.finished_block_viewport_rows)
         {
-            jterm_core::screen_replay::project_bounded_archive(output)
-                .filter(|document| !document.text.trim().is_empty())
-                .map(|document| {
-                    let output = jterm_gtk_view::FinishedTextView::output(
-                        &document,
-                        crate::font::terminal_font_description(&config.font_desc, config),
-                        config.default_font_scale,
-                        super::developer_block::terminal_foreground(),
-                        &config.palette,
-                    );
-                    output.install_links(crate::ui::shared_terminal::SharedTerminal::links());
+            jterm_core::screen_replay::project_bounded_archive(output).map(|document| {
+                let output = jterm_gtk_view::FinishedTextView::output(
+                    &document,
+                    crate::font::terminal_font_description(&config.font_desc, config),
+                    config.default_font_scale,
+                    super::developer_block::terminal_foreground(),
+                    &config.palette,
+                );
+                if is_background {
                     output
-                })
+                        .widget()
+                        .update_property(&[gtk4::accessible::Property::Label("Background output")]);
+                }
+                output.install_links(crate::ui::shared_terminal::SharedTerminal::links());
+                jterm_gtk_view::FinishedOutputView::new(
+                    output,
+                    fallback_viewport_cap,
+                    max_expanded_cap,
+                )
+            })
         } else {
             None
         };
@@ -3386,9 +3392,7 @@ impl FinishedBlock {
 
         content.append(&cmd_row);
         cmd_row.set_visible(!is_background);
-        // Always use a read-only VTE, including short output. The previous Label
-        // fast path stripped ANSI SGR bytes, so `ls` and `git status` lost the
-        // colors users see in regular VTE mode.
+        // Keep both the read-only text and the private scrollbar in the card.
         let output_box = gtk4::Box::new(Orientation::Horizontal, 0);
         output_box.set_hexpand(true);
         output_box.set_margin_start(BLOCK_GUTTER_PX);
@@ -3423,6 +3427,10 @@ impl FinishedBlock {
             };
             sync_visibility(&adj);
             adj.connect_changed(sync_visibility);
+        }
+        #[cfg(forge_shared_terminal)]
+        if let Some(output) = &output_document {
+            output.bind_controls(&output_scrollbar, &expand_btn, &jump_bottom_btn);
         }
         let output_widget: gtk4::Widget = output_box.clone().upcast::<gtk4::Widget>();
         content.append(&output_box);
@@ -3900,8 +3908,14 @@ impl FinishedBlock {
                                 ),
                                 preview.as_deref(),
                             );
-                            expand_btn.set_visible(can_expand);
-                            jump_bottom_btn.set_visible(has_private_scroll);
+                            if output_vte
+                                .as_ref()
+                                .and_then(glib::WeakRef::upgrade)
+                                .is_some()
+                            {
+                                expand_btn.set_visible(can_expand);
+                                jump_bottom_btn.set_visible(has_private_scroll);
+                            }
                             // Keep `displayed_output` in sync so a later unmap → remap
                             // (block scrolls out of view, then back) re-feeds the
                             // filtered text, not the full output.
@@ -4096,7 +4110,7 @@ impl FinishedBlock {
             output_notice,
             cols,
             viewport_cap,
-            long_output: uses_output_vte && long_output,
+            long_output,
             estimated_retained_bytes,
         };
         // Constructors do not receive provenance. Old/restored records and
@@ -4236,7 +4250,7 @@ impl FinishedBlock {
             }
             #[cfg(forge_shared_terminal)]
             if let Some(document) = &self.output_document {
-                output.prepend(&document.output_gutter());
+                output.prepend(&document.text().output_gutter());
                 document.widget().set_margin_start(12);
             }
         }
@@ -4418,7 +4432,7 @@ impl FinishedBlock {
         }
         #[cfg(forge_shared_terminal)]
         if let Some(document) = &self.output_document {
-            document.set_foreground(chat_snapshot_foreground());
+            document.text().set_foreground(chat_snapshot_foreground());
         }
         self.content.append(&command);
         self.content.append(&result);
@@ -4576,7 +4590,7 @@ impl FinishedBlock {
         use super::text_surface::TerminalTextSurface;
         #[cfg(forge_shared_terminal)]
         if let Some(output) = &self.output_document {
-            return TerminalTextSurface::Document(output.widget().clone());
+            return TerminalTextSurface::Document(output.text().widget().clone());
         }
         TerminalTextSurface::Native(
             self.output_vte
@@ -4595,10 +4609,22 @@ impl FinishedBlock {
 
     #[cfg(forge_shared_terminal)]
     fn refit_output_document_height(&self) -> Option<i32> {
-        if !self.content.is_mapped() {
+        let width = self.widget.width();
+        if !self.content.is_mapped() || width <= 0 {
             return None;
         }
-        let height = self.widget.height();
+        let output = self.output_document.as_ref()?;
+        let page = self
+            .widget
+            .ancestor(gtk4::ScrolledWindow::static_type())
+            .filter(|widget| widget.has_css_class("block-scroll"))
+            .and_downcast::<gtk4::ScrolledWindow>()
+            .map(|scroll| scroll.vadjustment().page_size());
+        output.refit(
+            page,
+            super::MIN_INPUT_ROWS as i64 + FINISHED_BLOCK_NON_OUTPUT_ROWS,
+        );
+        let (_, height, ..) = self.widget.measure(Orientation::Vertical, width);
         if height > 0 && self.output_document_height.replace(height) != height {
             Some(height)
         } else {
@@ -4708,18 +4734,15 @@ impl FinishedBlock {
         outer: &gtk4::ScrolledWindow,
         debouncer: &ScrollDebouncer,
     ) {
-        let output_for_jump = self.output_vte.as_ref().map(ObjectExt::downgrade);
+        let adjustment_for_jump = self.output_scrollbar.adjustment().downgrade();
         let widget_for_jump = self.widget.downgrade();
         let outer_for_jump = outer.downgrade();
         self.jump_bottom_btn.connect_clicked(move |_| {
-            let (Some(output), Some(widget), Some(outer)) = (
-                output_for_jump.as_ref().and_then(glib::WeakRef::upgrade),
-                widget_for_jump.upgrade(),
-                outer_for_jump.upgrade(),
-            ) else {
+            let (Some(widget), Some(outer)) = (widget_for_jump.upgrade(), outer_for_jump.upgrade())
+            else {
                 return;
             };
-            if let Some(adj) = output.vadjustment() {
+            if let Some(adj) = adjustment_for_jump.upgrade() {
                 let target = (adj.upper() - adj.page_size()).max(adj.lower());
                 if target > adj.lower() + f64::EPSILON {
                     adj.set_value(target);
@@ -4752,20 +4775,32 @@ impl FinishedBlock {
 
         #[cfg(forge_shared_terminal)]
         if let Some(output) = &self.output_document {
-            let wheel =
-                gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
-            wheel.set_propagation_phase(gtk4::PropagationPhase::Capture);
-            debouncer.watch_gesture(&wheel, outer);
-            let outer = outer.downgrade();
-            let debouncer = debouncer.clone();
-            wheel.connect_scroll(move |event, _, dy| {
-                let Some(outer) = outer.upgrade() else {
-                    return glib::Propagation::Proceed;
-                };
-                debouncer.scroll_wheel(&outer, dy, scroll_unit_is_surface(event));
-                glib::Propagation::Stop
-            });
-            output.widget().add_controller(wheel);
+            output.refit(
+                Some(outer.vadjustment().page_size()),
+                super::MIN_INPUT_ROWS as i64 + FINISHED_BLOCK_NON_OUTPUT_ROWS,
+            );
+            let targets = [output.widget(), self.output_scrollbar.upcast_ref()];
+            for target in targets {
+                let wheel =
+                    gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+                wheel.set_propagation_phase(gtk4::PropagationPhase::Capture);
+                debouncer.watch_gesture(&wheel, outer);
+                let outer = outer.downgrade();
+                let inner = output.adjustment().downgrade();
+                let debouncer = debouncer.clone();
+                wheel.connect_scroll(move |event, _, dy| {
+                    let (Some(outer), Some(inner)) = (outer.upgrade(), inner.upgrade()) else {
+                        return glib::Propagation::Proceed;
+                    };
+                    let surface = scroll_unit_is_surface(event);
+                    let remaining = jterm_gtk_view::scroll_finished_output(&inner, dy, surface);
+                    if remaining != 0.0 {
+                        debouncer.scroll_wheel(&outer, remaining, surface);
+                    }
+                    glib::Propagation::Stop
+                });
+                target.add_controller(wheel);
+            }
         }
 
         let Some(output_vte) = &self.output_vte else {

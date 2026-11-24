@@ -5253,7 +5253,7 @@ impl BlockBackend {
 /// buffer exceeds this, the oldest bytes are dropped, keeping the most recent tail
 /// (the part a finished block actually shows). 8 MiB comfortably covers any normal
 /// command's output.
-const MAX_RAW_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RAW_OUTPUT_BYTES: usize = jterm_core::screen_replay::MAX_COMPLETED_CAPTURE_BYTES;
 
 /// How often the shell-integration watch re-checks. It stops permanently once
 /// the first OSC 133 marker appears.
@@ -20531,7 +20531,7 @@ impl TermView {
             }
             #[cfg(forge_shared_terminal)]
             if let Some(output) = &block.output_document {
-                output.set_colors(document_foreground, &config.palette);
+                output.text().set_colors(document_foreground, &config.palette);
             }
         }
         install_block_css(&config);
