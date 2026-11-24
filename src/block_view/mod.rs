@@ -10621,9 +10621,9 @@ impl RenderBackend for BlockBackend {
             .map_or(dynamic_colors, |terminal| terminal.output_colors());
         let mut precomputed = FinishedBlockPrecomputed::documents(
             &finished_config,
-            record.command_source == CommandTextSource::ShellReported
-                && dynamic_colors.foreground.is_none(),
+            record.command_source == CommandTextSource::ShellReported,
             payload.output_notice().is_none(),
+            dynamic_colors,
         );
         precomputed.output_rows = Some(output_rows);
         precomputed.output_preview = Some(fold_preview::from_output(output_with_ansi));
@@ -19955,12 +19955,8 @@ impl TermView {
                     self.finished_blocks.borrow().iter().map(|card| card.id),
                     block.id,
                 );
-                let finished = FinishedBlock::from_retained(
-                    &block,
-                    &config,
-                    cols,
-                    self.dynamic_colors.get().foreground.is_none(),
-                );
+                let finished =
+                    FinishedBlock::from_retained(&block, &config, cols, self.dynamic_colors.get());
                 finished.set_lifecycle(
                     block.lifecycle_health(),
                     block.lifecycle_notice().as_deref(),
@@ -20189,12 +20185,8 @@ impl TermView {
                 } else {
                     fallback_cols
                 };
-                let finished = FinishedBlock::from_retained(
-                    block,
-                    &config,
-                    cols,
-                    self.dynamic_colors.get().foreground.is_none(),
-                );
+                let finished =
+                    FinishedBlock::from_retained(block, &config, cols, self.dynamic_colors.get());
                 finished.set_lifecycle(
                     block.lifecycle_health(),
                     block.lifecycle_notice().as_deref(),

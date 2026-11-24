@@ -2826,12 +2826,8 @@ impl TermView {
                     block.output.len(),
                     block.exit_code
                 );
-                let finished = FinishedBlock::from_retained(
-                    block,
-                    &config,
-                    cols,
-                    self.dynamic_colors.get().foreground.is_none(),
-                );
+                let finished =
+                    FinishedBlock::from_retained(block, &config, cols, self.dynamic_colors.get());
                 finished.set_lifecycle(
                     block.lifecycle_health(),
                     block.lifecycle_notice().as_deref(),
