@@ -5822,11 +5822,7 @@ impl ActiveBlock {
         self.alt_leave_pending.set(false);
         #[cfg(forge_shared_terminal)]
         if let Some(terminal) = &self.shared_active {
-            terminal.feed(if preserve_scrollback {
-                b"\x1b[0m"
-            } else {
-                b"\x1bc"
-            });
+            terminal.output().reset_prompt(preserve_scrollback);
             return;
         }
         if preserve_scrollback {

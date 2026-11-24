@@ -7,8 +7,8 @@ use crate::{
 };
 use gtk4::prelude::*;
 use jterm_gtk_view::{
-    EmbeddedTerminal, FindFrame, FindMatch, FindRegion, FindSnapshot, Pty, PtyExit, Theme,
-    TranscriptAnchor, TranscriptView,
+    EmbeddedTerminal, FindFrame, FindMatch, FindRegion, FindSnapshot, Pty, PtyExit, TerminalOutput,
+    TerminalProfile, Theme, TranscriptAnchor, TranscriptView,
 };
 use std::{
     cell::{Cell, OnceCell},
@@ -20,13 +20,49 @@ type DirectoryReport = Box<dyn Fn(&str)>;
 
 pub(super) struct SharedActiveTerminal {
     terminal: Rc<EmbeddedTerminal<Transport>>,
+    output: Rc<ActiveTerminalOutput>,
     transcript: Option<TranscriptView<Transport>>,
     output_start: Cell<Option<TranscriptAnchor>>,
     pub(super) widget: gtk4::Widget,
     input: Rc<OnceCell<InputBinding>>,
-    directory_report: OnceCell<DirectoryReport>,
     resize_error: Rc<Cell<Option<io::ErrorKind>>>,
     mode: TerminalMode,
+}
+
+pub(super) struct ActiveTerminalOutput {
+    runtime: TerminalOutput<Transport>,
+    directory_report: OnceCell<DirectoryReport>,
+}
+
+impl ActiveTerminalOutput {
+    pub(super) fn apply(&self, bytes: &[u8]) {
+        if let Some(report) = self.directory_report.get() {
+            // The host parser admits OSC 7 as an individual ST-terminated
+            // packet and retains that boundary during coalescing.
+            let uri = bytes
+                .strip_prefix(b"\x1b]7;")
+                .and_then(|payload| payload.strip_suffix(b"\x1b\\"))
+                .and_then(|payload| std::str::from_utf8(payload).ok());
+            if let Some(uri) = uri {
+                report(uri);
+            }
+        }
+        if let Err(error) = self.runtime.apply(bytes) {
+            log::warn!("Could not process active terminal output: {error}");
+        }
+    }
+
+    pub(super) fn finish(&self, status: PtyExit) {
+        self.runtime.finish(status);
+    }
+
+    pub(super) fn reset_prompt(&self, preserve_scrollback: bool) {
+        self.apply(if preserve_scrollback {
+            b"\x1b[0m"
+        } else {
+            b"\x1bc"
+        });
+    }
 }
 
 pub(super) struct Transport {
@@ -102,7 +138,8 @@ impl SharedActiveTerminal {
         let input = Rc::new(OnceCell::new());
         let resize_error = Rc::new(Cell::new(None));
         let (cols, rows) = super::child_winsize_or_initial((0, 0));
-        let (widget, terminal) = EmbeddedTerminal::new(
+        let links = SharedTerminal::links();
+        let runtime = TerminalOutput::new(
             Transport {
                 pty,
                 input: input.clone(),
@@ -110,9 +147,14 @@ impl SharedActiveTerminal {
             },
             cols,
             rows,
+            TerminalProfile::Embedded,
+            links.admit,
+        )?;
+        let (widget, terminal) = EmbeddedTerminal::attach(
+            runtime.handle(),
             Self::theme(config, config.default_font_scale, mode),
             |message, _| message.to_owned(),
-            SharedTerminal::links(),
+            links,
         )?;
         terminal
             .pane()
@@ -129,9 +171,12 @@ impl SharedActiveTerminal {
             .then(|| TranscriptView::new(terminal.clone()));
         Ok(Rc::new(Self {
             terminal,
+            output: Rc::new(ActiveTerminalOutput {
+                runtime,
+                directory_report: OnceCell::new(),
+            }),
             transcript,
             output_start: Cell::new(None),
-            directory_report: OnceCell::new(),
             widget,
             input,
             resize_error,
@@ -235,28 +280,16 @@ impl SharedActiveTerminal {
     }
 
     pub(super) fn on_directory_uri(&self, report: impl Fn(&str) + 'static) {
-        assert!(self.directory_report.set(Box::new(report)).is_ok());
+        assert!(self.output.directory_report.set(Box::new(report)).is_ok());
     }
 
+    pub(super) fn output(&self) -> &Rc<ActiveTerminalOutput> {
+        &self.output
+    }
+
+    #[cfg(test)]
     pub(super) fn feed(&self, bytes: &[u8]) {
-        if let Some(report) = self.directory_report.get() {
-            // The block parser admits OSC 7 as an individual ST-terminated
-            // packet, retaining its boundary during coalescing.
-            let uri = bytes
-                .strip_prefix(b"\x1b]7;")
-                .and_then(|payload| payload.strip_suffix(b"\x1b\\"))
-                .and_then(|payload| std::str::from_utf8(payload).ok());
-            if let Some(uri) = uri {
-                report(uri);
-            }
-        }
-        if let Err(error) = self.terminal.ingest(bytes) {
-            log::warn!("Could not process active terminal output: {error}");
-        }
-    }
-
-    pub(super) fn exited(&self, status: PtyExit) {
-        self.terminal.exited(status);
+        self.output.apply(bytes);
     }
 
     pub(super) fn on_event(&self, handler: impl Fn(jterm_gtk_view::PaneEvent) + 'static) {

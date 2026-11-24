@@ -7310,7 +7310,7 @@ trait RenderBackend {
     // ── live surface ──
     /// Feed bytes to the live terminal surface (including re-synthesized
     /// `\x1b[?..h/l` alt-screen toggles).
-    fn feed_live(&self, bytes: &[u8]);
+    fn feed_legacy(&self, bytes: &[u8]);
     /// Open/reassert the prompt zone selected by the engine at FTCS `A`.
     /// Block has no persistent marker surface, so this is a no-op by default.
     fn begin_prompt_zone(&self, _zone_id: u64) {}
@@ -7958,6 +7958,8 @@ impl FoldLayoutSync {
 struct ReaderCtx {
     /// Every widget/surface effect and query goes through this seam.
     backend: Rc<dyn RenderBackend>,
+    #[cfg(forge_shared_terminal)]
+    terminal_output: Option<Rc<shared_active::ActiveTerminalOutput>>,
     bstate_rc: Rc<Cell<BlockState>>,
     ftcs_seen_rc: Rc<Cell<bool>>,
     engine: RefCell<EngineState>,
@@ -8077,6 +8079,15 @@ struct ReaderCtx {
 /// order the events arrive. Bodies moved verbatim from the former
 /// `process_chunk` match closure (arm-level `continue` became `return`).
 impl ReaderCtx {
+    fn apply_live_output(&self, bytes: &[u8]) {
+        #[cfg(forge_shared_terminal)]
+        if let Some(output) = &self.terminal_output {
+            output.apply(bytes);
+            return;
+        }
+        self.backend.feed_legacy(bytes);
+    }
+
     /// Close the observer-facing half of one accepted `C` lifecycle exactly
     /// once. The engine-owned latch is shared by the ordinary `D` path and the
     /// trusted-`A` recovery path; renderer mode cannot change this contract,
@@ -8126,7 +8137,7 @@ impl ReaderCtx {
                 if state == BlockState::AwaitingCommand && !self.prompt_anchor_ready_rc.get() {
                     self.feed_after_prompt(bytes);
                 } else {
-                    self.backend.feed_live(bytes);
+                    self.apply_live_output(bytes);
                 }
             }
             ParserEvent::ColorSet { kind, spec } => self.on_color_set(*kind, spec),
@@ -8150,7 +8161,7 @@ impl ReaderCtx {
     /// old anchor instead of publishing it after the reset.
     fn release_prompt_fence_before_reset(&self) {
         release_post_prompt_fence(
-            &|deferred| self.backend.feed_live(deferred),
+            &|deferred| self.apply_live_output(deferred),
             &self.post_prompt_bytes_rc,
             &self.post_prompt_fence_released_rc,
         );
@@ -8328,14 +8339,14 @@ impl ReaderCtx {
             bytes.len(),
             MAX_RAW_OUTPUT_BYTES,
         ) {
-            PostPromptFeed::Live => self.backend.feed_live(bytes),
+            PostPromptFeed::Live => self.apply_live_output(bytes),
             PostPromptFeed::ReleaseThenFeed => {
                 release_post_prompt_fence(
-                    &|deferred| self.backend.feed_live(deferred),
+                    &|deferred| self.apply_live_output(deferred),
                     &self.post_prompt_bytes_rc,
                     &self.post_prompt_fence_released_rc,
                 );
-                self.backend.feed_live(bytes);
+                self.apply_live_output(bytes);
             }
             PostPromptFeed::Park => self.post_prompt_bytes_rc.borrow_mut().append(bytes),
         }
@@ -8423,7 +8434,7 @@ impl ReaderCtx {
         };
 
         if feed_active_vte {
-            self.backend.feed_live(bytes);
+            self.apply_live_output(bytes);
         }
     }
 
@@ -8473,7 +8484,7 @@ impl ReaderCtx {
                         engine.pending_zone,
                     )
                 };
-                self.backend.feed_live(format!("\x1b[?{mode}l").as_bytes());
+                self.apply_live_output(format!("\x1b[?{mode}l").as_bytes());
                 if let Some(id) = prompt_zone_to_reopen_after_alt(restored_state, pending_zone) {
                     // `rmcup` restores the main screen *after* the wrapper's
                     // prefix was interpreted, so reassert on the restored
@@ -9043,7 +9054,7 @@ impl ReaderCtx {
         };
         let deferred = self.post_prompt_bytes_rc.borrow_mut().take_vec();
         if !deferred.is_empty() {
-            self.backend.feed_live(&deferred);
+            self.apply_live_output(&deferred);
         }
         let command_zone_id = {
             let mut engine = self.engine.borrow_mut();
@@ -9255,7 +9266,7 @@ impl ReaderCtx {
                 )
             };
             let leave = format!("\x1b[?{mode}l");
-            self.backend.feed_live(leave.as_bytes());
+            self.apply_live_output(leave.as_bytes());
             // An app that never left its alternate screen never switched its
             // mouse reporting off either.
             self.reset_mouse_reporting();
@@ -9346,7 +9357,7 @@ impl ReaderCtx {
         // app draws (see sync_active_to_pty doc).
         self.backend.sync_geometry_to_pty();
         let enter = format!("\x1b[?{mode}h");
-        self.backend.feed_live(enter.as_bytes());
+        self.apply_live_output(enter.as_bytes());
     }
 
     fn on_alt_screen_leave(&self, mode: u32) {
@@ -9364,7 +9375,7 @@ impl ReaderCtx {
             (engine.prev_state, engine.pending_zone)
         };
         let leave = format!("\x1b[?{mode}l");
-        self.backend.feed_live(leave.as_bytes());
+        self.apply_live_output(leave.as_bytes());
         if let Some(id) = prompt_zone_to_reopen_after_alt(restored_state, pending_zone) {
             self.backend.restore_prompt_zone(id);
         }
@@ -9486,7 +9497,7 @@ impl ReaderCtx {
                 && !self.post_prompt_fence_released_rc.get()
             {
                 release_post_prompt_fence(
-                    &|deferred| self.backend.feed_live(deferred),
+                    &|deferred| self.apply_live_output(deferred),
                     &self.post_prompt_bytes_rc,
                     &self.post_prompt_fence_released_rc,
                 );
@@ -9604,7 +9615,7 @@ impl ReaderCtx {
         }
         let preserve = self.config_for_cb.borrow().preserve_live_scrollback;
         if !self.backend.live_surface_reset_at_prompt(preserve) {
-            self.backend.feed_live(MOUSE_AND_FOCUS_REPORTING_OFF);
+            self.apply_live_output(MOUSE_AND_FOCUS_REPORTING_OFF);
         }
     }
 
@@ -9915,12 +9926,7 @@ impl RenderBackend for BlockBackend {
         }
     }
 
-    fn feed_live(&self, bytes: &[u8]) {
-        #[cfg(forge_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            terminal.feed(bytes);
-            return;
-        }
+    fn feed_legacy(&self, bytes: &[u8]) {
         #[cfg(forge_shared_terminal)]
         if let Ok(active) = self.active_rc.try_borrow() {
             if let Some(widget) = active.shared_live_widget() {
@@ -11329,6 +11335,15 @@ impl UnifiedBackend {
         self.shared_active.as_ref()?.transcript()
     }
 
+    fn apply_terminal_effect(&self, bytes: &[u8]) {
+        #[cfg(forge_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            terminal.output().apply(bytes);
+            return;
+        }
+        self.feed_legacy(bytes);
+    }
+
     fn replay_zone_contents(
         &self,
         record: &CompletedCommandRecord,
@@ -11341,29 +11356,24 @@ impl UnifiedBackend {
         if let Some(transcript) = self.transcript() {
             let [prompt, input, output] = zone_history::replay_sections(record, text, truncated);
             transcript.begin_restored_prompt(record.id);
-            self.feed_live(&prompt);
+            self.apply_terminal_effect(&prompt);
             transcript.end_prompt();
-            self.feed_live(&input);
+            self.apply_terminal_effect(&input);
             transcript.begin_output(Some(record.id));
-            self.feed_live(&output);
+            self.apply_terminal_effect(&output);
             transcript.end_output(Some(record.id), _max_zones);
             return;
         }
         self.chrome.begin_zone(record.id, &self.vte);
         self.zone_marker.borrow_mut().begin_zone(record.id);
-        self.feed_live(&zone_history::replay_bytes(record, text, truncated));
+        self.feed_legacy(&zone_history::replay_bytes(record, text, truncated));
         self.zone_marker.borrow_mut().close_zone(Some(record.id));
         self.vte.feed(ZONE_MARKER_CLOSE);
     }
 }
 
 impl RenderBackend for UnifiedBackend {
-    fn feed_live(&self, bytes: &[u8]) {
-        #[cfg(forge_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            terminal.feed(bytes);
-            return;
-        }
+    fn feed_legacy(&self, bytes: &[u8]) {
         feed_vte_with_zone_marker(&self.vte, &self.zone_marker, bytes);
     }
 
@@ -11466,7 +11476,7 @@ impl RenderBackend for UnifiedBackend {
     /// surface always preserves; the knob only ever meant "which of Block's
     /// two resets".
     fn reset_active_surface(&self, _preserve_scrollback: bool) {
-        self.feed_live(b"\x1b[0m");
+        self.apply_terminal_effect(b"\x1b[0m");
     }
 
     /// The one terminal is never reset between prompts.
@@ -11688,7 +11698,7 @@ impl RenderBackend for UnifiedBackend {
         }
         // Replay is display-only. The surface paints a saved projection and
         // receives fresh zone identities without invoking the shell lifecycle.
-        self.feed_live(&zone_history::replay_banner(zones.len()));
+        self.apply_terminal_effect(&zone_history::replay_banner(zones.len()));
         let max_zones = self.config_for_cb.borrow().max_visible_blocks as usize;
         let mut restored = 0;
         for zone in zones {
@@ -12139,6 +12149,10 @@ impl ReaderCtx {
                         .watch_reader
                         .source_ended(std::time::Instant::now());
                     log::debug!("Shell exited with code {}", status.code);
+                    #[cfg(forge_shared_terminal)]
+                    if let Some(output) = &exit_ctx.terminal_output {
+                        output.finish(status);
+                    }
                     for cb in exit_ctx.exited_cbs.borrow().iter() {
                         cb(status);
                     }
@@ -16179,12 +16193,6 @@ impl TermView {
                 }
                 jterm_gtk_view::PaneEvent::Exited(_) => {}
             });
-            let terminal = Rc::downgrade(terminal);
-            exited_callbacks.borrow_mut().push(Box::new(move |status| {
-                if let Some(terminal) = terminal.upgrade() {
-                    terminal.exited(status);
-                }
-            }));
         }
         let activity_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
         let human_input_callbacks: HumanInputCallbacks = Rc::new(RefCell::new(vec![]));
@@ -16770,6 +16778,10 @@ impl TermView {
             *render_backend_for_view.borrow_mut() = Some(backend.clone());
             ReaderCtx {
                 backend,
+                #[cfg(forge_shared_terminal)]
+                terminal_output: shared_active
+                    .as_ref()
+                    .map(|terminal| Rc::clone(terminal.output())),
                 bstate_rc,
                 ftcs_seen_rc: ftcs_seen.clone(),
                 kitty_keyboard_rc: kitty_keyboard.clone(),
@@ -30086,7 +30098,7 @@ mod tests {
     }
 
     impl RenderBackend for RecordingBackend {
-        fn feed_live(&self, bytes: &[u8]) {
+        fn feed_legacy(&self, bytes: &[u8]) {
             self.marker_trace
                 .borrow_mut()
                 .push(MarkerTrace::Feed(bytes.to_vec()));
@@ -30742,6 +30754,8 @@ mod tests {
 
             let ctx = ReaderCtx {
                 backend: backend.clone(),
+                #[cfg(forge_shared_terminal)]
+                terminal_output: None,
                 bstate_rc: bstate.clone(),
                 ftcs_seen_rc: Rc::new(Cell::new(false)),
                 engine: RefCell::new(EngineState {
