@@ -307,20 +307,31 @@ fn finished_content_rows(
     upper: f64,
     visible_rows: i64,
 ) -> i64 {
-    let fallback = finished_buffer_rows_from_adjustment(lower, upper, visible_rows);
+    let extent = finished_buffer_rows_from_adjustment(lower, upper, visible_rows);
+    let cursor_rows = cursor_rows_from_retained_start(cursor_row, lower);
+    // The VTE cursor can reach the next row before GTK's adjustment records
+    // it. That row must fit before the settle pass can discard scrollback.
+    let retained_rows = if cursor_rows == extent.saturating_add(1) {
+        cursor_rows
+    } else {
+        extent
+    };
+    let text_rows = rendered_text
+        .map(|text| rendered_text_rows(text, cols))
+        .unwrap_or(extent);
+    cursor_rows.max(text_rows).clamp(1, retained_rows)
+}
+
+fn cursor_rows_from_retained_start(cursor_row: i64, lower: f64) -> i64 {
     let lower_row = if lower.is_finite() {
         lower.floor().clamp(i64::MIN as f64, i64::MAX as f64) as i64
     } else {
         0
     };
-    let cursor_rows = cursor_row
+    cursor_row
         .saturating_sub(lower_row)
         .saturating_add(1)
-        .max(1);
-    let text_rows = rendered_text
-        .map(|text| rendered_text_rows(text, cols))
-        .unwrap_or(fallback);
-    cursor_rows.max(text_rows).clamp(1, fallback.max(1))
+        .max(1)
 }
 
 #[cfg(test)]
@@ -499,11 +510,15 @@ pub(crate) fn settle_finished_terminal_after_feed(
                 return;
             }
             fit_finished_terminal_to_content(&terminal);
-            if tail_still_applied {
-                // Tail proof makes this the final fold for a non-blank
-                // snapshot. The generic fit deliberately keeps a bounded
-                // recovery ring for stale/mid-feed callers; it is safe to drop
-                // that ring only here.
+            let grid_contains_retained_rows = terminal.vadjustment().is_some_and(|adj| {
+                let rows = terminal.row_count();
+                let (_, cursor_row) = terminal.cursor_position();
+                cursor_rows_from_retained_start(cursor_row, adj.lower()) <= rows
+                    && finished_buffer_rows_from_adjustment(adj.lower(), adj.upper(), rows) <= rows
+            });
+            if tail_still_applied && grid_contains_retained_rows {
+                // Disabling scrollback before the fitted grid contains the
+                // retained rows can permanently delete the first output row.
                 #[cfg(test)]
                 trace_find_render("settle-before-drop-ring", &terminal);
                 terminal.set_scrollback_lines(0);
@@ -972,6 +987,21 @@ mod tests {
         assert_eq!(
             finished_content_rows(Some("alpha"), 80, 999, 0.0, 60.0, 60),
             60
+        );
+    }
+
+    #[test]
+    fn measured_content_keeps_a_cursor_row_missing_from_the_adjustment() {
+        assert_eq!(
+            finished_content_rows(
+                Some("second\nthird\nfourth\nfifth\nsixth"),
+                120,
+                6,
+                0.0,
+                6.0,
+                6
+            ),
+            7
         );
     }
 
