@@ -256,6 +256,13 @@ flatpak build-bundle flatpak-repo io.github.beamiter.forge.flatpak \
 
 ## 启动与配置
 
+带 `shared-terminal` 的 Linux 原生发行包默认为 Block、Chat 和 Unified
+新窗格使用共享终端。PTY、渲染与输入法随窗格创建时选定的实现运行到退出。
+需要回退时，退出 Forge 后，启动时设 `JTERM_SHARED_ACTIVE_TERMINAL=0`
+以让 Block 和 Chat 使用 VTE，或设 `JTERM_SHARED_TRANSCRIPT=0` 以让
+Unified 使用 VTE。普通终端中的已支持本地 Shell 可用
+`JTERM_SHARED_RUNTIME=0` 回退。Flatpak 的宿主 Shell 继续使用兼容路径。
+
 左右侧栏的分隔条均可拖动调整宽度，松手后自动保存。窗口变窄、侧栏隐藏或
 右侧栏转为抽屉时保留原宽度，恢复空间后还原。右侧抽屉的左缘也可拖动；
 可使用 F8 聚焦普通分隔条、方向键调整、Enter 保留或 Escape 取消。

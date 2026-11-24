@@ -60,13 +60,13 @@ def run(binary, root, mode):
     config.write_text(f'shell = {json.dumps(str(shell))}\nterminal_mode = "{mode}"\n')
     config.chmod(0o600)
     env = {key: value for key, value in os.environ.items()
-           if not key.startswith('JSH_') and key not in ('FORGE_SHELL', 'FORGE_HISTORY_PATH', 'BASH_ENV')}
+           if not key.startswith(('JSH_', 'JTERM_SHARED_'))
+           and key not in ('FORGE_SHELL', 'FORGE_HISTORY_PATH', 'BASH_ENV')}
     for key in ('HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'XDG_RUNTIME_DIR'):
         directory = root / key
         directory.mkdir(mode=0o700)
         env[key] = str(directory)
-    env.update(GDK_BACKEND='x11', GSK_RENDERER='cairo', GTK_A11Y='atspi', GTK_IM_MODULE='simple',
-               JTERM_SHARED_ACTIVE_TERMINAL='1', JTERM_SHARED_TRANSCRIPT='1')
+    env.update(GDK_BACKEND='x11', GSK_RENDERER='cairo', GTK_A11Y='atspi', GTK_IM_MODULE='simple')
 
     with application(binary, config, env, root / 'forge.log', restore=False) as process:
         pid = process.pid

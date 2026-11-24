@@ -47,7 +47,7 @@ impl TerminalMode {
     pub(crate) fn public_presentation_for_shell(&self, shell: &[String]) -> Self {
         #[cfg(all(forge_shared_terminal, target_os = "linux"))]
         if matches!(self, Self::Vte)
-            && jterm_gtk_view::RuntimeShell::admits_candidate(shell, crate::host::is_flatpak())
+            && jterm_gtk_view::RuntimeShell::supports_local_shell(shell, crate::host::is_flatpak())
         {
             return Self::Vte;
         }

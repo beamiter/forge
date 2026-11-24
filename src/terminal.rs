@@ -708,17 +708,28 @@ fn spawn_shell(
     let Some(generation) = launch_owner.state.borrow_mut().begin() else {
         return;
     };
-    // Append --session <id> to argv when restoring a session (only for jsh)
+    // Keep the pane's jsh identity when it starts through the Bash bootstrap.
     let mut argv_vec: Vec<String> = argv_owned.to_vec();
     if let Some(sid) =
         session_id.filter(|sid| jterm_core::execution_journal::is_valid_jsh_session_id(sid))
     {
-        let is_jsh = argv_vec
-            .first()
+        let program = match argv_owned {
+            [bash, mode, script, program, ..]
+                if std::path::Path::new(bash)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    == Some("bash")
+                    && mode == "-ic"
+                    && script == jterm_core::vim9::VIM9_SHELL_EXEC =>
+            {
+                Some(program)
+            }
+            [program, ..] => Some(program),
+            [] => None,
+        };
+        let is_jsh = program
             .and_then(|s| std::path::Path::new(s).file_name())
-            .and_then(|f| f.to_str())
-            .map(|name| name == "jsh")
-            .unwrap_or(false);
+            .is_some_and(|name| name == "jsh");
 
         if is_jsh {
             argv_vec.push("--session".to_string());

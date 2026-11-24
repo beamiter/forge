@@ -15018,14 +15018,17 @@ impl TermView {
         )
     }
 
-    #[cfg(forge_shared_terminal)]
+    #[cfg(all(forge_shared_terminal, target_os = "linux"))]
     fn shared_active_requested(mode: &crate::config::TerminalMode) -> bool {
-        (matches!(
-            mode,
-            crate::config::TerminalMode::Block | crate::config::TerminalMode::Chat
-        ) && std::env::var_os("JTERM_SHARED_ACTIVE_TERMINAL").is_some_and(|value| value == "1"))
-            || (mode.is_unified()
-                && std::env::var_os("JTERM_SHARED_TRANSCRIPT").is_some_and(|value| value == "1"))
+        use crate::config::TerminalMode;
+
+        let override_name = match mode {
+            TerminalMode::Block | TerminalMode::Chat => "JTERM_SHARED_ACTIVE_TERMINAL",
+            TerminalMode::Unified => "JTERM_SHARED_TRANSCRIPT",
+            TerminalMode::Vte => return false,
+        };
+        std::env::var_os(override_name)
+            .map_or_else(|| !crate::host::is_flatpak(), |value| value == "1")
     }
 
     /// Constructor boundary with an injectable PTY spawner.
@@ -15075,12 +15078,6 @@ impl TermView {
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect();
-        #[cfg(forge_shared_terminal)]
-        let shared_active_requested = Self::shared_active_requested(mode);
-        #[cfg(forge_shared_terminal)]
-        if shared_active_requested {
-            env_extra.extend(jterm_gtk_view::INTERACTIVE_CHILD_ENV);
-        }
         let session_id_owned = session_id.map(str::to_owned);
         if let Some(ref sid) = session_id_owned {
             if is_jsh {
@@ -15097,7 +15094,8 @@ impl TermView {
         let pty_child_is_shell = pty_child_is_shell(shell_argv);
         let pty = Rc::new(spawn(&argv, cwd, &env_extra, request_shell_token)?);
         #[cfg(forge_shared_terminal)]
-        let shared_active = shared_active_requested
+        let shared_active = pty
+            .uses_shared_session()
             .then(|| shared_active::SharedActiveTerminal::new(config, pty.clone(), mode))
             .transpose()
             .map_err(io::Error::other)?;

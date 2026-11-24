@@ -2878,6 +2878,9 @@ impl FinishedBlock {
                 super::developer_block::terminal_foreground(),
                 &config.palette,
             )
+            .inspect(|command| {
+                command.install_links(crate::ui::shared_terminal::SharedTerminal::links())
+            })
         } else {
             None
         };
