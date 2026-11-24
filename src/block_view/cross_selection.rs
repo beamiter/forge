@@ -1060,12 +1060,30 @@ mod tests {
         let (card_id, command, output, second) = {
             let finished = view.finished_blocks.borrow();
             assert_eq!(finished.len(), 4);
-            assert!(
-                finished[1].command_vte.is_some() && finished[1].command_document.is_none(),
-                "the command captured from the screen still uses VTE"
-            );
+            assert!(finished[1].command_vte.is_none());
+            let heading = finished[1].command_document.as_ref().unwrap().widget();
+            assert!(heading.width() > 0 && heading.height() > 0);
             let captured = finished[1].cmd_text.as_str();
             assert_eq!(captured.strip_prefix("$ ").unwrap_or(captured), "echo link");
+            assert_eq!(
+                finished[1]
+                    .command_surface()
+                    .unwrap()
+                    .document_text()
+                    .as_deref(),
+                Some(captured)
+            );
+            assert!(!finished[1].command_replay_is_exact.get());
+            let records = view.block_data.borrow();
+            let record = &records[1];
+            assert_eq!(
+                super::super::historical_rerun_disabled_reason(
+                    record.id,
+                    &record.cmd,
+                    Some(record)
+                ),
+                Some("Command text is unverified; recall the capture to review it")
+            );
             assert!(finished[3].command_vte.is_none());
             let multiline = finished[3]
                 .command_document
@@ -1257,6 +1275,19 @@ mod tests {
             assert_eq!(copied, "mixed-output");
             view.clear_find();
         }
+        assert!(matches!(
+            view.find_in_blocks("echo link", false),
+            FindSearchResult::Matches(progress) if progress.total == 1
+        ));
+        settle();
+        view.copy_to_clipboard();
+        let copied = gtk::glib::MainContext::default()
+            .block_on(window.clipboard().read_text_future())
+            .unwrap()
+            .unwrap();
+        assert_eq!(copied, "echo link");
+        view.clear_find();
+
         let cross = &view.cross_selection;
         let surfaces = cross.ordered_vtes();
         let first = TerminalTextSurface::Document(command);
@@ -1269,7 +1300,7 @@ mod tests {
             .expect("selected first card output");
         let inferred_command = copied
             .find("echo link")
-            .unwrap_or_else(|| panic!("native command missing from {copied:?}"));
+            .unwrap_or_else(|| panic!("captured command missing from {copied:?}"));
         let following = copied
             .find("https://example.test/mixed-output")
             .expect("selected next card output");
@@ -1283,7 +1314,8 @@ mod tests {
             settle();
             let finished = view.finished_blocks.borrow();
             assert!(finished[0].command_document.is_some());
-            assert!(finished[1].command_vte.is_some());
+            assert!(finished[1].command_document.is_some());
+            assert!(!finished[1].command_replay_is_exact.get());
             assert_eq!(
                 finished[1].output_surface().document_text().as_deref(),
                 Some("https://example.test/mixed-output")
@@ -1371,6 +1403,31 @@ mod tests {
             settle();
             assert!(adjustment.page_size() > height);
         }
+        let mut retained = view.block_data.borrow()[1].clone();
+        retained.command_exact = true;
+        retained.command_truncated = true;
+        retained.cmd_markup = Some(format!("\x1b[32m{}\x1b[0m", retained.cmd));
+        let config = view.config.borrow().clone();
+        let restored = super::super::FinishedBlock::from_retained(&retained, &config, 80);
+        assert!(restored.command_vte.is_none());
+        assert!(!restored.command_replay_is_exact.get());
+        assert_eq!(
+            restored
+                .command_surface()
+                .unwrap()
+                .document_text()
+                .as_deref(),
+            Some(retained.cmd.as_str())
+        );
+        retained.command_truncated = false;
+        let exact = super::super::FinishedBlock::from_retained(&retained, &config, 80);
+        assert!(exact.command_replay_is_exact.get());
+
+        retained.cmd = "printf\tpreserved-tab".into();
+        retained.cmd_markup = None;
+        let fallback = super::super::FinishedBlock::from_retained(&retained, &config, 80);
+        assert!(fallback.command_vte.is_some());
+        assert_eq!(fallback.output_vte.is_none(), document_output);
         window.close();
     }
 

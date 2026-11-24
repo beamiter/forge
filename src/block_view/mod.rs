@@ -3019,8 +3019,8 @@ fn format_color_query_reply(kind: ColorKind, rgba: RGBA) -> String {
     }
 }
 
-/// Overlay tracked dynamic OSC 10/11 colors on a finished block's snapshot
-/// VTEs. Snapshots are freshly themed from the static config, so a block that
+/// Overlay tracked dynamic OSC 10/11 colors on a finished block's surfaces.
+/// Snapshots are freshly themed from the static config, so a block that
 /// finishes after an app recolored the terminal (OSC 11 theme switchers, vim
 /// `background=`) would otherwise sit visibly mismatched next to the recolored
 /// live view. The cursor slot is deliberately skipped: snapshot cursors are
@@ -3040,6 +3040,25 @@ fn apply_dynamic_colors_to_finished(block: &FinishedBlock, dynamic: DynamicColor
         .filter(|terminal| terminal.has_css_class("chat-command-terminal"))
     {
         terminal.set_color_background(&RGBA::new(0.0, 0.0, 0.0, 0.0));
+    }
+    #[cfg(forge_shared_terminal)]
+    {
+        if let Some(command) = &block.command_document {
+            if let Some(foreground) = dynamic.foreground {
+                command.set_foreground(foreground);
+            }
+            command.set_background(
+                dynamic
+                    .background
+                    .filter(|_| !block.widget().has_css_class("chat-pair")),
+            );
+        }
+        if let Some(output) = &block.output_document {
+            if let Some(foreground) = dynamic.foreground {
+                output.text().set_foreground(foreground);
+            }
+            output.text().set_background(dynamic.background);
+        }
     }
 }
 
@@ -10621,9 +10640,7 @@ impl RenderBackend for BlockBackend {
             .map_or(dynamic_colors, |terminal| terminal.output_colors());
         let mut precomputed = FinishedBlockPrecomputed::documents(
             &finished_config,
-            record.command_source == CommandTextSource::ShellReported,
             payload.output_notice().is_none(),
-            dynamic_colors,
         );
         precomputed.output_rows = Some(output_rows);
         precomputed.output_preview = Some(fold_preview::from_output(output_with_ansi));
@@ -18758,6 +18775,15 @@ impl TermView {
         if self.root.has_css_class("term-chat-root") {
             finished.set_chat_layout();
         }
+        let colors = self.dynamic_colors.get();
+        #[cfg(forge_shared_terminal)]
+        let colors = self
+            .active
+            .borrow()
+            .shared_active
+            .as_ref()
+            .map_or(colors, |terminal| terminal.output_colors());
+        apply_dynamic_colors_to_finished(finished, colors);
         // A card rebuilt into a narrowed stream is tested once, here, rather
         // than by rescanning the document on the next visibility pass.
         if let Some(kind) = self.block_filter.get() {
@@ -19955,17 +19981,14 @@ impl TermView {
                     self.finished_blocks.borrow().iter().map(|card| card.id),
                     block.id,
                 );
-                let finished =
-                    FinishedBlock::from_retained(&block, &config, cols, self.dynamic_colors.get());
+                let finished = FinishedBlock::from_retained(&block, &config, cols);
                 finished.set_lifecycle(
                     block.lifecycle_health(),
                     block.lifecycle_notice().as_deref(),
                 );
-                finished.set_command_provenance(block.command_exact, block.command_truncated);
                 finished.set_output_notice(
                     block.output_notice.as_deref().and_then(known_output_notice),
                 );
-                apply_dynamic_colors_to_finished(&finished, self.dynamic_colors.get());
                 // The card that will follow this one, or the live block when
                 // every mounted card is older.
                 let sibling = self
@@ -20185,13 +20208,11 @@ impl TermView {
                 } else {
                     fallback_cols
                 };
-                let finished =
-                    FinishedBlock::from_retained(block, &config, cols, self.dynamic_colors.get());
+                let finished = FinishedBlock::from_retained(block, &config, cols);
                 finished.set_lifecycle(
                     block.lifecycle_health(),
                     block.lifecycle_notice().as_deref(),
                 );
-                finished.set_command_provenance(block.command_exact, block.command_truncated);
                 finished.set_output_notice(
                     block.output_notice.as_deref().and_then(known_output_notice),
                 );
@@ -20204,7 +20225,6 @@ impl TermView {
                 } else {
                     finished.widget().remove_css_class("block-bookmarked");
                 }
-                apply_dynamic_colors_to_finished(&finished, self.dynamic_colors.get());
                 // Decorate before map-time native command measurement.
                 self.mount_rebuilt_block(&finished);
                 finished
@@ -20531,6 +20551,7 @@ impl TermView {
             #[cfg(forge_shared_terminal)]
             if let Some(command) = &block.command_document {
                 command.set_colors(document_foreground, &config.palette);
+                command.set_background(None);
             }
             if let Some(terminal) = &block.output_vte {
                 apply_snapshot_theme_to_vte(terminal, &config);
@@ -20543,6 +20564,7 @@ impl TermView {
                 output
                     .text()
                     .set_colors(document_foreground, &config.palette);
+                output.text().set_background(None);
             }
         }
         install_block_css(&config);

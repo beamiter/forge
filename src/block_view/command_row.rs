@@ -59,8 +59,8 @@ mod imp {
             let measured = self.content.measure(orientation, for_size);
             let Some(terminal) = self.terminal.upgrade() else {
                 #[cfg(forge_shared_terminal)]
-                if orientation == gtk::Orientation::Horizontal {
-                    if let Some(document) = self.document.borrow().as_ref() {
+                if let Some(document) = self.document.borrow().as_ref() {
+                    if orientation == gtk::Orientation::Horizontal {
                         return (
                             measured.0,
                             measured.1.max(document.natural_width()),
@@ -68,6 +68,16 @@ mod imp {
                             measured.3,
                         );
                     }
+                    // A wrapped TextView can report zero before its first
+                    // allocation. A heading aligned inside a fixed header
+                    // needs one measured font row to acquire that allocation.
+                    let line_height = document.line_height();
+                    return (
+                        measured.0.max(line_height),
+                        measured.1.max(line_height),
+                        measured.2,
+                        measured.3,
+                    );
                 }
                 return measured;
             };
@@ -174,6 +184,12 @@ impl CommandRow {
     pub(super) fn append(&self, child: &impl IsA<gtk::Widget>) {
         self.imp().content.append(child);
     }
+
+    #[cfg(forge_shared_terminal)]
+    pub(super) fn append_document(&self, document: &jterm_gtk_view::FinishedTextView) {
+        self.imp().document.replace(Some(document.clone()));
+        self.append(document.widget());
+    }
 }
 
 pub(super) fn fit(row: &CommandRow, terminal: &Terminal, columns: i64, command: &str) {
@@ -190,14 +206,5 @@ pub(super) fn fit(row: &CommandRow, terminal: &Terminal, columns: i64, command: 
             row.queue_resize();
         }
     });
-    row.queue_resize();
-}
-
-#[cfg(forge_shared_terminal)]
-pub(super) fn fit_document(row: &CommandRow, document: &jterm_gtk_view::FinishedTextView) {
-    *row.imp().document.borrow_mut() = Some(document.clone());
-    row.set_halign(gtk::Align::Start);
-    row.set_hexpand(false);
-    row.set_overflow(gtk::Overflow::Hidden);
     row.queue_resize();
 }
