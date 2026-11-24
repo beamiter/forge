@@ -206,6 +206,7 @@ pub(crate) struct SharedPane {
     header: super::PaneHeader,
     live: Option<SharedTerminal>,
     failure: Option<String>,
+    hosted_directory: Option<String>,
 }
 
 #[cfg(target_os = "linux")]
@@ -231,7 +232,7 @@ impl SharedPane {
                 )
             },
         );
-        Self::from_runtime(config, argv, runtime, false)
+        Self::from_runtime(config, argv, runtime, None)
     }
 
     pub(crate) fn open_hosted_attachment(
@@ -239,26 +240,23 @@ impl SharedPane {
         argv: &[String],
         cwd: &str,
     ) -> Option<Rc<Self>> {
-        let runtime = RuntimeShell::spawn_hosted_attachment(
-            argv,
-            std::path::Path::new(cwd),
-            crate::host::is_flatpak(),
-            || {
-                SharedTerminal::runtime_environment(
-                    argv,
-                    config.vim9.auto_gui,
-                    &jterm_gtk_view::INTERACTIVE_CHILD_ENV,
-                )
-            },
-        );
-        Self::from_runtime(config, argv, runtime, true)
+        let (launch, local_directory) =
+            crate::host::hosted_attachment_pty(argv, cwd, &jterm_gtk_view::INTERACTIVE_CHILD_ENV);
+        let runtime = RuntimeShell::spawn_hosted_attachment(&launch, local_directory, || {
+            SharedTerminal::runtime_environment(
+                argv,
+                config.vim9.auto_gui,
+                &jterm_gtk_view::INTERACTIVE_CHILD_ENV,
+            )
+        });
+        Self::from_runtime(config, &launch, runtime, Some(cwd))
     }
 
     fn from_runtime(
         config: &Config,
         argv: &[String],
         runtime: Result<Option<Rc<RuntimeShell>>, String>,
-        hosted_attachment: bool,
+        hosted_directory: Option<&str>,
     ) -> Option<Rc<Self>> {
         let open = |runtime: Rc<RuntimeShell>| {
             let pid = runtime
@@ -266,7 +264,7 @@ impl SharedPane {
                 .ok_or("shared shell has no live process id")?;
             let guard =
                 crate::gtk_process::Guard::capture(pid, RuntimeShell::candidate_program(argv));
-            let mount = if hosted_attachment {
+            let mount = if hosted_directory.is_some() {
                 TerminalPane::with_hosted_attachment
             } else {
                 TerminalPane::with_runtime_embedded
@@ -310,6 +308,7 @@ impl SharedPane {
             header,
             live,
             failure,
+            hosted_directory: hosted_directory.map(str::to_owned),
         }))
     }
 
@@ -362,6 +361,13 @@ impl SharedPane {
 
     pub(crate) fn terminal_pane(&self) -> Option<&Rc<TerminalPane<OwnedPty>>> {
         self.live.as_ref().map(|live| &live.pane)
+    }
+
+    pub(crate) fn working_directory(&self) -> Option<String> {
+        let runtime = self.terminal_pane()?.runtime()?;
+        self.hosted_directory
+            .clone()
+            .or_else(|| runtime.inspect_child(jterm_core::process::process_cwd))
     }
 
     pub(crate) fn terminal_action(&self, action: Action) {

@@ -1912,14 +1912,20 @@ impl UiState {
                     .as_deref()
                     .and_then(|cwd| SharedPane::open_hosted_attachment(&config, shell_argv, cwd))
             } else if allow_local_recovery
-                && initial_commands.as_slice().is_empty()
                 && matches!(terminal_mode, crate::config::TerminalMode::Vte)
             {
                 SharedPane::open(&config, shell_argv, working_directory.as_deref(), &sid)
             } else {
                 None
             }
-            .map(PaneLeaf::Shared)
+            .map(|view| {
+                if !hosted_attachment {
+                    if let Some(pane) = view.terminal_pane() {
+                        pane.schedule_initial_commands(initial_commands.as_slice());
+                    }
+                }
+                PaneLeaf::Shared(view)
+            })
         };
         #[cfg(not(all(forge_shared_terminal, target_os = "linux")))]
         let shared: Option<PaneLeaf> = {

@@ -70,10 +70,7 @@ impl PaneLeaf {
     pub(crate) fn working_directory(&self) -> Option<String> {
         #[cfg(all(forge_shared_terminal, target_os = "linux"))]
         if let Self::Shared(view) = self {
-            return view
-                .terminal_pane()?
-                .runtime()?
-                .inspect_child(jterm_core::process::process_cwd);
+            return view.working_directory();
         }
         self.terminal()
             .and_then(crate::terminal::terminal_working_directory)

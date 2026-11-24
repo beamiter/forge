@@ -407,7 +407,7 @@ impl UiState {
             ),
             crate::config::TerminalMode::Vte => {
                 #[cfg(all(forge_shared_terminal, target_os = "linux"))]
-                if initial_commands.is_empty() && std::env::var_os("FORGE_SAFE_MODE").is_none() {
+                if std::env::var_os("FORGE_SAFE_MODE").is_none() {
                     let sid = session_id
                         .filter(|sid| jterm_core::execution_journal::is_valid_jsh_session_id(sid))
                         .map(str::to_owned)
@@ -432,6 +432,9 @@ impl UiState {
                         leaf.set_remote(false);
                         self.install_pane_rearrange(&leaf);
                         self.connect_shared_pane(&view);
+                        if let Some(pane) = view.terminal_pane() {
+                            pane.schedule_initial_commands(initial_commands);
+                        }
                         return Ok(leaf);
                     }
                 }
