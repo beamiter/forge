@@ -1662,9 +1662,9 @@ pub(crate) struct FinishedBlockPrecomputed {
 }
 
 impl FinishedBlockPrecomputed {
-    pub(super) fn documents(config: &Config, complete_output: bool) -> Self {
+    pub(super) fn documents(config: &Config) -> Self {
         #[cfg(not(forge_shared_terminal))]
-        let _ = (config, complete_output);
+        let _ = config;
         #[cfg(forge_shared_terminal)]
         let foreground_documents = matches!(
             config.terminal_mode,
@@ -1675,9 +1675,8 @@ impl FinishedBlockPrecomputed {
             #[cfg(forge_shared_terminal)]
             document_command: foreground_documents,
             #[cfg(forge_shared_terminal)]
-            document_output: complete_output
-                && std::env::var_os("JTERM_SHARED_FINISHED_OUTPUT")
-                    .is_none_or(|value| value == "1"),
+            document_output: std::env::var_os("JTERM_SHARED_FINISHED_OUTPUT")
+                .is_none_or(|value| value == "1"),
             ..Self::default()
         }
     }
@@ -2296,7 +2295,7 @@ impl FinishedBlock {
             &[],
             block.output.len(),
             None,
-            FinishedBlockPrecomputed::documents(config, block.output_notice.is_none()),
+            FinishedBlockPrecomputed::documents(config),
         );
         card.set_command_provenance(block.command_exact, block.command_truncated);
         card
@@ -2863,16 +2862,32 @@ impl FinishedBlock {
         let cmd_rows = cmd_bytes.iter().filter(|&&b| b == b'\n').count() as i64 + 1;
         #[cfg(forge_shared_terminal)]
         let command_document = if precomputed.document_command {
-            jterm_gtk_view::FinishedTextView::command(
-                cmd,
-                &cmd_bytes,
-                crate::font::terminal_font_description(&config.font_desc, config),
-                config.default_font_scale,
-                super::developer_block::terminal_foreground(),
-                &config.palette,
-            )
-            .inspect(|command| {
-                command.install_links(crate::ui::shared_terminal::SharedTerminal::document_links())
+            let font = crate::font::terminal_font_description(&config.font_desc, config);
+            let foreground = super::developer_block::terminal_foreground();
+            let archive = cmd_ansi.and_then(|capture| {
+                jterm_core::screen_replay::project_bounded_command_archive(capture, cmd)
+            });
+            let command = match archive {
+                Some(archive) => jterm_gtk_view::FinishedTextView::archived_command(
+                    cmd,
+                    &archive,
+                    font,
+                    config.default_font_scale,
+                    foreground,
+                    &config.palette,
+                ),
+                None => jterm_gtk_view::FinishedTextView::command(
+                    cmd,
+                    &cmd_bytes,
+                    font,
+                    config.default_font_scale,
+                    foreground,
+                    &config.palette,
+                ),
+            };
+            command.inspect(|command| {
+                command.set_terminal_background(super::developer_block::terminal_background());
+                command.install_links(crate::ui::shared_terminal::SharedTerminal::document_links());
             })
         } else {
             None
@@ -2938,32 +2953,31 @@ impl FinishedBlock {
         let full_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
         let displayed_output: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         #[cfg(forge_shared_terminal)]
-        let output_document = if precomputed.document_output
-            && (precomputed.document_command || is_background)
-        {
-            jterm_core::screen_replay::project_bounded_archive(output).map(|document| {
-                let output = jterm_gtk_view::FinishedTextView::output(
-                    &document,
-                    crate::font::terminal_font_description(&config.font_desc, config),
-                    config.default_font_scale,
-                    super::developer_block::terminal_foreground(),
-                    &config.palette,
-                );
-                if is_background {
-                    output
-                        .widget()
-                        .update_property(&[gtk4::accessible::Property::Label("Background output")]);
-                }
-                output.install_links(crate::ui::shared_terminal::SharedTerminal::document_links());
-                jterm_gtk_view::FinishedOutputView::new(
-                    output,
-                    fallback_viewport_cap,
-                    max_expanded_cap,
-                )
-            })
-        } else {
-            None
-        };
+        let output_archive =
+            if precomputed.document_output && (precomputed.document_command || is_background) {
+                jterm_core::screen_replay::project_finished_output(output, cols.max(1) as usize)
+                    .map(Rc::new)
+            } else {
+                None
+            };
+        #[cfg(forge_shared_terminal)]
+        let output_document = output_archive.as_deref().map(|document| {
+            let output = jterm_gtk_view::FinishedTextView::output(
+                document,
+                crate::font::terminal_font_description(&config.font_desc, config),
+                config.default_font_scale,
+                super::developer_block::terminal_foreground(),
+                &config.palette,
+            );
+            if is_background {
+                output
+                    .widget()
+                    .update_property(&[gtk4::accessible::Property::Label("Background output")]);
+            }
+            output.set_terminal_background(super::developer_block::terminal_background());
+            output.install_links(crate::ui::shared_terminal::SharedTerminal::document_links());
+            jterm_gtk_view::FinishedOutputView::new(output, fallback_viewport_cap, max_expanded_cap)
+        });
         #[cfg(forge_shared_terminal)]
         let uses_output_vte = output_document.is_none();
         #[cfg(not(forge_shared_terminal))]
@@ -3591,6 +3605,8 @@ impl FinishedBlock {
             let output_vte = output_vte.as_ref().map(ObjectExt::downgrade);
             #[cfg(forge_shared_terminal)]
             let output_document = output_document.clone();
+            #[cfg(forge_shared_terminal)]
+            let output_archive = output_archive.clone();
             let expand_btn = expand_btn.downgrade();
             let filter_btn_weak = filter_btn.downgrade();
             let jump_bottom_btn = jump_bottom_btn.downgrade();
@@ -3682,6 +3698,8 @@ impl FinishedBlock {
                         let output_vte = output_vte.clone();
                         #[cfg(forge_shared_terminal)]
                         let output_document = output_document.clone();
+                        #[cfg(forge_shared_terminal)]
+                        let output_archive = output_archive.clone();
                         let full_output = full_output.clone();
                         let displayed_output = displayed_output.clone();
                         let filter_enabled = filter_enabled.clone();
@@ -3731,8 +3749,26 @@ impl FinishedBlock {
                             };
                             let q = filter_entry.text().to_string();
                             let full = full_output.borrow();
-                            let full_rows = output_row_count(&full);
-                            let (display_override, invalid_regex) =
+                            let full_text = full.as_str();
+                            #[cfg(forge_shared_terminal)]
+                            let full_text = output_archive
+                                .as_deref()
+                                .map_or(full_text, |document| document.text.as_str());
+                            #[cfg(forge_shared_terminal)]
+                            let archive_filter = output_archive.as_deref().map(|document| {
+                                if !filter_enabled.get() {
+                                    return Ok(None);
+                                }
+                                jterm_core::screen_replay::filter_archived_output(
+                                    document,
+                                    &q,
+                                    regex_tg.is_active(),
+                                    case_tg.is_active(),
+                                    invert_tg.is_active(),
+                                    ctx_spin.value() as usize,
+                                )
+                            });
+                            let filter_raw = || {
                                 if !filter_enabled.get() || q.is_empty() {
                                     (None, false)
                                 } else {
@@ -3749,8 +3785,20 @@ impl FinishedBlock {
                                         }
                                         Err(_) => (None, true),
                                     }
-                                };
-                            let shown = resolved_finished_output(full.as_str(), &display_override);
+                                }
+                            };
+                            #[cfg(not(forge_shared_terminal))]
+                            let (display_override, invalid_regex) = filter_raw();
+                            #[cfg(forge_shared_terminal)]
+                            let (display_override, invalid_regex) = match &archive_filter {
+                                Some(Ok(document)) => {
+                                    (document.as_ref().map(|doc| doc.text.clone()), false)
+                                }
+                                Some(Err(_)) => (None, true),
+                                None => filter_raw(),
+                            };
+                            let full_rows = output_row_count(full_text);
+                            let shown = resolved_finished_output(full_text, &display_override);
                             let shown_rows = output_row_count(shown);
 
                             let display_changed =
@@ -3839,15 +3887,15 @@ impl FinishedBlock {
                             } else {
                                 #[cfg(forge_shared_terminal)]
                                 if display_changed {
-                                    if let Some(output) = &output_document {
-                                        let Some(document) =
-                                            jterm_core::screen_replay::project_bounded_archive(
-                                                shown,
-                                            )
-                                        else {
-                                            return;
-                                        };
-                                        output.present_output(&document);
+                                    if let (Some(output), Some(original)) =
+                                        (&output_document, output_archive.as_deref())
+                                    {
+                                        let document = archive_filter
+                                            .as_ref()
+                                            .and_then(|result| result.as_ref().ok())
+                                            .and_then(Option::as_ref)
+                                            .unwrap_or(original);
+                                        output.present_output(document);
                                         render_stamp.replace(output_render_stamp(
                                             cols,
                                             shown_rows.max(1),
@@ -4420,11 +4468,15 @@ impl FinishedBlock {
         #[cfg(forge_shared_terminal)]
         if let Some(document) = &self.command_document {
             document.set_foreground(chat_snapshot_foreground());
+            document.set_terminal_background(crate::terminal::chat_terminal_colors().1);
             command.set_overflow(gtk4::Overflow::Hidden);
         }
         #[cfg(forge_shared_terminal)]
         if let Some(document) = &self.output_document {
             document.text().set_foreground(chat_snapshot_foreground());
+            document
+                .text()
+                .set_terminal_background(crate::terminal::chat_terminal_colors().1);
         }
         self.content.append(&command);
         self.content.append(&result);
@@ -5867,7 +5919,7 @@ mod tests {
                 std::slice::from_ref(&texture),
                 caption.len(),
                 None,
-                super::FinishedBlockPrecomputed::documents(&config, true),
+                super::FinishedBlockPrecomputed::documents(&config),
             );
             let output = card.output_surface();
             assert_eq!(output.document_text().as_deref(), expected);

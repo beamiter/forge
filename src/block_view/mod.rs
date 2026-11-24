@@ -3050,6 +3050,9 @@ fn apply_dynamic_colors_to_finished(block: &FinishedBlock, dynamic: DynamicColor
             if let Some(foreground) = dynamic.foreground {
                 command.set_foreground(foreground);
             }
+            if let Some(background) = dynamic.background {
+                command.set_terminal_background(background);
+            }
             command.set_background(
                 dynamic
                     .background
@@ -3059,6 +3062,9 @@ fn apply_dynamic_colors_to_finished(block: &FinishedBlock, dynamic: DynamicColor
         if let Some(output) = &block.output_document {
             if let Some(foreground) = dynamic.foreground {
                 output.text().set_foreground(foreground);
+            }
+            if let Some(background) = dynamic.background {
+                output.text().set_terminal_background(background);
             }
             output.text().set_background(dynamic.background);
         }
@@ -10655,10 +10661,7 @@ impl RenderBackend for BlockBackend {
             .shared_active
             .as_ref()
             .map_or(dynamic_colors, |terminal| terminal.output_colors());
-        let mut precomputed = FinishedBlockPrecomputed::documents(
-            &finished_config,
-            payload.output_notice().is_none(),
-        );
+        let mut precomputed = FinishedBlockPrecomputed::documents(&finished_config);
         precomputed.output_rows = Some(output_rows);
         precomputed.output_preview = Some(fold_preview::from_output(output_with_ansi));
         let finished = FinishedBlock::new_with_pool(
@@ -20665,11 +20668,18 @@ impl TermView {
         }
         for block in self.finished_blocks.borrow().iter() {
             #[cfg(forge_shared_terminal)]
-            let document_foreground = if block.widget().has_css_class("chat-pair") {
-                blocks::chat_snapshot_foreground()
-            } else {
-                developer_block::terminal_foreground()
-            };
+            let (document_foreground, document_background) =
+                if block.widget().has_css_class("chat-pair") {
+                    (
+                        blocks::chat_snapshot_foreground(),
+                        crate::terminal::chat_terminal_colors().1,
+                    )
+                } else {
+                    (
+                        developer_block::terminal_foreground(),
+                        developer_block::terminal_background(),
+                    )
+                };
             if let Some(terminal) = &block.command_vte {
                 apply_snapshot_theme_to_vte(terminal, &config);
                 if developer {
@@ -20680,6 +20690,7 @@ impl TermView {
             #[cfg(forge_shared_terminal)]
             if let Some(command) = &block.command_document {
                 command.set_colors(document_foreground, &config.palette);
+                command.set_terminal_background(document_background);
                 command.set_background(None);
             }
             if let Some(terminal) = &block.output_vte {
@@ -20693,6 +20704,7 @@ impl TermView {
                 output
                     .text()
                     .set_colors(document_foreground, &config.palette);
+                output.text().set_terminal_background(document_background);
                 output.text().set_background(None);
             }
         }
