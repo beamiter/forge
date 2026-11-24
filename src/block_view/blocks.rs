@@ -3,10 +3,12 @@ use super::bounded_bytes::BoundedByteRing;
 use super::*;
 use crate::config::Config;
 use gtk4::Orientation;
+use jterm_core::screen_replay::FinishedDocument;
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::sync::Arc;
 use vte4::Terminal;
 use vte4::TerminalExt;
 
@@ -322,6 +324,11 @@ pub(crate) struct BlockData {
     /// [`known_output_notice`].
     #[serde(default)]
     pub(crate) output_notice: Option<String>,
+    /// Stored in the history frame extension. The archived body and JSON
+    /// exports continue to carry the plain logical output.
+    #[rkyv(with = rkyv::with::Skip)]
+    #[serde(skip)]
+    pub(crate) finished_document: Option<Arc<FinishedDocument>>,
 }
 
 pub(super) fn markdown_fence(text: &str) -> String {
@@ -339,6 +346,12 @@ pub(super) fn markdown_fence(text: &str) -> String {
 }
 
 impl BlockData {
+    pub(super) fn finished_document_bytes(&self) -> usize {
+        self.finished_document
+            .as_deref()
+            .map_or(0, FinishedDocument::retained_bytes)
+    }
+
     pub(crate) fn is_background(&self) -> bool {
         self.cmd.trim().is_empty()
     }
@@ -413,6 +426,7 @@ impl BlockData {
             self.cwd.as_ref().map_or(0, String::len),
             0,
         )
+        .saturating_add(self.finished_document_bytes())
     }
 
     /// Export block to JSON format
@@ -1653,6 +1667,7 @@ fn finished_block_height_for_rows(
 /// and tests.
 #[derive(Clone, Default)]
 pub(crate) struct FinishedBlockPrecomputed {
+    pub(super) finished_document: Option<Arc<FinishedDocument>>,
     #[cfg(forge_shared_terminal)]
     pub(crate) document_command: bool,
     #[cfg(forge_shared_terminal)]
@@ -2295,7 +2310,14 @@ impl FinishedBlock {
             &[],
             block.output.len(),
             None,
-            FinishedBlockPrecomputed::documents(config),
+            FinishedBlockPrecomputed {
+                finished_document: block
+                    .finished_document
+                    .as_ref()
+                    .filter(|document| document.archive.text == block.output)
+                    .cloned(),
+                ..FinishedBlockPrecomputed::documents(config)
+            },
         );
         card.set_command_provenance(block.command_exact, block.command_truncated);
         card
@@ -2409,7 +2431,13 @@ impl FinishedBlock {
             0
         } else {
             super::kitty_graphics::MAX_PENDING_BYTES_PER_BLOCK
-        });
+        })
+        .saturating_add(
+            precomputed
+                .finished_document
+                .as_deref()
+                .map_or(0, FinishedDocument::retained_bytes),
+        );
 
         // A collapsed transcript is a DIFFERENT string from the one the caller
         // measured — `collapse_repaint_output` clips every row at `cols` and
@@ -2955,15 +2983,23 @@ impl FinishedBlock {
         #[cfg(forge_shared_terminal)]
         let output_archive =
             if precomputed.document_output && (precomputed.document_command || is_background) {
-                jterm_core::screen_replay::project_finished_output(output, cols.max(1) as usize)
-                    .map(Rc::new)
+                precomputed.finished_document.clone().or_else(|| {
+                    FinishedDocument::capture(output, (cols.clamp(1, u16::MAX as i64) as u16, 0))
+                        .map(Arc::new)
+                })
             } else {
                 None
             };
         #[cfg(forge_shared_terminal)]
+        let stripped_output = output_archive
+            .as_ref()
+            .map(|document| document.archive.text.clone());
+        #[cfg(not(forge_shared_terminal))]
+        let stripped_output = None;
+        #[cfg(forge_shared_terminal)]
         let output_document = output_archive.as_deref().map(|document| {
             let output = jterm_gtk_view::FinishedTextView::output(
-                document,
+                &document.archive,
                 crate::font::terminal_font_description(&config.font_desc, config),
                 config.default_font_scale,
                 super::developer_block::terminal_foreground(),
@@ -3753,14 +3789,14 @@ impl FinishedBlock {
                             #[cfg(forge_shared_terminal)]
                             let full_text = output_archive
                                 .as_deref()
-                                .map_or(full_text, |document| document.text.as_str());
+                                .map_or(full_text, |document| document.archive.text.as_str());
                             #[cfg(forge_shared_terminal)]
                             let archive_filter = output_archive.as_deref().map(|document| {
                                 if !filter_enabled.get() {
                                     return Ok(None);
                                 }
                                 jterm_core::screen_replay::filter_archived_output(
-                                    document,
+                                    &document.archive,
                                     &q,
                                     regex_tg.is_active(),
                                     case_tg.is_active(),
@@ -3894,7 +3930,7 @@ impl FinishedBlock {
                                             .as_ref()
                                             .and_then(|result| result.as_ref().ok())
                                             .and_then(Option::as_ref)
-                                            .unwrap_or(original);
+                                            .unwrap_or(&original.archive);
                                         output.present_output(document);
                                         render_stamp.replace(output_render_stamp(
                                             cols,
@@ -4115,7 +4151,7 @@ impl FinishedBlock {
             output_document_height: Rc::new(Cell::new(0)),
             full_output,
             displayed_output,
-            stripped_output: Rc::new(RefCell::new(None)),
+            stripped_output: Rc::new(RefCell::new(stripped_output)),
             cmd_text: cmd.to_string(),
             command_replay_is_exact: Rc::new(Cell::new(false)),
             command_source_notice,
@@ -7145,6 +7181,7 @@ mod tests {
             output.len(),
             None,
             super::FinishedBlockPrecomputed {
+                finished_document: None,
                 output_rows: Some(rows),
                 output_preview: Some(super::super::fold_preview::from_plain(&output)),
                 #[cfg(forge_shared_terminal)]
@@ -7341,6 +7378,7 @@ mod tests {
             command_exact: false,
             command_truncated: false,
             output_notice: None,
+            finished_document: None,
         }
     }
 

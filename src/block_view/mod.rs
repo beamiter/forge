@@ -6978,6 +6978,7 @@ struct BlockRenderPayload {
     prompt: String,
     output_with_ansi: String,
     output_plain: String,
+    capture_size: (u16, u16),
     /// Whether the ANSI replay that produced `output_plain` stopped before the
     /// last captured byte. The text is a prefix then, and nothing in it says
     /// so, so a snapshot taken from it must report the loss.
@@ -7158,6 +7159,7 @@ impl BlockRenderPayloadAccessor for LazyBlockRenderPayload {
                 prompt,
                 output_with_ansi: rendered.output_with_ansi,
                 output_plain: rendered.output_plain,
+                capture_size: self.child_winsize,
                 output_plain_lost_bytes: rendered.lost,
                 output_dropped_front: self.dropped_front,
                 output_head_dropped: rendered.head_dropped,
@@ -10527,7 +10529,15 @@ impl RenderBackend for BlockBackend {
         let prompt = payload.prompt.as_str();
         let cmd = record.cmd.as_str();
         let output_with_ansi = payload.output_with_ansi.as_str();
-        let output_plain = payload.output_plain.as_str();
+        let finished_document = jterm_core::screen_replay::FinishedDocument::capture(
+            output_with_ansi,
+            payload.capture_size,
+        )
+        .map(std::sync::Arc::new);
+        let output_plain = finished_document.as_ref().map_or_else(
+            || payload.output_plain.as_str(),
+            |document| &document.archive.text,
+        );
         let plain_output_bytes = output_plain.len();
         let block_cwd = record.cwd.as_deref();
         let cols = self.grid_cols();
@@ -10569,7 +10579,13 @@ impl RenderBackend for BlockBackend {
             prompt: prompt.to_owned(),
             cmd: cmd.to_owned(),
             cmd_markup: None,
-            output: output_plain.trim().to_owned(),
+            output: if finished_document.is_some() {
+                output_plain
+            } else {
+                output_plain.trim()
+            }
+            .to_owned(),
+            finished_document: finished_document.clone(),
             exit_code: record.exit_code,
             lifecycle_schema: blocks::BLOCK_LIFECYCLE_SCHEMA,
             completion_provenance: record.completion_provenance.into(),
@@ -10598,6 +10614,7 @@ impl RenderBackend for BlockBackend {
                 cols,
                 &images,
             )
+            .saturating_add(block_data.finished_document_bytes())
         };
         let prebuild_retention_plan = {
             let finished = self.finished_blocks_for_cb.borrow();
@@ -10662,6 +10679,7 @@ impl RenderBackend for BlockBackend {
             .as_ref()
             .map_or(dynamic_colors, |terminal| terminal.output_colors());
         let mut precomputed = FinishedBlockPrecomputed::documents(&finished_config);
+        precomputed.finished_document = finished_document;
         precomputed.output_rows = Some(output_rows);
         precomputed.output_preview = Some(fold_preview::from_output(output_with_ansi));
         let finished = FinishedBlock::new_with_pool(
@@ -22898,6 +22916,7 @@ mod tests {
             command_exact: false,
             command_truncated: false,
             output_notice: None,
+            finished_document: None,
         };
 
         let expanded = super::collapsed_aware_block_height(&config, &data, false, 80);
@@ -27716,6 +27735,7 @@ mod tests {
             command_exact: false,
             command_truncated: false,
             output_notice: None,
+            finished_document: None,
         }
     }
 
@@ -30452,6 +30472,7 @@ mod tests {
                 command_exact: false,
                 command_truncated: false,
                 output_notice: None,
+                finished_document: None,
             };
             self.records.borrow_mut().push_back(block_data);
             self.record(Call::FinalizeBlock(FinalizeRecord {

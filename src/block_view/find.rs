@@ -4294,6 +4294,7 @@ tail ab";
             command_exact: false,
             command_truncated: false,
             output_notice: None,
+            finished_document: None,
         };
         let metadata = CompletedCommandRecord {
             id: 2,
@@ -4686,6 +4687,7 @@ tail ab";
             command_exact: false,
             command_truncated: false,
             output_notice: None,
+            finished_document: None,
         };
         let unmarked_block = block(1, "first", "first output", Some(7), Some(2_000));
         let marked_block = block(3, "", "background output", Some(9), Some(9_000));
@@ -15507,6 +15509,7 @@ tail ab";
             command_exact: false,
             command_truncated: false,
             output_notice: None,
+            finished_document: None,
         };
         let block_record = || [BackendRecordRef::Block(&block)];
         let hits = metadata_filter_hits(
@@ -15904,6 +15907,7 @@ tail ab";
             command_exact: false,
             command_truncated: false,
             output_notice: None,
+            finished_document: None,
         };
         let backend_record = BackendRecordRef::Block(&block);
         let re = regex::Regex::new("needle").unwrap();
@@ -23787,6 +23791,7 @@ tail ab";
             command_exact: false,
             command_truncated: false,
             output_notice: None,
+            finished_document: None,
         };
         let backend = [BackendRecordRef::Block(&block)];
         let re = regex::Regex::new("needle").unwrap();
@@ -23869,6 +23874,7 @@ tail ab";
             command_exact: false,
             command_truncated: false,
             output_notice: None,
+            finished_document: None,
         };
         let backend = [BackendRecordRef::Block(&block)];
         let re = regex::Regex::new("needle").unwrap();

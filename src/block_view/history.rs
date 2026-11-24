@@ -14,6 +14,8 @@ use super::{
 use crate::persistence::{self, PersistenceKey};
 use gtk4::glib;
 use gtk4::prelude::*;
+use jterm_core::screen_replay::FinishedHistoryFrame;
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::ffi::{CString, OsString};
 use std::fs::{self, File, OpenOptions};
@@ -466,6 +468,7 @@ impl From<LegacyBlockDataV3> for BlockData {
             command_exact: legacy.command_exact,
             command_truncated: legacy.command_truncated,
             output_notice: None,
+            finished_document: None,
         }
     }
 }
@@ -520,6 +523,7 @@ impl From<LegacyBlockDataV2> for BlockData {
             command_exact: false,
             command_truncated: false,
             output_notice: None,
+            finished_document: None,
         }
     }
 }
@@ -577,13 +581,14 @@ impl From<LegacyBlockDataV1> for BlockData {
             command_exact: false,
             command_truncated: false,
             output_notice: None,
+            finished_document: None,
         }
     }
 }
 
 /// Current schema first, then the pre-round-8 layout. Order matters: a current
 /// frame must never be squeezed through the legacy shape.
-fn decode_rkyv_block(data: &[u8]) -> Option<BlockData> {
+fn decode_rkyv_body(data: &[u8]) -> Option<BlockData> {
     rkyv::from_bytes::<BlockData, rkyv::rancor::Error>(data)
         .ok()
         .filter(|block| block.lifecycle_schema == super::blocks::BLOCK_LIFECYCLE_SCHEMA)
@@ -604,6 +609,27 @@ fn decode_rkyv_block(data: &[u8]) -> Option<BlockData> {
                 .map(BlockData::from)
         })
         .map(normalize_block_lifecycle)
+}
+
+fn decode_rkyv_block(data: &[u8]) -> Option<BlockData> {
+    let frame = FinishedHistoryFrame::read(data);
+    if let Some(mut block) = decode_rkyv_body(frame.record) {
+        block.finished_document = frame.document(&block.output).map(Arc::new);
+        Some(block)
+    } else if frame.record.len() != data.len() {
+        decode_rkyv_body(data)
+    } else {
+        None
+    }
+}
+
+fn attach_finished_document<'a>(block: &BlockData, body: &'a [u8]) -> Cow<'a, [u8]> {
+    block
+        .finished_document
+        .as_deref()
+        .map_or(Cow::Borrowed(body), |document| {
+            document.attach(&block.output, body)
+        })
 }
 
 fn normalize_block_lifecycle(mut block: BlockData) -> BlockData {
@@ -1693,6 +1719,7 @@ fn estimated_block_payload_bytes(block: &BlockData) -> u64 {
         .saturating_add(block.cmd.len())
         .saturating_add(block.cmd_markup.as_ref().map_or(0, String::len))
         .saturating_add(block.output.len())
+        .saturating_add(block.finished_document_bytes())
         .saturating_add(block.cwd.as_ref().map_or(0, String::len));
     (std::mem::size_of::<BlockData>() as u64).saturating_add(strings as u64)
 }
@@ -1714,6 +1741,7 @@ fn estimated_loaded_block_owned_bytes(block: &BlockData) -> usize {
         .saturating_add(block.cmd.capacity())
         .saturating_add(block.cmd_markup.as_ref().map_or(0, String::capacity))
         .saturating_add(block.output.capacity())
+        .saturating_add(block.finished_document_bytes())
         .saturating_add(block.cwd.as_ref().map_or(0, String::capacity))
 }
 
@@ -1732,6 +1760,7 @@ fn estimated_snapshot_retained_bytes(blocks: &[BlockData], capacity: usize) -> u
                 .saturating_add(block.cmd.capacity())
                 .saturating_add(block.cmd_markup.as_ref().map_or(0, String::capacity))
                 .saturating_add(block.output.capacity())
+                .saturating_add(block.finished_document_bytes())
                 .saturating_add(block.cwd.as_ref().map_or(0, String::capacity))
         },
     )
@@ -1800,8 +1829,9 @@ fn append_spooled_block(
     block: &BlockData,
     compress: bool,
 ) -> io::Result<Option<SpoolRecord>> {
-    let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(block)
+    let body = rkyv::to_bytes::<rkyv::rancor::Error>(block)
         .map_err(|error| io::Error::other(error.to_string()))?;
+    let serialized = attach_finished_document(block, &body);
     if serialized.len() > MAX_DECODED_RECORD_BYTES as usize {
         log::warn!(
             "save_history: skipping a {} byte block (decoded record limit {})",
@@ -1811,10 +1841,10 @@ fn append_spooled_block(
         return Ok(None);
     }
     let encoded = if compress {
-        zstd::encode_all(serialized.as_slice(), 3)
+        zstd::encode_all(serialized.as_ref(), 3)
             .map_err(|error| io::Error::other(error.to_string()))?
     } else {
-        serialized.as_slice().to_vec()
+        serialized.as_ref().to_vec()
     };
     if encoded.len() > MAX_ENCODED_RECORD_BYTES || encoded.len() > u32::MAX as usize {
         log::warn!(
@@ -1937,8 +1967,9 @@ fn encode_history_frames_bounded(
     let mut decoded_bytes = 0u64;
 
     for block in blocks.iter().rev() {
-        let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(block)
+        let body = rkyv::to_bytes::<rkyv::rancor::Error>(block)
             .map_err(|error| io::Error::other(error.to_string()))?;
+        let serialized = attach_finished_document(block, &body);
         if serialized.len() > max_decoded_record_bytes {
             log::warn!(
                 "save_history: skipping a {} byte block (decoded record limit {})",
@@ -1949,10 +1980,10 @@ fn encode_history_frames_bounded(
         }
 
         let record = if compress {
-            zstd::encode_all(serialized.as_slice(), 3)
+            zstd::encode_all(serialized.as_ref(), 3)
                 .map_err(|error| io::Error::other(error.to_string()))?
         } else {
-            serialized.as_slice().to_vec()
+            serialized.as_ref().to_vec()
         };
         if record.len() > max_encoded_record_bytes || record.len() > u32::MAX as usize {
             log::warn!(
@@ -2951,6 +2982,7 @@ mod tests {
             command_exact: false,
             command_truncated: false,
             output_notice: None,
+            finished_document: None,
         }
     }
 
@@ -3590,6 +3622,49 @@ mod tests {
                     .cmd,
                 "printf hello"
             );
+        }
+    }
+
+    #[test]
+    fn styled_history_preserves_the_document_and_legacy_plain_record() {
+        let document = jterm_core::screen_replay::FinishedDocument::capture(
+            "  \x1b[32m中\x1b[0m\t\x1b]8;;https://example.test/\x07label\x1b]8;;\x07\r\n\r\n",
+            (83, 27),
+        )
+        .unwrap();
+        assert_eq!(document.archive.text, "  中\tlabel\n");
+        let mut block = sample_block(9, "printf");
+        block.output = document.archive.text.clone();
+        block.finished_document = Some(Arc::new(document.clone()));
+        block.output_notice = Some(super::super::FINISHED_OUTPUT_NOT_RETAINED.into());
+
+        for compressed in [false, true] {
+            let frames = encode_history_frames_bounded(
+                std::slice::from_ref(&block),
+                compressed,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+            )
+            .unwrap();
+            let [frame] = frames.as_slice() else {
+                panic!("expected one record");
+            };
+            let (restored, decoded_len) = decode_block_record(frame, compressed).unwrap();
+            assert_eq!(restored.output, block.output);
+            assert_eq!(restored.finished_document.as_deref(), Some(&document));
+            assert_eq!(restored.output_notice, block.output_notice);
+
+            let bytes = if compressed {
+                super::decode_zstd_bounded(frame, super::MAX_DECODED_RECORD_BYTES).unwrap()
+            } else {
+                frame.clone()
+            };
+            assert_eq!(decoded_len, bytes.len());
+            let legacy = super::decode_rkyv_body(&bytes).expect("legacy reader's body");
+            assert_eq!(legacy.output, block.output);
+            assert_eq!(legacy.exit_code, block.exit_code);
+            assert!(legacy.finished_document.is_none());
         }
     }
 

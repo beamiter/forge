@@ -76,6 +76,7 @@ fn collapsed_output_navigation(mode: crate::config::TerminalMode) {
             command_exact: true,
             command_truncated: false,
             output_notice: None,
+            finished_document: None,
         });
         view.finished_blocks.borrow_mut().push(card);
     }
