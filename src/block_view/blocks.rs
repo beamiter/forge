@@ -1657,21 +1657,14 @@ pub(crate) struct FinishedBlockPrecomputed {
     pub(crate) document_command: bool,
     #[cfg(forge_shared_terminal)]
     pub(crate) document_output: bool,
-    #[cfg(forge_shared_terminal)]
-    document_output_with_native_command: bool,
     pub(crate) output_preview: Option<String>,
     pub(crate) output_rows: Option<i64>,
 }
 
 impl FinishedBlockPrecomputed {
-    pub(super) fn documents(
-        config: &Config,
-        exact_command: bool,
-        complete_output: bool,
-        colors: super::DynamicColors,
-    ) -> Self {
+    pub(super) fn documents(config: &Config, complete_output: bool) -> Self {
         #[cfg(not(forge_shared_terminal))]
-        let _ = (config, exact_command, complete_output, colors);
+        let _ = (config, complete_output);
         #[cfg(forge_shared_terminal)]
         let foreground_documents = matches!(
             config.terminal_mode,
@@ -1680,17 +1673,11 @@ impl FinishedBlockPrecomputed {
             .is_none_or(|value| value == "1");
         Self {
             #[cfg(forge_shared_terminal)]
-            document_command: exact_command && foreground_documents && colors.foreground.is_none(),
+            document_command: foreground_documents,
             #[cfg(forge_shared_terminal)]
             document_output: complete_output
                 && std::env::var_os("JTERM_SHARED_FINISHED_OUTPUT")
                     .is_none_or(|value| value == "1"),
-            #[cfg(forge_shared_terminal)]
-            // Mixed-renderer cards retain the VTE fallback for OSC colors the
-            // foreground command and output currently inherit together.
-            document_output_with_native_command: foreground_documents
-                && colors.foreground.is_none()
-                && colors.background.is_none(),
             ..Self::default()
         }
     }
@@ -2293,13 +2280,8 @@ impl FinishedBlock {
         Self::with_cached_stripped_output(&self.full_output, &self.stripped_output, f)
     }
 
-    pub(super) fn from_retained(
-        block: &BlockData,
-        config: &Config,
-        cols: i64,
-        colors: super::DynamicColors,
-    ) -> Self {
-        Self::new_with_pool(
+    pub(super) fn from_retained(block: &BlockData, config: &Config, cols: i64) -> Self {
+        let card = Self::new_with_pool(
             block.id,
             &block.prompt,
             &block.cmd,
@@ -2314,13 +2296,10 @@ impl FinishedBlock {
             &[],
             block.output.len(),
             None,
-            FinishedBlockPrecomputed::documents(
-                config,
-                block.command_exact && !block.command_truncated,
-                block.output_notice.is_none(),
-                colors,
-            ),
-        )
+            FinishedBlockPrecomputed::documents(config, block.output_notice.is_none()),
+        );
+        card.set_command_provenance(block.command_exact, block.command_truncated);
+        card
     }
 
     #[cfg(test)]
@@ -2883,7 +2862,7 @@ impl FinishedBlock {
         // Command VTE: full-height read-only renderer for the executed command.
         let cmd_rows = cmd_bytes.iter().filter(|&&b| b == b'\n').count() as i64 + 1;
         #[cfg(forge_shared_terminal)]
-        let command_document = if precomputed.document_command && cmd_ansi.is_none() {
+        let command_document = if precomputed.document_command {
             jterm_gtk_view::FinishedTextView::command(
                 cmd,
                 &cmd_bytes,
@@ -2960,9 +2939,7 @@ impl FinishedBlock {
         let displayed_output: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         #[cfg(forge_shared_terminal)]
         let output_document = if precomputed.document_output
-            && (command_document.is_some()
-                || is_background
-                || precomputed.document_output_with_native_command)
+            && (precomputed.document_command || is_background)
         {
             jterm_core::screen_replay::project_bounded_archive(output).map(|document| {
                 let output = jterm_gtk_view::FinishedTextView::output(
@@ -3401,7 +3378,7 @@ impl FinishedBlock {
 
         #[cfg(forge_shared_terminal)]
         if let Some(command) = &command_document {
-            cmd_row.append(command.widget());
+            cmd_row.append_document(command);
             chevron.set_visible(false);
         }
 
@@ -4443,7 +4420,7 @@ impl FinishedBlock {
         #[cfg(forge_shared_terminal)]
         if let Some(document) = &self.command_document {
             document.set_foreground(chat_snapshot_foreground());
-            super::command_row::fit_document(&command, document);
+            command.set_overflow(gtk4::Overflow::Hidden);
         }
         #[cfg(forge_shared_terminal)]
         if let Some(document) = &self.output_document {
@@ -5871,7 +5848,7 @@ mod tests {
                 std::slice::from_ref(&texture),
                 caption.len(),
                 None,
-                super::FinishedBlockPrecomputed::documents(&config, true, true, Default::default()),
+                super::FinishedBlockPrecomputed::documents(&config, true),
             );
             let output = card.output_surface();
             assert_eq!(output.document_text().as_deref(), expected);
@@ -7103,8 +7080,6 @@ mod tests {
                 document_command: false,
                 #[cfg(forge_shared_terminal)]
                 document_output: false,
-                #[cfg(forge_shared_terminal)]
-                document_output_with_native_command: false,
             },
         );
         let calls = super::OUTPUT_VISUAL_ROW_COUNT_CALLS.with(Cell::get);
