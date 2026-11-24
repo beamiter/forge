@@ -1,11 +1,12 @@
+use jterm_core::link::{detect_delimited_references, DelimitedReference};
+
+pub(crate) fn detect(rows: &[(&str, bool)]) -> Vec<DelimitedReference> {
+    let lines: Vec<_> = rows.iter().map(|&(line, _)| line).collect();
+    detect_delimited_references(&lines)
+}
+
 mod tests {
-    use jterm_core::link::{detect_delimited_references, DelimitedReference};
-
-    fn detect(rows: &[(&str, bool)]) -> Vec<DelimitedReference> {
-        let lines: Vec<_> = rows.iter().map(|&(line, _)| line).collect();
-        detect_delimited_references(&lines)
-    }
-
+    use super::detect;
     #[test]
     fn never_invents_authority_or_path_across_rows() {
         for full in [false, true] {
