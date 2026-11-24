@@ -20531,7 +20531,9 @@ impl TermView {
             }
             #[cfg(forge_shared_terminal)]
             if let Some(output) = &block.output_document {
-                output.text().set_colors(document_foreground, &config.palette);
+                output
+                    .text()
+                    .set_colors(document_foreground, &config.palette);
             }
         }
         install_block_css(&config);
