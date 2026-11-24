@@ -1,35 +1,12 @@
 use gtk4::{pango, prelude::*};
 #[cfg(target_os = "linux")]
 use jterm_gtk_view::RuntimeShell;
-use jterm_gtk_view::{CursorColors, LinkActions, Pty, TerminalPane, Theme};
+use jterm_gtk_view::{CursorColors, LinkActions, TerminalPane, Theme};
 use std::rc::Rc;
 
 use crate::{config::Config, keybindings::Action, pty::OwnedPty};
 
 const PAGE_DATA: &str = "forge-shared-terminal";
-
-impl Pty for OwnedPty {
-    fn write(&self, bytes: &[u8]) -> Result<(), String> {
-        self.write_bytes(bytes).map_err(|error| error.to_string())
-    }
-
-    fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
-        OwnedPty::resize(self, cols, rows).map_err(|error| error.to_string())
-    }
-
-    fn stop(&self) {
-        self.kill();
-    }
-
-    fn start_reader(
-        &self,
-        output: impl FnMut(Vec<u8>) + 'static,
-        exited: impl FnOnce(jterm_core::exit_status::PtyExit) + 'static,
-    ) -> Result<(), String> {
-        OwnedPty::start_reader(self, output, exited);
-        Ok(())
-    }
-}
 
 pub(crate) struct SharedTerminal {
     pane: Rc<TerminalPane<OwnedPty>>,
