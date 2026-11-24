@@ -1492,6 +1492,7 @@ pub fn run() -> glib::ExitCode {
         let ui = Rc::new(UiState {
             unified_navigation_owner,
             window: window.clone(),
+            quit_draining: Rc::new(Cell::new(false)),
             toast_overlay: toast_overlay.clone(),
             opacity_toast: Rc::new(RefCell::new(None)),
             notebook: notebook.clone(),
@@ -2352,58 +2353,72 @@ pub fn run() -> glib::ExitCode {
         let close_allowed = Rc::new(Cell::new(false));
         let close_confirmation_open = Rc::new(Cell::new(false));
         window.connect_close_request(move |window| {
-            if crate::vim9_ide::request_embedded_close(window) { return glib::Propagation::Stop; }
-            if crate::eva_companion::close_waiting(window.upcast_ref()) {
-                crate::eva_companion::observe_close_work(window.upcast_ref(),
-                    (crate::state::withdrawal_work_probe(&notebook_for_close_request))());
-            }
-            if !close_allowed.get() {
-                // A zoomed split keeps the sibling tree outside the Notebook.
-                // Restore it before scanning/saving so no hidden pane escapes
-                // confirmation or teardown. Cancellation simply leaves the tab
-                // safely unzoomed.
-                if let Some(state) = zoom_for_close.borrow_mut().take() {
-                    let _ = ui::restore_zoomed_leaf(&notebook_for_close_request, &state.swap);
+            if !ui_for_close_request.quit_draining.get() {
+                if crate::vim9_ide::request_embedded_close(window) {
+                    return glib::Propagation::Stop;
                 }
-                if close_confirmation_open.get() {
-                    return true.into();
+                if crate::eva_companion::close_waiting(window.upcast_ref()) {
+                    crate::eva_companion::observe_close_work(
+                        window.upcast_ref(),
+                        (crate::state::withdrawal_work_probe(&notebook_for_close_request))(),
+                    );
                 }
-                if let Some(processes) =
-                    UiState::running_process_summary_for_notebook(&notebook_for_close_request)
-                {
-                    close_confirmation_open.set(true);
-                    let window_for_confirmation = window.clone();
-                    let allowed_for_confirmation = close_allowed.clone();
-                    let open_for_confirmation = close_confirmation_open.clone();
-                    glib::MainContext::default().spawn_local(async move {
-                        let confirmed = UiState::confirm_close_with_processes(
-                            &window_for_confirmation,
-                            "Close window with running processes?",
-                            "Close Window",
-                            &processes,
-                        )
-                        .await;
-                        open_for_confirmation.set(false);
-                        if confirmed {
-                            allowed_for_confirmation.set(true);
-                            window_for_confirmation.close();
-                        }
-                    });
-                    return true.into();
-                }
-            }
-
-            let work = crate::state::withdrawal_work_probe(&notebook_for_close_request);
-            let ready_window = window.downgrade();
-            let reset_allowed = close_allowed.clone();
-            if crate::eva_companion::defer_close(window.upcast_ref(), !close_allowed.get(),
-                work,
-                move |revision| {
-                    if let Some(window) = ready_window.upgrade() {
-                        if crate::eva_companion::close_callback_current(window.upcast_ref(), revision) { window.close(); }
+                if !close_allowed.get() {
+                    // Restore any sibling hidden by a zoomed pane before
+                    // checking running processes and saving the layout.
+                    if let Some(state) = zoom_for_close.borrow_mut().take() {
+                        let _ = ui::restore_zoomed_leaf(&notebook_for_close_request, &state.swap);
                     }
-                }, move || reset_allowed.set(false)) {
-                return glib::Propagation::Stop;
+                    if close_confirmation_open.get() {
+                        return glib::Propagation::Stop;
+                    }
+                    if let Some(processes) =
+                        UiState::running_process_summary_for_notebook(&notebook_for_close_request)
+                    {
+                        close_confirmation_open.set(true);
+                        let window_for_confirmation = window.clone();
+                        let allowed_for_confirmation = close_allowed.clone();
+                        let open_for_confirmation = close_confirmation_open.clone();
+                        glib::MainContext::default().spawn_local(async move {
+                            let confirmed = UiState::confirm_close_with_processes(
+                                &window_for_confirmation,
+                                "Close window with running processes?",
+                                "Close Window",
+                                &processes,
+                            )
+                            .await;
+                            open_for_confirmation.set(false);
+                            if confirmed {
+                                allowed_for_confirmation.set(true);
+                                window_for_confirmation.close();
+                            }
+                        });
+                        return glib::Propagation::Stop;
+                    }
+                }
+
+                let ready_window = window.downgrade();
+                let reset_allowed = close_allowed.clone();
+                if crate::eva_companion::defer_close(
+                    window.upcast_ref(),
+                    !close_allowed.get(),
+                    crate::state::withdrawal_work_probe(&notebook_for_close_request),
+                    move |revision| {
+                        if let Some(window) = ready_window.upgrade() {
+                            if crate::eva_companion::close_callback_current(
+                                window.upcast_ref(), revision,
+                            ) {
+                                window.close();
+                            }
+                        }
+                    },
+                    move || reset_allowed.set(false),
+                ) {
+                    return glib::Propagation::Stop;
+                }
+                // Child-exit callbacks can run while the close waits for the
+                // PTYs to drain. Keep their panes and session IDs for the save.
+                ui_for_close_request.quit_draining.set(true);
             }
             let window_after_drain = window.clone();
             if crate::gtk_process::defer_children(window.upcast_ref(),

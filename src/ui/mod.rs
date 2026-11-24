@@ -333,6 +333,8 @@ pub(crate) struct UiState {
     /// they must not retain the notebook that contains themselves.
     pub(crate) unified_navigation_owner: Rc<RefCell<std::rc::Weak<UiState>>>,
     pub(crate) window: adw::ApplicationWindow,
+    /// The accepted window close owns the pane tree until it saves the layout.
+    pub(crate) quit_draining: Rc<Cell<bool>>,
     /// Window-level toast host wrapping the main layout.
     pub(crate) toast_overlay: adw::ToastOverlay,
     /// The live opacity-hotkey toast, if one is currently shown. Held so rapid

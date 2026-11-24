@@ -493,6 +493,9 @@ impl UiState {
                 }
             }
         }
+        if self.quit_draining.get() {
+            return;
+        }
 
         // A zoom swap temporarily removes the sibling tree from the Notebook.
         // Restore it before collapsing the exited leaf; merely dropping the
@@ -1682,6 +1685,9 @@ impl UiState {
     /// died abnormally (non-zero exit), schedule an auto-reconnect; otherwise
     /// close the tab normally.
     pub(crate) fn handle_tab_exit(&self, tab_num: u32, code: i32, dead_leaf: &gtk4::Widget) {
+        if self.quit_draining.get() {
+            return;
+        }
         let conn = self.tab_connections.borrow().get(&tab_num).cloned();
         if let Some(conn) = conn {
             if code != 0 {
@@ -1755,6 +1761,9 @@ impl UiState {
         self.set_tab_strip_label(tab_num, &format!("{} — reconnect {}s", host.name, delay));
 
         glib::timeout_add_seconds_local(1, move || {
+            if ui.quit_draining.get() {
+                return glib::ControlFlow::Break;
+            }
             // Follow the connection record rather than the old tab number: a
             // dead remote pane can move while this countdown is active.
             let current_tab_num =
@@ -2076,7 +2085,7 @@ impl UiState {
                     if is_remote && !is_split {
                         ui_for_exit.handle_tab_exit(current_tab_num, status.code, &root);
                     } else {
-                        if is_remote {
+                        if is_remote && !ui_for_exit.quit_draining.get() {
                             ui_for_exit
                                 .tab_connections
                                 .borrow_mut()
@@ -2154,7 +2163,7 @@ impl UiState {
                     if is_remote && !is_split {
                         ui_for_exit.handle_tab_exit(current_tab_num, code, &root);
                     } else {
-                        if is_remote {
+                        if is_remote && !ui_for_exit.quit_draining.get() {
                             ui_for_exit
                                 .tab_connections
                                 .borrow_mut()
