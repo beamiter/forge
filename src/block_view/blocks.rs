@@ -6424,8 +6424,10 @@ mod tests {
                     "stamp":probe.render_stamp.get(), "revision":probe.render_stamp.revision(),
                     "pending":probe.render_stamp.pending_revision()
                 });
+                // A bounded recovery ring can remain after the viewport fits.
+                let output_fits = adj.is_some_and(|(lower, upper, page, _)| upper - lower <= page);
                 let generation_settled = probe.render_stamp.pending_revision().is_none()
-                    && (!probe.output_vte_for_test().is_mapped() || probe.output_vte_for_test().scrollback_lines()==0);
+                    && (!probe.output_vte_for_test().is_mapped() || output_fits);
                 let unchanged = last_frame.borrow().as_ref()==Some(&geometry);
                 stable_frame.set(if generation_settled && unchanged { stable_frame.get()+1 } else { 0 });
                 *last_frame.borrow_mut()=Some(geometry.clone());
