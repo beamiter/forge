@@ -1352,9 +1352,9 @@ impl UiState {
         &self,
         working_directory: Option<String>,
         argv: Vec<String>,
-    ) -> Terminal {
+    ) {
         let terminal_mode = self.config.borrow().terminal_mode.clone();
-        self.add_native_terminal_tab(TabLaunch {
+        self.add_tab_with_argv(TabLaunch {
             working_directory,
             tab_name: argv.first().cloned(),
             session_id: None,
@@ -1363,7 +1363,7 @@ impl UiState {
             remote: None,
             terminal_mode,
             task: None,
-        })
+        });
     }
 
     /// Select an existing CLI attachment or open its approved host relay.
@@ -1483,8 +1483,8 @@ impl UiState {
         )
     }
 
-    pub(crate) fn add_named_tab_with_argv(&self, tab_name: &str, argv: Vec<String>) -> Terminal {
-        self.add_native_terminal_tab(TabLaunch {
+    pub(crate) fn add_named_tab_with_argv(&self, tab_name: &str, argv: Vec<String>) {
+        self.add_tab_with_argv(TabLaunch {
             working_directory: None,
             tab_name: Some(tab_name.to_string()),
             session_id: None,
@@ -1493,7 +1493,7 @@ impl UiState {
             remote: None,
             terminal_mode: crate::config::TerminalMode::Vte,
             task: None,
-        })
+        });
     }
 
     /// Launch an explicit argv in its own named tab as a native agent task
@@ -1911,10 +1911,15 @@ impl UiState {
                 working_directory
                     .as_deref()
                     .and_then(|cwd| SharedPane::open_hosted_attachment(&config, shell_argv, cwd))
-            } else if allow_local_recovery
+            } else if remote.is_none()
+                && task.is_none()
                 && matches!(terminal_mode, crate::config::TerminalMode::Vte)
             {
-                SharedPane::open(&config, shell_argv, working_directory.as_deref(), &sid)
+                if argv_override.is_some() {
+                    SharedPane::open_explicit(&config, shell_argv, working_directory.as_deref())
+                } else {
+                    SharedPane::open(&config, shell_argv, working_directory.as_deref(), &sid)
+                }
             } else {
                 None
             }

@@ -252,6 +252,28 @@ impl SharedPane {
         Self::from_runtime(config, &launch, runtime, Some(cwd))
     }
 
+    pub(crate) fn open_explicit(
+        config: &Config,
+        argv: &[String],
+        cwd: Option<&str>,
+    ) -> Option<Rc<Self>> {
+        let home = std::env::var("HOME").ok();
+        let launch = crate::agent_cli::inline_argv(argv);
+        let runtime = RuntimeShell::spawn_explicit_command(
+            &launch,
+            cwd.or(home.as_deref()),
+            crate::host::is_flatpak(),
+            || {
+                SharedTerminal::runtime_environment(
+                    argv,
+                    config.vim9.auto_gui,
+                    &jterm_gtk_view::INTERACTIVE_CHILD_ENV,
+                )
+            },
+        );
+        Self::from_runtime(config, &launch, runtime, None)
+    }
+
     fn from_runtime(
         config: &Config,
         argv: &[String],
