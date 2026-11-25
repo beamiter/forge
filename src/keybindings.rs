@@ -965,6 +965,8 @@ mod tests {
             Action::JumpToPrevPinned,
             Action::JumpToNextPinned,
             Action::UndoClearBlocks,
+            Action::OpenSharedBlockHistory,
+            Action::OpenSharedUnifiedHistory,
             Action::JumpToPrevFailed,
             Action::JumpToNextFailed,
             Action::PreviousCommand,
