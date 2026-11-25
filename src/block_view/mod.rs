@@ -1560,8 +1560,8 @@ fn resolve_command_for_block(
     // output, and because this function is the last place that can tell the
     // difference between "exact" and "a prefix".
     if !meta.command_truncated {
-        if let Some(command) = meta.command.as_deref().map(str::trim) {
-            if !command.is_empty()
+        if let Some(command) = meta.command.as_deref() {
+            if !command.trim().is_empty()
                 && command.len() <= MAX_COMMAND_CAPTURE_BYTES
                 && !command
                     .chars()
@@ -8628,18 +8628,17 @@ impl ReaderCtx {
         // Finalize the previous command (deferred from CommandEnd),
         // or turn commandless async output into a first-class block.
         if state == BlockState::PostCommand || is_background {
-            // The VTE-text capture taken at CommandStart is
-            // authoritative — it reflects what was on screen
-            // when the user pressed Enter. Fall back to the
-            // keystroke shadow only if the VTE read came back
-            // empty (which would indicate the prompt-end
-            // anchor never captured a valid cursor position).
+            // Preserve the shell's exact spelling. Screen reconstruction and
+            // the keystroke shadow can both include surrounding padding.
             let mut cmd = if is_background {
                 String::new()
             } else {
-                let vte_cmd = self.engine.borrow().vte_typed_cmd.trim().to_string();
-                if !vte_cmd.is_empty() {
-                    vte_cmd
+                let engine = self.engine.borrow();
+                let recorded = &engine.vte_typed_cmd;
+                if engine.pending_command_source == CommandTextSource::ShellReported {
+                    recorded.clone()
+                } else if !recorded.trim().is_empty() {
+                    recorded.trim().to_string()
                 } else {
                     self.typed_cmd_rc.borrow().trim().to_string()
                 }
@@ -9197,7 +9196,9 @@ impl ReaderCtx {
         if !reviewed_identity_matches
             && external_submission
                 .as_deref()
-                .is_some_and(|approved| submitted_command == approved)
+                .is_some_and(|approved| {
+                    submitted_command == approved || submitted_command.trim() == approved
+                })
         {
             submitted_command = UNAVAILABLE_COMMAND_PLACEHOLDER.to_string();
             // The rendered identity failed the review check: the placeholder
@@ -26766,13 +26767,13 @@ mod tests {
     #[test]
     fn shell_metadata_outranks_the_screen_reconstruction() {
         let meta = CommandMeta {
-            command: Some("git status --short".to_string()),
+            command: Some("  git status --short \t\n".to_string()),
             ..CommandMeta::default()
         };
         assert_eq!(
             resolve_command_for_block(&meta, "git stat"),
             (
-                "git status --short".to_string(),
+                "  git status --short \t\n".to_string(),
                 super::CommandTextSource::ShellReported
             )
         );

@@ -2903,15 +2903,15 @@ impl FinishedBlock {
         // Command VTE: full-height read-only renderer for the executed command.
         let cmd_rows = cmd_bytes.iter().filter(|&&b| b == b'\n').count() as i64 + 1;
         #[cfg(forge_shared_terminal)]
-        let command_document = if precomputed.document_command {
+        let command_document = if precomputed.document_command && !is_background {
             let font = crate::font::terminal_font_description(&config.font_desc, config);
             let foreground = super::developer_block::terminal_foreground();
             let archive = cmd_ansi.and_then(|capture| {
-                jterm_core::screen_replay::project_bounded_command_archive(capture, cmd)
+                jterm_core::screen_replay::project_bounded_command_archive(capture, &display_cmd)
             });
             let command = match archive {
                 Some(archive) => jterm_gtk_view::FinishedTextView::archived_command(
-                    cmd,
+                    &display_cmd,
                     &archive,
                     font,
                     config.default_font_scale,
@@ -2919,7 +2919,7 @@ impl FinishedBlock {
                     &config.palette,
                 ),
                 None => jterm_gtk_view::FinishedTextView::command(
-                    cmd,
+                    &display_cmd,
                     &cmd_bytes,
                     font,
                     config.default_font_scale,
