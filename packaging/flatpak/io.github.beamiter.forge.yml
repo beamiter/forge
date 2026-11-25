@@ -80,6 +80,19 @@ modules:
           version-scheme: odd-minor-is-unstable
           name: vte
 
+  # Local task worktrees use a private Git binary. Interactive Git still
+  # runs in the user's host shell.
+  - name: task-git
+    buildsystem: simple
+    build-commands:
+      - make -j${FLATPAK_BUILDER_N_JOBS} prefix=/app gitexecdir=/app/libexec/jterm NO_GETTEXT=1 NO_CURL=1 NO_EXPAT=1 NO_OPENSSL=1 git
+      - install -Dm0755 git ${FLATPAK_DEST}/libexec/jterm/git
+      - install -Dm0644 COPYING ${FLATPAK_DEST}/share/licenses/task-git/COPYING
+    sources:
+      - type: archive
+        url: https://www.kernel.org/pub/software/scm/git/git-2.56.1.tar.xz
+        sha256: f0b0bf89264b9bd2e1c640363e7529643989da76281600473c50745cd34a607f
+
   - name: forge
     buildsystem: simple
     build-options:
