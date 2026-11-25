@@ -435,6 +435,15 @@ impl BlockData {
             return "{}".to_string();
         };
         if let Some(object) = value.as_object_mut() {
+            if let Some(document) = self.finished_document.as_deref() {
+                if let Some(source) = &document.execution_source {
+                    object.insert("output_source".to_string(), serde_json::json!(source));
+                    object.insert(
+                        "capture_size".to_string(),
+                        serde_json::json!(document.capture_size),
+                    );
+                }
+            }
             if self.is_background() {
                 object.remove("completion_provenance");
                 object.remove("start_mark_seen");
@@ -476,6 +485,10 @@ impl BlockData {
             md.push_str(&format!("\n{fence}\n\n"));
         }
 
+        if let Some(notice) = self.output_notice.as_deref().and_then(known_output_notice) {
+            md.push_str(notice);
+            md.push_str("\n\n");
+        }
         if !self.output.is_empty() {
             let fence = markdown_fence(&self.output);
             md.push_str(&format!("**Output:**\n{fence}\n"));

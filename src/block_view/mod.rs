@@ -26,7 +26,11 @@ use jterm_core::execution_journal::ExecutionLifecycle;
 use jterm_core::kitty_keyboard::{
     self, AltEscapeJoiner, JoinStep, KittyKey, KittyKeyboardStacks, Modifiers as KittyModifiers,
 };
+use jterm_core::parser::ShellMarkerPosition;
 use jterm_core::pty_input::{self, Paste, PasteModes, PastePolicy, UnbracketedMultiline};
+use jterm_core::screen_replay::{
+    FinishedDocument, FinishedExecutionSource, RunningExecutionSource,
+};
 use jterm_core::terminal_report::{classify_terminal_report, TerminalReport};
 use jterm_core::wheel::WheelAccumulator;
 #[cfg(forge_shared_terminal)]
@@ -6670,6 +6674,7 @@ struct EngineState {
     command_finished_event_pending: bool,
     /// OSC 133 metadata for the command currently running, if the shell sends any.
     pending_command_meta: PendingCommandMeta,
+    pending_execution_source: Option<RunningExecutionSource>,
     /// The id opened at A and carried through C until its completed record is
     /// finalized at the following A. A marker alone is not a record.
     pending_zone: Option<PendingZone>,
@@ -6976,6 +6981,7 @@ enum CapturedFinalizeOutput {
 }
 
 struct BlockRenderPayload {
+    execution_source: Option<FinishedExecutionSource>,
     prompt: String,
     output_with_ansi: String,
     output_plain: String,
@@ -7096,6 +7102,7 @@ trait BlockRenderPayloadAccessor {
 }
 
 struct LazyBlockRenderPayload {
+    execution_source: Option<FinishedExecutionSource>,
     value: OnceCell<BlockRenderPayload>,
     prompt: RefCell<Option<String>>,
     output: RefCell<Option<CapturedFinalizeOutput>>,
@@ -7116,6 +7123,7 @@ impl LazyBlockRenderPayload {
         };
         Self {
             value: OnceCell::new(),
+            execution_source: None,
             prompt: RefCell::new(Some(prompt)),
             output: RefCell::new(Some(output)),
             dropped_front,
@@ -7157,6 +7165,7 @@ impl BlockRenderPayloadAccessor for LazyBlockRenderPayload {
                 CapturedFinalizeOutput::Background(mut output) => render(&mut output),
             };
             BlockRenderPayload {
+                execution_source: self.execution_source.clone(),
                 prompt,
                 output_with_ansi: rendered.output_with_ansi,
                 output_plain: rendered.output_plain,
@@ -7998,6 +8007,7 @@ impl FoldLayoutSync {
 struct ReaderCtx {
     /// Every widget/surface effect and query goes through this seam.
     backend: Rc<dyn RenderBackend>,
+    source_stream_id: uuid::Uuid,
     #[cfg(forge_shared_terminal)]
     terminal_output: Option<Rc<shared_active::ActiveTerminalOutput>>,
     bstate_rc: Rc<Cell<BlockState>>,
@@ -8159,15 +8169,15 @@ impl ReaderCtx {
         })
     }
 
-    fn handle_event(&self, event: &ParserEvent) {
+    fn handle_event(&self, event: &ParserEvent, position: Option<ShellMarkerPosition>) {
         let state = self.bstate_rc.get();
         match event {
             ParserEvent::DecsetMode { mode, set } => self.on_decset_mode(*mode, *set),
             ParserEvent::Bytes(bytes) => self.on_bytes(bytes, state),
-            ParserEvent::PromptStart => self.on_prompt_start(),
+            ParserEvent::PromptStart => self.on_prompt_start(position),
             ParserEvent::PromptEnd => self.on_prompt_end(),
-            ParserEvent::CommandStart(meta) => self.on_command_start(meta),
-            ParserEvent::CommandEnd { exit, meta } => self.on_command_end(*exit, meta),
+            ParserEvent::CommandStart(meta) => self.on_command_start(meta, position),
+            ParserEvent::CommandEnd { exit, meta } => self.on_command_end(*exit, meta, position),
             ParserEvent::AltScreenEnter(mode) => self.on_alt_screen_enter(*mode),
             ParserEvent::AltScreenLeave(mode) => self.on_alt_screen_leave(*mode),
             ParserEvent::ClipboardSet(text) => self.on_clipboard_set(text),
@@ -8289,6 +8299,7 @@ impl ReaderCtx {
             engine.pending_completion_provenance = CompletionProvenance::Unknown;
             engine.command_finished_event_pending = false;
             engine.pending_command_meta = PendingCommandMeta::default();
+            engine.pending_execution_source = None;
             engine.command_start_instant = None;
             engine.idle_kitty_pipeline_dirty = false;
             self.bstate_rc.get() == BlockState::AltScreen
@@ -8478,7 +8489,7 @@ impl ReaderCtx {
         }
     }
 
-    fn on_prompt_start(&self) {
+    fn on_prompt_start(&self, position: Option<ShellMarkerPosition>) {
         self.prompt_identity_output_rc.set(false);
         // Readiness is prompt-scoped. A replacement shell
         // cannot inherit a previous integration's ability
@@ -8772,6 +8783,16 @@ impl ReaderCtx {
             let block_id = zone_plan
                 .completed_record_id
                 .expect("a finalized lifecycle has a pending zone id");
+            let execution_source = if is_background {
+                None
+            } else {
+                self.engine
+                    .borrow_mut()
+                    .pending_execution_source
+                    .take()
+                    .zip(position)
+                    .and_then(|(source, mark)| source.finish(self.source_stream_id, mark))
+            };
             let record = CompletedCommandRecord {
                 id: block_id,
                 cmd: cmd.clone(),
@@ -8785,11 +8806,12 @@ impl ReaderCtx {
                 command_source,
                 start_mark_seen: !is_background,
             };
-            let payload = LazyBlockRenderPayload::new(
+            let mut payload = LazyBlockRenderPayload::new(
                 prompt,
                 captured_output,
                 self.pty_winsize.child_winsize(),
             );
+            payload.execution_source = execution_source;
 
             // jsh owns the command/cwd/status/duration events. The lifecycle
             // token names the exact Start generation the terminal observed,
@@ -9002,7 +9024,7 @@ impl ReaderCtx {
         }
     }
 
-    fn on_command_start(&self, meta: &CommandMeta) {
+    fn on_command_start(&self, meta: &CommandMeta, position: Option<ShellMarkerPosition>) {
         let state = self.bstate_rc.get();
         if state == BlockState::CollectingOutput || state == BlockState::AltScreen {
             if self.pty_for_init.foreground_owner() != PtyForeground::Shell {
@@ -9036,6 +9058,8 @@ impl ReaderCtx {
             engine.pending_completion_provenance = CompletionProvenance::Unknown;
             engine.command_finished_event_pending = true;
             engine.pending_command_meta = command_meta;
+            engine.pending_execution_source = position
+                .map(|mark| RunningExecutionSource::new(mark, self.pty_winsize.child_winsize()));
             // A command start without an intervening PromptStart is
             // an ambiguous shell-integration edge. Keep those bytes
             // visible in the live VTE but do not merge them into the
@@ -9211,7 +9235,12 @@ impl ReaderCtx {
         self.backend.mark_scroll_dirty();
     }
 
-    fn on_command_end(&self, exit: Option<i32>, meta: &CommandMeta) {
+    fn on_command_end(
+        &self,
+        exit: Option<i32>,
+        meta: &CommandMeta,
+        position: Option<ShellMarkerPosition>,
+    ) {
         let state = self.bstate_rc.get();
         if state != BlockState::CollectingOutput && state != BlockState::AltScreen {
             return;
@@ -9331,6 +9360,9 @@ impl ReaderCtx {
             engine.pending_exit_code = exit;
             engine.pending_completion_provenance = CompletionProvenance::ShellReported;
             engine.pending_command_meta.merge_command_end(meta);
+            if let (Some(source), Some(mark)) = (&mut engine.pending_execution_source, position) {
+                source.report_end(mark);
+            }
             let command_started_at = engine.command_start_instant.take();
             let frontend_duration_ms = command_started_at
                 .and_then(|started| u64::try_from(started.elapsed().as_millis()).ok());
@@ -10092,7 +10124,9 @@ impl RenderBackend for BlockBackend {
         let finished = self.finished_blocks_for_cb.borrow();
         let mut remaining = max_bytes;
         let mut surfaces = Vec::new();
+        let mut capture_incomplete = false;
         for (block_index, block) in finished.iter().enumerate() {
+            capture_incomplete |= block.output_notice.is_visible();
             if remaining == 0 {
                 return BackendSearchBatch {
                     surfaces,
@@ -10263,7 +10297,7 @@ impl RenderBackend for BlockBackend {
         }
         BackendSearchBatch {
             surfaces,
-            incomplete: false,
+            incomplete: capture_incomplete,
             native_fallback: None,
         }
     }
@@ -10530,11 +10564,18 @@ impl RenderBackend for BlockBackend {
         let prompt = payload.prompt.as_str();
         let cmd = record.cmd.as_str();
         let output_with_ansi = payload.output_with_ansi.as_str();
-        let finished_document = jterm_core::screen_replay::FinishedDocument::capture(
+        let source = payload.execution_source.clone().map(|mut source| {
+            source.head_dropped = payload.output_dropped_front || payload.output_head_dropped;
+            source.tail_dropped = payload.output_plain_lost_bytes;
+            source
+        });
+        let finished_document = FinishedDocument::capture_with_source(
             output_with_ansi,
+            payload.output_plain.trim(),
             payload.capture_size,
+            source,
         )
-        .map(std::sync::Arc::new);
+        .map(Arc::new);
         let output_plain = finished_document.as_ref().map_or_else(
             || payload.output_plain.as_str(),
             |document| &document.archive.text,
@@ -12217,10 +12258,19 @@ impl ReaderCtx {
             .begin_dispatch(origin, std::time::Instant::now());
         let mut events = self.event_buf.borrow_mut();
         events.clear();
-        self.parser.borrow_mut().feed(data, &mut events);
+        let mut positions = Vec::new();
+        self.parser
+            .borrow_mut()
+            .feed_with_marker_positions(data, &mut events, &mut positions);
+        let mut positions = positions.into_iter();
         coalesce_bytes_events(&mut events);
         for event in events.iter() {
-            self.handle_event(event);
+            let position = if event.is_shell_lifecycle() {
+                positions.next().flatten()
+            } else {
+                None
+            };
+            self.handle_event(event, position);
         }
         drop(events);
         if let Some(resize) = &self.pty_winsize.inline_resize {
@@ -15161,8 +15211,9 @@ impl TermView {
             TerminalMode::Unified => "JTERM_SHARED_TRANSCRIPT",
             TerminalMode::Vte => return false,
         };
-        std::env::var_os(override_name)
-            .map_or_else(|| !crate::host::is_flatpak(), |value| value == "1")
+        // The prepared PTY owns the local endpoint of the host bridge as
+        // well. The sandbox changes argv and cwd resolution, not presentation.
+        std::env::var_os(override_name).is_none_or(|value| value == "1")
     }
 
     /// Constructor boundary with an injectable PTY spawner.
@@ -16893,6 +16944,7 @@ impl TermView {
             };
             *render_backend_for_view.borrow_mut() = Some(backend.clone());
             ReaderCtx {
+                source_stream_id: uuid::Uuid::new_v4(),
                 backend,
                 #[cfg(forge_shared_terminal)]
                 terminal_output: shared_active
@@ -16922,6 +16974,7 @@ impl TermView {
                     pending_command_source: CommandTextSource::Screen,
                     command_finished_event_pending: false,
                     pending_command_meta: PendingCommandMeta::default(),
+                    pending_execution_source: None,
                     pending_zone: None,
                     active_alt_screen_mode: None,
                     idle_kitty_pipeline_dirty: false,
@@ -30959,6 +31012,7 @@ mod tests {
             };
 
             let ctx = ReaderCtx {
+                source_stream_id: uuid::Uuid::new_v4(),
                 backend: backend.clone(),
                 #[cfg(forge_shared_terminal)]
                 terminal_output: None,
@@ -30979,6 +31033,7 @@ mod tests {
                     pending_command_source: super::CommandTextSource::Screen,
                     command_finished_event_pending: false,
                     pending_command_meta: PendingCommandMeta::default(),
+                    pending_execution_source: None,
                     pending_zone: None,
                     active_alt_screen_mode: None,
                     idle_kitty_pipeline_dirty: false,
@@ -31077,7 +31132,7 @@ mod tests {
         /// one. Each of those stages has its own tests; nothing below re-tests
         /// them, and nothing below can catch a defect in them.
         fn feed(&self, event: ParserEvent) {
-            self.ctx.handle_event(&event);
+            self.ctx.handle_event(&event, None);
         }
 
         fn feed_all(&self, events: impl IntoIterator<Item = ParserEvent>) {
