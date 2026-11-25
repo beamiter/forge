@@ -1986,6 +1986,7 @@ impl UiState {
                             }
                             term_view.set_menu_keybindings(self.keybinding_map.clone());
                             term_view.start_history_load();
+                            term_view.arm_completed_history_checkpoint();
                             PaneLeaf::Block(term_view)
                         }
                         Err(error) => {

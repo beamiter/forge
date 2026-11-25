@@ -5521,6 +5521,7 @@ type OutputBlockFinishedCallback =
     Box<dyn Fn(String, Option<i32>, String, Option<u64>, Option<u64>, CompletionProvenance)>;
 
 enum BlockFinishedCallback {
+    Checkpoint(Box<dyn Fn()>),
     Metadata(MetadataBlockFinishedCallback),
     WithOutput(OutputBlockFinishedCallback),
 }
@@ -6554,6 +6555,7 @@ pub struct TermView {
     /// aborted. Such a never-visible pane must not overwrite the real session's
     /// history merely because its controller is being rolled back.
     persist_history_on_drop: Cell<bool>,
+    history_checkpoint: jterm_gtk_view::HistoryCheckpoint,
     /// Main-thread poll applying a completed history load to GTK widgets.
     history_load_poll_id: RefCell<Option<glib::SourceId>>,
     /// Sticky Retry ReloadFirst: after the async reload reaches Loaded (or an
@@ -8884,6 +8886,7 @@ impl ReaderCtx {
                 let output_sample = OnceCell::new();
                 for cb in self.block_finished_cbs.borrow().iter() {
                     match cb {
+                        BlockFinishedCallback::Checkpoint(schedule) => schedule(),
                         BlockFinishedCallback::Metadata(cb) => cb(
                             record.cmd.clone(),
                             record.exit_code,
@@ -18269,6 +18272,7 @@ impl TermView {
             session_id: session_id_owned,
             history_load: Arc::new(history::HistoryLoadShared::default()),
             persist_history_on_drop: Cell::new(true),
+            history_checkpoint: jterm_gtk_view::HistoryCheckpoint::default(),
             history_load_poll_id: RefCell::new(None),
             retry_save_after_history_load: Cell::new(false),
             resize_tick_id: Rc::new(RefCell::new(None)),

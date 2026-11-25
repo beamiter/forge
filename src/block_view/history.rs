@@ -10,8 +10,8 @@ use super::zone_history;
 
 pub(crate) mod archive;
 use super::{
-    estimated_finished_block_height_for_text, next_block_id, BlockData, FinishedBlock, TermView,
-    MAX_COMPLETED_BLOCK_RETAINED_BYTES,
+    estimated_finished_block_height_for_text, next_block_id, BlockData, BlockFinishedCallback,
+    FinishedBlock, TermView, MAX_COMPLETED_BLOCK_RETAINED_BYTES,
 };
 use crate::persistence::{self, PersistenceKey};
 use gtk4::glib;
@@ -2141,6 +2141,38 @@ impl TermView {
         self.persist_history_on_drop.set(false);
     }
 
+    fn live_history_checkpoint_enabled(&self) -> bool {
+        self.persist_history_on_drop.get()
+            && self.render_backend.persists_block_history()
+            && self.session_id.is_some()
+            && self.config.borrow().block_history_path.is_some()
+    }
+
+    pub(crate) fn arm_completed_history_checkpoint(self: &Rc<Self>) {
+        let pane = Rc::downgrade(self);
+        self.block_finished_callbacks
+            .borrow_mut()
+            .push(BlockFinishedCallback::Checkpoint(Box::new(move || {
+                let Some(view) = pane
+                    .upgrade()
+                    .filter(|view| view.live_history_checkpoint_enabled())
+                else {
+                    return;
+                };
+                let pane = pane.clone();
+                view.history_checkpoint.schedule(move || {
+                    if let Some(view) = pane
+                        .upgrade()
+                        .filter(|view| view.live_history_checkpoint_enabled())
+                    {
+                        if let Err(error) = view.save_history() {
+                            log::warn!("checkpoint completed Block history: {error}");
+                        }
+                    }
+                });
+            })));
+    }
+
     /// Where this pane's bounded zone document lives: a sibling of the Block
     /// history file, distinct by stem so a pane that changes mode between
     /// runs can never decode one as the other.
@@ -2320,7 +2352,7 @@ impl TermView {
             BLOCK_HISTORY_PERSIST_OPERATION,
             estimated_bytes,
             report_failure,
-            move || {
+            self.history_checkpoint.track_write(move || {
                 let _pre_apply_save_lease = pre_apply_save_lease;
                 let loaded_for_save = if _pre_apply_save_lease.is_some() {
                     if history_load.discarded.load(Ordering::Acquire) {
@@ -2382,7 +2414,7 @@ impl TermView {
                 }
                 history_load.set_revision(Some(revision));
                 Ok(())
-            },
+            }),
         )
     }
 

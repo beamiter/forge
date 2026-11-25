@@ -278,6 +278,7 @@ impl UiState {
         drop(shell_argv);
         view.set_menu_keybindings(self.keybinding_map.clone());
         view.start_history_load();
+        view.arm_completed_history_checkpoint();
 
         if let Some(terminal) = view.legacy_terminal() {
             setup_terminal_click_handler(terminal);
