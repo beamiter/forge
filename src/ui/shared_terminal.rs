@@ -226,9 +226,14 @@ impl SharedPane {
         session_id: &str,
     ) -> Option<Rc<Self>> {
         let home = std::env::var("HOME").ok();
+        let cwd = cwd.or(home.as_deref());
+        if crate::host::is_flatpak() {
+            let argv = RuntimeShell::configured_shell_argv(argv, session_id)?;
+            return Self::open_host_command(config, &argv, cwd);
+        }
         let runtime = RuntimeShell::spawn_session_candidate(
             argv,
-            cwd.or(home.as_deref()),
+            cwd,
             session_id,
             crate::host::is_flatpak(),
             crate::host::working_directory_available,
@@ -267,18 +272,27 @@ impl SharedPane {
     ) -> Option<Rc<Self>> {
         let home = std::env::var("HOME").ok();
         let launch = crate::agent_cli::inline_argv(argv);
-        let runtime = RuntimeShell::spawn_explicit_command(
-            &launch,
-            cwd.or(home.as_deref()),
-            crate::host::is_flatpak(),
-            || {
+        let cwd = cwd.or(home.as_deref());
+        if crate::host::is_flatpak() {
+            return Self::open_host_command(config, &launch, cwd);
+        }
+        let runtime =
+            RuntimeShell::spawn_explicit_command(&launch, cwd, crate::host::is_flatpak(), || {
                 SharedTerminal::runtime_environment(
                     argv,
                     config.vim9.auto_gui,
                     &jterm_gtk_view::INTERACTIVE_CHILD_ENV,
                 )
-            },
-        );
+            });
+        Self::from_runtime(config, &launch, runtime, None)
+    }
+
+    fn open_host_command(config: &Config, argv: &[String], cwd: Option<&str>) -> Option<Rc<Self>> {
+        let environment = &jterm_gtk_view::INTERACTIVE_CHILD_ENV;
+        let launch = crate::host::wrap_argv(argv, cwd, environment);
+        let runtime = RuntimeShell::spawn_explicit_command(&launch, Some("/"), false, || {
+            SharedTerminal::runtime_environment(argv, config.vim9.auto_gui, environment)
+        });
         Self::from_runtime(config, &launch, runtime, None)
     }
 
