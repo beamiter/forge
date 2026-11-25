@@ -1920,7 +1920,8 @@ impl UiState {
         let shared = {
             use super::shared_terminal::SharedPane;
             let config = self.config.borrow();
-            if std::env::var_os("FORGE_SAFE_MODE").is_some() {
+            // The recovery profile launches its own ordinary shell.
+            if std::env::var_os("FORGE_SAFE_MODE").is_some() && !allow_local_recovery {
                 None
             } else if hosted_attachment {
                 working_directory
