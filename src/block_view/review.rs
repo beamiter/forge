@@ -934,6 +934,7 @@ mod tests {
             command_exact: false,
             command_truncated: false,
             output_notice: None,
+            output_source: None,
             finished_document: None,
         }
     }

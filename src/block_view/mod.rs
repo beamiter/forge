@@ -29,7 +29,7 @@ use jterm_core::kitty_keyboard::{
 use jterm_core::parser::ShellMarkerPosition;
 use jterm_core::pty_input::{self, Paste, PasteModes, PastePolicy, UnbracketedMultiline};
 use jterm_core::screen_replay::{
-    FinishedDocument, FinishedExecutionSource, RunningExecutionSource,
+    CapturedExecutionSource, FinishedDocument, FinishedExecutionSource, RunningExecutionSource,
 };
 use jterm_core::terminal_report::{classify_terminal_report, TerminalReport};
 use jterm_core::wheel::WheelAccumulator;
@@ -10564,18 +10564,21 @@ impl RenderBackend for BlockBackend {
         let prompt = payload.prompt.as_str();
         let cmd = record.cmd.as_str();
         let output_with_ansi = payload.output_with_ansi.as_str();
-        let source = payload.execution_source.clone().map(|mut source| {
+        let output_source = payload.execution_source.clone().map(|mut source| {
             source.head_dropped = payload.output_dropped_front || payload.output_head_dropped;
             source.tail_dropped = payload.output_plain_lost_bytes;
-            source
+            CapturedExecutionSource {
+                execution: source,
+                capture_size: payload.capture_size,
+            }
         });
-        let finished_document = FinishedDocument::capture_with_source(
-            output_with_ansi,
-            payload.output_plain.trim(),
-            payload.capture_size,
-            source,
-        )
-        .map(Arc::new);
+        let finished_document = FinishedDocument::capture(output_with_ansi, payload.capture_size)
+            .map(|mut document| {
+                document.execution_source = output_source
+                    .as_ref()
+                    .map(|source| source.execution.clone());
+                Arc::new(document)
+            });
         let output_plain = finished_document.as_ref().map_or_else(
             || payload.output_plain.as_str(),
             |document| &document.archive.text,
@@ -10628,6 +10631,7 @@ impl RenderBackend for BlockBackend {
             }
             .to_owned(),
             finished_document: finished_document.clone(),
+            output_source,
             exit_code: record.exit_code,
             lifecycle_schema: blocks::BLOCK_LIFECYCLE_SCHEMA,
             completion_provenance: record.completion_provenance.into(),
@@ -15211,8 +15215,8 @@ impl TermView {
             TerminalMode::Unified => "JTERM_SHARED_TRANSCRIPT",
             TerminalMode::Vte => return false,
         };
-        // The prepared PTY owns the local endpoint of the host bridge as
-        // well. The sandbox changes argv and cwd resolution, not presentation.
+        // The prepared PTY owns the local endpoint while the bridge resolves
+        // the program and working directory in the host environment.
         std::env::var_os(override_name).is_none_or(|value| value == "1")
     }
 
@@ -22970,6 +22974,7 @@ mod tests {
             command_exact: false,
             command_truncated: false,
             output_notice: None,
+            output_source: None,
             finished_document: None,
         };
 
@@ -27789,6 +27794,7 @@ mod tests {
             command_exact: false,
             command_truncated: false,
             output_notice: None,
+            output_source: None,
             finished_document: None,
         }
     }
@@ -30526,6 +30532,7 @@ mod tests {
                 command_exact: false,
                 command_truncated: false,
                 output_notice: None,
+                output_source: None,
                 finished_document: None,
             };
             self.records.borrow_mut().push_back(block_data);

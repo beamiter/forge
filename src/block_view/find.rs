@@ -4294,6 +4294,7 @@ tail ab";
             command_exact: false,
             command_truncated: false,
             output_notice: None,
+            output_source: None,
             finished_document: None,
         };
         let metadata = CompletedCommandRecord {
@@ -4687,6 +4688,7 @@ tail ab";
             command_exact: false,
             command_truncated: false,
             output_notice: None,
+            output_source: None,
             finished_document: None,
         };
         let unmarked_block = block(1, "first", "first output", Some(7), Some(2_000));
@@ -15509,6 +15511,7 @@ tail ab";
             command_exact: false,
             command_truncated: false,
             output_notice: None,
+            output_source: None,
             finished_document: None,
         };
         let block_record = || [BackendRecordRef::Block(&block)];
@@ -15907,6 +15910,7 @@ tail ab";
             command_exact: false,
             command_truncated: false,
             output_notice: None,
+            output_source: None,
             finished_document: None,
         };
         let backend_record = BackendRecordRef::Block(&block);
@@ -23791,6 +23795,7 @@ tail ab";
             command_exact: false,
             command_truncated: false,
             output_notice: None,
+            output_source: None,
             finished_document: None,
         };
         let backend = [BackendRecordRef::Block(&block)];
@@ -23874,6 +23879,7 @@ tail ab";
             command_exact: false,
             command_truncated: false,
             output_notice: None,
+            output_source: None,
             finished_document: None,
         };
         let backend = [BackendRecordRef::Block(&block)];

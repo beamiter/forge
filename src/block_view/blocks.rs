@@ -3,7 +3,7 @@ use super::bounded_bytes::BoundedByteRing;
 use super::*;
 use crate::config::Config;
 use gtk4::Orientation;
-use jterm_core::screen_replay::FinishedDocument;
+use jterm_core::screen_replay::{CapturedExecutionSource, FinishedDocument};
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -329,6 +329,9 @@ pub(crate) struct BlockData {
     #[rkyv(with = rkyv::with::Skip)]
     #[serde(skip)]
     pub(crate) finished_document: Option<Arc<FinishedDocument>>,
+    #[rkyv(with = rkyv::with::Skip)]
+    #[serde(skip)]
+    pub(crate) output_source: Option<CapturedExecutionSource>,
 }
 
 pub(super) fn markdown_fence(text: &str) -> String {
@@ -435,14 +438,8 @@ impl BlockData {
             return "{}".to_string();
         };
         if let Some(object) = value.as_object_mut() {
-            if let Some(document) = self.finished_document.as_deref() {
-                if let Some(source) = &document.execution_source {
-                    object.insert("output_source".to_string(), serde_json::json!(source));
-                    object.insert(
-                        "capture_size".to_string(),
-                        serde_json::json!(document.capture_size),
-                    );
-                }
+            if let Some(source) = &self.output_source {
+                object.insert("output_source".to_string(), serde_json::json!(source));
             }
             if self.is_background() {
                 object.remove("completion_provenance");
@@ -483,6 +480,10 @@ impl BlockData {
             md.push_str(&format!("**Command:**\n{fence}bash\n"));
             md.push_str(&self.cmd);
             md.push_str(&format!("\n{fence}\n\n"));
+        }
+
+        if let Some(source) = &self.output_source {
+            md.push_str(&format!("{source}\n\n"));
         }
 
         if let Some(notice) = self.output_notice.as_deref().and_then(known_output_notice) {
@@ -7393,6 +7394,7 @@ mod tests {
             command_exact: false,
             command_truncated: false,
             output_notice: None,
+            output_source: None,
             finished_document: None,
         }
     }
