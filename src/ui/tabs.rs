@@ -1232,6 +1232,12 @@ impl UiState {
                 }
             });
             menu.append(&close);
+            crate::block_view::history_archive::append_menu_items(
+                &menu,
+                &popover,
+                &ui_for_context.window,
+                &ui_for_context.config.borrow(),
+            );
             popover.set_child(Some(&crate::context_menu::scrolled_content(
                 &menu,
                 &button_for_context,
@@ -2876,6 +2882,12 @@ impl UiState {
                 vbox.append(&item);
             }
 
+            crate::block_view::history_archive::append_menu_items(
+                &vbox,
+                &popover,
+                &ui_for_ctx.window,
+                &ui_for_ctx.config.borrow(),
+            );
             popover.set_child(Some(&crate::context_menu::scrolled_content(
                 &vbox,
                 &strip_btn_for_ctx,

@@ -7,6 +7,8 @@
 #[cfg(test)]
 use super::completed_block_retention_plan;
 use super::zone_history;
+
+pub(crate) mod archive;
 use super::{
     estimated_finished_block_height_for_text, next_block_id, BlockData, FinishedBlock, TermView,
     MAX_COMPLETED_BLOCK_RETAINED_BYTES,
@@ -119,27 +121,12 @@ impl HistoryRevision {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LegacyHistoryAuthority {
-    /// This pane loaded its own session target (or no file), so the shared
-    /// legacy sibling is unrelated and must neither be merged nor removed.
-    Ignore,
-    /// The legacy source was not fully observed. A normal save must fail while
-    /// it remains present; union-merging a partial view could later resurrect
-    /// records removed by another pane's explicit Clear.
-    MergeOnly,
-    /// A complete fallback load observed this exact legacy revision, allowing
-    /// UI deletions only while the locked source still matches it.
-    Revision(HistoryRevision),
-}
-
 pub(super) struct LoadedHistory {
     blocks: Arc<Vec<BlockData>>,
     total_loaded: usize,
     /// `None` means this load did not observe every eligible disk record and
     /// therefore must reload before a normal save can authorize replacement.
     target_revision: Option<HistoryRevision>,
-    legacy_authority: LegacyHistoryAuthority,
     retained_estimated_bytes: usize,
     _reservation: Option<persistence::EstimatedBytesReservation>,
 }
@@ -165,7 +152,6 @@ pub(super) struct HistoryLoadShared {
     state: Mutex<HistoryLoadState>,
     zone_persistence: Mutex<zone_history::SessionPersistence>,
     revision: Mutex<Option<HistoryRevision>>,
-    legacy_authority: Mutex<LegacyHistoryAuthority>,
     applied: AtomicBool,
     discarded: AtomicBool,
     explicit_replace_epoch: AtomicU64,
@@ -182,7 +168,6 @@ impl Default for HistoryLoadShared {
             }),
             zone_persistence: Mutex::new(zone_history::SessionPersistence::default()),
             revision: Mutex::new(None),
-            legacy_authority: Mutex::new(LegacyHistoryAuthority::MergeOnly),
             applied: AtomicBool::new(true),
             discarded: AtomicBool::new(false),
             explicit_replace_epoch: AtomicU64::new(0),
@@ -275,14 +260,6 @@ impl HistoryLoadShared {
             .as_ref()
             .ok()
             .and_then(|loaded| loaded.target_revision);
-        *self
-            .legacy_authority
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = result
-            .as_ref()
-            .map_or(LegacyHistoryAuthority::MergeOnly, |loaded| {
-                loaded.legacy_authority
-            });
         let outcome = match result {
             Ok(loaded) => HistoryLoadOutcome::Loaded(Arc::clone(loaded)),
             Err(error) => HistoryLoadOutcome::Failed {
@@ -327,20 +304,6 @@ impl HistoryLoadShared {
             .revision
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = revision;
-    }
-
-    fn legacy_authority(&self) -> LegacyHistoryAuthority {
-        *self
-            .legacy_authority
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn set_legacy_authority(&self, authority: LegacyHistoryAuthority) {
-        *self
-            .legacy_authority
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = authority;
     }
 
     fn acquire_pre_apply_save_lease(self: &Arc<Self>) -> Option<PreApplyHistorySaveLease> {
@@ -779,28 +742,35 @@ fn sanitize_session_component(session_id: &str) -> String {
 /// (last close wins); keying the file by the tab's persistent session id gives
 /// each restored tab its own history.
 fn per_session_history_path(base: &Path, session_id: &str) -> PathBuf {
-    let sid = sanitize_session_component(session_id);
+    history_path_with_component(base, &sanitize_session_component(session_id))
+}
+
+fn history_path_with_component(base: &Path, component: &str) -> PathBuf {
     let stem = base
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_else(|| "blocks".to_string());
     let name = match base.extension() {
-        Some(ext) => format!("{stem}-{sid}.{}", ext.to_string_lossy()),
-        None => format!("{stem}-{sid}"),
+        Some(ext) => format!("{stem}-{component}.{}", ext.to_string_lossy()),
+        None => format!("{stem}-{component}"),
     };
     base.with_file_name(name)
 }
 
-/// Where to read history from: the tab's own file when it exists, otherwise
-/// the legacy shared file (pre-split sessions saved there). Returns `None`
-/// when neither exists yet.
-fn choose_load_path(base: &Path, per_session: Option<&Path>) -> Option<PathBuf> {
-    if let Some(session_path) = per_session {
-        if session_path.exists() {
-            return Some(session_path.to_path_buf());
-        }
+// Reserve the former Unified namespace. A user-edited session id can be
+// the literal "zones" or "zones-<session>" and would otherwise alias an
+// unowned archive or another pane's Unified history. "~7A" cannot occur at
+// the start of a normal encoded session id: ASCII 'Z' is written literally.
+fn block_history_path(base: &Path, session_id: &str) -> PathBuf {
+    if session_id == "zones" || session_id.starts_with("zones-") {
+        let encoded = sanitize_session_component(session_id);
+        return history_path_with_component(base, &format!("~7A{encoded}"));
     }
-    base.exists().then(|| base.to_path_buf())
+    per_session_history_path(base, session_id)
+}
+
+fn legacy_zone_path(base: &Path) -> PathBuf {
+    history_path_with_component(base, "zones")
 }
 
 /// Remove sibling per-session history files that have not been touched within
@@ -931,7 +901,11 @@ fn open_parent_directory(target: &Path) -> io::Result<File> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true).mode(0o700);
     builder.create(parent)?;
+    open_existing_parent_directory(target)
+}
 
+fn open_existing_parent_directory(target: &Path) -> io::Result<File> {
+    let parent = parent_path(target);
     let directory = OpenOptions::new()
         .read(true)
         .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
@@ -1585,15 +1559,14 @@ fn scan_history_records_in_directory(
     })
 }
 
+#[cfg(test)]
 fn read_history_snapshot(
-    base: &Path,
-    session_id: Option<&str>,
+    path: &Path,
     prefer_compressed: bool,
     load_limit: usize,
 ) -> io::Result<Arc<LoadedHistory>> {
     read_history_snapshot_with_retained_budget(
-        base,
-        session_id,
+        path,
         prefer_compressed,
         load_limit,
         MAX_COMPLETED_BLOCK_RETAINED_BYTES,
@@ -1602,56 +1575,32 @@ fn read_history_snapshot(
 }
 
 fn read_history_snapshot_with_retained_budget(
-    base: &Path,
-    session_id: Option<&str>,
+    path: &Path,
     prefer_compressed: bool,
     load_limit: usize,
     retained_budget: usize,
 ) -> io::Result<LoadedHistory> {
-    let session_path = session_id.map(|sid| per_session_history_path(base, sid));
-    let target = session_path.as_deref().unwrap_or(base);
-    let Some(path) = choose_load_path(base, session_path.as_deref()) else {
-        return Ok(LoadedHistory {
-            blocks: Arc::new(Vec::new()),
-            total_loaded: 0,
-            target_revision: Some(HistoryRevision::Missing),
-            legacy_authority: LegacyHistoryAuthority::Ignore,
-            retained_estimated_bytes: 0,
-            _reservation: None,
-        });
-    };
-    let directory = open_parent_directory(&path)?;
-    let mut loaded = read_history_records_in_directory(
-        &directory,
-        &path,
-        prefer_compressed,
-        load_limit,
-        UndecodablePolicy::Skip,
-        Some(retained_budget),
-    )?;
-    let observed_target_revision = if path == target {
-        loaded.revision
-    } else {
-        HistoryRevision::Missing
-    };
-    let deletion_authority =
-        loaded.retained_records_dropped == 0 && loaded.skipped_undecodable == 0;
-    let target_revision = deletion_authority.then_some(observed_target_revision);
-    let legacy_authority = if path == target {
-        LegacyHistoryAuthority::Ignore
-    } else if deletion_authority {
-        LegacyHistoryAuthority::Revision(loaded.revision)
-    } else {
-        LegacyHistoryAuthority::MergeOnly
-    };
-
-    if loaded.total_loaded > load_limit {
-        log::info!(
-            "Loading Block history: keeping {} recent blocks out of {} total",
+    let mut loaded = match open_existing_parent_directory(path) {
+        Ok(directory) => read_history_records_in_directory(
+            &directory,
+            path,
+            prefer_compressed,
             load_limit,
-            loaded.total_loaded
-        );
-    }
+            UndecodablePolicy::Skip,
+            Some(retained_budget),
+        )?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => LoadedRecords {
+            blocks: VecDeque::new(),
+            total_loaded: 0,
+            revision: HistoryRevision::Missing,
+            retained_estimated_bytes: 0,
+            retained_records_dropped: 0,
+            skipped_undecodable: 0,
+        },
+        Err(error) => return Err(error),
+    };
+    let target_revision = (loaded.retained_records_dropped == 0 && loaded.skipped_undecodable == 0)
+        .then_some(loaded.revision);
     if loaded.retained_records_dropped > 0 {
         log::warn!(
             "Block history load omitted {} record(s) to fit its count/{}-byte retained-result limits; normal saves require a complete reload",
@@ -1664,7 +1613,6 @@ fn read_history_snapshot_with_retained_budget(
         blocks: Arc::new(loaded.blocks.into_iter().collect()),
         total_loaded: loaded.total_loaded,
         target_revision,
-        legacy_authority,
         retained_estimated_bytes: loaded.retained_estimated_bytes,
         _reservation: None,
     })
@@ -1674,8 +1622,7 @@ fn read_history_snapshot_with_retained_budget(
 /// available result budget. No permit waits: a queued weighted save may own
 /// the missing capacity and is itself waiting for this single worker.
 fn read_history_snapshot_reserved(
-    base: &Path,
-    session_id: Option<&str>,
+    path: &Path,
     prefer_compressed: bool,
     load_limit: usize,
 ) -> io::Result<Arc<LoadedHistory>> {
@@ -1685,8 +1632,7 @@ fn read_history_snapshot_reserved(
         persistence::reserve_estimated_bytes_up_to(MAX_COMPLETED_BLOCK_RETAINED_BYTES)?;
     let retained_budget = reservation.estimated_bytes();
     let mut loaded = read_history_snapshot_with_retained_budget(
-        base,
-        session_id,
+        path,
         prefer_compressed,
         load_limit,
         retained_budget,
@@ -2019,46 +1965,25 @@ fn encode_history_frames_bounded(
     Ok(newest_first)
 }
 
-#[derive(Debug)]
-struct SaveHistoryOutcome {
-    revision: HistoryRevision,
-    authoritative: bool,
-    legacy_handled: bool,
-    legacy_retry_revision: Option<HistoryRevision>,
-}
-
 #[derive(Clone, Copy, Debug)]
 enum HistoryWriteIntent {
-    Revision {
-        target: Option<HistoryRevision>,
-        legacy: LegacyHistoryAuthority,
-    },
+    Revision(Option<HistoryRevision>),
     ExplicitReplace,
 }
 
 #[cfg(test)]
 fn write_history_snapshot(
-    base: &Path,
     path: &Path,
-    session_id: Option<&str>,
     blocks: &[BlockData],
     compress: bool,
     expected_revision: Option<HistoryRevision>,
-) -> io::Result<SaveHistoryOutcome> {
-    write_history_snapshot_with_intent(
-        base,
+) -> io::Result<HistoryRevision> {
+    write_history_snapshot_with_intent_parts(
         path,
-        session_id,
+        &[],
         blocks,
         compress,
-        HistoryWriteIntent::Revision {
-            target: expected_revision,
-            legacy: if base == path {
-                LegacyHistoryAuthority::Ignore
-            } else {
-                LegacyHistoryAuthority::MergeOnly
-            },
-        },
+        HistoryWriteIntent::Revision(expected_revision),
     )
 }
 
@@ -2105,127 +2030,29 @@ fn validate_history_source(
     ensure_scanned_revision(path, scanned, expected_revision)
 }
 
-fn remove_history_source_in_directory(
-    directory: &File,
-    path: &Path,
-    expected_revision: HistoryRevision,
-) -> io::Result<()> {
-    let Some((file, metadata)) = open_history_file_in_directory(directory, path)? else {
-        return Ok(());
-    };
-    if HistoryRevision::from_metadata(&metadata) != expected_revision {
-        return Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "legacy Block history changed before it could be removed",
-        ));
-    }
-    drop(file);
-    let name = relative_name_cstring(path, "legacy Block history")?;
-    // SAFETY: `name` is a relative basename and `directory` retains the
-    // validated, exclusively locked parent directory for this call.
-    if unsafe { nix::libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    directory.sync_all()
-}
-
-fn legacy_removal_state(
-    should_consume: bool,
-    revision: HistoryRevision,
-    removal_succeeded: bool,
-) -> (bool, Option<HistoryRevision>) {
-    if !should_consume {
-        (false, None)
-    } else if revision == HistoryRevision::Missing || removal_succeeded {
-        (true, None)
-    } else {
-        (false, Some(revision))
-    }
-}
-
-fn write_history_snapshot_with_intent(
-    base: &Path,
-    path: &Path,
-    session_id: Option<&str>,
-    blocks: &[BlockData],
-    compress: bool,
-    intent: HistoryWriteIntent,
-) -> io::Result<SaveHistoryOutcome> {
-    write_history_snapshot_with_intent_parts(base, path, session_id, &[], blocks, compress, intent)
-}
-
-#[allow(clippy::too_many_arguments)]
 fn write_history_snapshot_with_intent_parts(
-    base: &Path,
     path: &Path,
-    session_id: Option<&str>,
     prefix: &[BlockData],
     blocks: &[BlockData],
     compress: bool,
     intent: HistoryWriteIntent,
-) -> io::Result<SaveHistoryOutcome> {
+) -> io::Result<HistoryRevision> {
     let lock = HistoryFileLock::acquire(path)?;
     let target_revision = current_history_revision_in_directory(&lock.directory, path)?;
-    let legacy_revision = if base != path {
-        debug_assert_eq!(base.parent(), path.parent());
-        current_history_revision_in_directory(&lock.directory, base)?
-    } else {
-        HistoryRevision::Missing
-    };
-    let (legacy_should_consume, authoritative) = match intent {
-        HistoryWriteIntent::ExplicitReplace => (base != path, true),
-        HistoryWriteIntent::Revision {
-            target: expected_target,
-            legacy,
-        } => {
-            match expected_target {
-                Some(expected) if expected == target_revision => {}
-                None if target_revision == HistoryRevision::Missing => {}
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "Block history changed since this pane loaded it; reload before saving",
-                    ));
-                }
-            };
-            let (legacy_should_consume, legacy_safe) = match legacy {
-                LegacyHistoryAuthority::Ignore => (false, true),
-                LegacyHistoryAuthority::MergeOnly
-                    if legacy_revision == HistoryRevision::Missing =>
-                {
-                    (true, true)
-                }
-                LegacyHistoryAuthority::MergeOnly => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "legacy Block history was not fully loaded; reload before migrating it",
-                    ));
-                }
-                LegacyHistoryAuthority::Revision(expected) => {
-                    if expected != legacy_revision && legacy_revision != HistoryRevision::Missing {
-                        return Err(io::Error::new(
-                            io::ErrorKind::WouldBlock,
-                            "legacy Block history changed since this pane loaded it; reload before migrating it",
-                        ));
-                    }
-                    (true, true)
-                }
-            };
-            (legacy_should_consume, legacy_safe)
+    if let HistoryWriteIntent::Revision(expected) = intent {
+        if expected.unwrap_or(HistoryRevision::Missing) != target_revision {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Block history changed since this pane loaded it; reload before saving",
+            ));
         }
-    };
-
-    let mut spool = create_unlinked_spool(&lock.directory, path)?;
-
-    if base != path && legacy_should_consume && legacy_revision != HistoryRevision::Missing {
-        validate_history_source(&lock.directory, base, compress, legacy_revision)?;
     }
-
     validate_history_source(&lock.directory, path, compress, target_revision)?;
 
+    let mut spool = create_unlinked_spool(&lock.directory, path)?;
     let candidates = spool_snapshot_sources(prefix, blocks, compress, &mut spool)?;
     let selected = selected_spool_entries(&candidates)?;
-    let result = atomic_write_in_directory(&lock.directory, path, |file| {
+    atomic_write_in_directory(&lock.directory, path, |file| {
         let mut buffer = vec![0u8; 64 * 1024];
         for &index in selected.iter().rev() {
             copy_spooled_record(
@@ -2236,32 +2063,7 @@ fn write_history_snapshot_with_intent_parts(
             )?;
         }
         Ok(())
-    });
-
-    let mut legacy_removal_succeeded = legacy_revision == HistoryRevision::Missing;
-    if result.is_ok() && session_id.is_some() {
-        // This tab's history now lives in its own file; the legacy shared file
-        // is removed only when this save explicitly handled it by exact
-        // revision validation or replacement. A pane which loaded its own target must not
-        // consume an unrelated fallback source.
-        if base != path && legacy_should_consume && legacy_revision != HistoryRevision::Missing {
-            match remove_history_source_in_directory(&lock.directory, base, legacy_revision) {
-                Ok(()) => legacy_removal_succeeded = true,
-                Err(error) => {
-                    log::warn!(
-                        "could not remove superseded shared block history {}; its exact revision will be retried: {error}",
-                        base.display()
-                    );
-                }
-            }
-        }
-    }
-    result?;
-    let (legacy_handled, legacy_retry_revision) = legacy_removal_state(
-        base != path && legacy_should_consume,
-        legacy_revision,
-        legacy_removal_succeeded,
-    );
+    })?;
     let (_, metadata) =
         open_history_file_in_directory(&lock.directory, path)?.ok_or_else(|| {
             io::Error::new(
@@ -2269,12 +2071,7 @@ fn write_history_snapshot_with_intent_parts(
                 format!("Block history disappeared after save: {}", path.display()),
             )
         })?;
-    Ok(SaveHistoryOutcome {
-        revision: HistoryRevision::from_metadata(&metadata),
-        authoritative,
-        legacy_handled,
-        legacy_retry_revision,
-    })
+    Ok(HistoryRevision::from_metadata(&metadata))
 }
 
 const ZONE_HISTORY_NOTICE_NAME: &str = "zone-history-recovery-notice";
@@ -2337,19 +2134,8 @@ impl TermView {
     fn zone_history_path(&self) -> Option<PathBuf> {
         let configured = self.config.borrow().block_history_path.as_ref().cloned()?;
         let base = absolute_history_path(&configured).ok()?;
-        let stem = base
-            .file_stem()
-            .map(|stem| stem.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "blocks".to_string());
-        let name = match base.extension() {
-            Some(ext) => format!("{stem}-zones.{}", ext.to_string_lossy()),
-            None => format!("{stem}-zones"),
-        };
-        let zone_base = base.with_file_name(name);
-        Some(match self.session_id.as_deref() {
-            Some(sid) => per_session_history_path(&zone_base, sid),
-            None => zone_base,
-        })
+        let sid = self.session_id.as_deref()?;
+        Some(per_session_history_path(&legacy_zone_path(&base), sid))
     }
 
     /// Persist the backend's bounded zone document. Encoding is small and
@@ -2494,16 +2280,10 @@ impl TermView {
                 config.max_visible_blocks as usize,
             )
         };
-        if path_opt.is_none() {
+        let (Some(configured), Some(sid)) = (path_opt, self.session_id.as_deref()) else {
             return Ok(());
-        }
-
-        let base = absolute_history_path(&path_opt.unwrap())?;
-        let session_id = self.session_id.clone();
-        let path = match session_id.as_deref() {
-            Some(sid) => per_session_history_path(&base, sid),
-            None => base.clone(),
         };
+        let path = block_history_path(&absolute_history_path(&configured)?, sid);
         let records = self.render_backend.records();
         let Some(block_data) = records.block_data() else {
             return Ok(());
@@ -2574,16 +2354,11 @@ impl TermView {
                 let _working_reservation =
                     persistence::try_reserve_estimated_bytes(HISTORY_SAVE_WORKING_ESTIMATED_BYTES)?;
                 let intent = explicit_replace_epoch.map_or_else(
-                    || HistoryWriteIntent::Revision {
-                        target: history_load.revision(),
-                        legacy: history_load.legacy_authority(),
-                    },
+                    || HistoryWriteIntent::Revision(history_load.revision()),
                     |_| HistoryWriteIntent::ExplicitReplace,
                 );
-                let outcome = write_history_snapshot_with_intent_parts(
-                    &base,
+                let revision = write_history_snapshot_with_intent_parts(
                     &path,
-                    session_id.as_deref(),
                     loaded_prefix,
                     &blocks,
                     compress,
@@ -2592,14 +2367,7 @@ impl TermView {
                 if let Some(epoch) = explicit_replace_epoch {
                     history_load.mark_explicit_replace_persisted(epoch);
                 }
-                // Only a complete, revision-matched snapshot grants deletion
-                // authority. Any later mismatch fails closed until reload.
-                history_load.set_revision(outcome.authoritative.then_some(outcome.revision));
-                if outcome.legacy_handled {
-                    history_load.set_legacy_authority(LegacyHistoryAuthority::Ignore);
-                } else if let Some(revision) = outcome.legacy_retry_revision {
-                    history_load.set_legacy_authority(LegacyHistoryAuthority::Revision(revision));
-                }
+                history_load.set_revision(Some(revision));
                 Ok(())
             },
         )
@@ -2634,7 +2402,7 @@ impl TermView {
                 ),
             )
         };
-        let Some(path) = path_opt else {
+        let (Some(path), Some(sid)) = (path_opt, self.session_id.as_deref()) else {
             self.resolve_block_onboarding_after_history();
             self.finish_reload_first_labeled_save();
             return;
@@ -2653,16 +2421,11 @@ impl TermView {
             source.remove();
         }
         self.history_load.begin();
-        let session_id = self.session_id.clone();
-        let target = session_id
-            .as_deref()
-            .map(|sid| per_session_history_path(&base, sid))
-            .unwrap_or_else(|| base.clone());
+        let target = block_history_path(&base, sid);
         let load_for_job = Arc::clone(&self.history_load);
         let key = PersistenceKey::unique_for_path("block-history-load", &target);
         if let Err(error) = persistence::enqueue(key, "Load Block history", move || {
-            let result =
-                read_history_snapshot_reserved(&base, session_id.as_deref(), compress, load_limit);
+            let result = read_history_snapshot_reserved(&target, compress, load_limit);
             load_for_job.complete(&result);
             if load_for_job.discarded.load(Ordering::Acquire) {
                 Ok(())
@@ -2907,20 +2670,19 @@ impl TermView {
 #[cfg(test)]
 mod tests {
     use super::{
-        absolute_history_path, atomic_write, choose_load_path, decode_block_record,
+        absolute_history_path, atomic_write, block_history_path, decode_block_record,
         decode_zstd_bounded, encode_history_frames_bounded, estimated_history_save_working_bytes,
         estimated_loaded_block_owned_bytes, history_load_limit, history_retry_action,
-        loaded_prefix_for_live, lock_file_name, per_session_history_path,
+        legacy_zone_path, loaded_prefix_for_live, lock_file_name, per_session_history_path,
         prune_stale_session_histories, push_bounded_back, push_loaded_record_bounded,
         read_history_records, read_history_snapshot, read_history_snapshot_reserved,
         read_history_snapshot_with_retained_budget, refresh_loaded_block_ids,
-        snapshot_live_blocks_bounded, write_history_snapshot, write_history_snapshot_with_intent,
+        snapshot_live_blocks_bounded, write_history_snapshot,
         write_history_snapshot_with_intent_parts, BlockData, HistoryFileLock, HistoryLoadOutcome,
-        HistoryLoadShared, HistoryRetryAction, HistoryRevision, HistoryWriteIntent,
-        LegacyHistoryAuthority, LoadedHistory, UndecodablePolicy,
-        HISTORY_LOAD_TRANSIENT_ESTIMATED_BYTES, HISTORY_SAVE_WORKING_ESTIMATED_BYTES,
-        MAX_ENCODED_RECORD_BYTES, MAX_HISTORY_COMMAND_BYTES, MAX_HISTORY_FILE_BYTES,
-        MAX_HISTORY_SAVE_CANDIDATE_RECORDS,
+        HistoryLoadShared, HistoryRetryAction, HistoryRevision, HistoryWriteIntent, LoadedHistory,
+        UndecodablePolicy, HISTORY_LOAD_TRANSIENT_ESTIMATED_BYTES,
+        HISTORY_SAVE_WORKING_ESTIMATED_BYTES, MAX_ENCODED_RECORD_BYTES, MAX_HISTORY_COMMAND_BYTES,
+        MAX_HISTORY_FILE_BYTES, MAX_HISTORY_SAVE_CANDIDATE_RECORDS,
     };
     use std::collections::VecDeque;
     use std::ffi::CString;
@@ -3035,7 +2797,8 @@ mod tests {
         use crate::ui::history_notice::{persistence_failure_surface, PersistenceFailureSurface};
         gtk4::init().expect("GTK display");
         let directory = TestDir::new("retry-failure");
-        let path = directory.0.join("history.bin");
+        let base = directory.0.join("history.bin");
+        let path = block_history_path(&base, "retry-fixture");
         let original = b"inert damaged saved history";
         let preserved_path = if reload_first {
             fs::create_dir(&path).unwrap();
@@ -3047,14 +2810,14 @@ mod tests {
             write_native_zone_fixture(&preserved_path, original);
         }
         let mut config = crate::config::Config::safe_defaults();
-        config.block_history_path = Some(path.to_string_lossy().into_owned());
+        config.block_history_path = Some(base.to_string_lossy().into_owned());
         let view = Rc::new(
             super::TermView::new_with_spawner(
                 &config,
                 &crate::config::TerminalMode::Block,
                 &["inert-fixture-never-executed".to_string()],
                 None,
-                None,
+                Some("retry-fixture"),
                 &[],
                 |_argv, _cwd, _env, _token| {
                     crate::pty::OwnedPty::for_live_display_tests(crate::pty::PtyForeground::Other)
@@ -3104,8 +2867,6 @@ mod tests {
             fs::rename(&path, &original_directory).unwrap();
             write_history_snapshot(
                 &path,
-                &path,
-                None,
                 &[sample_block(1, "recovered after repair")],
                 config.block_history_compress,
                 Some(HistoryRevision::Missing),
@@ -3127,7 +2888,7 @@ mod tests {
                 HistoryLoadOutcome::Idle
             ));
             let restored =
-                read_history_snapshot(&path, None, config.block_history_compress, 100).unwrap();
+                read_history_snapshot(&path, config.block_history_compress, 100).unwrap();
             if clear_retry {
                 assert!(view.finished_blocks.borrow().is_empty());
                 assert!(restored.blocks.is_empty());
@@ -3493,29 +3254,6 @@ mod tests {
     }
 
     #[test]
-    fn failed_legacy_unlink_retains_exact_retry_authority() {
-        let revision = HistoryRevision::Present {
-            device: 1,
-            inode: 2,
-            len: 3,
-            modified_seconds: 4,
-            modified_nanoseconds: 5,
-        };
-        assert_eq!(
-            super::legacy_removal_state(true, revision, false),
-            (false, Some(revision))
-        );
-        assert_eq!(
-            super::legacy_removal_state(true, revision, true),
-            (true, None)
-        );
-        assert_eq!(
-            super::legacy_removal_state(true, HistoryRevision::Missing, false),
-            (true, None)
-        );
-    }
-
-    #[test]
     fn failed_load_keeps_reload_intent_after_apply_and_last_save_lease() {
         for leased in [false, true] {
             let shared = Arc::new(HistoryLoadShared::default());
@@ -3558,7 +3296,7 @@ mod tests {
             blocks: Arc::new(vec![sample_block(1, "loaded")]),
             total_loaded: 1,
             target_revision: Some(HistoryRevision::Missing),
-            legacy_authority: LegacyHistoryAuthority::Ignore,
+
             retained_estimated_bytes: 123,
             _reservation: None,
         });
@@ -4801,7 +4539,7 @@ mod tests {
         fs::write(&target, b"not history").unwrap();
         symlink(&target, &link).unwrap();
 
-        let Err(error) = read_history_snapshot(&link, None, false, 10) else {
+        let Err(error) = read_history_snapshot(&link, false, 10) else {
             panic!("a symlink must not be accepted as Block history");
         };
         assert!(matches!(
@@ -4819,7 +4557,7 @@ mod tests {
         let result = unsafe { nix::libc::mkfifo(fifo_c.as_ptr(), 0o600) };
         assert_eq!(result, 0, "mkfifo failed: {}", io::Error::last_os_error());
 
-        let Err(error) = read_history_snapshot(&fifo, None, false, 10) else {
+        let Err(error) = read_history_snapshot(&fifo, false, 10) else {
             panic!("a FIFO must not be accepted as Block history");
         };
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -4833,7 +4571,7 @@ mod tests {
         fs::write(&history, []).unwrap();
         fs::hard_link(&history, &alias).unwrap();
 
-        let Err(error) = read_history_snapshot(&history, None, false, 10) else {
+        let Err(error) = read_history_snapshot(&history, false, 10) else {
             panic!("a multiply-linked file must not be accepted as Block history");
         };
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
@@ -4846,7 +4584,7 @@ mod tests {
         let file = fs::File::create(&history).unwrap();
         file.set_len(MAX_HISTORY_FILE_BYTES + 1).unwrap();
 
-        let Err(error) = read_history_snapshot(&history, None, false, 10) else {
+        let Err(error) = read_history_snapshot(&history, false, 10) else {
             panic!("an oversized file must not be accepted as Block history");
         };
         assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
@@ -4862,7 +4600,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = match read_history_snapshot(&history, None, false, 10) {
+        let error = match read_history_snapshot(&history, false, 10) {
             Ok(_) => panic!("oversized frame was accepted"),
             Err(error) => error,
         };
@@ -5018,28 +4756,21 @@ mod tests {
     }
 
     #[test]
-    fn load_prefers_own_session_file_and_falls_back_to_legacy_shared_file() {
-        let dir = TestDir::new("load-choice");
-        let base = dir.path().join("blocks.bin");
-        let session = per_session_history_path(&base, "sid-9");
-
-        // Nothing on disk yet: a fresh tab has no history to load.
-        assert_eq!(choose_load_path(&base, Some(&session)), None);
-
-        // Pre-split installs only have the shared file: read it once so the
-        // upgrade does not silently drop the visible history.
-        fs::write(&base, b"legacy").unwrap();
-        assert_eq!(choose_load_path(&base, Some(&session)), Some(base.clone()));
-
-        // Once the tab owns a file, the shared one is ignored.
-        fs::write(&session, b"own").unwrap();
-        assert_eq!(
-            choose_load_path(&base, Some(&session)),
-            Some(session.clone())
+    fn block_session_paths_do_not_alias_the_unified_namespace() {
+        let base = Path::new("/state/forge/blocks.bin");
+        assert_ne!(block_history_path(base, "zones"), legacy_zone_path(base));
+        assert_ne!(
+            block_history_path(base, "zones-42"),
+            per_session_history_path(&legacy_zone_path(base), "42"),
         );
-
-        // No session id (legacy caller): the shared file remains the source.
-        assert_eq!(choose_load_path(&base, None), Some(base.clone()));
+        assert_ne!(
+            block_history_path(base, "~7Azones-42"),
+            block_history_path(base, "zones-42"),
+        );
+        assert_eq!(
+            block_history_path(base, "42"),
+            per_session_history_path(base, "42"),
+        );
     }
 
     /// The failure bar's Retry has to do different things for different
@@ -5064,7 +4795,7 @@ mod tests {
                     blocks: Arc::new(Vec::new()),
                     total_loaded: 0,
                     target_revision: None,
-                    legacy_authority: LegacyHistoryAuthority::Ignore,
+
                     retained_estimated_bytes: 0,
                     _reservation: None,
                 })),
@@ -5157,9 +4888,7 @@ mod tests {
         let session_a = per_session_history_path(&base, "sid-a");
         let session_b = per_session_history_path(&base, "sid-b");
         write_history_snapshot(
-            &base,
             &session_b,
-            Some("sid-b"),
             &[sample_block(1, "session-b")],
             false,
             Some(HistoryRevision::Missing),
@@ -5176,9 +4905,7 @@ mod tests {
             .unwrap();
 
         write_history_snapshot(
-            &base,
             &session_a,
-            Some("sid-a"),
             &[sample_block(2, "session-a")],
             false,
             Some(HistoryRevision::Missing),
@@ -5220,7 +4947,7 @@ mod tests {
         let history = dir.path().join("history.bin");
 
         fs::write(&history, [1_u8, 2]).unwrap();
-        let error = match read_history_snapshot(&history, None, false, 10) {
+        let error = match read_history_snapshot(&history, false, 10) {
             Ok(_) => panic!("partial header was accepted"),
             Err(error) => error,
         };
@@ -5229,7 +4956,7 @@ mod tests {
         let mut partial_payload = 8_u32.to_le_bytes().to_vec();
         partial_payload.extend_from_slice(b"tiny");
         fs::write(&history, partial_payload).unwrap();
-        let error = match read_history_snapshot(&history, None, false, 10) {
+        let error = match read_history_snapshot(&history, false, 10) {
             Ok(_) => panic!("partial payload was accepted"),
             Err(error) => error,
         };
@@ -5243,22 +4970,14 @@ mod tests {
         let original = b"not-a-complete-frame";
         fs::write(&history, original).unwrap();
 
-        let error = write_history_snapshot(
-            &history,
-            &history,
-            None,
-            &[sample_block(1, "new")],
-            false,
-            None,
-        )
-        .unwrap_err();
+        let error =
+            write_history_snapshot(&history, &[sample_block(1, "new")], false, None).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         assert_eq!(fs::read(&history).unwrap(), original);
 
-        let clear_error = write_history_snapshot_with_intent(
+        let clear_error = write_history_snapshot_with_intent_parts(
             &history,
-            &history,
-            None,
+            &[],
             &[],
             false,
             HistoryWriteIntent::ExplicitReplace,
@@ -5275,8 +4994,6 @@ mod tests {
         let baseline = sample_block(1, "baseline");
         let initial = write_history_snapshot(
             &history,
-            &history,
-            None,
             std::slice::from_ref(&baseline),
             false,
             Some(HistoryRevision::Missing),
@@ -5284,15 +5001,7 @@ mod tests {
         .unwrap();
 
         let first = vec![baseline.clone(), sample_block(2, "first-writer")];
-        let first_outcome = write_history_snapshot(
-            &history,
-            &history,
-            None,
-            &first,
-            false,
-            Some(initial.revision),
-        )
-        .unwrap();
+        let first_outcome = write_history_snapshot(&history, &first, false, Some(initial)).unwrap();
         // This pane still believes the initial revision is current. Refusing
         // the whole write is the only safe choice without a persisted common
         // Clear generation: a union could revive explicitly removed records.
@@ -5300,15 +5009,7 @@ mod tests {
             BlockData { id: 99, ..baseline },
             sample_block(3, "stale-writer"),
         ];
-        let stale = write_history_snapshot(
-            &history,
-            &history,
-            None,
-            &second,
-            false,
-            Some(initial.revision),
-        )
-        .unwrap_err();
+        let stale = write_history_snapshot(&history, &second, false, Some(initial)).unwrap_err();
         assert_eq!(stale.kind(), io::ErrorKind::WouldBlock);
 
         let loaded =
@@ -5322,10 +5023,9 @@ mod tests {
             ["baseline", "first-writer"]
         );
 
-        let cleared = write_history_snapshot_with_intent(
+        let cleared = write_history_snapshot_with_intent_parts(
             &history,
-            &history,
-            None,
+            &[],
             &[],
             false,
             HistoryWriteIntent::ExplicitReplace,
@@ -5333,37 +5033,15 @@ mod tests {
         .unwrap();
         assert_eq!(fs::metadata(&history).unwrap().len(), 0);
 
-        let stale_after_clear = write_history_snapshot(
-            &history,
-            &history,
-            None,
-            &second,
-            false,
-            Some(first_outcome.revision),
-        )
-        .unwrap_err();
+        let stale_after_clear =
+            write_history_snapshot(&history, &second, false, Some(first_outcome)).unwrap_err();
         assert_eq!(stale_after_clear.kind(), io::ErrorKind::WouldBlock);
         assert_eq!(fs::metadata(&history).unwrap().len(), 0);
 
         let new_after_clear = vec![sample_block(4, "new-after-clear")];
-        write_history_snapshot(
-            &history,
-            &history,
-            None,
-            &new_after_clear,
-            false,
-            Some(cleared.revision),
-        )
-        .unwrap();
-        let stale_after_new = write_history_snapshot(
-            &history,
-            &history,
-            None,
-            &second,
-            false,
-            Some(first_outcome.revision),
-        )
-        .unwrap_err();
+        write_history_snapshot(&history, &new_after_clear, false, Some(cleared)).unwrap();
+        let stale_after_new =
+            write_history_snapshot(&history, &second, false, Some(first_outcome)).unwrap_err();
         assert_eq!(stale_after_new.kind(), io::ErrorKind::WouldBlock);
         let reloaded =
             read_history_records(&history, false, usize::MAX, UndecodablePolicy::Reject).unwrap();
@@ -5372,254 +5050,47 @@ mod tests {
     }
 
     #[test]
-    fn pressure_truncated_legacy_load_cannot_delete_unloaded_disk_records() {
-        let dir = TestDir::new("pressure-merge-only");
-        let base = dir.path().join("history.bin");
-        let session_id = "sid-pressure";
-        let session = per_session_history_path(&base, session_id);
-        let old = vec![
-            sample_block(1, "oldest"),
-            sample_block(2, "middle"),
-            sample_block(3, "newest-on-disk"),
-        ];
-        write_history_snapshot(
-            &base,
-            &base,
-            None,
-            &old,
-            false,
-            Some(HistoryRevision::Missing),
-        )
-        .unwrap();
+    fn opening_saving_and_clearing_panes_preserves_the_shared_archive() {
+        let dir = TestDir::new("shared-archive");
+        let archive = dir.path().join("history.bin");
+        let original = sample_block(1, "legacy");
+        write_history_snapshot(&archive, &[original], true, Some(HistoryRevision::Missing))
+            .unwrap();
+        let bytes = fs::read(&archive).unwrap();
 
-        // Models a worker whose transient decoder permit succeeded while
-        // queued/running work left no retained-result bytes available.
-        let loaded =
-            read_history_snapshot_with_retained_budget(&base, Some(session_id), false, 200, 0)
-                .unwrap();
-        assert!(loaded.blocks.is_empty());
-        assert_eq!(loaded.total_loaded, old.len());
-        assert_eq!(loaded.target_revision, None);
-
-        assert_eq!(loaded.legacy_authority, LegacyHistoryAuthority::MergeOnly);
-        let new = sample_block(4, "new-live-command");
-        let error = write_history_snapshot_with_intent(
-            &base,
-            &session,
-            Some(session_id),
-            std::slice::from_ref(&new),
-            false,
-            HistoryWriteIntent::Revision {
-                target: loaded.target_revision,
-                legacy: loaded.legacy_authority,
-            },
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-
-        assert!(!session.exists());
-        let reloaded =
-            read_history_records(&base, false, usize::MAX, UndecodablePolicy::Reject).unwrap();
-        assert_eq!(
-            reloaded
-                .blocks
-                .iter()
-                .map(|block| block.cmd.as_str())
-                .collect::<Vec<_>>(),
-            ["oldest", "middle", "newest-on-disk"]
-        );
-        assert!(
-            base.exists(),
-            "an incompletely loaded legacy source must remain untouched"
-        );
-    }
-
-    #[test]
-    fn complete_legacy_migration_preserves_ui_deletions_and_removes_the_source() {
-        let dir = TestDir::new("complete-legacy-migration");
-        let base = dir.path().join("history.bin");
-        let session_id = "sid-migrate";
-        let session = per_session_history_path(&base, session_id);
-        let original = vec![sample_block(1, "keep"), sample_block(2, "delete")];
-        let initial = write_history_snapshot(
-            &base,
-            &base,
-            None,
-            &original,
-            false,
-            Some(HistoryRevision::Missing),
-        )
-        .unwrap();
-
-        let loaded = read_history_snapshot_with_retained_budget(
-            &base,
-            Some(session_id),
-            false,
-            200,
-            super::MAX_COMPLETED_BLOCK_RETAINED_BYTES,
-        )
-        .unwrap();
-        assert_eq!(loaded.target_revision, Some(HistoryRevision::Missing));
-        assert_eq!(
-            loaded.legacy_authority,
-            LegacyHistoryAuthority::Revision(initial.revision)
-        );
-        let retained = loaded
-            .blocks
-            .iter()
-            .filter(|block| block.cmd != "delete")
-            .cloned()
-            .collect::<Vec<_>>();
-
-        let migrated = write_history_snapshot_with_intent(
-            &base,
-            &session,
-            Some(session_id),
-            &retained,
-            false,
-            HistoryWriteIntent::Revision {
-                target: loaded.target_revision,
-                legacy: loaded.legacy_authority,
-            },
-        )
-        .unwrap();
-        assert!(migrated.authoritative);
-        assert!(migrated.legacy_handled);
-        assert!(!base.exists());
-        let restored =
-            read_history_records(&session, false, usize::MAX, UndecodablePolicy::Reject).unwrap();
-        assert_eq!(restored.blocks.len(), 1);
-        assert_eq!(restored.blocks[0].cmd, "keep");
-    }
-
-    #[test]
-    fn changed_legacy_source_rejects_migration_without_swallowing_new_data() {
-        let dir = TestDir::new("changed-legacy-migration");
-        let base = dir.path().join("history.bin");
-        let session_id = "sid-changed";
-        let session = per_session_history_path(&base, session_id);
-        let original = vec![sample_block(1, "keep"), sample_block(2, "delete")];
-        let initial = write_history_snapshot(
-            &base,
-            &base,
-            None,
-            &original,
-            false,
-            Some(HistoryRevision::Missing),
-        )
-        .unwrap();
-        let loaded = read_history_snapshot_with_retained_budget(
-            &base,
-            Some(session_id),
-            false,
-            200,
-            super::MAX_COMPLETED_BLOCK_RETAINED_BYTES,
-        )
-        .unwrap();
-
-        let mut concurrent = original.clone();
-        concurrent.push(sample_block(3, "concurrent"));
-        write_history_snapshot(
-            &base,
-            &base,
-            None,
-            &concurrent,
-            false,
-            Some(initial.revision),
-        )
-        .unwrap();
-
-        let retained = loaded
-            .blocks
-            .iter()
-            .filter(|block| block.cmd != "delete")
-            .cloned()
-            .collect::<Vec<_>>();
-        let error = write_history_snapshot_with_intent(
-            &base,
-            &session,
-            Some(session_id),
-            &retained,
-            false,
-            HistoryWriteIntent::Revision {
-                target: loaded.target_revision,
-                legacy: loaded.legacy_authority,
-            },
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-        assert!(!session.exists());
-        let restored =
-            read_history_records(&base, false, usize::MAX, UndecodablePolicy::Reject).unwrap();
-        assert_eq!(
-            restored
-                .blocks
-                .iter()
-                .map(|block| block.cmd.as_str())
-                .collect::<Vec<_>>(),
-            ["keep", "delete", "concurrent"]
-        );
-    }
-
-    #[test]
-    fn two_sessions_can_migrate_the_same_consumed_legacy_revision() {
-        let dir = TestDir::new("parallel-legacy-migration");
-        let base = dir.path().join("history.bin");
-        let session_a = per_session_history_path(&base, "sid-a");
-        let session_b = per_session_history_path(&base, "sid-b");
-        let original = vec![sample_block(1, "legacy")];
-        write_history_snapshot(
-            &base,
-            &base,
-            None,
-            &original,
-            false,
-            Some(HistoryRevision::Missing),
-        )
-        .unwrap();
-        let loaded_a = read_history_snapshot_with_retained_budget(
-            &base,
-            Some("sid-a"),
-            false,
-            200,
-            super::MAX_COMPLETED_BLOCK_RETAINED_BYTES,
-        )
-        .unwrap();
-        let loaded_b = read_history_snapshot_with_retained_budget(
-            &base,
-            Some("sid-b"),
-            false,
-            200,
-            super::MAX_COMPLETED_BLOCK_RETAINED_BYTES,
-        )
-        .unwrap();
-
-        for (session_id, session, loaded) in [
-            ("sid-a", &session_a, &loaded_a),
-            ("sid-b", &session_b, &loaded_b),
-        ] {
-            write_history_snapshot_with_intent(
-                &base,
-                session,
-                Some(session_id),
-                loaded.blocks.as_ref(),
+        let first = block_history_path(&archive, "first");
+        let second = block_history_path(&archive, "second");
+        for path in [&first, &second] {
+            let loaded = read_history_snapshot(path, false, 10).unwrap();
+            assert!(loaded.blocks.is_empty());
+            assert_eq!(loaded.target_revision, Some(HistoryRevision::Missing));
+            write_history_snapshot(
+                path,
+                &[sample_block(2, path.file_name().unwrap().to_str().unwrap())],
                 false,
-                HistoryWriteIntent::Revision {
-                    target: loaded.target_revision,
-                    legacy: loaded.legacy_authority,
-                },
+                loaded.target_revision,
             )
             .unwrap();
         }
-
-        assert!(!base.exists());
-        for session in [&session_a, &session_b] {
-            let restored =
-                read_history_records(session, false, usize::MAX, UndecodablePolicy::Reject)
-                    .unwrap();
-            assert_eq!(restored.blocks.len(), 1);
-            assert_eq!(restored.blocks[0].cmd, "legacy");
-        }
+        write_history_snapshot_with_intent_parts(
+            &first,
+            &[],
+            &[],
+            false,
+            HistoryWriteIntent::ExplicitReplace,
+        )
+        .unwrap();
+        assert!(read_history_snapshot(&first, false, 10)
+            .unwrap()
+            .blocks
+            .is_empty());
+        assert_eq!(
+            read_history_snapshot(&second, false, 10).unwrap().blocks[0].cmd,
+            "history-second.bin"
+        );
+        assert_eq!(fs::read(&archive).unwrap(), bytes);
+        let loaded = read_history_snapshot_reserved(&archive, false, 10).unwrap();
+        assert_eq!(loaded.blocks[0].cmd, "legacy");
     }
 
     #[test]
@@ -5629,8 +5100,6 @@ mod tests {
         let event = sample_block(7, "same");
         write_history_snapshot(
             &history,
-            &history,
-            None,
             &[event.clone(), event],
             false,
             Some(HistoryRevision::Missing),
@@ -5652,15 +5121,10 @@ mod tests {
         let live = vec![sample_block(3, "live")];
         write_history_snapshot_with_intent_parts(
             &history,
-            &history,
-            None,
             &prefix,
             &live,
             false,
-            HistoryWriteIntent::Revision {
-                target: Some(HistoryRevision::Missing),
-                legacy: LegacyHistoryAuthority::Ignore,
-            },
+            HistoryWriteIntent::Revision(Some(HistoryRevision::Missing)),
         )
         .unwrap();
 
@@ -5692,15 +5156,13 @@ mod tests {
         assert!(owner_cost < super::MAX_COMPLETED_BLOCK_RETAINED_BYTES);
         write_history_snapshot(
             &history,
-            &history,
-            None,
             std::slice::from_ref(&block),
             false,
             Some(HistoryRevision::Missing),
         )
         .unwrap();
 
-        let loaded = read_history_snapshot_reserved(&history, None, false, 200).unwrap();
+        let loaded = read_history_snapshot_reserved(&history, false, 200).unwrap();
         assert_eq!(loaded.blocks.len(), 1);
         assert_eq!(
             loaded.blocks[0].output.len(),
@@ -5714,31 +5176,20 @@ mod tests {
         let dir = TestDir::new("pressure-explicit-clear");
         let history = dir.path().join("history.bin");
         let old = vec![sample_block(1, "oldest"), sample_block(2, "newest")];
-        write_history_snapshot(
-            &history,
-            &history,
-            None,
-            &old,
-            false,
-            Some(HistoryRevision::Missing),
-        )
-        .unwrap();
+        write_history_snapshot(&history, &old, false, Some(HistoryRevision::Missing)).unwrap();
 
-        let loaded =
-            read_history_snapshot_with_retained_budget(&history, None, false, 200, 0).unwrap();
+        let loaded = read_history_snapshot_with_retained_budget(&history, false, 200, 0).unwrap();
         assert!(loaded.blocks.is_empty());
         assert_eq!(loaded.target_revision, None);
 
-        let cleared = write_history_snapshot_with_intent(
+        write_history_snapshot_with_intent_parts(
             &history,
-            &history,
-            None,
+            &[],
             &[],
             false,
             HistoryWriteIntent::ExplicitReplace,
         )
         .unwrap();
-        assert!(cleared.authoritative);
         let reloaded =
             read_history_records(&history, false, usize::MAX, UndecodablePolicy::Reject).unwrap();
         assert!(reloaded.blocks.is_empty());
@@ -5750,8 +5201,6 @@ mod tests {
         let history = dir.path().join("history.bin");
         write_history_snapshot(
             &history,
-            &history,
-            None,
             &[sample_block(1, "old")],
             false,
             Some(HistoryRevision::Missing),
@@ -5769,10 +5218,9 @@ mod tests {
         shared.complete(&failed);
         assert_eq!(shared.pending_explicit_replace_epoch(), Some(epoch));
 
-        write_history_snapshot_with_intent(
+        write_history_snapshot_with_intent_parts(
             &history,
-            &history,
-            None,
+            &[],
             &[],
             false,
             HistoryWriteIntent::ExplicitReplace,
@@ -5807,8 +5255,6 @@ mod tests {
 
             assert!(write_history_snapshot(
                 &history,
-                &history,
-                None,
                 &[sample_block(1, "new")],
                 false,
                 Some(HistoryRevision::Missing),

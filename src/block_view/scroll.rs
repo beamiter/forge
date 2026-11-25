@@ -783,7 +783,7 @@ impl WidgetPool {
         self.available.pop()
     }
 
-    fn teardown(widget: &gtk::Box) {
+    pub(super) fn teardown(widget: &gtk::Box) {
         // Pool only the lightweight outer shell. A completed card's child tree
         // owns two VTEs and their private scrollback; retaining up to twenty of
         // those here would put evicted output outside the completed-block memory

@@ -538,6 +538,18 @@ impl UiState {
                     }
                 }
             }
+            Action::OpenSharedBlockHistory | Action::OpenSharedUnifiedHistory => {
+                use crate::block_view::history_archive::{open_configured, Kind};
+                let kind = if action == Action::OpenSharedBlockHistory {
+                    Kind::Block
+                } else {
+                    Kind::Unified
+                };
+                if !open_configured(&self.window, kind, &self.config.borrow()) {
+                    self.toast_overlay
+                        .add_toast(adw::Toast::new("No shared archive was found."));
+                }
+            }
             Action::CollapseAllBlocks | Action::ExpandAllBlocks => {
                 let collapse = action == Action::CollapseAllBlocks;
                 log::info!(

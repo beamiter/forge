@@ -1302,13 +1302,15 @@ mod tests {
         let reset = paint
             .find("self.dynamic_colors.set(Default::default());")
             .unwrap();
-        let recolor = paint
-            .find("apply_terminal_theme(&self.active_vte, &config)")
-            .unwrap();
-        assert!(
-            reset < recolor,
-            "explicit themes retire the old OSC color overrides"
-        );
+        for recolor in [
+            "apply_terminal_theme(terminal, &config)",
+            "terminal.update_theme(&config, config.default_font_scale)",
+        ] {
+            assert!(
+                reset < paint.find(recolor).unwrap(),
+                "explicit themes retire the old OSC color overrides before {recolor}"
+            );
+        }
         let broadcast = production
             .split_once("pub(crate) fn apply_colors_all(&self) {")
             .unwrap()
@@ -1323,7 +1325,6 @@ mod tests {
                 < broadcast.find("view.apply_theme();").unwrap()
         );
         assert!(paint.contains("let config = self.config.borrow();"));
-        assert!(paint.contains("apply_terminal_theme(&self.active_vte, &config)"));
         assert!(paint.contains("install_block_css(&config)"));
         assert!(paint.contains("apply_snapshot_theme_to_vte(terminal, &config)"));
         let snapshots = include_str!("../block_view/alt_screen.rs");

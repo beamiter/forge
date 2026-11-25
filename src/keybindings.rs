@@ -105,6 +105,8 @@ pub(crate) enum Action {
     ClearBlocks,
     /// Restore the most recently cleared set of finished blocks.
     UndoClearBlocks,
+    OpenSharedBlockHistory,
+    OpenSharedUnifiedHistory,
     /// Fold every finished block's output away.
     CollapseAllBlocks,
     /// Unfold every finished block's output.
@@ -247,6 +249,8 @@ impl Action {
             Action::SelectAllBlocks => "Select all blocks",
             Action::ClearBlocks => "Clear blocks",
             Action::UndoClearBlocks => "Undo removing blocks",
+            Action::OpenSharedBlockHistory => "Open shared Block history",
+            Action::OpenSharedUnifiedHistory => "Open shared Unified history",
             Action::CollapseAllBlocks => "Collapse all blocks",
             Action::ExpandAllBlocks => "Expand all blocks",
             Action::CollapseSelectedBlocks => "Collapse selected output",
@@ -352,6 +356,8 @@ impl Action {
             Action::SelectAllBlocks => Some("select_all_blocks"),
             Action::ClearBlocks => Some("clear_blocks"),
             Action::UndoClearBlocks => Some("undo_clear_blocks"),
+            Action::OpenSharedBlockHistory => Some("open_shared_block_history"),
+            Action::OpenSharedUnifiedHistory => Some("open_shared_unified_history"),
             Action::CollapseAllBlocks => Some("collapse_all_blocks"),
             Action::ExpandAllBlocks => Some("expand_all_blocks"),
             Action::CollapseSelectedBlocks => Some("collapse_selected_blocks"),
@@ -455,6 +461,8 @@ impl Action {
             Action::SelectAllBlocks,
             Action::ClearBlocks,
             Action::UndoClearBlocks,
+            Action::OpenSharedBlockHistory,
+            Action::OpenSharedUnifiedHistory,
             Action::CollapseAllBlocks,
             Action::ExpandAllBlocks,
             Action::CollapseSelectedBlocks,
