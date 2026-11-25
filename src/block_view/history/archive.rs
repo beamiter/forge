@@ -98,7 +98,34 @@ fn open(parent: &Window, kind: Kind, path: PathBuf, config: Config) {
     status.set_xalign(0.0);
     status.set_wrap(true);
     content.append(&status);
-    window.set_child(Some(&content));
+    let close = gtk4::Button::with_label("Close archive");
+    close.set_halign(gtk4::Align::End);
+    let target = window.downgrade();
+    close.connect_clicked(move |_| {
+        if let Some(window) = target.upgrade() {
+            window.close();
+        }
+    });
+    let archive = GtkBox::new(Orientation::Vertical, 8);
+    archive.append(&content);
+    archive.append(&close);
+    close.set_margin_end(12);
+    close.set_margin_bottom(12);
+    content.set_vexpand(true);
+    window.set_child(Some(&archive));
+
+    let keys = gtk4::EventControllerKey::new();
+    let target = window.downgrade();
+    keys.connect_key_pressed(move |_, key, _, _| {
+        if key != gtk4::gdk::Key::Escape {
+            return glib::Propagation::Proceed;
+        }
+        if let Some(window) = target.upgrade() {
+            window.close();
+        }
+        glib::Propagation::Stop
+    });
+    window.add_controller(keys);
 
     let (send, receive) = std::sync::mpsc::sync_channel(1);
     let key = PersistenceKey::unique_for_path("legacy-history-read", &path);
