@@ -383,6 +383,13 @@ impl PaneLeaf {
     /// jsh deployment launchers that a generic restorable-command probe cannot
     /// safely reconstruct.
     pub(crate) fn observed_ssh_command(&self) -> Option<crate::process::ObservedSshCommand> {
+        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+        if let Self::Shared(view) = self {
+            return view
+                .terminal_pane()?
+                .runtime()?
+                .inspect_child(crate::process::observed_ssh_command_via_stat);
+        }
         let (pty_fd, shell_pid) = self.process_probe();
         crate::process::observed_ssh_command(pty_fd, shell_pid)
     }
