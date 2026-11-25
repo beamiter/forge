@@ -7,8 +7,8 @@ use gtk4::{EventControllerKey, GestureClick, ToggleButton};
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::os::fd::BorrowedFd;
 use std::rc::Rc;
-use vte4::Terminal;
 use vte4::TerminalExt;
 
 use super::*;
@@ -45,7 +45,7 @@ fn connect_remote_launch_status(leaf: &PaneLeaf, on_status: impl Fn(ConnStatus) 
     });
 }
 
-struct TabLaunch {
+struct TabLaunch<'a> {
     working_directory: Option<String>,
     tab_name: Option<String>,
     session_id: Option<String>,
@@ -58,12 +58,14 @@ struct TabLaunch {
     /// Native agent task terminal extras: environment overlays (validation
     /// no-rc pins) and a one-shot spawn-resolved hook releasing the launch-time
     /// cwd descriptor. `None` for ordinary shells.
-    task: Option<TaskSpawnExtras>,
+    task: Option<TaskSpawnExtras<'a>>,
 }
 
-struct TaskSpawnExtras {
-    env_extra: Vec<(String, String)>,
-    on_launched: Option<Box<dyn FnOnce()>>,
+pub(super) struct TaskSpawnExtras<'a> {
+    pub(super) role: crate::agent_task::TaskTerminalRole,
+    pub(super) env_extra: Vec<(String, String)>,
+    pub(super) pinned_directory: Option<BorrowedFd<'a>>,
+    pub(super) on_launched: Option<Box<dyn FnOnce()>>,
 }
 
 struct RemoteLaunch {
@@ -1507,22 +1509,17 @@ impl UiState {
         });
     }
 
-    /// Launch an explicit argv in its own named tab as a native agent task
-    /// terminal, in conventional VTE mode. The pane is marked with its task
-    /// role so the task manager can bind it and the session snapshot prunes
-    /// the whole tab; the synthetic session identity is attached by the caller
-    /// once the leaf exists. Returns the marked leaf, or `None` when the leaf
-    /// could not be resolved after spawn.
-    pub(crate) fn add_task_terminal_tab(
+    /// The task role follows the pane so layout snapshots prune task tabs.
+    /// The task reducer attaches its synthetic session id after mounting.
+    pub(super) fn add_task_terminal_tab(
         &self,
         title: &str,
         argv: Vec<String>,
         working_directory: Option<String>,
-        env_extra: Vec<(String, String)>,
-        role: crate::agent_task::TaskTerminalRole,
-        on_launched: Option<Box<dyn FnOnce()>>,
-    ) -> Option<PaneLeaf> {
-        let terminal = self.add_native_terminal_tab(TabLaunch {
+        spawn: TaskSpawnExtras<'_>,
+    ) -> PaneLeaf {
+        let role = spawn.role;
+        let leaf = self.add_tab_with_argv(TabLaunch {
             working_directory,
             tab_name: Some(title.to_string()),
             session_id: None,
@@ -1530,18 +1527,31 @@ impl UiState {
             argv_override: Some(argv),
             remote: None,
             terminal_mode: crate::config::TerminalMode::Vte,
-            task: Some(TaskSpawnExtras {
-                env_extra,
-                on_launched,
-            }),
+            task: Some(spawn),
         });
-        let leaf_root = pane_leaf_root_of(terminal.upcast_ref())?;
-        let leaf = PaneLeaf::from_widget(&leaf_root)?;
-        leaf.set_task_role(role);
-        if role == crate::agent_task::TaskTerminalRole::Agent {
-            crate::block_view::install_inline_cli_reading(&terminal);
+        if let PaneLeaf::Vte(view) = &leaf {
+            if role == crate::agent_task::TaskTerminalRole::Agent {
+                crate::block_view::install_inline_cli_reading(view.vte());
+            }
         }
-        Some(leaf)
+        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+        if let PaneLeaf::Shared(view) = &leaf {
+            if let Some(message) = view.launch_error() {
+                let root = leaf.root_widget().downgrade();
+                let ui = self.clone();
+                let message = message.to_owned();
+                // The caller binds the task identity before GTK dispatches
+                // this launch result.
+                glib::idle_add_local_once(move || {
+                    if let Some(leaf) = root.upgrade().and_then(|root| PaneLeaf::from_widget(&root))
+                    {
+                        ui.note_task_terminal_launch_failed(&leaf);
+                        ui.toast_overlay.add_toast(adw::Toast::new(&message));
+                    }
+                });
+            }
+        }
+        leaf
     }
 
     /// Open a new tab connecting to a saved remote host over ssh.
@@ -1880,18 +1890,11 @@ impl UiState {
     /// argv (e.g. an ssh command) instead of the configured local shell. When
     /// `remote` is `Some`, the tab is tracked as an ssh connection (status badge +
     /// auto-reconnect) via `tab_connections`.
-    fn add_native_terminal_tab(&self, launch: TabLaunch) -> Terminal {
-        self.add_tab_with_argv(launch)
-            .terminal()
-            .expect("an explicit terminal launch owns its native terminal")
-            .clone()
-    }
-
-    fn add_tab_with_argv(&self, launch: TabLaunch) -> PaneLeaf {
+    fn add_tab_with_argv(&self, launch: TabLaunch<'_>) -> PaneLeaf {
         self.mount_terminal_tab(launch, false)
     }
 
-    fn mount_terminal_tab(&self, launch: TabLaunch, hosted_attachment: bool) -> PaneLeaf {
+    fn mount_terminal_tab(&self, launch: TabLaunch<'_>, hosted_attachment: bool) -> PaneLeaf {
         let TabLaunch {
             working_directory,
             tab_name,
@@ -1915,20 +1918,32 @@ impl UiState {
             .as_deref()
             .unwrap_or(configured_shell.as_slice());
 
+        #[cfg(not(all(forge_shared_terminal, target_os = "linux")))]
+        let _ = task.as_ref().and_then(|extras| extras.pinned_directory);
+
+        let task_role = task.as_ref().map(|extras| extras.role);
         // Create terminal view based on configured mode
         #[cfg(all(forge_shared_terminal, target_os = "linux"))]
         let shared = {
             use super::shared_terminal::SharedPane;
             let config = self.config.borrow();
             // The recovery profile launches its own ordinary shell.
-            if std::env::var_os("FORGE_SAFE_MODE").is_some() && !allow_local_recovery {
+            if let Some(task) = task.as_ref() {
+                SharedPane::open_task(
+                    &config,
+                    shell_argv,
+                    working_directory.as_deref(),
+                    task.pinned_directory,
+                    &task.env_extra,
+                    task.role == crate::agent_task::TaskTerminalRole::Agent,
+                )
+            } else if std::env::var_os("FORGE_SAFE_MODE").is_some() && !allow_local_recovery {
                 None
             } else if hosted_attachment {
                 working_directory
                     .as_deref()
                     .and_then(|cwd| SharedPane::open_hosted_attachment(&config, shell_argv, cwd))
             } else if remote.is_none()
-                && task.is_none()
                 && matches!(terminal_mode, crate::config::TerminalMode::Vte)
             {
                 if argv_override.is_some() {
@@ -1952,6 +1967,17 @@ impl UiState {
         let shared: Option<PaneLeaf> = {
             let _ = hosted_attachment;
             None
+        };
+        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+        let task = if let Some(PaneLeaf::Shared(view)) = &shared {
+            if view.launch_error().is_none() {
+                if let Some(on_launched) = task.and_then(|extras| extras.on_launched) {
+                    glib::idle_add_local_once(on_launched);
+                }
+            }
+            None
+        } else {
+            task
         };
         let view_type = shared.unwrap_or_else(|| {
             match &terminal_mode {
@@ -2029,6 +2055,9 @@ impl UiState {
             }
         });
 
+        if let Some(role) = task_role {
+            view_type.set_task_role(role);
+        }
         if allow_local_recovery {
             if let PaneLeaf::Vte(view) = &view_type {
                 view.enable_local_launch_recovery();

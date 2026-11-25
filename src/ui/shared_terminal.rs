@@ -2,6 +2,8 @@ use gtk4::{pango, prelude::*};
 #[cfg(target_os = "linux")]
 use jterm_gtk_view::RuntimeShell;
 use jterm_gtk_view::{CursorColors, LinkActions, TerminalPane, Theme};
+#[cfg(target_os = "linux")]
+use std::os::fd::BorrowedFd;
 use std::rc::Rc;
 
 use crate::{config::Config, keybindings::Action, pty::OwnedPty};
@@ -105,10 +107,6 @@ impl SharedTerminal {
         auto_gui: bool,
         terminal_env: &[(&str, &str)],
     ) -> Result<Vec<std::ffi::CString>, String> {
-        let policy = jterm_core::child_env::ChildEnv {
-            less_default: Some("R"),
-            ..jterm_core::child_env::ChildEnv::from_identity()
-        };
         let vim = crate::vim9_ide::shell_environment(argv, auto_gui);
         let extra = terminal_env
             .iter()
@@ -118,7 +116,18 @@ impl SharedTerminal {
                     .map(|(name, value)| (name.as_str(), value.as_str())),
             )
             .collect::<Vec<_>>();
-        let env = jterm_core::child_env::envp_from_captured(&policy, &extra)
+        Self::captured_runtime_environment(&extra)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn captured_runtime_environment(
+        extra: &[(&str, &str)],
+    ) -> Result<Vec<std::ffi::CString>, String> {
+        let policy = jterm_core::child_env::ChildEnv {
+            less_default: Some("R"),
+            ..jterm_core::child_env::ChildEnv::from_identity()
+        };
+        let env = jterm_core::child_env::envp_from_captured(&policy, extra)
             .map_err(|error| error.to_string())?;
         let mut env = crate::agent_cli::environment(env);
         env.retain(|item| {
@@ -245,7 +254,7 @@ impl SharedPane {
                 )
             },
         );
-        Self::from_runtime(config, argv, runtime, None)
+        Self::from_runtime(config, argv, runtime, None, false)
     }
 
     pub(crate) fn open_hosted_attachment(
@@ -262,7 +271,7 @@ impl SharedPane {
                 &jterm_gtk_view::INTERACTIVE_CHILD_ENV,
             )
         });
-        Self::from_runtime(config, &launch, runtime, Some(cwd))
+        Self::from_runtime(config, &launch, runtime, Some(cwd), false)
     }
 
     pub(crate) fn open_explicit(
@@ -284,7 +293,40 @@ impl SharedPane {
                     &jterm_gtk_view::INTERACTIVE_CHILD_ENV,
                 )
             });
-        Self::from_runtime(config, &launch, runtime, None)
+        Self::from_runtime(config, &launch, runtime, None, false)
+    }
+
+    pub(crate) fn open_task(
+        config: &Config,
+        argv: &[String],
+        cwd: Option<&str>,
+        pinned_directory: Option<BorrowedFd<'_>>,
+        env_extra: &[(String, String)],
+        inline_agent: bool,
+    ) -> Option<Rc<Self>> {
+        let host_bridge = crate::host::is_flatpak();
+        if host_bridge && pinned_directory.is_some() {
+            return None;
+        }
+        let home = std::env::var("HOME").ok();
+        let cwd = cwd.or(home.as_deref());
+        let vim = if env_extra.is_empty() {
+            crate::vim9_ide::shell_environment(argv, config.vim9.auto_gui)
+        } else {
+            Vec::new()
+        };
+        let extra: Vec<_> = vim
+            .iter()
+            .chain(env_extra)
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let launch = crate::host::wrap_argv(&crate::agent_cli::inline_argv(argv), cwd, &extra);
+        let local_cwd = if host_bridge { Some("/") } else { cwd };
+        let runtime =
+            SharedTerminal::captured_runtime_environment(&extra).and_then(|environment| {
+                RuntimeShell::spawn_pane_command(&launch, local_cwd, pinned_directory, environment)
+            });
+        Self::from_runtime(config, &launch, runtime.map(Some), None, inline_agent)
     }
 
     fn open_host_command(config: &Config, argv: &[String], cwd: Option<&str>) -> Option<Rc<Self>> {
@@ -293,7 +335,7 @@ impl SharedPane {
         let runtime = RuntimeShell::spawn_explicit_command(&launch, Some("/"), false, || {
             SharedTerminal::runtime_environment(argv, config.vim9.auto_gui, environment)
         });
-        Self::from_runtime(config, &launch, runtime, None)
+        Self::from_runtime(config, &launch, runtime, None, false)
     }
 
     fn from_runtime(
@@ -301,6 +343,7 @@ impl SharedPane {
         argv: &[String],
         runtime: Result<Option<Rc<RuntimeShell>>, String>,
         hosted_directory: Option<&str>,
+        inline_task: bool,
     ) -> Option<Rc<Self>> {
         let open = |runtime: Rc<RuntimeShell>| {
             let pid = runtime
@@ -310,6 +353,8 @@ impl SharedPane {
                 crate::gtk_process::Guard::capture(pid, RuntimeShell::candidate_program(argv));
             let mount = if hosted_directory.is_some() {
                 TerminalPane::with_hosted_attachment
+            } else if inline_task {
+                TerminalPane::with_inline_task
             } else {
                 TerminalPane::with_runtime_embedded
             };

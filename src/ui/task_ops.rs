@@ -11,10 +11,11 @@
 //! on the [`PaneLeaf`] itself (GObject data), so they survive tab moves and
 //! split rearrangements without any index bookkeeping. Validation cwd pins are
 //! keyed by the synthetic task session id for the same reason, and are
-//! released from the spawn-resolved hook VTE runs once the child has entered
+//! released from the spawn-resolved hook once the child has entered
 //! its working directory (forge has no `PaneLaunched` message).
 
 use std::collections::{HashMap, HashSet};
+use std::os::fd::AsFd;
 use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 
@@ -27,6 +28,7 @@ use crate::agent_task::{
     TaskManager, TaskRuntimeKind, TaskStatus, TaskTerminalRole, TaskValidationStatus,
 };
 use crate::agent_task_ui::{self, row_status_line, TaskPanelAction, TaskRowSnapshot};
+use crate::ui::tabs::TaskSpawnExtras;
 use crate::ui::tasks_panel::{DiffSync, TaskDetailSync, TasksPanelSync};
 use crate::ui::{PaneLeaf, UiState};
 
@@ -1285,23 +1287,17 @@ impl UiState {
         );
         let serial = self.next_task_terminal_serial();
         let session_id = agent_task_ui::terminal_session_id(serial);
-        let Some(leaf) = self.add_task_terminal_tab(
+        let leaf = self.add_task_terminal_tab(
             &session_name,
             launch.argv,
             Some(worktree.to_string_lossy().into_owned()),
-            Vec::new(),
-            TaskTerminalRole::Agent,
-            None,
-        ) else {
-            if failed_terminal_retry.is_none() && !native_recovery {
-                let _ = self.agent_tasks.borrow_mut().task_manager.update_status(
-                    task_id,
-                    TaskStatus::Created,
-                    Some("the task terminal pane could not be resolved".to_string()),
-                );
-            }
-            return;
-        };
+            TaskSpawnExtras {
+                role: TaskTerminalRole::Agent,
+                env_extra: Vec::new(),
+                pinned_directory: None,
+                on_launched: None,
+            },
+        );
         leaf.set_task_session_id(&session_id);
 
         let binding = {
@@ -1494,16 +1490,17 @@ impl UiState {
                 .pending_validation_pins
                 .remove(&pin_session);
         });
-        let Some(leaf) = self.add_task_terminal_tab(
+        let leaf = self.add_task_terminal_tab(
             &session_name,
             argv,
             Some(pinned_path.to_string_lossy().into_owned()),
-            env_extra,
-            TaskTerminalRole::Validation,
-            Some(on_launched),
-        ) else {
-            return;
-        };
+            TaskSpawnExtras {
+                role: TaskTerminalRole::Validation,
+                env_extra,
+                pinned_directory: Some(prepared.pinned_cwd.as_fd()),
+                on_launched: Some(on_launched),
+            },
+        );
         leaf.set_task_session_id(&session_id);
 
         let binding = {
@@ -1568,7 +1565,7 @@ impl UiState {
         }
     }
 
-    /// No child-exited signal follows a rejected VTE spawn. Record the
+    /// No child-exited signal follows a rejected spawn. Record the
     /// missing result while retaining the pane's diagnostic and task binding
     /// for retry; do not invent an exit code or call this user cancellation.
     pub(crate) fn note_task_terminal_launch_failed(&self, leaf: &PaneLeaf) {
