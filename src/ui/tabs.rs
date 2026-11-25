@@ -23,20 +23,22 @@ use crate::terminal::{
 /// A launch diagnostic is rendered through VTE too. Only the first output of
 /// an attempt which has not failed may turn its remote badge green.
 fn connect_remote_launch_status(leaf: &PaneLeaf, on_status: impl Fn(ConnStatus) + 'static) {
-    let Some(terminal) = leaf.terminal() else {
+    if let PaneLeaf::Block(view) = leaf {
+        view.connect_first_pty_output(move || on_status(ConnStatus::Connected));
         return;
-    };
+    }
+    let PaneLeaf::Vte(view) = leaf else { return };
     let settled = Rc::new(Cell::new(false));
     let on_status = Rc::new(on_status);
-    if let PaneLeaf::Vte(view) = leaf {
+    view.connect_launch_failed({
         let settled = settled.clone();
         let on_status = on_status.clone();
-        view.connect_launch_failed(move |_| {
+        move |_| {
             settled.set(true);
             on_status(ConnStatus::Disconnected);
-        });
-    }
-    terminal.connect_contents_changed(move |_| {
+        }
+    });
+    view.vte().connect_contents_changed(move |_| {
         if !settled.replace(true) {
             on_status(ConnStatus::Connected);
         }
@@ -1543,7 +1545,7 @@ impl UiState {
     }
 
     /// Open a new tab connecting to a saved remote host over ssh.
-    pub(crate) fn connect_remote(&self, host: &crate::config::RemoteHost) -> Option<Terminal> {
+    pub(crate) fn connect_remote(&self, host: &crate::config::RemoteHost) -> Option<PaneLeaf> {
         self.connect_remote_with_attempt(host, 0, false)
     }
 
@@ -1555,7 +1557,7 @@ impl UiState {
         &self,
         target: &jterm_core::jsh_remote::RemoteHostConfig,
         overlay: &super::remote_fs::FsExecutionOverlay,
-    ) -> Option<Terminal> {
+    ) -> Option<PaneLeaf> {
         let (host, _) = match super::remote_fs::plain_interactive_ssh_argv(target, overlay) {
             Ok(value) => value,
             Err(error) => {
@@ -1574,7 +1576,7 @@ impl UiState {
         host: &crate::config::RemoteHost,
         overlay: &super::remote_fs::FsExecutionOverlay,
         attempt: u32,
-    ) -> Option<Terminal> {
+    ) -> Option<PaneLeaf> {
         let argv = match super::remote_fs::plain_interactive_ssh_argv_for_host(host, overlay) {
             Ok(argv) => argv,
             Err(error) => {
@@ -1586,7 +1588,7 @@ impl UiState {
             }
         };
         let terminal_mode = remote_tab_terminal_mode(&self.config.borrow().terminal_mode);
-        Some(self.add_native_terminal_tab(TabLaunch {
+        Some(self.add_tab_with_argv(TabLaunch {
             working_directory: None,
             tab_name: Some(format!("ssh: {} (temporary)", host.name)),
             session_id: None,
@@ -1610,7 +1612,7 @@ impl UiState {
         host: &crate::config::RemoteHost,
         attempt: u32,
         profile_session_overridden: bool,
-    ) -> Option<Terminal> {
+    ) -> Option<PaneLeaf> {
         self.launch_remote(
             host,
             attempt,
@@ -1618,7 +1620,6 @@ impl UiState {
             Some(host.name.clone()),
             profile_session_overridden,
         )
-        .and_then(|leaf| leaf.terminal().cloned())
     }
 
     /// Restore a managed remote through the same direct-argv path as a fresh
@@ -1762,8 +1763,7 @@ impl UiState {
 
         let ui = self.clone();
         let remaining = Rc::new(Cell::new(delay));
-        let dead_terminal =
-            PaneLeaf::from_widget(&dead_leaf).and_then(|leaf| leaf.terminal().cloned());
+        let dead_terminal = PaneLeaf::from_widget(&dead_leaf).map(|leaf| leaf.focus_widget());
         self.set_tab_strip_label(tab_num, &format!("{} — reconnect {}s", host.name, delay));
 
         glib::timeout_add_seconds_local(1, move || {
@@ -1797,7 +1797,7 @@ impl UiState {
                 .is_some_and(|page| page == dead_leaf);
             let zoomed_dead_leaf = dead_terminal.as_ref().is_some_and(|terminal| {
                 ui.zoom_state.borrow().as_ref().is_some_and(|state| {
-                    state.zoomed_terminal == *terminal.upcast_ref::<gtk4::Widget>()
+                    state.zoomed_terminal == *terminal
                 })
             });
             if !direct_page || zoomed_dead_leaf {

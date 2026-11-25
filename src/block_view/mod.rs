@@ -6491,6 +6491,7 @@ pub struct TermView {
     bell_callbacks: VoidCallbacks,
     title_callbacks: StrCallbacks,
     activity_callbacks: VoidCallbacks,
+    first_pty_output: Rc<jterm_core::pty_reader::FirstPtyOutput>,
     watch_reader: Rc<WatchReader>,
     human_input_callbacks: HumanInputCallbacks,
     alt_screen_callbacks: AltScreenCallbacks,
@@ -12305,7 +12306,12 @@ impl ReaderCtx {
     /// `live_vte` is passed in rather than read back off the backend:
     /// `ReaderCtx` itself no longer names widget types, and the selection
     /// hold's VTE hooks are wiring, not lifecycle dispatch.
-    fn install(self, pty: &Rc<OwnedPty>, live_vte: Option<&Terminal>) -> io::Result<()> {
+    fn install(
+        self,
+        pty: &Rc<OwnedPty>,
+        live_vte: Option<&Terminal>,
+        first_pty_output: Rc<jterm_core::pty_reader::FirstPtyOutput>,
+    ) -> io::Result<()> {
         // Selection-hold triggers that live on the VTE itself (selection
         // cleared, user typed). Wired before the pipeline closure below
         // captures the shared ctx — and before the view connects its own
@@ -12323,6 +12329,7 @@ impl ReaderCtx {
         let exit_ctx = ctx.clone();
         pty.start_stamped_reader(
             move |data, read_at| {
+                first_pty_output.observe(&data);
                 ctx.process_fresh_read(&data, read_at);
             },
             move |status| {
@@ -16358,6 +16365,7 @@ impl TermView {
             });
         }
         let activity_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
+        let first_pty_output = Rc::new(jterm_core::pty_reader::FirstPtyOutput::default());
         let human_input_callbacks: HumanInputCallbacks = Rc::new(RefCell::new(vec![]));
         {
             let onboarding = block_onboarding.clone();
@@ -17035,7 +17043,7 @@ impl TermView {
                 verified_submission: verified_submission.clone(),
                 selection_feed_hold: selection_feed_hold.clone(),
             }
-            .install(&pty, active_vte.as_ref())?;
+            .install(&pty, active_vte.as_ref(), first_pty_output.clone())?;
         }
         let render_backend = render_backend_for_view
             .borrow_mut()
@@ -18231,6 +18239,7 @@ impl TermView {
             bell_callbacks,
             title_callbacks,
             activity_callbacks,
+            first_pty_output,
             watch_reader,
             human_input_callbacks,
             alt_screen_callbacks,
@@ -19711,6 +19720,10 @@ impl TermView {
 
     pub fn connect_activity<F: Fn() + 'static>(&self, f: F) {
         self.activity_callbacks.borrow_mut().push(Box::new(f));
+    }
+
+    pub(crate) fn connect_first_pty_output(&self, callback: impl FnOnce() + 'static) {
+        self.first_pty_output.connect(callback);
     }
 
     /// Observe accepted direct-human PTY input without exposing its contents.
