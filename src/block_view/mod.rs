@@ -16146,6 +16146,7 @@ impl TermView {
                             scroll.width(),
                             scroll.height(),
                             BlockState::RawFallback,
+                            false,
                         ) {
                             if let (Some(winsize), Some(pty)) =
                                 (shared_geometry.0.upgrade(), shared_geometry.1.upgrade())
@@ -16285,6 +16286,7 @@ impl TermView {
                             scroll.width(),
                             height,
                             bstate.get(),
+                            chat_surface.is_some_and(|surface| surface.composer_docked()),
                         ) {
                             if let (Some(winsize), Some(pty)) =
                                 (shared_geometry.0.upgrade(), shared_geometry.1.upgrade())

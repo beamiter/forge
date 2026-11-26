@@ -1829,7 +1829,7 @@ pub(crate) fn install(
     legacy_tools_footer.set_visible(false);
     // Native-grid input has no second composer. Keep only an optional,
     // closable tools strip; the actual Chat/Block editor docks are unchanged.
-    if let Some(center) = ui.notebook.parent().and_downcast::<gtk4::Box>() {
+    if let Some(center) = ui.ai_paned.start_child().and_downcast::<gtk4::Box>() {
         let footer = legacy_tools_footer.clone();
         let ui_for_terminal = Rc::downgrade(ui);
         let (actions, _) = composer_controls(move || {
@@ -2786,7 +2786,7 @@ pub(crate) fn install(
                 title.set_text(mode.presentation_label());
             }
         }
-        if let Some(center) = ui.notebook.parent() {
+        if let Some(center) = ui.ai_paned.start_child() {
             if mode == TerminalMode::Block {
                 center.add_css_class("reference-developer-active");
             } else {

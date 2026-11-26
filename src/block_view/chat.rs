@@ -58,11 +58,10 @@ pub(super) const fn card_extra_height(is_background: bool) -> i32 {
     SHELL_ROLE_HEIGHT_PX + if is_background { 0 } else { COMMAND_GAP_PX }
 }
 
-/// Three input rows and one breathing row share the real native editor.
-/// Grow for wrapped commands and completion menus, keeping one spare row
-/// below their extent whenever the pane has room. The companion stays an
-/// independent overlay and does not participate in this row budget.
-pub(super) const EDITOR_MIN_ROWS: i64 = 4;
+/// Reserve four editable rows and one row for a two-line shell prompt's
+/// heading. Grow for wrapped commands and completion menus, keeping one
+/// spare row below their extent whenever the pane has room.
+pub(super) const EDITOR_MIN_ROWS: i64 = 5;
 
 pub(super) fn composer_rows(input: i64, drawn: i64, viewport: i64) -> i64 {
     let viewport = viewport.max(1);
@@ -100,7 +99,7 @@ pub(super) fn editor_height_budget(
             / cell,
     )
     .max(EDITOR_MIN_ROWS);
-    // Zoom must not turn four native rows into a one-line editor. The
+    // Zoom must not turn five native rows into a one-line editor. The
     // independent canvas fraction still wins in a genuinely short pane.
     let preferred_height = (preferred_rows as i32)
         .saturating_mul(cell)
@@ -1046,9 +1045,9 @@ mod tests {
     }
 
     #[test]
-    fn composer_keeps_three_input_rows_and_clearance_within_the_pane() {
-        assert_eq!(composer_rows(1, 1, 40), 4);
-        assert_eq!(composer_rows(3, 1, 40), 4);
+    fn composer_keeps_four_editable_rows_with_a_two_line_prompt() {
+        assert_eq!(composer_rows(1, 2, 40), 5);
+        assert_eq!(composer_rows(3, 1, 40), 5);
         assert_eq!(composer_rows(7, 4, 40), 8);
         assert_eq!(composer_rows(1, 12, 40), 13);
         assert_eq!(composer_rows(1, i64::MAX, 40), 40);
@@ -1062,7 +1061,7 @@ mod tests {
             for insets in [0, 2, 10] {
                 let budget = editor_height_budget(cell, insets, 40, 1200);
                 let minimum = budget.minimum_rows as i32 * cell + insets;
-                let preferred = EDITOR_MIN_HEIGHT_PX.max(4 * cell + insets);
+                let preferred = EDITOR_MIN_HEIGHT_PX.max(5 * cell + insets);
                 assert!(minimum >= preferred);
                 assert!(minimum - cell < preferred);
                 assert!(budget.maximum_height >= minimum);
@@ -1072,7 +1071,7 @@ mod tests {
         assert_eq!(
             editor_height_budget(21, 0, 30, 600),
             EditorHeightBudget {
-                minimum_rows: 4,
+                minimum_rows: 5,
                 maximum_height: 210,
             }
         );

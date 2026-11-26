@@ -5680,6 +5680,7 @@ impl ActiveBlock {
         viewport_width: i32,
         viewport_height: i32,
         state: BlockState,
+        composer_docked: bool,
     ) -> Option<(u16, u16)> {
         if viewport_width <= 1 || viewport_height <= 1 || !self.widget.is_mapped() {
             return None;
@@ -5710,29 +5711,32 @@ impl ActiveBlock {
             0
         };
         let grid = terminal.fit_grid(width, viewport_height.saturating_sub(header));
+        let rows = i64::from(grid.1);
         let visible_rows = if matches!(
             state,
             BlockState::Idle | BlockState::RawFallback | BlockState::AltScreen
         ) || self.preserve_live_scrollback()
         {
-            grid.1
+            rows
         } else if matches!(
             state,
             BlockState::CollectingOutput | BlockState::PostCommand
         ) {
-            let rows = self
+            let extent = self
                 .live_extent_rows
                 .get()
                 .max(i64::from(terminal.drawn_rows()));
-            self.live_extent_rows.set(rows);
-            rows.clamp(1, i64::from(grid.1)) as u16
+            self.live_extent_rows.set(extent);
+            extent.clamp(1, rows)
+        } else if composer_docked {
+            super::chat::composer_rows(1, i64::from(terminal.drawn_rows()), rows)
         } else {
-            terminal.drawn_rows().clamp(1, grid.1)
+            i64::from(terminal.drawn_rows()).clamp(1, rows)
         };
         let geometry = (
             width,
-            live_rows_height_px(cell_height, i64::from(grid.1), top * 2),
-            live_rows_height_px(cell_height, i64::from(visible_rows), top * 2),
+            live_rows_height_px(cell_height, rows, top * 2),
+            live_rows_height_px(cell_height, visible_rows, top * 2),
         );
         if self.live_geometry.replace(geometry) != geometry {
             self.vte_overlay.set_size_request(geometry.0, geometry.1);

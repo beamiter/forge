@@ -339,14 +339,12 @@ pub(super) fn live_toolbar() -> (gtk4::Box, gtk4::Label, gtk4::Button, gtk4::But
 mod tests {
     use super::*;
     #[test]
-    fn block_input_rows_keep_three_lines_plus_clearance_and_follow_native_content() {
-        // An empty prompt, a one-line prompt and a two-line prompt all leave
-        // three full lines of room to type into plus the spare row.
-        assert_eq!(composer_rows(1, 1, 30), 4);
-        assert_eq!(composer_rows(1, 2, 30), 4);
-        assert_eq!(composer_rows(2, 1, 30), 4);
+    fn block_input_rows_keep_four_editable_lines_and_follow_native_content() {
+        assert_eq!(composer_rows(1, 1, 30), 5);
+        assert_eq!(composer_rows(1, 2, 30), 5);
+        assert_eq!(composer_rows(2, 1, 30), 5);
         // Beyond the floor the editor follows native content with headroom.
-        assert_eq!(composer_rows(4, 1, 30), 5);
+        assert_eq!(composer_rows(5, 1, 30), 6);
         assert_eq!(composer_rows(1, 12, 30), 13);
         assert_eq!(composer_rows(1, 100, 30), 30);
         // A pane shorter than the floor never asks for more than it has.
