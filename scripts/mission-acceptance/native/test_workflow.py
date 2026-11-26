@@ -119,9 +119,10 @@ class GtkDependencyAcquisitionTests(unittest.TestCase):
         end = workflow.index('\n      - name:', start + 1)
         return workflow[start:end]
 
-    def run_step(self, failure, fail_at='update'):
+    def run_step(self, failure, fail_at='update', *, package_404=False, retry_status=0):
         step = self.step()
-        self.assertIn('        timeout-minutes: 6\n', step)
+        minutes = 12 if self.workflow_file == 'ci.yml' else 6
+        self.assertIn(f'        timeout-minutes: {minutes}\n', step)
         self.assertIn('        shell: bash\n', step)
         body = step.split('        run: |\n', 1)[1]
         script = '\n'.join(line[10:] for line in body.splitlines()) + '\n'
@@ -137,15 +138,25 @@ args = sys.argv[1:]
 if not args or args[0] != 'apt-get':
     raise SystemExit(91)
 source = next(a.split('=', 1)[1] for a in args if a.startswith('Dir::Etc::sourcelist='))
-with open(os.environ['APT_LOG'], 'a') as stream:
+log = pathlib.Path(os.environ['APT_LOG'])
+prior = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+with log.open('a') as stream:
     stream.write(json.dumps({'args': args, 'source': source, 'text': pathlib.Path(source).read_text(),
                             'mode': pathlib.Path(source).stat().st_mode & 0o777}) + '\\n')
+if os.environ['APT_PACKAGE_404'] == '1':
+    if 'update' in args:
+        raise SystemExit(0)
+    if not any('install' in call['args'] for call in prior) or os.environ['APT_RETRY_STATUS'] == '100':
+        print('E: Failed to fetch https://security.ubuntu.com/ubuntu/pool/main/t/tiff/libtiff6_1_amd64.deb  404  Not Found', file=sys.stderr)
+        raise SystemExit(100)
+    raise SystemExit(int(os.environ['APT_RETRY_STATUS']))
 raise SystemExit(int(os.environ['APT_FAILURE']) if os.environ['APT_FAIL_AT'] in args else 0)
 ''')
             fake.chmod(0o755)
             env = {**os.environ, 'PATH': str(root) + os.pathsep + os.environ['PATH'],
                    'TMPDIR': directory, 'APT_LOG': str(log), 'APT_FAILURE': str(failure),
-                   'APT_FAIL_AT': fail_at}
+                   'APT_FAIL_AT': fail_at, 'APT_PACKAGE_404': str(int(package_404)),
+                   'APT_RETRY_STATUS': str(retry_status)}
             result = subprocess.run(['bash', '-c', script], env=env, capture_output=True,
                                     text=True, timeout=5)
             calls = [json.loads(line) for line in log.read_text().splitlines()]
@@ -154,6 +165,7 @@ raise SystemExit(int(os.environ['APT_FAILURE']) if os.environ['APT_FAIL_AT'] in 
                 self.assertEqual(Path(call['source']).parent, root)
                 self.assertEqual(call['mode'], 0o644)
                 self.assertFalse(Path(call['source']).exists(), 'Temporary apt source was not cleaned')
+            self.assertEqual(set(root.iterdir()), {fake, log}, 'Temporary APT files were not cleaned')
             return calls
 
     def test_official_signed_sources_bounds_and_all_native_packages(self):
@@ -171,8 +183,23 @@ raise SystemExit(int(os.environ['APT_FAILURE']) if os.environ['APT_FAIL_AT'] in 
         options = ['apt-get', '-o', 'Dir::Etc::sourcelist=' + calls[0]['source'],
                    '-o', 'Dir::Etc::sourceparts=-', '-o', 'Acquire::Retries=2',
                    '-o', 'Acquire::http::Timeout=30', '-o', 'Acquire::https::Timeout=30']
-        self.assertEqual(calls[0]['args'], options + ['update'])
+        update_options = []
+        if self.workflow_file == 'ci.yml':
+            options[5:5] = ['-o', 'Acquire::Languages=none']
+            update_options = ['-o', 'APT::Update::Error-Mode=any']
+        self.assertEqual(calls[0]['args'], options + update_options + ['update'])
         self.assertEqual(calls[1]['args'], options + self.expected_install)
+        if self.workflow_file == 'ci.yml':
+            for status in (0, 100):
+                with self.subTest(retry_status=status):
+                    retried = self.run_step(status, package_404=True, retry_status=status)
+                    retry_options = options.copy()
+                    retry_options[2] = 'Dir::Etc::sourcelist=' + retried[0]['source']
+                    self.assertEqual([call['args'] for call in retried],
+                                     [retry_options + update_options + ['update'],
+                                      retry_options + self.expected_install] * 2)
+                    for call in retried:
+                        self.assertEqual(call['text'].splitlines(), sources)
 
     def test_failed_update_stops_before_install_and_cleans_source(self):
         calls = self.run_step(42)
