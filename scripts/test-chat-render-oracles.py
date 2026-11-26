@@ -2,10 +2,22 @@ import copy
 import importlib.util
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 p = Path(__file__).with_name('test-chat-render-matrix.py')
 spec = importlib.util.spec_from_file_location('matrix', p)
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
+
+class FixtureBuild(unittest.TestCase):
+    def test_build_uses_oracle_wrapper_and_captures_cargo_json(self):
+        with patch.object(m.subprocess, 'run') as run:
+            self.assertIs(m.build_oracle_tests(), run.return_value)
+        run.assert_called_once_with(
+            [m.sys.executable, str(p.resolve().parents[1] / 'tools/vte-oracle/run.py'),
+             'test', '--lib', '--all-features', '--locked', '--no-run', '--message-format=json'],
+            check=True, capture_output=True, text=True,
+        )
+
 
 class GeometryOracles(unittest.TestCase):
     def setup_geometry(self, scale=1.5):

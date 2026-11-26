@@ -297,8 +297,7 @@ def main():
         if font not in face[0].split(','):
             raise RuntimeError('Requested font is not installed: ' + font)
         faces[font] = dict(family=face[0], path=face[1], sha256=hashlib.sha256(Path(face[1]).read_bytes()).hexdigest())
-    build = subprocess.run(['cargo', 'test', '--lib', '--all-features', '--locked', '--no-run', '--message-format=json'],
-                           check=True, capture_output=True, text=True)
+    build = matrix.build_oracle_tests()
     (out / 'cargo-artifacts.jsonl').write_text(build.stdout)
     paths = {item['executable'] for line in build.stdout.splitlines() if (item := json.loads(line)).get('reason') == 'compiler-artifact'
              and item.get('executable') and item.get('profile', {}).get('test') and 'lib' in item.get('target', {}).get('kind', [])}
