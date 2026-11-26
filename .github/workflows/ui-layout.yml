@@ -97,10 +97,10 @@ jobs:
           export XDG_RUNTIME_DIR="$test_xdg_root/runtime"
           tests=(
             pty::tests::live_display_fixture_reaps_its_idle_child_on_drop
-            block_view::chat::tests::composer_keeps_three_input_rows_and_clearance_within_the_pane
+            block_view::chat::tests::composer_keeps_four_editable_rows_with_a_two_line_prompt
             block_view::chat::tests::real_editor_minimum_uses_native_cell_height_and_bounded_canvas_budget
             block_view::chat::tests::bounded_editor_reveals_caret_without_changing_native_ring_or_history
-            block_view::developer_block::tests::block_input_rows_keep_three_lines_plus_clearance_and_follow_native_content
+            block_view::developer_block::tests::block_input_rows_keep_four_editable_lines_and_follow_native_content
             block_view::chat_layout_tests::chat_bubbles_keep_alignment_through_resize_and_font_changes
             ui::reference_conversation::tests::user_capsules_follow_reading_edge_and_wrap_in_narrow_windows
             block_view::chat::tests::chat_moves_only_the_native_clip_and_keeps_history_anchor
