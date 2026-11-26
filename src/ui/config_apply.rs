@@ -643,6 +643,11 @@ impl UiState {
                  color: rgb({fr},{fg_g},{fb});
                  border: 1px solid rgba({fr},{fg_g},{fb},0.16);
                  border-radius: 8px;
+                 transition: background-color 110ms ease, border-color 110ms ease;
+             }}
+             .ai-empty-action:hover {{
+                 background-color: rgba({fr},{fg_g},{fb},0.08);
+                 border-color: rgba({acc_r},{acc_g},{acc_b},0.42);
              }}
              .ai-panel-status-row {{
                  min-height: 22px;
@@ -668,6 +673,10 @@ impl UiState {
                  background-color: rgba({fr},{fg_g},{fb},0.06);
                  border: 1px solid rgba({fr},{fg_g},{fb},0.20);
                  border-radius: 10px;
+                 transition: border-color 120ms ease;
+             }}
+             .ai-panel-input:focus-within {{
+                 border-color: rgba({acc_r},{acc_g},{acc_b},0.72);
              }}
              .ai-panel-input textview, .ai-panel-input text {{
                  background-color: transparent;
@@ -768,6 +777,10 @@ impl UiState {
                  caret-color: rgb({fr},{fg_g},{fb});
                  background-color: rgba({br},{bg_g},{bb},0.62);
                  border-color: rgba({fr},{fg_g},{fb},0.20);
+                 transition: border-color 120ms ease;
+             }}
+             .agent-input:focus-within {{
+                 border-color: rgba({acc_r},{acc_g},{acc_b},0.72);
              }}
              .agent-input text {{
                  color: rgb({fr},{fg_g},{fb});

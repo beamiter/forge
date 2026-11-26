@@ -53,6 +53,7 @@ window.forge-window.reference-shell popover row,
     background: transparent;
     box-shadow: none;
     color: @POPUP_FOREGROUND@;
+    transition: background-color 100ms ease, border-color 100ms ease, color 100ms ease;
 }
 window.forge-window.reference-shell popover.forge-popup button:hover,
 .forge-workspace-dialog popover.forge-popup button:hover,
@@ -106,6 +107,15 @@ window.forge-window.reference-shell popover.forge-popup button.destructive-actio
 .forge-workspace-dialog popover.forge-popup button.destructive-action:not(:disabled) label {
     color: mix(@error_color, @POPUP_FOREGROUND@, .45);
 }
+window.forge-window.reference-shell popover.forge-popup button.destructive-action:not(:disabled):hover,
+.forge-workspace-dialog popover.forge-popup button.destructive-action:not(:disabled):hover {
+    background: alpha(@error_color, .18);
+    border-color: alpha(@error_color, .35);
+}
+window.forge-window.reference-shell popover.forge-popup button.destructive-action:not(:disabled):active,
+.forge-workspace-dialog popover.forge-popup button.destructive-action:not(:disabled):active {
+    background: alpha(@error_color, .28);
+}
 window.forge-window.reference-shell popover separator,
 .forge-workspace-dialog popover separator {
     min-height: 1px;
@@ -129,6 +139,7 @@ window.forge-window.reference-shell popover scrollbar trough,
 window.forge-window.reference-shell popover scrollbar slider,
 .forge-workspace-dialog popover scrollbar slider {
     background: alpha(@POPUP_MUTED@, .45);
+    border-radius: 4px;
 }
 window.forge-window.reference-shell popover scrollbar slider:hover,
 .forge-workspace-dialog popover scrollbar slider:hover {
@@ -140,8 +151,10 @@ window.forge-window.reference-shell dropdown popover entry,
 .forge-workspace-dialog dropdown popover entry {
     background: @INSPECTOR@;
     border: 1px solid @POPUP_BORDER@;
+    border-radius: 6px;
     color: @POPUP_FOREGROUND@;
     caret-color: @POPUP_FOREGROUND@;
+    transition: border-color 120ms ease, box-shadow 120ms ease;
 }
 window.forge-window.reference-shell popover.forge-popup entry text,
 .forge-workspace-dialog popover.forge-popup entry text,
@@ -156,6 +169,7 @@ window.forge-window.reference-shell dropdown popover entry:focus-within,
 .forge-workspace-dialog dropdown popover entry:focus-within {
     border-color: @ACCENT@;
     outline-color: @ACCENT@;
+    box-shadow: 0 0 0 1px alpha(@ACCENT@, .28);
 }
 
 window.forge-window.reference-shell popover.forge-popup checkbutton check,

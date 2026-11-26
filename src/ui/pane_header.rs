@@ -23,6 +23,10 @@ pub(crate) const PANE_HEADER_CSS: &str = "
         padding: 1px 6px;
         border-bottom: 1px solid alpha(currentColor, 0.15);
         background-color: alpha(currentColor, 0.06);
+        transition: background-color 120ms ease, border-color 120ms ease;
+    }
+    .pane-header:hover {
+        background-color: alpha(currentColor, 0.10);
     }
     .pane-header.pane-header-focused {
         background-color: alpha(currentColor, 0.16);
@@ -31,7 +35,7 @@ pub(crate) const PANE_HEADER_CSS: &str = "
     .pane-header label { font-size: 0.82em; }
     .pane-header-index { font-weight: bold; opacity: 0.9; }
     .pane-header-title { font-weight: bold; }
-    .pane-header-cwd { opacity: 0.6; }
+    .pane-header-cwd { opacity: 0.68; }
     .pane-header-command { font-weight: 600; }
     .pane-drop-target { outline: 2px solid alpha(currentColor, 0.8); outline-offset: -2px; }
     .pane-tab-drop-left { box-shadow: inset 10px 0 alpha(currentColor, 0.5); }

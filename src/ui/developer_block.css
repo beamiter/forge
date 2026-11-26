@@ -9,42 +9,66 @@ window.forge-window.reference-shell .developer-block-canvas .developer-command-c
   padding:0; border:0; border-radius:0; outline:0; background:transparent;
   box-shadow:none; min-height:0; transition:background-color 100ms ease, border-color 100ms ease, box-shadow 100ms ease;
 }
-window.forge-window.reference-shell .developer-block-canvas .developer-card-body { border:1px solid #293c57; border-radius:10px; background:#0e1621; padding:0; }
+window.forge-window.reference-shell .developer-block-canvas .developer-card-body { border:1px solid #293c57; border-radius:10px; background:#0e1621; padding:0; transition:background-color 120ms ease, border-color 120ms ease, box-shadow 120ms ease; }
 /* Completion belongs to the compact status badge; ordinary card frames share
    the reference's quiet navy edge. These state layers change paint only. */
 window.forge-window.reference-shell .developer-block-canvas .developer-command-card.block-hovered .developer-card-body { border-color:#3a506e; background:#101b2b; }
 window.forge-window.reference-shell .developer-block-canvas .developer-command-card:focus-within .developer-card-body { outline:1px solid #6288bb; outline-offset:-1px; }
 window.forge-window.reference-shell .developer-block-canvas .developer-command-card.block-selection-active .developer-card-body { box-shadow:inset 0 0 0 1px alpha(#4199ff,.45); }
 window.forge-window.reference-shell .developer-block-canvas .developer-command-card.block-selected .developer-card-body { outline:1px solid #4199ff; outline-offset:-1px; }
-window.forge-window.reference-shell .developer-block-canvas .developer-command-header { background:linear-gradient(180deg,#132037,#101b2e); border-bottom:1px solid #24334a; }
-window.forge-window.reference-shell .developer-block-canvas .developer-command-header button { min-height:22px; min-width:22px; padding:0 3px; border-radius:5px; color:#91a4bf; }
-window.forge-window.reference-shell .developer-block-canvas .developer-command-header button:hover { background:#253852; }
+window.forge-window.reference-shell .developer-block-canvas .developer-command-header { background:linear-gradient(180deg,#132037,#101b2e); border-bottom:1px solid #24334a; border-radius:9px 9px 0 0; }
+window.forge-window.reference-shell .developer-block-canvas .developer-command-header button { min-height:22px; min-width:22px; padding:0 3px; border-radius:5px; color:#91a4bf; transition:background-color 110ms ease, color 110ms ease; }
+window.forge-window.reference-shell .developer-block-canvas .developer-command-header button:hover { background:#253852; color:#dce6f5; }
+window.forge-window.reference-shell .developer-block-canvas .developer-command-header button:active { background:#1c2d45; }
 window.forge-window.reference-shell .developer-block-canvas .developer-command-header button:focus-visible { outline:1px solid #4199ff; }
 window.forge-window.reference-shell .developer-block-canvas .developer-command-icon { color:#a9c9fa; background:#20385d; border:1px solid #496bba; border-radius:6px; padding:0; }
-window.forge-window.reference-shell .developer-block-canvas .developer-command-status { font-size:10px; border-radius:5px; padding:3px 7px; background:#1c2b40; color:#91a4bf; }
+window.forge-window.reference-shell .developer-block-canvas .developer-command-status { font-size:10px; border-radius:5px; padding:3px 7px; background:#1c2b40; color:#91a4bf; box-shadow:inset 0 0 0 1px alpha(#91a4bf,.16); }
 window.forge-window.reference-shell .developer-block-canvas .developer-command-status label { font-size:10px; font-weight:700; color:inherit; }
-window.forge-window.reference-shell .developer-block-canvas .block-success .developer-command-status { color:#39dda0; background:#12352e; }
-window.forge-window.reference-shell .developer-block-canvas .block-failed .developer-command-status { color:#ff646f; background:#3b222e; }
+window.forge-window.reference-shell .developer-block-canvas .block-success .developer-command-status { color:#39dda0; background:#12352e; box-shadow:inset 0 0 0 1px alpha(#39dda0,.24); }
+window.forge-window.reference-shell .developer-block-canvas .block-failed .developer-command-status { color:#ff646f; background:#3b222e; box-shadow:inset 0 0 0 1px alpha(#ff646f,.28); }
 window.forge-window.reference-shell .developer-block-canvas .block-failed .developer-command-icon { color:#ff9b9f; background:#3c2632; border-color:#765057; }
 window.forge-window.reference-shell .developer-block-canvas .developer-command-elapsed { font-size:9px; color:#91a4bf; }
 window.forge-window.reference-shell .developer-block-canvas .developer-command-terminal { background:transparent; padding:0; margin:0; }
 window.forge-window.reference-shell .developer-block-canvas .developer-command-output { background:#0e1621; }
 window.forge-window.reference-shell .developer-block-canvas .developer-output-gutter { color:#637d9c; }
-window.forge-window.reference-shell .developer-block-canvas .block-active { margin:0; padding:0; background:#0e1621; border:1px solid #293c57; border-radius:10px; outline:0; box-shadow:none; }
+window.forge-window.reference-shell .developer-block-canvas .block-output-scrollbar trough { background-color:alpha(#91a4bf,.08); }
+window.forge-window.reference-shell .developer-block-canvas .block-output-scrollbar slider { background-color:alpha(#91a4bf,.38); }
+window.forge-window.reference-shell .developer-block-canvas .block-output-scrollbar slider:hover { background-color:#6b97f0; }
+window.forge-window.reference-shell .developer-block-canvas .block-active { margin:0; padding:0; background:#0e1621; border:1px solid #293c57; border-radius:10px; outline:0; box-shadow:none; transition:border-color 140ms ease, box-shadow 140ms ease; }
 window.forge-window.reference-shell .reference-developer-active .reference-canvas-header { background:#101c30; border-color:#293c57; color:#d5deec; }
 window.forge-window.reference-shell .reference-developer-active .reference-canvas-title { color:#d5deec; }
 window.forge-window.reference-shell .reference-developer-active .reference-canvas-subtitle { color:#91a4bf; }
 window.forge-window.reference-shell .reference-developer-active .reference-canvas-header button { color:#91a4bf; }
+window.forge-window.reference-shell .reference-developer-active .reference-canvas-header button:not(:disabled):hover,
+window.forge-window.reference-shell .reference-developer-active .reference-canvas-header .reference-header-action:not(:disabled):hover { background:#223452; color:#e3ecff; }
+window.forge-window.reference-shell .reference-developer-active .reference-canvas-header button:not(:disabled):active,
+window.forge-window.reference-shell .reference-developer-active .reference-canvas-header .reference-header-action:not(:disabled):active { background:#1a2942; }
+window.forge-window.reference-shell .reference-developer-active .reference-canvas-header .top-tabs .tab-strip-btn { color:#9eb1ce; background:transparent; }
+window.forge-window.reference-shell .reference-developer-active .reference-canvas-header .top-tabs .tab-strip-btn:not(:checked):hover { color:#dce7fa; background:#1c2d48; }
+window.forge-window.reference-shell .reference-developer-active .reference-canvas-header .top-tabs .tab-strip-btn:checked { color:#e8f0ff; background:#253a66; outline:none; box-shadow:inset 0 -2px #6b97f0; }
+window.forge-window.reference-shell .reference-developer-active .reference-canvas-header .top-tabs .tab-strip-btn:checked:hover { background:#2e477c; }
+window.forge-window.reference-shell .reference-developer-active .reference-canvas-header .top-tabs .tab-strip-close:hover { background:alpha(#ff646f,.18); color:#ff8d95; }
+window.forge-window.reference-shell .reference-developer-active searchbar > revealer > box { background:#101c30; border-bottom:1px solid #293c57; color:#d5deec; }
+window.forge-window.reference-shell .reference-developer-active searchbar searchentry { background:#0c1524; color:#d5deec; caret-color:#d5deec; border-color:#324663; }
+window.forge-window.reference-shell .reference-developer-active searchbar searchentry text { color:#d5deec; caret-color:#d5deec; }
+window.forge-window.reference-shell .reference-developer-active searchbar searchentry:focus-within { border-color:#4199ff; box-shadow:0 0 0 2px alpha(#4199ff,.22); }
+window.forge-window.reference-shell .reference-developer-active searchbar button { background:#19283c; border-color:#344864; color:#b8c8e0; }
+window.forge-window.reference-shell .reference-developer-active searchbar button:not(:disabled):hover { background:#243857; border-color:#496bba; color:#eef4ff; }
+window.forge-window.reference-shell .reference-developer-active searchbar button:not(:disabled):active { background:#1b2d47; }
+window.forge-window.reference-shell .reference-developer-active searchbar label.dim-label { color:#91a4bf; }
 window.forge-window.reference-shell .reference-developer-active .reference-block-composer { background:#172338; border-color:#293c57; color:#91a4bf; box-shadow:none; }
 window.forge-window.reference-shell .reference-developer-active .reference-block-composer button,
 window.forge-window.reference-shell .reference-developer-active .reference-block-composer label { color:#91a4bf; }
 window.forge-window.reference-shell .developer-block-canvas .block-active.developer-running { border-color:#4199ff; box-shadow:0 0 7px alpha(#4199ff,.18); }
-window.forge-window.reference-shell .developer-block-canvas .developer-running-header .developer-command-status { color:#4199ff; background:#152f50; }
+window.forge-window.reference-shell .developer-block-canvas .developer-running-header .developer-command-status { color:#4199ff; background:#152f50; box-shadow:inset 0 0 0 1px alpha(#4199ff,.30); }
 window.forge-window.reference-shell .developer-block-canvas .developer-running-command { color:#d5deec; }
 
 window.forge-window.reference-shell .developer-live-toolbar { background:#101c30; border-bottom:1px solid #293c57; padding:0 12px; color:#91a4bf; }
 window.forge-window.reference-shell .developer-live-toolbar label { font-size:12px; color:#91a4bf; }
-window.forge-window.reference-shell .developer-live-toolbar button { min-width:24px; min-height:24px; padding:0; color:#91a4bf; }
+window.forge-window.reference-shell .developer-live-toolbar button { min-width:24px; min-height:24px; padding:0; border-radius:6px; color:#91a4bf; transition:background-color 110ms ease, color 110ms ease; }
+window.forge-window.reference-shell .developer-live-toolbar button:hover { background:#223452; color:#dce7fa; }
+window.forge-window.reference-shell .developer-live-toolbar button:active { background:#1a2a44; }
+window.forge-window.reference-shell .developer-live-toolbar button:focus-visible { outline:1px solid #4199ff; }
 
 /* New Block dock only. Native prompt clip is the sole editor; while a command
    runs, it returns to its card and the footer states that input authority. */
@@ -52,30 +76,44 @@ window.forge-window.reference-shell .reference-developer-active .reference-canva
 window.forge-window.reference-shell .developer-docked-input .chat-canvas { background:#091323; }
 window.forge-window.reference-shell .developer-docked-input .chat-live-anchor { padding:0; margin:0; border:0; min-height:0; background:transparent; box-shadow:none; }
 window.forge-window.reference-shell .developer-docked-input .chat-dock,
-window.forge-window.reference-shell .developer-docked-input .chat-dock.chat-dock-compact { margin:0 @COMPOSER_INSET@px @COMPOSER_BOTTOM@px; padding:7px 0; min-height:@BLOCK_DOCK_INNER_HEIGHT@px; border:1px solid #293c57; border-radius:12px; background:#172338; box-shadow:none; }
+window.forge-window.reference-shell .developer-docked-input .chat-dock.chat-dock-compact { margin:0 @COMPOSER_INSET@px @COMPOSER_BOTTOM@px; padding:7px 0; min-height:@BLOCK_DOCK_INNER_HEIGHT@px; border:1px solid #293c57; border-radius:12px; background:#172338; box-shadow:none; transition:border-color 130ms ease, box-shadow 130ms ease; }
 window.forge-window.reference-shell .developer-docked-input .chat-composer,
 window.forge-window.reference-shell .developer-docked-input .chat-composer.block-compact { margin:0; padding:0; min-height:0; border:0; background:transparent; box-shadow:none; }
-window.forge-window.reference-shell .developer-docked-input .chat-composer-card:focus-within { border-color:#4199ff; box-shadow:0 0 0 1px alpha(#4199ff,.12); }
+window.forge-window.reference-shell .developer-docked-input .chat-composer-card:focus-within { border-color:#4199ff; box-shadow:0 0 0 1px alpha(#4199ff,.16); }
 window.forge-window.reference-shell .developer-docked-input .reference-composer-controls { min-height:28px; margin-top:0; padding:0 9px 0 11px; background:transparent; }
 window.forge-window.reference-shell .developer-docked-input .reference-composer-controls button,
 window.forge-window.reference-shell .developer-docked-input .reference-composer-controls menubutton > button,
-window.forge-window.reference-shell .developer-docked-input .reference-unavailable-tool { min-height:26px; padding:0 6px; border:1px solid #344864; border-radius:7px; background:#19283c; color:#91a4bf; }
+window.forge-window.reference-shell .developer-docked-input .reference-unavailable-tool { min-height:26px; padding:0 6px; border:1px solid #344864; border-radius:7px; background:#19283c; color:#a4b7d2; transition:background-color 110ms ease, border-color 110ms ease, color 110ms ease; }
+window.forge-window.reference-shell .developer-docked-input .reference-composer-controls button:not(:disabled):hover,
+window.forge-window.reference-shell .developer-docked-input .reference-composer-controls menubutton > button:hover,
+window.forge-window.reference-shell .developer-docked-input .reference-composer-controls menubutton > button:checked { background:#233754; border-color:#496bba; color:#e6effd; }
+window.forge-window.reference-shell .developer-docked-input .reference-composer-controls button:not(:disabled):active,
+window.forge-window.reference-shell .developer-docked-input .reference-composer-controls menubutton > button:active { background:#1b2d47; border-color:#3f5da3; }
+window.forge-window.reference-shell .developer-docked-input .reference-unavailable-tool { background:#152234; border-color:#2a3b54; color:#6f83a1; }
+window.forge-window.reference-shell .developer-docked-input .reference-unavailable-tool label { color:#6f83a1; }
 window.forge-window.reference-shell .developer-docked-input .reference-unavailable-tool button { border:0; padding:0; background:transparent; }
-window.forge-window.reference-shell .developer-docked-input .reference-composer-controls label { color:#91a4bf; }
-window.forge-window.reference-shell .developer-docked-input .reference-composer-controls button:disabled { opacity:1; filter:none; color:#91a4bf; }
+window.forge-window.reference-shell .developer-docked-input .reference-composer-controls label { color:inherit; }
+window.forge-window.reference-shell .developer-docked-input .reference-composer-controls button:disabled { opacity:1; filter:none; color:#778ba8; }
 window.forge-window.reference-shell .developer-docked-input .reference-composer-controls .chat-submit { background:#366fdd; border-color:#4c8af2; color:#eff6ff; }
-window.forge-window.reference-shell .developer-docked-input .reference-composer-controls .chat-stop { color:#ff8d95; }
+window.forge-window.reference-shell .developer-docked-input .reference-composer-controls .chat-submit:not(:disabled):hover { background:#467fed; border-color:#689df8; color:#ffffff; }
+window.forge-window.reference-shell .developer-docked-input .reference-composer-controls .chat-submit:not(:disabled):active { background:#2b5ec4; border-color:#4176d6; color:#eff6ff; }
+window.forge-window.reference-shell .developer-docked-input .reference-composer-controls .chat-submit:disabled { background:#223557; border-color:#31476b; color:#7f93b0; }
+window.forge-window.reference-shell .developer-docked-input .reference-composer-controls .chat-stop { background:#3b222e; border-color:#765057; color:#ff8d95; }
+window.forge-window.reference-shell .developer-docked-input .reference-composer-controls .chat-stop:not(:disabled):hover { background:#4f2b3a; border-color:#9b5d69; color:#ffb4b9; }
+window.forge-window.reference-shell .developer-docked-input .reference-composer-controls .chat-stop:not(:disabled):active { background:#331c27; }
 window.forge-window.reference-shell .developer-dock-input-hint { margin:0 12px 4px; color:#91a4bf; font-size:12px; }
-window.forge-window.reference-shell .developer-block-canvas .sticky-running-header { background:#172338; border:1px solid #293c57; color:#91a4bf; }
+window.forge-window.reference-shell .developer-block-canvas .sticky-running-header { background:#172338; border:1px solid #293c57; color:#91a4bf; box-shadow:0 4px 12px alpha(#030914,.45); }
 
 /* A card's existing context actions retain their real signals and owners, but
    cannot inherit bold Main text or the platform's light popup surface. */
 .developer-block-menu { background:transparent; }
 .developer-block-menu, .developer-block-menu label, .developer-block-menu button { font-family:"DejaVu Sans",sans-serif; font-size:12px; font-weight:400; color:#d5deec; }
-.developer-block-menu > contents { background:#1c293a; border:1px solid #344864; border-radius:12px; padding:8px; }
-.developer-block-menu button { min-height:28px; padding:0 8px; border:0; border-radius:6px; background:transparent; background-image:none; box-shadow:none; }
+.developer-block-menu > contents { background:#1c293a; border:1px solid #344864; border-radius:12px; padding:8px; box-shadow:0 10px 26px alpha(#030914,.48); }
+.developer-block-menu button { min-height:28px; padding:0 8px; border:0; border-radius:6px; background:transparent; background-image:none; box-shadow:none; transition:background-color 100ms ease, color 100ms ease; }
 .developer-block-menu button:hover, .developer-block-menu button:focus-visible { background:#283d6f; outline:1px solid #496bba; }
-.developer-block-menu button:disabled { color:#91a4bf; opacity:1; filter:none; }
+.developer-block-menu button:active { background:#213561; }
+.developer-block-menu button:disabled { color:#7a8fae; opacity:1; filter:none; }
+.developer-block-menu separator { min-height:1px; margin:4px 0; background:#2c3d57; }
 .developer-block-menu viewport, .developer-block-menu scrolledwindow { background:transparent; }
 window.forge-window.reference-shell .developer-block-canvas .block-selection-hint { font-family:"DejaVu Sans",sans-serif; font-size:10px; font-weight:400; color:#91a4bf; }
 window.forge-window.reference-shell .developer-block-canvas .block-review-selection { font-family:"DejaVu Sans",sans-serif; font-size:12px; font-weight:400; color:#a9c9fa; }

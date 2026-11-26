@@ -44,6 +44,7 @@ dialog.forge-workspace-dialog {
     background: transparent;
     color: @POPUP_FOREGROUND@;
     border-color: @DARK_BORDER@;
+    transition: background-color 110ms ease;
 }
 .forge-workspace-dialog row:hover,
 .forge-workspace-dialog row:selected {
@@ -58,6 +59,14 @@ dialog.forge-workspace-dialog {
     border: 1px solid @POPUP_BORDER@;
     border-radius: 7px;
     box-shadow: none;
+    transition: background-color 110ms ease, border-color 120ms ease;
+}
+.forge-workspace-dialog dropdown > button:not(:disabled):hover {
+    background: @POPUP_SELECTED@;
+}
+.forge-workspace-dialog dropdown > button:focus-visible {
+    outline: 2px solid @ACCENT@;
+    outline-offset: -2px;
 }
 .forge-workspace-dialog entry text,
 .forge-workspace-dialog searchentry text,
@@ -89,6 +98,7 @@ dialog.forge-workspace-dialog {
     border: 1px solid @POPUP_BORDER@;
     border-radius: 7px;
     box-shadow: none;
+    transition: background-color 110ms ease, border-color 110ms ease, color 110ms ease;
 }
 .forge-workspace-dialog button.flat {
     background: transparent;
@@ -111,6 +121,14 @@ dialog.forge-workspace-dialog {
     border-color: @ACCENT@;
     color: white;
 }
+.forge-workspace-dialog button.suggested-action:not(:disabled):hover {
+    background: shade(@ACCENT@, 1.08);
+    border-color: shade(@ACCENT@, 1.08);
+}
+.forge-workspace-dialog button.suggested-action:not(:disabled):active {
+    background: shade(@ACCENT@, .92);
+    border-color: shade(@ACCENT@, .92);
+}
 .forge-workspace-dialog button.suggested-action:not(:disabled) label {
     color: white;
 }
@@ -118,6 +136,13 @@ dialog.forge-workspace-dialog {
     background: alpha(@error_color, .18);
     border-color: alpha(@error_color, .5);
     color: mix(@error_color, @POPUP_FOREGROUND@, .45);
+}
+.forge-workspace-dialog button.destructive-action:not(:disabled):hover {
+    background: alpha(@error_color, .28);
+    border-color: alpha(@error_color, .68);
+}
+.forge-workspace-dialog button.destructive-action:not(:disabled):active {
+    background: alpha(@error_color, .36);
 }
 .forge-workspace-dialog button.destructive-action:not(:disabled) label {
     color: mix(@error_color, @POPUP_FOREGROUND@, .45);
@@ -154,6 +179,7 @@ dialog.forge-workspace-dialog {
 }
 .forge-workspace-dialog scrollbar slider {
     background: alpha(@POPUP_MUTED@, .45);
+    border-radius: 4px;
 }
 .forge-workspace-dialog scrollbar slider:hover {
     background: @POPUP_MUTED@;

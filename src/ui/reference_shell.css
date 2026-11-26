@@ -3,40 +3,65 @@ window.reference-shell.csd { border: 0; padding: 0; margin: 0; outline: none; bo
 window.reference-shell decoration { border: 0; padding: 0; margin: 0; border-radius: 0; box-shadow: none; }
 .reference-shell .reference-titlebar { padding: 0; min-height: @TITLEBAR_HEIGHT@px; background: @TITLEBAR@; color: #d9e4f5; }
 .reference-shell .reference-toolbar { padding: 0 10px; min-height: @TITLEBAR_HEIGHT@px; }
-.reference-shell .reference-toolbar button { color: #c5d1e5; min-height: 26px; min-width: 22px; padding: 0 5px; border-radius: 7px; }
+.reference-shell .reference-toolbar button { color: #c5d1e5; min-height: 26px; min-width: 22px; padding: 0 5px; border-radius: 7px; transition: background-color 110ms ease, color 110ms ease, border-color 110ms ease; }
+.reference-shell .reference-toolbar button:not(:disabled):hover { background: #223452; color: #e8f0ff; }
+.reference-shell .reference-toolbar button:not(:disabled):active { background: #1a2a44; }
 .reference-shell .reference-toolbar .window-control { min-width: 16px; min-height: 16px; padding: 0; border: 1px solid #35445d; }
 .reference-shell .reference-toolbar button.reference-inspector-toggle { min-width: 26px; min-height: 26px; padding: 0; border: 1px solid transparent; }
+.reference-shell .reference-toolbar button.reference-inspector-toggle:not(:checked):not(:disabled):hover { background: #223452; color: #dce7ff; border-color: #364b70; }
 .reference-shell .reference-toolbar button.reference-inspector-toggle:checked { color: #dce7ff; background: #283d6f; border-color: #466296; }
+.reference-shell .reference-toolbar button.reference-inspector-toggle:checked:hover { background: #304982; border-color: #5575b0; }
+.reference-shell .reference-toolbar button.reference-inspector-toggle:active { background: #1d2f52; }
 .reference-shell .reference-inspector-drawer { box-shadow: -6px 0 18px alpha(#030914,.25); }
 .reference-shell .reference-product { font-size: 12px; font-weight: 700; margin: 0 10px 0 4px; }
 .reference-shell .reference-toolbar-path { font-size: 10px; color: #a7b8d3; }
-.reference-shell .reference-search { border: 1px solid #303d54; background: #192437; margin: 0; padding: 0 8px; min-height: @SEARCH_INNER_HEIGHT@px; border-radius: 7px; color: #a9bad2; }
-.reference-shell .reference-shortcut { font-size: 9px; background: #273349; color: #a9bbd7; padding: 2px 5px; border-radius: 4px; }
+.reference-shell .reference-search { border: 1px solid #303d54; background: #192437; margin: 0; padding: 0 8px; min-height: @SEARCH_INNER_HEIGHT@px; border-radius: 7px; color: #a9bad2; transition: background-color 120ms ease, border-color 120ms ease, box-shadow 120ms ease, color 120ms ease; }
+.reference-shell .reference-search:hover { background: #1f2e47; border-color: #425678; color: #c7d6ed; }
+.reference-shell .reference-search:active { background: #162235; border-color: #4e6996; }
+.reference-shell .reference-search:focus-visible { border-color: @ACCENT@; box-shadow: 0 0 0 2px alpha(@ACCENT@, .28); }
+.reference-shell .reference-shortcut { font-size: 9px; background: #273349; color: #a9bbd7; padding: 2px 5px; border-radius: 4px; box-shadow: inset 0 0 0 1px alpha(#7d91ae, .22); }
 .reference-shell .reference-mode-switch { border-radius: 7px; background: #172338; padding: 0; }
-.reference-shell .reference-mode-switch button { font-size: 10px; min-width: @MODE_MIN_WIDTH@px; min-height: @MODE_HEIGHT@px; padding: 0; border-width: 0; }
-.reference-shell .reference-mode-switch button:not(:checked):hover { background: #24364f; }
+.reference-shell .reference-mode-switch button { font-size: 10px; min-width: @MODE_MIN_WIDTH@px; min-height: @MODE_HEIGHT@px; padding: 0; border-width: 0; transition: background-color 120ms ease, color 120ms ease, box-shadow 120ms ease; }
+.reference-shell .reference-mode-switch button:not(:checked):hover { background: #24364f; color: #dce7fa; }
+.reference-shell .reference-mode-switch button:not(:checked):active { background: #1c2c44; }
 .reference-shell .reference-mode-switch button:checked { background: @ACCENT@; color: white; border-color: transparent; box-shadow: 0 0 6px alpha(@ACCENT@,.22); }
 .reference-shell .reference-mode-switch button:checked:hover { background: shade(@ACCENT@,1.08); }
 .reference-shell .reference-mode-switch button:checked:active { background: shade(@ACCENT@,.92); }
 .reference-shell .reference-mode-switch button:disabled { color: #90a0b9; background: #1d2b41; box-shadow: none; }
 .reference-shell .reference-mode-switch button:checked:disabled { color: #d5e0f4; background: alpha(@ACCENT@,.5); }
 .reference-shell .reference-rail { background: @RAIL@; border-right: 1px solid #253247; padding: 12px @RAIL_PADDING_X@px 8px; min-width: 34px; }
-.reference-shell .reference-rail button { min-width: 32px; min-height: 32px; padding: 0; color: #8a9dbb; border-radius: 8px; }
-.reference-shell .reference-rail button:hover, .reference-shell .reference-rail button:checked { background: #273d70; color: #b9d2ff; }
-.reference-shell .reference-profile { min-width: 26px; min-height: 26px; padding: 0; font-size: 11px; color: #cedaf0; border: 1px solid @PROFILE_BORDER@; background: @PROFILE_BACKGROUND@; border-radius: 14px; font-weight: 600; }
+.reference-shell .reference-rail button { min-width: 32px; min-height: 32px; padding: 0; color: #8a9dbb; border-radius: 8px; transition: background-color 120ms ease, color 120ms ease, box-shadow 120ms ease; }
+.reference-shell .reference-rail button:not(:disabled):hover { background: #1f3154; color: #b4cdfa; }
+.reference-shell .reference-rail button:checked { background: #273d70; color: #d5e4ff; box-shadow: inset 2px 0 #6b97f0; }
+.reference-shell .reference-rail button:checked:hover { background: #2f4884; color: #ebf2ff; }
+.reference-shell .reference-rail button:not(:disabled):active { background: #1c2d4d; }
+.reference-shell .reference-rail button:disabled { color: #546684; background: transparent; opacity: .72; }
+.reference-shell .reference-profile { min-width: 26px; min-height: 26px; padding: 0; font-size: 11px; color: #cedaf0; border: 1px solid @PROFILE_BORDER@; background: @PROFILE_BACKGROUND@; border-radius: 14px; font-weight: 600; transition: background-color 120ms ease, border-color 120ms ease; }
+.reference-shell .reference-profile:hover { border-color: #5b78ad; background: #273b5e; }
 .reference-shell .reference-navigation { min-width: @NAVIGATION_CONTENT_MIN@px; padding: 16px 14px 0; background: @NAVIGATION@; color: #bac9e1; border-right: 1px solid #2c394f; }
 .reference-shell .reference-section-label { color: #7d91ae; font-size: 8px; font-weight: 700; letter-spacing: 1px; margin: 0 0 9px; }
-.reference-shell .reference-workspace-selector { min-height: 31px; min-width: 0; padding: 0 8px; margin-bottom: 0; color: #c6d4eb; background: #23324a; border: 1px solid #35445e; border-radius: 8px; font-size: 10px; }
+.reference-shell .reference-workspace-selector { min-height: 31px; min-width: 0; padding: 0 8px; margin-bottom: 0; color: #c6d4eb; background: #23324a; border: 1px solid #35445e; border-radius: 8px; font-size: 10px; transition: background-color 120ms ease, border-color 120ms ease; }
+.reference-shell .reference-workspace-selector:hover { background: #293c58; border-color: #465b7d; }
+.reference-shell .reference-workspace-selector:active { background: #1f2e45; }
+.reference-shell .reference-workspace-selector:focus-within { border-color: @ACCENT@; }
 .reference-shell .reference-workspace-selector > button { min-height: 31px; min-width: 0; padding: 0; color: inherit; background: transparent; border: 0; box-shadow: none; }
 .reference-shell .reference-workspace-selector:disabled { opacity: .8; }
 .reference-shell .reference-navigation .sidebar-switcher { margin: 0 0 8px; }
-.reference-shell .reference-navigation .sidebar-switcher button { color: #9eb1ce; padding: 4px 6px; font-size: 10px; min-height: 24px; border-radius: 6px; }
+.reference-shell .reference-navigation .sidebar-switcher button { color: #9eb1ce; padding: 4px 6px; font-size: 10px; min-height: 24px; border-radius: 6px; transition: background-color 110ms ease, color 110ms ease; }
+.reference-shell .reference-navigation .sidebar-switcher button:not(:checked):hover { color: #c9d9f0; background: #1e2f4a; }
 .reference-shell .reference-navigation .sidebar-switcher button:checked { color: #e3ecff; background: #283d6f; }
-.reference-shell .reference-navigation .tab-strip-search { min-width: 0; min-height: 22px; padding: 3px 6px; margin: 0 0 7px; border-radius: 6px; background: #101c2e; border: 1px solid #2b3b55; color: #b5c5df; font-size: 10px; }
+.reference-shell .reference-navigation .sidebar-switcher button:checked:hover { background: #304982; }
+.reference-shell .reference-navigation .tab-strip-search { min-width: 0; min-height: 22px; padding: 3px 6px; margin: 0 0 7px; border-radius: 6px; background: #101c2e; border: 1px solid #2b3b55; color: #b5c5df; font-size: 10px; transition: border-color 120ms ease, box-shadow 120ms ease; }
+.reference-shell .reference-navigation .tab-strip-search:focus-within { border-color: @ACCENT@; box-shadow: 0 0 0 1px alpha(@ACCENT@, .28); }
 .reference-shell .reference-navigation .tab-strip-search text { font-size: 10px; color: #d4e2f8; caret-color: #d4e2f8; }
-.reference-shell .reference-navigation .tab-strip-btn { min-height: 29px; padding: 1px 7px; margin: 2px 0; border: 0; border-radius: 6px; color: #aebfd9; background: transparent; outline: none; font-size: 10px; }
+.reference-shell .reference-navigation .tab-strip-btn { min-height: 29px; padding: 1px 7px; margin: 2px 0; border: 0; border-radius: 6px; color: #aebfd9; background: transparent; outline: none; font-size: 10px; transition: background-color 110ms ease, color 110ms ease, box-shadow 110ms ease; }
+.reference-shell .reference-navigation .tab-strip-btn:not(:checked):hover { color: #d4e2f8; background: #1d2d47; }
 .reference-shell .reference-navigation .tab-strip-btn:checked { color: #e3ecff; background: #283d6f; box-shadow: inset -2px 0 #719cfa; }
-.reference-shell .reference-navigation .tab-strip-close { min-width: 12px; min-height: 16px; padding: 0; }
+.reference-shell .reference-navigation .tab-strip-btn:checked:hover { background: #304982; }
+.reference-shell .reference-navigation .tab-strip-btn:focus-visible { outline: 2px solid #7da6ff; outline-offset: -2px; }
+.reference-shell .reference-navigation .tab-strip-close { min-width: 12px; min-height: 16px; padding: 0; border-radius: 4px; color: #7d91ae; transition: background-color 110ms ease, color 110ms ease; }
+.reference-shell .reference-navigation .tab-strip-close:hover { background: alpha(#ff646f, .18); color: #ff8d95; }
+.reference-shell .reference-navigation .tab-strip-close:active { background: alpha(#ff646f, .28); }
 .reference-shell .reference-space-row { min-height: 42px; padding: 0 7px; font-size: 10px; color: #9eb1ce; }
 .reference-shell .reference-space-row:disabled, .reference-shell .reference-space-row:disabled label { opacity: 1; color: #8a9dbb; }
 .reference-shell .reference-navigation-status { border-top: 1px solid #344158; margin-top: 10px; }
@@ -45,11 +70,24 @@ window.reference-shell decoration { border: 0; padding: 0; margin: 0; border-rad
 .reference-shell .reference-canvas-header { min-height: @HEADER_INNER_HEIGHT@px; padding: 0 24px 0 28px; background: #f9fbff; border-bottom: 1px solid #dae3ef; color: #24334b; }
 .reference-shell .reference-canvas-title { font-size: 12px; font-weight: 600; }
 .reference-shell .reference-canvas-subtitle { color: #7b8ca4; font-size: 9px; }
-.reference-shell .reference-canvas-header button { color: #657893; min-height: 24px; padding: 0 6px; }
+.reference-shell .reference-canvas-header button { color: #657893; min-height: 24px; padding: 0 6px; border-radius: 6px; transition: background-color 110ms ease, color 110ms ease; }
+.reference-shell .reference-canvas-header button:not(:disabled):hover { background: #e6eefb; color: #24334b; }
+.reference-shell .reference-canvas-header button:not(:disabled):active { background: #d6e3f8; }
+.reference-shell .reference-canvas-header .top-tabs .tab-strip-btn { color: #5c708e; background: transparent; outline: none; border-radius: 6px; transition: background-color 110ms ease, color 110ms ease, box-shadow 110ms ease; }
+.reference-shell .reference-canvas-header .top-tabs .tab-strip-btn:not(:checked):hover { color: #24334b; background: #e8f0fc; }
+.reference-shell .reference-canvas-header .top-tabs .tab-strip-btn:checked { color: #1d3560; background: #dce8fc; outline: none; box-shadow: inset 0 -2px @ACCENT@; }
+.reference-shell .reference-canvas-header .top-tabs .tab-strip-btn:checked:hover { background: #d0e0fb; }
+.reference-shell .reference-canvas-header .top-tabs .tab-strip-close { border-radius: 4px; color: #7d91ae; transition: background-color 110ms ease, color 110ms ease; }
+.reference-shell .reference-canvas-header .top-tabs .tab-strip-close:hover { background: alpha(#d94b58, .14); color: #c83e4d; }
 .reference-shell .reference-inspector { min-width: @INSPECTOR_CONTENT_MIN@px; background: @INSPECTOR@; color: #bacbe5; border-left: 1px solid #29364b; }
 .reference-shell .reference-inspector-tabs { min-height: @INSPECTOR_TABS_INNER_HEIGHT@px; padding: 0 14px; border-bottom: 1px solid #253248; }
-.reference-shell .reference-inspector-tabs button { font-size: 10px; color: #8fa5c5; padding: 0 8px; min-height: 27px; border-radius: 6px; }
+.reference-shell .reference-inspector-tabs button { font-size: 10px; color: #8fa5c5; padding: 0 8px; min-height: 27px; border-radius: 6px; transition: background-color 110ms ease, color 110ms ease, box-shadow 110ms ease; }
+.reference-shell .reference-inspector-tabs button:not(:checked):hover { color: #c9d9f0; background: #1c2c47; }
 .reference-shell .reference-inspector-tabs button:checked { color: #e2ecff; background: #233555; box-shadow: inset 0 -2px #6898f5; }
+.reference-shell .reference-inspector-tabs button:checked:hover { background: #2b4066; }
+.reference-shell .reference-inspector-tabs menubutton > button { min-width: 24px; min-height: 24px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: #8fa5c5; box-shadow: none; transition: background-color 110ms ease, color 110ms ease; }
+.reference-shell .reference-inspector-tabs menubutton > button:hover,
+.reference-shell .reference-inspector-tabs menubutton > button:checked { background: #233555; color: #e2ecff; }
 .reference-shell .reference-agent-card { margin: 0 @INSPECTOR_CARD_MARGIN@px 14px; padding: 13px 13px 7px; border-radius: 12px; border: 1px solid #314056; background: #1c293a; }
 .reference-shell .reference-agent-card.reference-rich-inspector { padding: 13px 13px 7px; border: 1px solid #314056; border-radius: 12px; background: @INSPECTOR_CARD@; }
 .reference-shell .reference-rich-inspector .reference-inspector-metadata { padding: 0; border: 0; background: transparent; }
@@ -67,8 +105,16 @@ window.reference-shell decoration { border: 0; padding: 0; margin: 0; border-rad
 .reference-shell .reference-output { background: #090c17; color: #96acd0; padding: 10px; border: 1px solid #2d3d57; border-radius: 7px; }
 .reference-shell .reference-output-text { font-family: "DejaVu Sans Mono", monospace; color: #8498b7; font-size: 9px; }
 .reference-shell .reference-context-path { color: #cfdbef; font-size: 11px; }
-.reference-shell .reference-inspector progressbar trough { min-height: 4px; background: #34445c; }
-.reference-shell .reference-inspector progressbar progress { background: #648bef; }
+.reference-shell .reference-inspector progressbar trough { min-height: 4px; background: #34445c; border-radius: 999px; }
+.reference-shell .reference-inspector progressbar progress { background: #648bef; border-radius: 999px; }
+.reference-shell .reference-inspector scrollbar,
+.reference-shell .reference-inspector scrollbar trough,
+.reference-shell .reference-navigation scrollbar,
+.reference-shell .reference-navigation scrollbar trough { background: transparent; }
+.reference-shell .reference-inspector scrollbar slider,
+.reference-shell .reference-navigation scrollbar slider { background: alpha(#879bb9, .32); border-radius: 4px; }
+.reference-shell .reference-inspector scrollbar slider:hover,
+.reference-shell .reference-navigation scrollbar slider:hover { background: alpha(#b9d2ff, .62); }
 .reference-shell .reference-inspector .file-tree-box, .reference-shell .reference-inspector .ai-panel, .reference-shell .reference-inspector .tasks-panel { min-width: 0; background: @INSPECTOR@; color: #bdcce4; }
 .reference-shell .reference-inspector .file-tree-header { padding: 4px; }
 .reference-shell .reference-inspector .file-tree-header button { min-width: 18px; padding: 1px; }
@@ -87,11 +133,11 @@ window.reference-shell decoration { border: 0; padding: 0; margin: 0; border-rad
 .reference-shell .term-chat-root .block-list, .reference-shell .term-chat-root .block-scroll, .reference-shell .term-chat-root .block-active, .reference-shell .term-chat-root .chat-live-anchor { background: transparent; }
 .reference-shell .term-chat-root .chat-transcript { padding: 0 28px 16px; }
 .reference-shell .term-chat-root .chat-pair { margin: 0 0 18px; padding: 0; }
-.reference-shell .term-chat-root .chat-command { background: #d9e4fa; color: #293e62; border: 1px solid #d0dff6; border-radius: 12px; padding: 8px 12px; }
+.reference-shell .term-chat-root .chat-command { background: #d9e4fa; color: #293e62; border: 1px solid #d0dff6; border-radius: 12px; padding: 8px 12px; box-shadow: 0 1px 2px alpha(#284273, .06); }
 .reference-shell .term-chat-root .chat-result { background: transparent; border: none; box-shadow: none; padding: 9px 0 0; color: #26364c; }
 .reference-shell .term-chat-root .chat-meta-chip { color: #71839c; background: #e8effa; border: 1px solid #d6e1f1; font-size: 9px; padding: 2px 5px; }
 .reference-shell .term-chat-root .chat-dock, .reference-shell .term-chat-root .chat-dock.chat-dock-compact { margin: 0 @COMPOSER_INSET@px @COMPOSER_BOTTOM@px; }
-.reference-shell .term-chat-root .chat-dock { min-height: @BLOCK_DOCK_INNER_HEIGHT@px; padding: 7px 0; border-radius: 14px; background: #fefefe; border: 1px solid #bdcee6; box-shadow: 0 3px 10px alpha(#486ca6, .10); }
+.reference-shell .term-chat-root .chat-dock { min-height: @BLOCK_DOCK_INNER_HEIGHT@px; padding: 7px 0; border-radius: 14px; background: #fefefe; border: 1px solid #bdcee6; box-shadow: 0 3px 10px alpha(#486ca6, .10); transition: border-color 130ms ease, box-shadow 130ms ease; }
 .reference-shell .term-chat-root .chat-composer { margin: 0; padding: 0 10px; background: transparent; border: none; box-shadow: none; }
 .reference-shell .term-chat-root .chat-controls { background: transparent; padding: 0 9px; border: none; min-height: 26px; }
 .reference-shell .term-chat-root .chat-input-hint { color: #8192aa; font-size: 9px; }
@@ -143,11 +189,12 @@ window.forge-window.reference-shell .reference-rich-conversation .reference-user
 window.forge-window.reference-shell .reference-rich-conversation label.reference-message-chip { padding: 3px 7px; border: 1px solid #d2dff1; background: #e9f0fb; color: #6d82a0; border-radius: 6px; font-size: 9px; }
 .reference-shell .reference-rich-steps { border: 1px solid #dce7f4; border-radius: 8px; background: #edf4fc; }
 .reference-shell .reference-rich-step { padding: 0 9px; border-bottom: 1px solid alpha(#bdcde2,.4); }
+.reference-shell .reference-rich-step:last-child { border-bottom: 0; }
 window.forge-window.reference-shell .reference-rich-conversation .reference-rich-step label { font-size: 10px; color: #4e647f; }
 window.forge-window.reference-shell .reference-rich-conversation .reference-step-complete label.reference-step-symbol { color: #2ca37d; }
 window.forge-window.reference-shell .reference-rich-conversation .reference-step-running label.reference-step-symbol { color: #6086dc; }
 window.forge-window.reference-shell .reference-rich-conversation .reference-rich-step label.reference-step-elapsed { font-size: 9px; color: #8492a7; }
-.reference-shell .reference-rich-diff { border: 1px solid #cbd9ec; border-radius: 11px; background: #fbfdff; }
+.reference-shell .reference-rich-diff { border: 1px solid #cbd9ec; border-radius: 11px; background: #fbfdff; box-shadow: 0 1px 4px alpha(#243b63, .06); }
 .reference-shell .reference-code-header { padding: 0 9px; border-bottom: 1px solid #d4e0ef; background: #eff4fb; border-radius: 10px 10px 0 0; }
 .reference-shell .reference-code-header button { padding: 0 4px; min-height: 20px; min-width: 20px; }
 window.forge-window.reference-shell .reference-rich-conversation .reference-code-header label { font-size: 10px; color: #647c9d; }
@@ -176,14 +223,25 @@ window.forge-window.reference-shell .reference-rich-inspector .reference-step-co
 window.forge-window.reference-shell .reference-rich-inspector .reference-step-running label.reference-step-symbol { color: #80a9fa; }
 window.forge-window.reference-shell .reference-rich-inspector .reference-step-attention label.reference-step-symbol { color: #e8bb76; }
 .reference-shell .reference-agent-actions { margin: 10px @INSPECTOR_CARD_MARGIN@px 0; }
-.reference-shell .reference-agent-actions button { min-height: 28px; }
+.reference-shell .reference-agent-actions button,
+.reference-shell .reference-session-context button { min-height: 28px; padding: 0 10px; border: 1px solid #344864; border-radius: 7px; background: #20314b; color: #cddbf0; box-shadow: none; transition: background-color 110ms ease, border-color 110ms ease, color 110ms ease; }
+.reference-shell .reference-agent-actions button:not(:disabled):hover,
+.reference-shell .reference-session-context button:not(:disabled):hover { background: #283d6f; border-color: #496bba; color: #eff5ff; }
+.reference-shell .reference-agent-actions button:not(:disabled):active,
+.reference-shell .reference-session-context button:not(:disabled):active { background: #1d2e52; border-color: #3f5da3; }
+.reference-shell .reference-agent-actions button:disabled,
+.reference-shell .reference-session-context button:disabled { background: #172336; border-color: #27364d; color: #6d819e; opacity: 1; filter: none; }
 window.forge-window.reference-shell .reference-agent-actions button label,
-window.forge-window.reference-shell .reference-session-context button label { font-family: "DejaVu Sans", sans-serif; font-size: 10px; font-weight: 400; }
+window.forge-window.reference-shell .reference-session-context button label { font-family: "DejaVu Sans", sans-serif; font-size: 10px; font-weight: 400; color: inherit; }
 .reference-shell .reference-navigation-links { margin-top: 7px; }
-.reference-shell .reference-navigation-link { min-height: 26px; border: none; padding: 0 8px; margin: 0; border-radius: 6px; color: #9eb1cf; background: transparent; }
+.reference-shell .reference-navigation-link { min-height: 26px; border: none; padding: 0 8px; margin: 0; border-radius: 6px; color: #9eb1cf; background: transparent; transition: background-color 110ms ease, color 110ms ease; }
+.reference-shell .reference-navigation-link:hover { color: #d0dff5; background: #1e2f4a; }
+.reference-shell .reference-navigation-link:active { background: #1a2942; }
 .reference-shell .reference-navigation-active { color: #d4e5ff; background: #283d6f; box-shadow: inset -2px 0 #6b97f0; }
+.reference-shell .reference-navigation-active:hover { background: #304982; color: #e8f1ff; }
 .reference-shell .reference-recent-section { margin-top: 14px; }
-.reference-shell .reference-recent-row { padding: 6px 5px; }
+.reference-shell .reference-recent-row { padding: 6px 5px; border-radius: 6px; transition: background-color 110ms ease; }
+.reference-shell .reference-recent-row:hover { background: #1b2a43; }
 window.forge-window.reference-shell .reference-navigation label.reference-recent-title { font-size: 10px; color: #aebfda; }
 window.forge-window.reference-shell .reference-navigation label.reference-recent-detail,
 window.forge-window.reference-shell .reference-navigation label.reference-recent-time,
@@ -195,12 +253,13 @@ window.forge-window.reference-shell .reference-role-header label.reference-messa
 .reference-shell .chat-controls button.flat, .reference-shell .chat-controls menubutton,
 .reference-shell .reference-block-composer button { border: 1px solid #d4e0f0; border-radius: 7px; background: #f7faff; }
 .reference-shell .chat-controls .chat-submit { background: @ACCENT@; }
-.reference-shell .reference-unavailable-tool { border: 1px solid #d4e0f0; border-radius: 7px; background: #f7faff; color: #71829a; }
+.reference-shell .reference-unavailable-tool { border: 1px solid #dde6f3; border-radius: 7px; background: #f2f6fc; color: #8494ac; }
 .reference-shell .reference-unavailable-tool button { border: 0; background: transparent; }
-window.forge-window.reference-shell .reference-unavailable-tool label { color: #71829a; font-family: "DejaVu Sans", sans-serif; font-size: 10px; }
+window.forge-window.reference-shell .reference-unavailable-tool label { color: #8494ac; font-family: "DejaVu Sans", sans-serif; font-size: 10px; }
 window.forge-window.reference-shell .reference-navigation label.reference-space-title { color: #9fb2cd; font-size: 10px; }
 window.forge-window.reference-shell .reference-navigation label.reference-space-unavailable { color: #778da9; font-size: 8px; }
-.reference-shell .reference-rail-selected { background: #273d70; color: #b9d2ff; border-radius: 8px; }
+.reference-shell .reference-rail-selected { background: #273d70; color: #d5e4ff; border-radius: 8px; box-shadow: inset 2px 0 #6b97f0; }
+.reference-shell .reference-rail-selected:hover { background: #2f4884; color: #ebf2ff; }
 
 .reference-shell .reference-toolbar windowcontrols { padding: 0; min-height: 24px; }
 .reference-shell .reference-toolbar windowcontrols button { min-width: 24px; min-height: 24px; padding: 0; margin: 0; border: none; background: transparent; border-radius: 6px; box-shadow: none; }
@@ -218,12 +277,14 @@ window.forge-window.reference-shell .reference-rich-conversation label.reference
 .reference-shell .reference-space-ember { color: #ef9a91; background: #4e3439; }
 .reference-shell .reference-space-frost { color: #8fd1e1; background: #294552; }
 
-.reference-shell .reference-toolbar button.reference-window-control { min-width: 24px; min-height: 24px; padding: 0; margin: 0; border: none; background: transparent; box-shadow: none; }
-.reference-shell .reference-toolbar button.reference-window-control:hover { background: #273955; }
+.reference-shell .reference-toolbar button.reference-window-control { min-width: 24px; min-height: 24px; padding: 0; margin: 0; border: none; background: transparent; box-shadow: none; transition: background-color 110ms ease, color 110ms ease; }
+.reference-shell .reference-toolbar button.reference-window-control:hover { background: #273955; color: #eaf1ff; }
+.reference-shell .reference-toolbar button.reference-window-control:active { background: #1d2d46; }
 .reference-shell .reference-toolbar button.reference-window-control image { -gtk-icon-size: 12px; }
 .reference-shell .reference-local-session { color: #8c9fb9; font-size: 9px; }
-.reference-shell .jump-bottom-fab { background: @ACCENT@; border-color: #7694ed; color: white; box-shadow: 0 3px 9px alpha(#4768af,.2); }
-.reference-shell .jump-bottom-fab:hover { background: #7293f0; }
+.reference-shell .jump-bottom-fab { background: @ACCENT@; border-color: #7694ed; color: white; box-shadow: 0 3px 9px alpha(#4768af,.2); transition: background-color 120ms ease, box-shadow 120ms ease; }
+.reference-shell .jump-bottom-fab:hover { background: #7293f0; box-shadow: 0 4px 12px alpha(#4768af,.30); }
+.reference-shell .jump-bottom-fab:active { background: shade(@ACCENT@, .90); }
 .reference-shell .reference-model-selector { color: #6c7f9b; font-size: 9px; }
 
 window.forge-window.reference-shell .reference-navigation label.reference-status-dot { font-size: 5px; color: #8c9fb9; }
@@ -243,9 +304,19 @@ window.forge-window.reference-shell .reference-quiet-prompt { color:#34517a; }
 window.forge-window.reference-shell .reference-quiet-placeholder { color:#91a0b6; }
 window.forge-window.reference-shell .reference-composer-controls,
 window.forge-window.reference-shell .term-chat-root .reference-composer-controls { margin:0; padding:0 10px; min-height:28px; border:0; background:transparent; }
-window.forge-window.reference-shell .reference-composer-controls button { min-height:24px; padding:0 5px; margin:0; border:1px solid #d4e0f0; border-radius:7px; background:#f7faff; color:#6e829f; font-size:10px; font-weight:400; }
+window.forge-window.reference-shell .reference-composer-controls button { min-height:24px; padding:0 5px; margin:0; border:1px solid #d4e0f0; border-radius:7px; background:#f7faff; color:#6e829f; font-size:10px; font-weight:400; transition: background-color 110ms ease, border-color 110ms ease, color 110ms ease; }
+window.forge-window.reference-shell .reference-composer-controls button:not(:disabled):hover,
+window.forge-window.reference-shell .reference-composer-controls .reference-tools > button:hover,
+window.forge-window.reference-shell .reference-composer-controls .reference-tools > button:checked { background:#eaf1fd; border-color:#aec4e6; color:#2b4266; }
+window.forge-window.reference-shell .reference-composer-controls button:not(:disabled):active,
+window.forge-window.reference-shell .reference-composer-controls .reference-tools > button:active { background:#dce7fb; border-color:#98b3df; }
 window.forge-window.reference-shell .reference-composer-controls .chat-submit { min-height:26px; min-width:26px; padding:0; margin:0; background:@ACCENT@; color:white; border:1px solid #527de0; }
-window.forge-window.reference-shell .reference-composer-controls .chat-stop { margin:0; padding:0; min-height:26px; }
+window.forge-window.reference-shell .reference-composer-controls .chat-submit:not(:disabled):hover { background:shade(@ACCENT@, 1.08); border-color:#4470d8; color:white; }
+window.forge-window.reference-shell .reference-composer-controls .chat-submit:not(:disabled):active { background:shade(@ACCENT@, .92); border-color:#3f68c8; color:white; }
+window.forge-window.reference-shell .reference-composer-controls .chat-submit:disabled { background:alpha(@ACCENT@, .45); border-color:alpha(#527de0, .45); color:alpha(white, .85); }
+window.forge-window.reference-shell .reference-composer-controls .chat-stop { margin:0; padding:0; min-height:26px; background:#fdecee; border-color:#ebb6be; color:#c83e4d; }
+window.forge-window.reference-shell .reference-composer-controls .chat-stop:not(:disabled):hover { background:#fadce0; border-color:#df9aa5; color:#a82d3b; }
+window.forge-window.reference-shell .reference-composer-controls .chat-stop:not(:disabled):active { background:#f5cad0; }
 window.forge-window.reference-shell .reference-composer-controls .reference-tools { min-height:0; padding:0; border:0; background:transparent; }
 window.forge-window.reference-shell .reference-composer-controls .reference-tools > button { min-height:26px; padding:0 6px; margin:0; }
 window.forge-window.reference-shell .reference-composer-controls button:disabled { filter:none; opacity:1; color:#8493a9; }
@@ -253,7 +324,18 @@ window.forge-window.reference-shell .reference-composer-controls button:disabled
 window.forge-window.reference-shell .reference-mode-switch { padding:0; min-height:@MODE_HEIGHT@px; }
 window.forge-window.reference-shell .reference-mode-switch button { min-height:@MODE_HEIGHT@px; min-width:@MODE_MIN_WIDTH@px; padding:0; border-width:0; margin:0; }
 window.forge-window.reference-shell .reference-header-actions { margin:0; padding:0; }
-window.forge-window.reference-shell .reference-canvas-header .reference-header-action { min-width:24px; min-height:24px; padding:0; margin:0; border:0; background:transparent; }
+window.forge-window.reference-shell .reference-canvas-header .reference-header-action { min-width:24px; min-height:24px; padding:0; margin:0; border:0; border-radius:6px; background:transparent; transition: background-color 110ms ease, color 110ms ease; }
+window.forge-window.reference-shell .reference-canvas-header .reference-header-action:not(:disabled):hover { background:#e6eefb; color:#24334b; }
+window.forge-window.reference-shell .reference-canvas-header .reference-header-action:not(:disabled):active { background:#d6e3f8; }
+/* Inline find bar adopts the active canvas tone: light on Chat, dark navy on Block. */
+window.forge-window.reference-shell searchbar > revealer > box { background:#f2f6fe; border-bottom:1px solid #dae3ef; padding:2px 12px; color:#24334b; }
+window.forge-window.reference-shell searchbar searchentry { min-height:26px; background:#ffffff; color:#24334b; caret-color:#24334b; border:1px solid #c5d4e9; border-radius:7px; box-shadow:none; transition: border-color 120ms ease, box-shadow 120ms ease; }
+window.forge-window.reference-shell searchbar searchentry text { color:#24334b; caret-color:#24334b; }
+window.forge-window.reference-shell searchbar searchentry:focus-within { border-color:@ACCENT@; box-shadow:0 0 0 2px alpha(@ACCENT@, .18); }
+window.forge-window.reference-shell searchbar button { min-height:26px; border-radius:6px; border:1px solid #d4e0f0; background:#f8fbff; color:#4f6482; box-shadow:none; transition: background-color 110ms ease, border-color 110ms ease, color 110ms ease; }
+window.forge-window.reference-shell searchbar button:not(:disabled):hover { background:#e6eefb; border-color:#aec4e6; color:#24334b; }
+window.forge-window.reference-shell searchbar button:not(:disabled):active { background:#d6e3f8; }
+window.forge-window.reference-shell searchbar label.dim-label { color:#6c7f9b; opacity:1; }
 window.forge-window.reference-shell .reference-inspector-tabs button { min-width:48px; padding:0; margin:0; }
 window.forge-window.reference-shell .reference-navigation label,
 window.forge-window.reference-shell .reference-navigation button { font-weight:400; }
@@ -277,7 +359,9 @@ window.forge-window.reference-shell .reference-composer-controls .chat-submit { 
 window.forge-window.reference-shell .reference-workspace-selector:disabled { opacity:1; filter:none; }
 window.forge-window.reference-shell .reference-workspace-selector label.reference-workspace-name { color:#c6d4eb; font-size:10px; font-weight:400; }
 window.forge-window.reference-shell .reference-workspace-selector label.reference-workspace-branch { color:#91a2bb; font-size:9px; font-weight:400; }
-window.forge-window.reference-shell .reference-code-header button.reference-code-action { min-height:20px; padding:0 6px; border:1px solid #c5d4e8; border-radius:5px; background:#f8fbff; color:#526b8d; }
+window.forge-window.reference-shell .reference-code-header button.reference-code-action { min-height:20px; padding:0 6px; border:1px solid #c5d4e8; border-radius:5px; background:#f8fbff; color:#526b8d; transition: background-color 110ms ease, border-color 110ms ease, color 110ms ease; }
+window.forge-window.reference-shell .reference-code-header button.reference-code-action:not(:disabled):hover { background:#e8f0fc; border-color:#9cb7de; color:#283f63; }
+window.forge-window.reference-shell .reference-code-header button.reference-code-action:not(:disabled):active { background:#d9e6fa; }
 window.forge-window.reference-shell .reference-code-header button.reference-code-action:disabled { filter:none; opacity:1; color:#8795aa; background:#edf2f8; }
 
 window.forge-window.reference-shell .reference-organism-awake { color:#6fd7a1; font-family:"DejaVu Sans",sans-serif; font-size:9px; }
@@ -285,11 +369,11 @@ window.forge-window.reference-shell .reference-organism-speech { background:rgba
 
 /* The navigation and inspector already paint their one-pixel boundaries.
    Remove only the duplicate outer Paned handles, never terminal split rails. */
-window.forge-window.reference-shell paned.reference-layout-paned > separator { min-width:6px; min-height:0; padding:0; margin:0; border:0; background:#23324a; }
+window.forge-window.reference-shell paned.reference-layout-paned > separator { min-width:6px; min-height:0; padding:0; margin:0; border:0; background:#23324a; transition: background-color 140ms ease; }
 window.forge-window.reference-shell paned.reference-layout-paned > separator:hover,
 window.forge-window.reference-shell paned.reference-layout-paned > separator:active { background:#5c7ef0; }
 window.forge-window.reference-shell paned.reference-layout-paned:focus-visible > separator { background:#5c7ef0; outline:1px solid #b9d2ff; outline-offset:-1px; }
-.reference-drawer-grip { min-width:6px; background:#23324a; }
+.reference-drawer-grip { min-width:6px; background:#23324a; transition: background-color 140ms ease; }
 .reference-drawer-grip:hover, .reference-drawer-grip:active, .reference-drawer-grip:focus-visible { background:#5c7ef0; }
 
 /* Exact default capsule frames come from the shared logical-pixel contract.
@@ -358,7 +442,20 @@ window.forge-window.reference-shell .reference-inspector .file-tree-box label.er
 .reference-shell .reference-inspector .ai-panel .ai-panel-composer { padding: 6px 8px 8px; border-top: 1px solid #253248; }
 .reference-shell .reference-inspector .ai-panel .ai-empty-state { padding: 12px 10px; }
 .reference-shell .reference-inspector .ai-panel .ai-empty-actions { margin-top: 8px; }
-.reference-shell .reference-inspector .ai-panel button { min-height: 24px; min-width: 0; padding: 0 8px; border-radius: 6px; }
+.reference-shell .reference-inspector .ai-panel button,
+.reference-shell .reference-inspector .tasks-panel button { min-height: 24px; min-width: 0; padding: 0 8px; border-radius: 6px; border: 1px solid #324663; background: #1d2d45; color: #cddbf0; box-shadow: none; transition: background-color 110ms ease, border-color 110ms ease, color 110ms ease; }
+.reference-shell .reference-inspector .ai-panel button.flat,
+.reference-shell .reference-inspector .tasks-panel button.flat { border-color: transparent; background: transparent; color: #9eb1ce; }
+.reference-shell .reference-inspector .ai-panel button:not(:disabled):hover,
+.reference-shell .reference-inspector .tasks-panel button:not(:disabled):hover { background: #283d6f; border-color: #496bba; color: #eff5ff; }
+.reference-shell .reference-inspector .ai-panel button:not(:disabled):active,
+.reference-shell .reference-inspector .tasks-panel button:not(:disabled):active { background: #1d2e52; }
+.reference-shell .reference-inspector .ai-panel button.suggested-action:not(:disabled),
+.reference-shell .reference-inspector .tasks-panel button.suggested-action:not(:disabled) { background: @ACCENT@; border-color: @ACCENT@; color: white; }
+.reference-shell .reference-inspector .ai-panel button.suggested-action:not(:disabled):hover,
+.reference-shell .reference-inspector .tasks-panel button.suggested-action:not(:disabled):hover { background: shade(@ACCENT@, 1.08); border-color: shade(@ACCENT@, 1.08); }
+.reference-shell .reference-inspector .ai-panel button:disabled,
+.reference-shell .reference-inspector .tasks-panel button:disabled { background: #172336; border-color: #27364d; color: #6d819e; opacity: 1; filter: none; }
 .reference-shell .reference-inspector .ai-panel button.ai-empty-action { min-height: 28px; }
 .reference-shell .reference-inspector .ai-panel button.ai-chat-header-button,
 .reference-shell .reference-inspector .ai-panel button.ai-send-button,
@@ -366,10 +463,18 @@ window.forge-window.reference-shell .reference-inspector .file-tree-box label.er
 .reference-shell .reference-inspector .ai-panel textview,
 .reference-shell .reference-inspector .ai-panel textview text,
 .reference-shell .reference-inspector .ai-panel .ai-panel-input { background: #101c2e; color: #d4e2f8; caret-color: #d4e2f8; }
-.reference-shell .reference-inspector .ai-panel .ai-panel-input { border: 1px solid #2b3b55; border-radius: 8px; padding: 4px 6px; min-height: 0; }
+.reference-shell .reference-inspector .ai-panel .ai-panel-input { border: 1px solid #2b3b55; border-radius: 8px; padding: 4px 6px; min-height: 0; transition: border-color 120ms ease, box-shadow 120ms ease; }
+.reference-shell .reference-inspector .ai-panel .ai-panel-input:focus-within { border-color: @ACCENT@; box-shadow: 0 0 0 1px alpha(@ACCENT@, .28); }
 .reference-shell .reference-inspector .ai-panel entry,
-.reference-shell .reference-inspector .ai-panel searchentry { min-height: 22px; border: 1px solid #2b3b55; border-radius: 6px; background: #101c2e; color: #b5c5df; }
-.reference-shell .reference-inspector .ai-panel .card { background: @INSPECTOR_CARD@; border: 1px solid #314056; border-radius: 8px; padding: 8px; }
+.reference-shell .reference-inspector .ai-panel searchentry,
+.reference-shell .reference-inspector .tasks-panel entry,
+.reference-shell .reference-inspector .tasks-panel searchentry { min-height: 22px; border: 1px solid #2b3b55; border-radius: 6px; background: #101c2e; color: #b5c5df; caret-color: #d4e2f8; transition: border-color 120ms ease, box-shadow 120ms ease; }
+.reference-shell .reference-inspector .ai-panel entry:focus-within,
+.reference-shell .reference-inspector .ai-panel searchentry:focus-within,
+.reference-shell .reference-inspector .tasks-panel entry:focus-within,
+.reference-shell .reference-inspector .tasks-panel searchentry:focus-within { border-color: @ACCENT@; box-shadow: 0 0 0 1px alpha(@ACCENT@, .28); }
+.reference-shell .reference-inspector .ai-panel .card,
+.reference-shell .reference-inspector .tasks-panel .card { background: @INSPECTOR_CARD@; border: 1px solid #314056; border-radius: 8px; padding: 8px; }
 .reference-shell .reference-inspector .ai-panel .ai-context-chip { padding: 0 6px; border: 1px solid #344864; border-radius: 6px; background: #19283c; }
 .reference-shell .reference-inspector .ai-panel scrolledwindow,
 .reference-shell .reference-inspector .ai-panel viewport,
@@ -398,18 +503,21 @@ window.forge-window.reference-shell banner.reference-config-banner label { font-
 window.forge-window.reference-shell banner.reference-config-banner button label { font-size: 10px; color: #ff9b9f; }
 
 /* Eva is a native toolbar control, with its own allocated hit area. */
-menubutton.eva-companion-dock > button { min-height:26px; min-width:36px; padding:0 8px; border:1px solid #344864; border-radius:6px; background:#19283c; color:#d5deec; box-shadow:none; }
-menubutton.eva-companion-dock > button:hover, menubutton.eva-companion-dock > button:checked { background:#283d6f; color:#eff4ff; }
+menubutton.eva-companion-dock > button { min-height:26px; min-width:36px; padding:0 8px; border:1px solid #344864; border-radius:6px; background:#19283c; color:#d5deec; box-shadow:none; transition: background-color 110ms ease, border-color 110ms ease, color 110ms ease; }
+menubutton.eva-companion-dock > button:hover, menubutton.eva-companion-dock > button:checked { background:#283d6f; border-color:#496bba; color:#eff4ff; }
+menubutton.eva-companion-dock > button:active { background:#1f3159; }
 menubutton.eva-companion-dock label { color:inherit; font-size:11px; }
 .eva-companion-card { padding:8px; }
 
 /* Agent workspace: stable native navigation beside the central transcript. */
 .agent-workspace-navigation searchentry, .agent-workspace-navigation searchentry text { font-family: "DejaVu Sans", sans-serif; font-size: 12px; min-width: 0; }
-.agent-workspace-navigation button, .agent-workspace-navigation menubutton > button { min-width: 0; min-height: 24px; padding: 2px 5px; }
+.agent-workspace-navigation button, .agent-workspace-navigation menubutton > button { min-width: 0; min-height: 24px; padding: 2px 5px; border-radius: 6px; transition: background-color 110ms ease, color 110ms ease; }
 .agent-workspace-navigation button label, .agent-workspace-navigation label { font-family: "DejaVu Sans", sans-serif; font-size: 10px; }
 .agent-workspace-navigation .navigation-sidebar { background: transparent; }
-.agent-workspace-navigation .navigation-sidebar row { border-radius: 7px; margin: 2px 0; padding: 0; }
+.agent-workspace-navigation .navigation-sidebar row { border-radius: 7px; margin: 2px 0; padding: 0; transition: background-color 110ms ease; }
+.agent-workspace-navigation .navigation-sidebar row:hover { background: #1d2d47; }
 .agent-workspace-navigation .navigation-sidebar row.active-conversation { background: #263c63; }
+.agent-workspace-navigation .navigation-sidebar row.active-conversation:hover { background: #2e4876; }
 .agent-workspace-navigation .navigation-sidebar row:selected { outline: 1px solid #7d9ff1; outline-offset: -1px; }
 .agent-workspace-navigation .navigation-sidebar row label { font-size: 11px; }
 .agent-workspace-navigation .navigation-sidebar row label.dim-label { font-size: 9px; color: #92a6c3; }
@@ -419,8 +527,11 @@ menubutton.eva-companion-dock label { color:inherit; font-size:11px; }
 .reference-shell .reference-central .ai-panel label.dim-label, .reference-shell .reference-central .ai-panel label.caption, .reference-shell .reference-central .ai-panel label.ai-panel-subtitle { color: #91a5c1; font-size: 11px; }
 .reference-shell .reference-central .ai-panel .ai-panel-header { padding: 12px 16px; border-bottom: 1px solid #2a3a52; }
 .reference-shell .reference-central .ai-panel textview, .reference-shell .reference-central .ai-panel textview text { background: #101927; color: #d4e2f8; caret-color: #d4e2f8; font-size: 13px; }
-.reference-shell .reference-central .ai-panel .ai-panel-input, .reference-shell .reference-central .ai-panel .ai-panel-entry { background: #16243a; border: 1px solid #354a6b; border-radius: 10px; }
-.reference-shell .reference-central .ai-panel button { min-height: 28px; min-width: 0; padding: 3px 9px; border-radius: 7px; }
+.reference-shell .reference-central .ai-panel .ai-panel-input, .reference-shell .reference-central .ai-panel .ai-panel-entry { background: #16243a; border: 1px solid #354a6b; border-radius: 10px; transition: border-color 120ms ease, box-shadow 120ms ease; }
+.reference-shell .reference-central .ai-panel .ai-panel-input:focus-within, .reference-shell .reference-central .ai-panel .ai-panel-entry:focus-within { border-color: @ACCENT@; box-shadow: 0 0 0 2px alpha(@ACCENT@, .22); }
+.reference-shell .reference-central .ai-panel button { min-height: 28px; min-width: 0; padding: 3px 9px; border-radius: 7px; transition: background-color 110ms ease, border-color 110ms ease, color 110ms ease; }
+.reference-shell .reference-central .ai-panel button:not(.suggested-action):not(.destructive-action):not(:disabled):hover { background: #233658; border-color: #496bba; }
+.reference-shell .reference-central .ai-panel button:not(.suggested-action):not(.destructive-action):not(:disabled):active { background: #1b2c49; }
 .reference-shell .reference-central .ai-panel .ai-empty-state { padding: 28px; }
 .reference-shell .reference-central .ai-panel .ai-panel-composer { padding: 12px 16px; border-top: 1px solid #2a3a52; }
 
@@ -432,9 +543,12 @@ menubutton.eva-companion-dock label { color:inherit; font-size:11px; }
 .workspace-surface label { color:#d4e2f8; }
 .workspace-surface label.dim-label { color:#91a5c1; }
 .workspace-surface textview,.workspace-surface textview text { background:#101c2e; color:#d4e2f8; caret-color:#d4e2f8; font-size:13px; }
-.workspace-surface textview.workspace-material-editor { border:1px solid #354a6b; border-radius:8px; }
+.workspace-surface textview.workspace-material-editor { border:1px solid #354a6b; border-radius:8px; transition: border-color 120ms ease, box-shadow 120ms ease; }
+.workspace-surface textview.workspace-material-editor:focus-within { border-color:@ACCENT@; box-shadow:0 0 0 2px alpha(@ACCENT@, .22); }
 .workspace-surface textview text selection { background:#385a96; color:#ffffff; }
-.workspace-surface entry,.workspace-surface searchentry,.workspace-surface dropdown > button { background:#16243a; color:#d4e2f8; caret-color:#d4e2f8; border-color:#354a6b; }
-.workspace-surface button:not(.suggested-action):not(.destructive-action) { background:#19283c; color:#d4e2f8; border-color:#354a6b; }
-.workspace-surface button:not(.suggested-action):not(.destructive-action):hover { background:#283d6f; }
+.workspace-surface entry,.workspace-surface searchentry,.workspace-surface dropdown > button { background:#16243a; color:#d4e2f8; caret-color:#d4e2f8; border-color:#354a6b; border-radius:7px; transition: border-color 120ms ease, box-shadow 120ms ease, background-color 110ms ease; }
+.workspace-surface entry:focus-within,.workspace-surface searchentry:focus-within { border-color:@ACCENT@; box-shadow:0 0 0 2px alpha(@ACCENT@, .22); }
+.workspace-surface button:not(.suggested-action):not(.destructive-action) { background:#19283c; color:#d4e2f8; border-color:#354a6b; border-radius:7px; transition: background-color 110ms ease, border-color 110ms ease, color 110ms ease; }
+.workspace-surface button:not(.suggested-action):not(.destructive-action):not(:disabled):hover { background:#283d6f; border-color:#496bba; }
+.workspace-surface button:not(.suggested-action):not(.destructive-action):not(:disabled):active { background:#1f3159; }
 .workspace-surface scrolledwindow,.workspace-surface viewport { background:transparent; }

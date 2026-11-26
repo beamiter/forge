@@ -1074,6 +1074,7 @@ pub(crate) fn block_css(config: &Config) -> String {
             min-width: 6px;
             border-radius: 4px;
             background-color: rgba({fg_r},{fg_g},{fg_b},0.38);
+            transition: background-color 120ms ease;
         }}
         .block-output-scrollbar slider:hover {{
             background-color: rgba({acc_r},{acc_g},{acc_b},0.78);
@@ -1165,6 +1166,7 @@ pub(crate) fn block_css(config: &Config) -> String {
             min-height: 24px;
             padding: 0 4px;
             border-radius: 6px;
+            transition: background-color 110ms ease, color 110ms ease;
         }}
         .block-review-button:hover {{
             background-color: rgba({fg_r},{fg_g},{fg_b},0.08);
@@ -1219,6 +1221,11 @@ pub(crate) fn block_css(config: &Config) -> String {
             border-radius: 6px;
             font-family: {font_stack};
             font-size: 0.8em;
+            transition: background-color 110ms ease, color 110ms ease;
+        }}
+        .block-filter-toggle:not(:checked):hover {{
+            color: {fg_hex};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.10);
         }}
         .block-filter-toggle:checked {{
             color: {fg_hex};
@@ -1266,6 +1273,7 @@ pub(crate) fn block_css(config: &Config) -> String {
             font-size: 0.82em;
             padding: 2px 4px;
             border-radius: 5px;
+            transition: background-color 110ms ease, color 110ms ease;
         }}
         .block-output-summary:hover {{
             color: {accent};
@@ -1459,6 +1467,10 @@ pub(crate) fn block_css(config: &Config) -> String {
         .command-palette-list row {{
             padding: 0;
             border-radius: 6px;
+            transition: background-color 100ms ease;
+        }}
+        .command-palette-list row:not(:selected):hover {{
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.07);
         }}
         .command-palette-list row:selected {{
             background-color: rgba({acc_r},{acc_g},{acc_b},0.28);
