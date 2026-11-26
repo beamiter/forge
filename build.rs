@@ -37,11 +37,18 @@ fn nix_module_paths(store: &Path) -> Vec<PathBuf> {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rustc-check-cfg=cfg(forge_shared_terminal)");
-    println!("cargo:rerun-if-env-changed=JTERM_FORGE_SHARED_TERMINAL");
-    if env::var_os("CARGO_FEATURE_SHARED_TERMINAL").is_some()
-        || env::var("JTERM_FORGE_SHARED_TERMINAL").as_deref() == Ok("1")
-    {
+    println!("cargo:rustc-check-cfg=cfg(forge_legacy_renderer)");
+    println!("cargo:rustc-check-cfg=cfg(forge_vte_oracle)");
+    let oracle = env::var_os("CARGO_FEATURE_VTE_ORACLE").is_some();
+    if oracle {
+        println!("cargo:rustc-cfg=forge_vte_oracle");
+    }
+    let shared_terminal = !oracle || env::var_os("CARGO_FEATURE_SHARED_TERMINAL").is_some();
+    if shared_terminal {
         println!("cargo:rustc-cfg=forge_shared_terminal");
+    }
+    if oracle && (!shared_terminal || env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux")) {
+        println!("cargo:rustc-cfg=forge_legacy_renderer");
     }
     for name in [
         "FCITX5_GTK_PATH",

@@ -7,6 +7,7 @@
 
 use gtk4::prelude::*;
 use gtk4::{Paned, Widget};
+#[cfg(any(test, forge_legacy_renderer))]
 use vte4::Terminal;
 
 use super::PaneLeaf;
@@ -67,6 +68,7 @@ impl PaneNode {
             .or_else(|| self.first_leaf())
     }
 
+    #[cfg(any(test, forge_legacy_renderer))]
     pub(crate) fn active_terminal(&self) -> Option<Terminal> {
         self.active_leaf()
             .and_then(|controller| controller.terminal().cloned())

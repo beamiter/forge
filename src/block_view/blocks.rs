@@ -1,4 +1,4 @@
-//! blocks — finished-block widgets (VTE-backed) and the live ActiveBlock.
+//! Finished command documents and the live ActiveBlock.
 use super::bounded_bytes::BoundedByteRing;
 use super::*;
 use crate::config::Config;
@@ -9,7 +9,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
+#[cfg(any(test, forge_legacy_renderer))]
 use vte4::Terminal;
+#[cfg(any(test, forge_legacy_renderer))]
 use vte4::TerminalExt;
 
 /// A compact native reveal target. The preview is display-only and ellipsized;
@@ -756,6 +758,7 @@ pub(crate) struct FinishedBlock {
     compact: Rc<Cell<bool>>,
     pub(crate) prompt_text: String,
     /// Read-only VTE displaying the executed command when the card has one.
+    #[cfg(any(test, forge_legacy_renderer))]
     pub(crate) command_vte: Option<vte4::Terminal>,
     #[cfg(forge_shared_terminal)]
     pub(crate) command_document: Option<jterm_gtk_view::FinishedTextView>,
@@ -763,6 +766,7 @@ pub(crate) struct FinishedBlock {
     /// Read-only VTE displaying captured output. A block never grows past the
     /// space its pane can show at once: longer output keeps private VTE
     /// scrollback, reachable through `output_scrollbar`.
+    #[cfg(any(test, forge_legacy_renderer))]
     pub(crate) output_vte: Option<vte4::Terminal>,
     #[cfg(forge_shared_terminal)]
     pub(crate) output_document: Option<jterm_gtk_view::FinishedOutputView>,
@@ -834,6 +838,7 @@ pub(crate) struct FinishedBlock {
     restore_live_focus: LateBoundAction,
     /// Re-fit the output to the pane's current height. See
     /// [`FinishedBlock::refit_output_to_viewport`].
+    #[cfg(any(test, forge_legacy_renderer))]
     refit_output: Rc<dyn Fn() -> Option<i32>>,
     /// Cost cache for deriving wrapped rows from the displayed transcript.
     /// Kept separate from the render stamp because equal row counts do not
@@ -882,10 +887,12 @@ impl Clone for FinishedBlock {
             virtualized: self.virtualized.clone(),
             compact: self.compact.clone(),
             prompt_text: self.prompt_text.clone(),
+            #[cfg(any(test, forge_legacy_renderer))]
             command_vte: self.command_vte.clone(),
             #[cfg(forge_shared_terminal)]
             command_document: self.command_document.clone(),
             command_row: self.command_row.clone(),
+            #[cfg(any(test, forge_legacy_renderer))]
             output_vte: self.output_vte.clone(),
             #[cfg(forge_shared_terminal)]
             output_document: self.output_document.clone(),
@@ -915,6 +922,7 @@ impl Clone for FinishedBlock {
             collapsed_summary: self.collapsed_summary.clone(),
             filtered_out: self.filtered_out.clone(),
             restore_live_focus: self.restore_live_focus.clone(),
+            #[cfg(any(test, forge_legacy_renderer))]
             refit_output: self.refit_output.clone(),
             visual_rows_cache: self.visual_rows_cache.clone(),
             render_stamp: self.render_stamp.clone(),
@@ -1121,7 +1129,10 @@ fn filtered_output_override(full: &str, shown: std::borrow::Cow<'_, str>) -> Opt
 }
 
 fn output_row_count(text: &str) -> i64 {
-    let text = output_display_text(text);
+    literal_output_row_count(&output_display_text(text))
+}
+
+fn literal_output_row_count(text: &str) -> i64 {
     if text.is_empty() {
         1
     } else {
@@ -1485,6 +1496,7 @@ fn fitted_output_rows_for_viewport(
         .min(output_rows)
 }
 
+#[cfg(any(test, forge_legacy_renderer))]
 fn fitted_output_rows_for_widget(
     vte: &vte4::Terminal,
     fallback_rows: i64,
@@ -1514,6 +1526,7 @@ fn fitted_output_rows_for_widget(
 /// keep the recorded columns so restored output preserves its original line
 /// breaks. Falls back to the recorded columns while the widget has no
 /// allocation yet (first map), where the settle pass corrects any residue.
+#[cfg(any(test, forge_legacy_renderer))]
 fn effective_render_cols(vte: &vte4::Terminal, recorded_cols: i64) -> i64 {
     clamp_render_cols(recorded_cols, vte.width() as i64, vte.char_width())
 }
@@ -1925,6 +1938,7 @@ fn finished_snapshot_stream(display_text: &str) -> Vec<u8> {
     stream
 }
 
+#[cfg(any(test, forge_legacy_renderer))]
 fn hide_chat_snapshot_cursor(vte: &vte4::Terminal) {
     if vte.has_css_class("chat-command-terminal")
         || vte.has_css_class("chat-output-terminal")
@@ -2036,6 +2050,7 @@ fn stamp_change_needs_refeed(previous: RenderStamp, next: RenderStamp) -> bool {
 /// generous limit first so no `set_size` in either direction can trim the ring,
 /// then settle on the real one, which keeps screen + scrollback at exactly the
 /// same total the feed path left behind.
+#[cfg(any(test, forge_legacy_renderer))]
 fn rewindow_finished_vte(
     vte: &vte4::Terminal,
     cols: i64,
@@ -2077,6 +2092,7 @@ fn rewindow_finished_vte(
 
 // Keep the existing geometry arguments explicit; render_state only tracks ownership.
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn render_bytes_into_finished_vte(
     vte: &vte4::Terminal,
     text: &str,
@@ -2468,6 +2484,7 @@ impl FinishedBlock {
         let max_expanded_cap = (config.finished_block_max_expanded_rows as i64)
             .max(fallback_viewport_cap)
             .max(3);
+        #[cfg(any(test, forge_legacy_renderer))]
         let current_viewport_cap = Rc::new(Cell::new(viewport_cap));
         let long_output = output_rows > viewport_cap;
         // The row count above is the only walk this constructor needs. The
@@ -2491,6 +2508,7 @@ impl FinishedBlock {
         )));
         let virtualized = Rc::new(Cell::new(false));
         let compact = Rc::new(Cell::new(config.block_compact));
+        #[cfg(any(test, forge_legacy_renderer))]
         let capture_rows = output_rows
             .max(config.truncation_threshold_lines as i64)
             .max(4096);
@@ -2901,9 +2919,10 @@ impl FinishedBlock {
 
         // ── VTE-rendered command + output ─────────────────────────────────
         // Command VTE: full-height read-only renderer for the executed command.
+        #[cfg(any(test, forge_legacy_renderer))]
         let cmd_rows = cmd_bytes.iter().filter(|&&b| b == b'\n').count() as i64 + 1;
         #[cfg(forge_shared_terminal)]
-        let command_document = if precomputed.document_command && !is_background {
+        let command_document = if !is_background && (precomputed.document_command || !cfg!(test)) {
             let font = crate::font::terminal_font_description(&config.font_desc, config);
             let foreground = super::developer_block::terminal_foreground();
             let archive = cmd_ansi.and_then(|capture| {
@@ -2913,7 +2932,7 @@ impl FinishedBlock {
                 Some(archive) => jterm_gtk_view::FinishedTextView::archived_command(
                     &display_cmd,
                     &archive,
-                    font,
+                    font.clone(),
                     config.default_font_scale,
                     foreground,
                     &config.palette,
@@ -2921,26 +2940,36 @@ impl FinishedBlock {
                 None => jterm_gtk_view::FinishedTextView::command(
                     &display_cmd,
                     &cmd_bytes,
-                    font,
+                    font.clone(),
                     config.default_font_scale,
                     foreground,
                     &config.palette,
                 ),
             };
-            command.inspect(|command| {
-                command.set_terminal_background(super::developer_block::terminal_background());
-                command.install_links(crate::ui::shared_terminal::SharedTerminal::document_links());
-            })
+            let command = command.unwrap_or_else(|| {
+                jterm_gtk_view::FinishedTextView::plain_command(
+                    &display_cmd,
+                    font,
+                    config.default_font_scale,
+                    foreground,
+                    &config.palette,
+                )
+            });
+            command.set_terminal_background(super::developer_block::terminal_background());
+            command.install_links(crate::ui::shared_terminal::SharedTerminal::document_links());
+            Some(command)
         } else {
             None
         };
-        #[cfg(forge_shared_terminal)]
+        #[cfg(all(forge_shared_terminal, any(test, forge_legacy_renderer)))]
         let uses_command_vte = !is_background && command_document.is_none();
         #[cfg(not(forge_shared_terminal))]
         let uses_command_vte = !is_background;
+        #[cfg(any(test, forge_legacy_renderer))]
         let command_vte = uses_command_vte.then(|| {
             create_finished_terminal(config, cols, cmd_rows.max(1), cmd_rows.max(1), false)
         });
+        #[cfg(any(test, forge_legacy_renderer))]
         let command_render_cols = Rc::new(Cell::new(0_i64));
         // Defer feeds until the widget is actually mapped — VTE's internal
         // grid resize from set_size() doesn't take effect until the widget is
@@ -2948,6 +2977,7 @@ impl FinishedBlock {
         // width (the ls-output misalignment bug). connect_map fires once the
         // widget has been allocated, when the grid actually matches set_size.
         // One-shot: re-mapping during scroll must not re-feed.
+        #[cfg(any(test, forge_legacy_renderer))]
         if let Some(command_vte) = &command_vte {
             let cmd_bytes_for_map = cmd_bytes.clone();
             let cols_for_map = cols.max(1);
@@ -2995,21 +3025,45 @@ impl FinishedBlock {
         let full_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
         let displayed_output: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         #[cfg(forge_shared_terminal)]
-        let output_archive =
-            if precomputed.document_output && (precomputed.document_command || is_background) {
-                precomputed.finished_document.clone().or_else(|| {
-                    FinishedDocument::capture(output, (cols.clamp(1, u16::MAX as i64) as u16, 0))
-                        .map(Arc::new)
-                })
-            } else {
-                None
-            };
+        let (output_archive, output_projection_clipped, output_projection_notice) = if !cfg!(test)
+            || (precomputed.document_output && (precomputed.document_command || is_background))
+        {
+            match precomputed.finished_document.clone() {
+                Some(document) => {
+                    let notice = document.projection_notice();
+                    (Some(document), false, notice)
+                }
+                None => {
+                    let projection = FinishedDocument::project_for_display(
+                        output,
+                        (cols.clamp(1, u16::MAX as i64) as u16, 0),
+                    );
+                    let notice = projection.notice();
+                    (
+                        Some(Arc::new(projection.document)),
+                        projection.clipped,
+                        notice,
+                    )
+                }
+            }
+        } else {
+            (None, false, None)
+        };
         #[cfg(forge_shared_terminal)]
         let stripped_output = output_archive
             .as_ref()
+            .filter(|_| !output_projection_clipped)
             .map(|document| document.archive.text.clone());
         #[cfg(not(forge_shared_terminal))]
         let stripped_output = None;
+        #[cfg(forge_shared_terminal)]
+        let has_copyable_output = output_archive.as_ref().map_or(has_output, |document| {
+            (output_projection_clipped && has_output) || !document.archive.text.trim().is_empty()
+        });
+        #[cfg(not(forge_shared_terminal))]
+        let has_copyable_output = has_output;
+        #[cfg(forge_shared_terminal)]
+        let has_output = has_copyable_output || output_projection_notice.is_some();
         #[cfg(forge_shared_terminal)]
         let output_document = output_archive.as_deref().map(|document| {
             let output = jterm_gtk_view::FinishedTextView::output(
@@ -3026,12 +3080,21 @@ impl FinishedBlock {
             }
             output.set_terminal_background(super::developer_block::terminal_background());
             output.install_links(crate::ui::shared_terminal::SharedTerminal::document_links());
-            jterm_gtk_view::FinishedOutputView::new(output, fallback_viewport_cap, max_expanded_cap)
+            let output = jterm_gtk_view::FinishedOutputView::new(
+                output,
+                fallback_viewport_cap,
+                max_expanded_cap,
+            );
+            output.set_projection_notice(output_projection_notice);
+            output
         });
-        #[cfg(forge_shared_terminal)]
+        #[cfg(all(forge_shared_terminal, any(test, forge_legacy_renderer)))]
         let uses_output_vte = output_document.is_none();
+        #[cfg(not(any(test, forge_legacy_renderer)))]
+        let uses_output_vte = false;
         #[cfg(not(forge_shared_terminal))]
         let uses_output_vte = true;
+        #[cfg(any(test, forge_legacy_renderer))]
         let output_vte = uses_output_vte.then(|| {
             let output_vte =
                 create_finished_terminal(config, cols, output_rows, viewport_cap, false);
@@ -3045,6 +3108,7 @@ impl FinishedBlock {
         });
         // Tracks whether the user has toggled this block to its complete height.
         // The default cap is recomputed whenever virtualization remaps the card.
+        #[cfg(any(test, forge_legacy_renderer))]
         let expanded: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         // Identity of the snapshot most recently fed into the output VTE.
         // Virtualization
@@ -3056,6 +3120,7 @@ impl FinishedBlock {
         // the self-sustaining flicker loop on narrow panes. Cols start at 0
         // (below any real value) so the first map always renders.
         let render_stamp = Rc::new(RenderStampState::new(NEUTRAL_RENDER_STAMP));
+        #[cfg(any(test, forge_legacy_renderer))]
         if let Some(output_vte) = &output_vte {
             let render_stamp = Rc::downgrade(&render_stamp);
             output_vte.connect_contents_changed(move |_| {
@@ -3077,12 +3142,15 @@ impl FinishedBlock {
             let command_document_for_font = command_document.clone();
             #[cfg(forge_shared_terminal)]
             let output_document_for_font = output_document.clone();
+            #[cfg(any(test, forge_legacy_renderer))]
             let command_vte_for_font = command_vte.as_ref().map(ObjectExt::downgrade);
+            #[cfg(any(test, forge_legacy_renderer))]
             let output_vte_for_font = output_vte.as_ref().map(ObjectExt::downgrade);
             content.connect_map(move |_| {
                 let Some(scale) = pending.take() else {
                     return;
                 };
+                #[cfg(any(test, forge_legacy_renderer))]
                 if let Some(vte) = command_vte_for_font
                     .as_ref()
                     .and_then(glib::WeakRef::upgrade)
@@ -3097,6 +3165,7 @@ impl FinishedBlock {
                 if let Some(output) = &output_document_for_font {
                     output.set_font_scale(scale);
                 }
+                #[cfg(any(test, forge_legacy_renderer))]
                 if let Some(vte) = output_vte_for_font
                     .as_ref()
                     .and_then(glib::WeakRef::upgrade)
@@ -3116,6 +3185,7 @@ impl FinishedBlock {
             displayed_generation: 0,
             rows: output_rows,
         })));
+        #[cfg(any(test, forge_legacy_renderer))]
         if let Some(output_vte) = &output_vte {
             let cols_for_map = cols.max(1);
             let fallback_cap_for_map = viewport_cap;
@@ -3195,6 +3265,7 @@ impl FinishedBlock {
         // Geometry is finalized on map, so install the handler for every
         // block and let the map callback decide whether expansion is useful.
         expand_btn.set_visible(uses_output_vte && (long_output));
+        #[cfg(any(test, forge_legacy_renderer))]
         if let Some(output_vte) = &output_vte {
             let expand_for_btn = expanded.clone();
             let output_vte_for_btn = output_vte.downgrade();
@@ -3281,7 +3352,9 @@ impl FinishedBlock {
         // cards that are already on screen. It reports the card's new height so
         // the caller can keep virtualization metadata in step, and `None` when
         // the pane's geometry left this block's cap unchanged.
+        #[cfg(any(test, forge_legacy_renderer))]
         let refit_output: Rc<dyn Fn() -> Option<i32>> = {
+            #[cfg(any(test, forge_legacy_renderer))]
             let output_vte = output_vte.as_ref().map(ObjectExt::downgrade);
             let command_vte = command_vte.as_ref().map(ObjectExt::downgrade);
             let command_bytes = cmd_bytes.clone();
@@ -3436,6 +3509,7 @@ impl FinishedBlock {
         chevron.add_css_class("block-prompt-chevron");
         chevron.set_valign(gtk4::Align::Start);
         cmd_row.append(&chevron);
+        #[cfg(any(test, forge_legacy_renderer))]
         if let Some(command_vte) = &command_vte {
             cmd_row.append(command_vte);
         }
@@ -3452,6 +3526,7 @@ impl FinishedBlock {
         let output_box = gtk4::Box::new(Orientation::Horizontal, 0);
         output_box.set_hexpand(true);
         output_box.set_margin_start(BLOCK_GUTTER_PX);
+        #[cfg(any(test, forge_legacy_renderer))]
         if let Some(terminal) = &output_vte {
             output_box.append(terminal);
         }
@@ -3459,6 +3534,9 @@ impl FinishedBlock {
         if let Some(output) = &output_document {
             output_box.append(output.widget());
         }
+        #[cfg(not(any(test, forge_legacy_renderer)))]
+        let output_adjustment: Option<gtk4::Adjustment> = None;
+        #[cfg(any(test, forge_legacy_renderer))]
         let output_adjustment = output_vte
             .as_ref()
             .and_then(|terminal| terminal.vadjustment());
@@ -3548,6 +3626,7 @@ impl FinishedBlock {
         collapsed_summary.set_visible(false);
         content.append(&collapsed_summary);
 
+        #[cfg(any(test, forge_legacy_renderer))]
         if let Some(terminal) = &output_vte {
             crate::terminal::setup_terminal_click_handler(terminal);
         }
@@ -3556,8 +3635,10 @@ impl FinishedBlock {
         // Output-only controls are noise for commands such as `cd`,
         // `mkdir`, and successful redirects. Image-only commands (`kitten
         // icat`) still keep the collapse chevron so their Pictures fold away.
-        copy_output_btn.set_visible(has_output);
-        filter_btn.set_visible(has_output);
+        copy_output_btn.set_visible(has_copyable_output);
+        copy_output_btn.set_sensitive(has_copyable_output);
+        filter_btn.set_visible(has_copyable_output);
+        filter_btn.set_sensitive(has_copyable_output);
         collapse_btn.set_visible(has_output || has_images);
         if !has_output {
             output_widget.set_visible(false);
@@ -3652,13 +3733,16 @@ impl FinishedBlock {
                 Rc<dyn Fn()>,
             );
             type FilterRowBuilder = dyn Fn(&gtk4::Box, &gtk4::Widget) -> Option<FilterRowHandles>;
+            #[cfg(any(test, forge_legacy_renderer))]
             let output_vte = output_vte.as_ref().map(ObjectExt::downgrade);
             #[cfg(forge_shared_terminal)]
             let output_document = output_document.clone();
             #[cfg(forge_shared_terminal)]
             let output_archive = output_archive.clone();
+            #[cfg(any(test, forge_legacy_renderer))]
             let expand_btn = expand_btn.downgrade();
             let filter_btn_weak = filter_btn.downgrade();
+            #[cfg(any(test, forge_legacy_renderer))]
             let jump_bottom_btn = jump_bottom_btn.downgrade();
             let collapsed_summary = collapsed_summary.downgrade();
             let original_preview = original_preview.clone();
@@ -3668,7 +3752,9 @@ impl FinishedBlock {
                 let filter_btn = filter_btn_weak.clone();
                 let full_output = full_output.clone();
                 let displayed_output = displayed_output.clone();
+                #[cfg(any(test, forge_legacy_renderer))]
                 let expanded = expanded.clone();
+                #[cfg(any(test, forge_legacy_renderer))]
                 let current_viewport_cap = current_viewport_cap.clone();
                 let filter_enabled = filter_enabled.clone();
                 let render_stamp = render_stamp.clone();
@@ -3745,6 +3831,7 @@ impl FinishedBlock {
                     content.reorder_child_after(&filter_row, Some(cmd_row));
 
                     let apply = {
+                        #[cfg(any(test, forge_legacy_renderer))]
                         let output_vte = output_vte.clone();
                         #[cfg(forge_shared_terminal)]
                         let output_document = output_document.clone();
@@ -3759,16 +3846,21 @@ impl FinishedBlock {
                         let invert_tg = invert_tg.downgrade();
                         let ctx_spin = ctx_spin.downgrade();
                         let filter_status = filter_status.downgrade();
+                        #[cfg(any(test, forge_legacy_renderer))]
                         let expand_btn = expand_btn.clone();
+                        #[cfg(any(test, forge_legacy_renderer))]
                         let expanded = expanded.clone();
+                        #[cfg(any(test, forge_legacy_renderer))]
                         let current_viewport_cap = current_viewport_cap.clone();
                         let render_stamp = render_stamp.clone();
                         let displayed_generation = displayed_generation.clone();
                         let visual_rows_cache = visual_rows_cache.clone();
                         let filter_btn = filter_btn.clone();
+                        #[cfg(any(test, forge_legacy_renderer))]
                         let jump_bottom_btn = jump_bottom_btn.clone();
                         let collapsed_summary = collapsed_summary.clone();
                         let original_preview = original_preview.clone();
+                        #[cfg(any(test, forge_legacy_renderer))]
                         let max_expanded_cap_for_filter = max_expanded_cap;
                         move || {
                             let (
@@ -3778,9 +3870,7 @@ impl FinishedBlock {
                                 Some(invert_tg),
                                 Some(ctx_spin),
                                 Some(filter_status),
-                                Some(expand_btn),
                                 Some(filter_btn),
-                                Some(jump_bottom_btn),
                                 Some(collapsed_summary),
                             ) = (
                                 filter_entry.upgrade(),
@@ -3789,11 +3879,15 @@ impl FinishedBlock {
                                 invert_tg.upgrade(),
                                 ctx_spin.upgrade(),
                                 filter_status.upgrade(),
-                                expand_btn.upgrade(),
                                 filter_btn.upgrade(),
-                                jump_bottom_btn.upgrade(),
                                 collapsed_summary.upgrade(),
                             )
+                            else {
+                                return;
+                            };
+                            #[cfg(any(test, forge_legacy_renderer))]
+                            let (Some(expand_btn), Some(jump_bottom_btn)) =
+                                (expand_btn.upgrade(), jump_bottom_btn.upgrade())
                             else {
                                 return;
                             };
@@ -3847,9 +3941,17 @@ impl FinishedBlock {
                                 Some(Err(_)) => (None, true),
                                 None => filter_raw(),
                             };
-                            let full_rows = output_row_count(full_text);
+                            #[cfg(not(forge_shared_terminal))]
+                            let count_rows = output_row_count;
+                            #[cfg(forge_shared_terminal)]
+                            let count_rows = if output_archive.is_some() {
+                                literal_output_row_count
+                            } else {
+                                output_row_count
+                            };
+                            let full_rows = count_rows(full_text);
                             let shown = resolved_finished_output(full_text, &display_override);
-                            let shown_rows = output_row_count(shown);
+                            let shown_rows = count_rows(shown);
 
                             let display_changed =
                                 displayed_output.borrow().as_deref() != display_override.as_deref();
@@ -3865,6 +3967,29 @@ impl FinishedBlock {
                             } else {
                                 displayed_generation.get()
                             };
+                            let present_document = || {
+                                #[cfg(forge_shared_terminal)]
+                                if display_changed {
+                                    if let (Some(output), Some(original)) =
+                                        (&output_document, output_archive.as_deref())
+                                    {
+                                        let document = archive_filter
+                                            .as_ref()
+                                            .and_then(|result| result.as_ref().ok())
+                                            .and_then(Option::as_ref)
+                                            .unwrap_or(&original.archive);
+                                        output.present_output(document);
+                                        render_stamp.replace(output_render_stamp(
+                                            cols,
+                                            shown_rows.max(1),
+                                            shown_rows.max(1),
+                                            generation,
+                                        ));
+                                    }
+                                }
+                                (false, false)
+                            };
+                            #[cfg(any(test, forge_legacy_renderer))]
                             let (can_expand, has_private_scroll) = if let Some(output_vte) =
                                 output_vte.as_ref().and_then(glib::WeakRef::upgrade)
                             {
@@ -3935,27 +4060,10 @@ impl FinishedBlock {
                                 }
                                 (can_expand, shown_visual_rows > fitted_cap)
                             } else {
-                                #[cfg(forge_shared_terminal)]
-                                if display_changed {
-                                    if let (Some(output), Some(original)) =
-                                        (&output_document, output_archive.as_deref())
-                                    {
-                                        let document = archive_filter
-                                            .as_ref()
-                                            .and_then(|result| result.as_ref().ok())
-                                            .and_then(Option::as_ref)
-                                            .unwrap_or(&original.archive);
-                                        output.present_output(document);
-                                        render_stamp.replace(output_render_stamp(
-                                            cols,
-                                            shown_rows.max(1),
-                                            shown_rows.max(1),
-                                            generation,
-                                        ));
-                                    }
-                                }
-                                (false, false)
+                                present_document()
                             };
+                            #[cfg(not(any(test, forge_legacy_renderer)))]
+                            present_document();
                             let has_query = filter_enabled.get() && !q.trim().is_empty();
                             if invalid_regex {
                                 filter_btn.add_css_class("block-action-active");
@@ -3986,6 +4094,10 @@ impl FinishedBlock {
                                 if display_override.is_none() {
                                     original_preview.as_ref().clone()
                                 } else {
+                                    #[cfg(forge_shared_terminal)]
+                                    if output_archive.is_some() {
+                                        return super::fold_preview::from_plain(shown);
+                                    }
                                     super::fold_preview::from_output(shown)
                                 }
                             });
@@ -3998,6 +4110,8 @@ impl FinishedBlock {
                                 ),
                                 preview.as_deref(),
                             );
+                            #[cfg(any(test, forge_legacy_renderer))]
+                            #[cfg(any(test, forge_legacy_renderer))]
                             if output_vte
                                 .as_ref()
                                 .and_then(glib::WeakRef::upgrade)
@@ -4154,10 +4268,12 @@ impl FinishedBlock {
             virtualized,
             compact,
             prompt_text: prompt.to_string(),
+            #[cfg(any(test, forge_legacy_renderer))]
             command_vte,
             #[cfg(forge_shared_terminal)]
             command_document,
             command_row: cmd_row,
+            #[cfg(any(test, forge_legacy_renderer))]
             output_vte,
             #[cfg(forge_shared_terminal)]
             output_document,
@@ -4187,6 +4303,7 @@ impl FinishedBlock {
             collapsed_summary,
             filtered_out: Rc::new(Cell::new(false)),
             restore_live_focus,
+            #[cfg(any(test, forge_legacy_renderer))]
             refit_output,
             visual_rows_cache,
             render_stamp,
@@ -4270,6 +4387,7 @@ impl FinishedBlock {
         self.header_row.insert_child_after(&command, after.as_ref());
         command.set_hexpand(true);
         command.set_valign(gtk4::Align::Center);
+        #[cfg(any(test, forge_legacy_renderer))]
         if let Some(terminal) = &self.command_vte {
             if let Some(chevron) = terminal.prev_sibling() {
                 chevron.set_visible(false);
@@ -4309,11 +4427,13 @@ impl FinishedBlock {
             elapsed.set_valign(gtk4::Align::Center);
             self.header_row.insert_child_after(&elapsed, Some(&status));
         }
+        #[cfg(any(test, forge_legacy_renderer))]
         if let Some(terminal) = &self.command_vte {
             terminal.add_css_class("developer-command-terminal");
             super::developer_block::terminal_colors(terminal);
             terminal.set_color_background(&RGBA::new(0.0, 0.0, 0.0, 0.0));
         }
+        #[cfg(any(test, forge_legacy_renderer))]
         if let Some(terminal) = &self.output_vte {
             terminal.add_css_class("developer-output-terminal");
             super::developer_block::terminal_colors(terminal);
@@ -4329,6 +4449,7 @@ impl FinishedBlock {
             output.set_margin_end(16);
             output.set_margin_top(super::developer_block::OUTPUT_PADDING);
             output.set_margin_bottom(super::developer_block::OUTPUT_PADDING);
+            #[cfg(any(test, forge_legacy_renderer))]
             if let Some(terminal) = &self.output_vte {
                 let gutter = super::developer_block::line_gutter(
                     terminal,
@@ -4399,7 +4520,7 @@ impl FinishedBlock {
     /// Show lifecycle provenance only when the completion is not fully trusted.
     /// Background output has no command completion to qualify.
     pub(crate) fn set_lifecycle(&self, health: BlockLifecycleHealth, notice: Option<&str>) {
-        let badge = super::unified_chrome::lifecycle_badge(health).filter(|_| !self.is_background);
+        let badge = lifecycle_badge(health).filter(|_| !self.is_background);
         match badge {
             Some(badge) => {
                 self.lifecycle_chip.set_text(badge);
@@ -4500,6 +4621,7 @@ impl FinishedBlock {
         } else {
             super::chat::COMMAND_GAP_PX
         });
+        #[cfg(any(test, forge_legacy_renderer))]
         if let Some(terminal) = &self.command_vte {
             terminal.add_css_class("chat-command-terminal");
             terminal.set_color_foreground(&chat_snapshot_foreground());
@@ -4510,6 +4632,7 @@ impl FinishedBlock {
             terminal.set_size(cols, rows);
             terminal.set_color_background(&RGBA::new(0.0, 0.0, 0.0, 0.0));
         }
+        #[cfg(any(test, forge_legacy_renderer))]
         if let Some(terminal) = &self.output_vte {
             terminal.add_css_class("chat-output-terminal");
             terminal.set_color_foreground(&chat_snapshot_foreground());
@@ -4674,6 +4797,11 @@ impl FinishedBlock {
         if let Some(command) = &self.command_document {
             return Some(TerminalTextSurface::Document(command.widget().clone()));
         }
+        #[cfg(not(any(test, forge_legacy_renderer)))]
+        {
+            None
+        }
+        #[cfg(any(test, forge_legacy_renderer))]
         self.command_vte
             .as_ref()
             .cloned()
@@ -4686,6 +4814,11 @@ impl FinishedBlock {
         if let Some(output) = &self.output_document {
             return TerminalTextSurface::Document(output.text().widget().clone());
         }
+        #[cfg(not(any(test, forge_legacy_renderer)))]
+        {
+            unreachable!("shared finished output always owns a document")
+        }
+        #[cfg(any(test, forge_legacy_renderer))]
         TerminalTextSurface::Native(
             self.output_vte
                 .as_ref()
@@ -4767,6 +4900,7 @@ impl FinishedBlock {
             return false;
         }
         self.pending_font_scale.set(None);
+        #[cfg(any(test, forge_legacy_renderer))]
         if let Some(terminal) = &self.command_vte {
             terminal.set_font_scale(scale);
         }
@@ -4774,6 +4908,7 @@ impl FinishedBlock {
         if let Some(command) = &self.command_document {
             command.set_font_scale(scale);
         }
+        #[cfg(any(test, forge_legacy_renderer))]
         if let Some(terminal) = &self.output_vte {
             terminal.set_font_scale(scale);
         }
@@ -4795,12 +4930,18 @@ impl FinishedBlock {
             return self.refit_output_document_height();
         }
         #[cfg(test)]
+        #[cfg(any(test, forge_legacy_renderer))]
         if let Some(terminal) = &self.output_vte {
             super::alt_screen::trace_find_render(
                 &format!("output-refit-entry stamp={:?}", self.render_stamp()),
                 terminal,
             );
         }
+        #[cfg(not(any(test, forge_legacy_renderer)))]
+        {
+            None
+        }
+        #[cfg(any(test, forge_legacy_renderer))]
         (self.refit_output)().map(|height| {
             if self.widget.has_css_class("chat-pair") {
                 height.saturating_add(super::chat::card_extra_height(self.is_background))
@@ -4897,91 +5038,95 @@ impl FinishedBlock {
             }
         }
 
-        let Some(output_vte) = &self.output_vte else {
-            return;
-        };
+        #[cfg(any(test, forge_legacy_renderer))]
+        {
+            let Some(output_vte) = &self.output_vte else {
+                return;
+            };
 
-        let scroll_ctrl =
-            gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
-        // Decide canvas/overflow ownership before VTE can swallow a wheel
-        // event even when its fitted output has no private scroll range.
-        scroll_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
-        let vte = output_vte.downgrade();
-        let outer_for_vte = outer.downgrade();
-        let debouncer_for_vte = debouncer.clone();
-        debouncer.watch_gesture(&scroll_ctrl, outer);
-        scroll_ctrl.connect_scroll(move |controller, _dx, dy| {
-            let mut remaining = dy;
-            let (Some(vte), Some(outer_for_vte)) = (vte.upgrade(), outer_for_vte.upgrade()) else {
-                return glib::Propagation::Proceed;
-            };
-            // The cap is determined only after map/resize. Inspect the actual
-            // VTE adjustment on every wheel event rather than trusting a stale
-            // construction-time flag.
-            let Some(inner_adj) = vte.vadjustment() else {
-                return glib::Propagation::Proceed;
-            };
-            let at_top = inner_adj.value() <= inner_adj.lower() + f64::EPSILON;
-            let at_bottom =
-                inner_adj.value() + inner_adj.page_size() >= inner_adj.upper() - f64::EPSILON;
-            if !scroll_unit_is_surface(controller) {
-                // Preserve VTE's native discrete-wheel path inside long output.
-                if (dy < 0.0 && !at_top) || (dy > 0.0 && !at_bottom) {
+            let scroll_ctrl =
+                gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+            // Decide canvas/overflow ownership before VTE can swallow a wheel
+            // event even when its fitted output has no private scroll range.
+            scroll_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            let vte = output_vte.downgrade();
+            let outer_for_vte = outer.downgrade();
+            let debouncer_for_vte = debouncer.clone();
+            debouncer.watch_gesture(&scroll_ctrl, outer);
+            scroll_ctrl.connect_scroll(move |controller, _dx, dy| {
+                let mut remaining = dy;
+                let (Some(vte), Some(outer_for_vte)) = (vte.upgrade(), outer_for_vte.upgrade())
+                else {
                     return glib::Propagation::Proceed;
+                };
+                // The cap is determined only after map/resize. Inspect the actual
+                // VTE adjustment on every wheel event rather than trusting a stale
+                // construction-time flag.
+                let Some(inner_adj) = vte.vadjustment() else {
+                    return glib::Propagation::Proceed;
+                };
+                let at_top = inner_adj.value() <= inner_adj.lower() + f64::EPSILON;
+                let at_bottom =
+                    inner_adj.value() + inner_adj.page_size() >= inner_adj.upper() - f64::EPSILON;
+                if !scroll_unit_is_surface(controller) {
+                    // Preserve VTE's native discrete-wheel path inside long output.
+                    if (dy < 0.0 && !at_top) || (dy > 0.0 && !at_bottom) {
+                        return glib::Propagation::Proceed;
+                    }
+                } else {
+                    remaining =
+                        scroll_adjustment_by_input(&inner_adj, dy, true, vte.char_height() as f64);
+                    if remaining == 0.0 {
+                        return glib::Propagation::Stop;
+                    }
                 }
-            } else {
-                remaining =
-                    scroll_adjustment_by_input(&inner_adj, dy, true, vte.char_height() as f64);
-                if remaining == 0.0 {
-                    return glib::Propagation::Stop;
-                }
-            }
-            debouncer_for_vte.scroll_wheel(
-                &outer_for_vte,
-                remaining,
-                scroll_unit_is_surface(controller),
-            );
-            glib::Propagation::Stop
-        });
-        output_vte.add_controller(scroll_ctrl);
-
-        // Wheeling over the slider itself should move the block it belongs to,
-        // not the history behind it. GtkScrollbar would scroll its own
-        // adjustment natively, but it stops dead at the ends; capture the event
-        // so the same edge hand-off as the VTE applies.
-        let scrollbar_scroll =
-            gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
-        scrollbar_scroll.set_propagation_phase(gtk4::PropagationPhase::Capture);
-        let vte_for_scrollbar = output_vte.downgrade();
-        let outer_for_scrollbar = outer.downgrade();
-        let debouncer_for_scrollbar = debouncer.clone();
-        debouncer.watch_gesture(&scrollbar_scroll, outer);
-        scrollbar_scroll.connect_scroll(move |controller, _dx, dy| {
-            let mut remaining = dy;
-            let (Some(vte), Some(outer)) =
-                (vte_for_scrollbar.upgrade(), outer_for_scrollbar.upgrade())
-            else {
-                return glib::Propagation::Proceed;
-            };
-            if let Some(inner_adj) = vte.vadjustment() {
-                remaining = scroll_adjustment_by_input(
-                    &inner_adj,
-                    dy,
+                debouncer_for_vte.scroll_wheel(
+                    &outer_for_vte,
+                    remaining,
                     scroll_unit_is_surface(controller),
-                    vte.char_height() as f64,
                 );
-                if remaining == 0.0 {
-                    return glib::Propagation::Stop;
+                glib::Propagation::Stop
+            });
+            output_vte.add_controller(scroll_ctrl);
+
+            // Wheeling over the slider itself should move the block it belongs to,
+            // not the history behind it. GtkScrollbar would scroll its own
+            // adjustment natively, but it stops dead at the ends; capture the event
+            // so the same edge hand-off as the VTE applies.
+            let scrollbar_scroll =
+                gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+            scrollbar_scroll.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            let vte_for_scrollbar = output_vte.downgrade();
+            let outer_for_scrollbar = outer.downgrade();
+            let debouncer_for_scrollbar = debouncer.clone();
+            debouncer.watch_gesture(&scrollbar_scroll, outer);
+            scrollbar_scroll.connect_scroll(move |controller, _dx, dy| {
+                let mut remaining = dy;
+                let (Some(vte), Some(outer)) =
+                    (vte_for_scrollbar.upgrade(), outer_for_scrollbar.upgrade())
+                else {
+                    return glib::Propagation::Proceed;
+                };
+                if let Some(inner_adj) = vte.vadjustment() {
+                    remaining = scroll_adjustment_by_input(
+                        &inner_adj,
+                        dy,
+                        scroll_unit_is_surface(controller),
+                        vte.char_height() as f64,
+                    );
+                    if remaining == 0.0 {
+                        return glib::Propagation::Stop;
+                    }
                 }
-            }
-            debouncer_for_scrollbar.scroll_wheel(
-                &outer,
-                remaining,
-                scroll_unit_is_surface(controller),
-            );
-            glib::Propagation::Stop
-        });
-        self.output_scrollbar.add_controller(scrollbar_scroll);
+                debouncer_for_scrollbar.scroll_wheel(
+                    &outer,
+                    remaining,
+                    scroll_unit_is_surface(controller),
+                );
+                glib::Propagation::Stop
+            });
+            self.output_scrollbar.add_controller(scrollbar_scroll);
+        }
     }
 
     /// Wire the hover quick-action buttons (copy command, copy output, re-run).
@@ -5076,16 +5221,32 @@ impl FinishedBlock {
 
 // ─── ActiveBlock ──────────────────────────────────────────────────────────────
 
+pub(super) enum ActiveSurface {
+    #[cfg(forge_shared_terminal)]
+    Shared(Rc<super::shared_active::SharedActiveTerminal>),
+    #[cfg(any(test, forge_legacy_renderer))]
+    Legacy(Terminal),
+}
+
+#[cfg(any(test, forge_legacy_renderer))]
+impl ActiveSurface {
+    fn legacy_terminal(&self) -> Option<&Terminal> {
+        match self {
+            ActiveSurface::Legacy(terminal) => Some(terminal),
+            #[cfg(forge_shared_terminal)]
+            ActiveSurface::Shared(_) => None,
+        }
+    }
+}
+
 /// The live area retains one input-capable terminal across the prompt,
 /// running command and fullscreen seats. When a command finishes, its
 /// accumulated output (`raw_output`) is snapshotted into a styled FinishedBlock
 /// stacked above this card.
 pub(crate) struct ActiveBlock {
     pub(crate) widget: gtk4::Box,
-    pub(super) active_vte: Option<Terminal>,
+    pub(super) surface: ActiveSurface,
     pub(super) developer_header: Option<super::developer_block::RunningHeader>,
-    #[cfg(forge_shared_terminal)]
-    pub(super) shared_active: Option<Rc<super::shared_active::SharedActiveTerminal>>,
     /// Measured wrapper around the live terminal and its unmeasured overlays.
     vte_overlay: gtk4::Overlay,
     /// Sole measured child of the clip: its height IS the live card's height.
@@ -5135,9 +5296,11 @@ pub(crate) struct ActiveBlock {
     /// Probe-addressed Kitty image layer used by Unified mode. Added before
     /// the organism surface so inline assistant UI always remains readable.
     /// Hidden in Block mode, whose images move into finished cards instead.
+    #[cfg(any(test, forge_legacy_renderer))]
     pub(crate) unified_image_surface: gtk4::Fixed,
     /// Pass-through, non-measuring chrome overlay used only by Unified mode.
     /// It exists (hidden) in Block mode so the widget tree stays mode-neutral.
+    #[cfg(any(test, forge_legacy_renderer))]
     pub(crate) unified_chrome_surface: gtk4::DrawingArea,
     /// Slim overlay scrollbar bound to the live VTE's own adjustment, so the
     /// still-running command's scrollback is visibly navigable. An overlay —
@@ -5160,6 +5323,7 @@ pub(crate) struct ActiveBlock {
 /// Reserve those insets once in the enclosing clip and grid request. Otherwise
 /// the final row extends past a clip sized only as `rows * char_height`.
 #[allow(deprecated)] // GTK4 has no replacement getters for the computed CSS box.
+#[cfg(any(test, forge_legacy_renderer))]
 pub(super) fn terminal_vertical_insets(vte: &Terminal) -> i32 {
     let style = vte.style_context();
     let padding = style.padding();
@@ -5192,6 +5356,7 @@ fn chat_live_width_budget(clip: i32, minimum: i32, gutter: i32) -> (i32, i32) {
     }
 }
 
+#[cfg(any(test, forge_legacy_renderer))]
 fn sync_live_scrollbar_visibility(
     vte: &Terminal,
     scrollbar: &gtk4::Scrollbar,
@@ -5219,6 +5384,17 @@ fn live_rows_height_px(cell_h: i32, rows: i64, insets: i32) -> i32 {
     (rows.clamp(1, i32::MAX as i64) as i32)
         .saturating_mul(cell_h.max(1))
         .saturating_add(insets.max(0))
+}
+
+/// One word for a record whose lifecycle is not fully trusted, or `None` when
+/// it is. Block's card chip and Unified's status line share this vocabulary.
+pub(super) fn lifecycle_badge(health: super::BlockLifecycleHealth) -> Option<&'static str> {
+    match health {
+        super::BlockLifecycleHealth::Healthy => None,
+        super::BlockLifecycleHealth::Recovered => Some("recovered"),
+        super::BlockLifecycleHealth::Degraded => Some("inferred"),
+        super::BlockLifecycleHealth::Incomplete => Some("incomplete"),
+    }
 }
 
 impl ActiveBlock {
@@ -5254,6 +5430,7 @@ impl ActiveBlock {
         } else {
             None
         };
+        #[cfg(any(test, forge_legacy_renderer))]
         let create_legacy = || {
             let terminal = create_active_terminal(config);
             if developer_header.is_some() {
@@ -5263,18 +5440,24 @@ impl ActiveBlock {
             terminal.set_vexpand(false);
             terminal
         };
-        #[cfg(forge_shared_terminal)]
-        let active_vte = shared_active.is_none().then(create_legacy);
+        #[cfg(not(any(test, forge_legacy_renderer)))]
+        let surface = ActiveSurface::Shared(shared_active.expect("shared active terminal"));
+        #[cfg(all(forge_shared_terminal, any(test, forge_legacy_renderer)))]
+        let surface = match shared_active {
+            Some(terminal) => ActiveSurface::Shared(terminal),
+            None => ActiveSurface::Legacy(create_legacy()),
+        };
         #[cfg(not(forge_shared_terminal))]
-        let active_vte = Some(create_legacy());
+        let surface = ActiveSurface::Legacy(create_legacy());
+
         let vte_overlay = gtk4::Overlay::new();
         vte_overlay.set_hexpand(true);
         vte_overlay.set_vexpand(false);
-
-        vte_overlay.set_child(active_vte.as_ref());
-        #[cfg(forge_shared_terminal)]
-        if let Some(terminal) = &shared_active {
-            vte_overlay.set_child(Some(&terminal.widget));
+        match &surface {
+            #[cfg(forge_shared_terminal)]
+            ActiveSurface::Shared(terminal) => vte_overlay.set_child(Some(&terminal.widget)),
+            #[cfg(any(test, forge_legacy_renderer))]
+            ActiveSurface::Legacy(terminal) => vte_overlay.set_child(Some(terminal)),
         }
 
         let live_organism_surface = gtk4::Fixed::new();
@@ -5287,42 +5470,52 @@ impl ActiveBlock {
         live_organism_surface.set_focusable(false);
         live_organism_surface.set_visible(false);
 
-        let unified_image_surface = gtk4::Fixed::new();
-        unified_image_surface.set_hexpand(true);
-        unified_image_surface.set_vexpand(true);
-        unified_image_surface.set_halign(gtk4::Align::Fill);
-        unified_image_surface.set_valign(gtk4::Align::Fill);
-        unified_image_surface.set_overflow(gtk4::Overflow::Hidden);
-        unified_image_surface.set_can_target(false);
-        unified_image_surface.set_focusable(false);
-        unified_image_surface.set_visible(false);
-        // Paint above terminal cells but below the organism and chrome. The
-        // insertion order is load-bearing: Unified's organism has no other
-        // body surface and must never be silently covered by a large image.
-        vte_overlay.add_overlay(&unified_image_surface);
-        vte_overlay.set_measure_overlay(&unified_image_surface, false);
-        vte_overlay.set_clip_overlay(&unified_image_surface, true);
+        #[cfg(any(test, forge_legacy_renderer))]
+        let unified_image_surface = {
+            let unified_image_surface = gtk4::Fixed::new();
+            unified_image_surface.set_hexpand(true);
+            unified_image_surface.set_vexpand(true);
+            unified_image_surface.set_halign(gtk4::Align::Fill);
+            unified_image_surface.set_valign(gtk4::Align::Fill);
+            unified_image_surface.set_overflow(gtk4::Overflow::Hidden);
+            unified_image_surface.set_can_target(false);
+            unified_image_surface.set_focusable(false);
+            unified_image_surface.set_visible(false);
+            // Paint above terminal cells but below the organism and chrome. The
+            // insertion order is load-bearing: Unified's organism has no other
+            // body surface and must never be silently covered by a large image.
+            vte_overlay.add_overlay(&unified_image_surface);
+            vte_overlay.set_measure_overlay(&unified_image_surface, false);
+            vte_overlay.set_clip_overlay(&unified_image_surface, true);
+            unified_image_surface
+        };
+
         vte_overlay.add_overlay(&live_organism_surface);
         vte_overlay.set_measure_overlay(&live_organism_surface, false);
         vte_overlay.set_clip_overlay(&live_organism_surface, true);
 
-        let unified_chrome_surface = gtk4::DrawingArea::new();
-        unified_chrome_surface.set_hexpand(true);
-        unified_chrome_surface.set_vexpand(true);
-        unified_chrome_surface.set_halign(gtk4::Align::Fill);
-        unified_chrome_surface.set_valign(gtk4::Align::Fill);
-        unified_chrome_surface.set_can_target(false);
-        unified_chrome_surface.set_focusable(false);
-        unified_chrome_surface.set_visible(false);
-        vte_overlay.add_overlay(&unified_chrome_surface);
-        vte_overlay.set_measure_overlay(&unified_chrome_surface, false);
-        vte_overlay.set_clip_overlay(&unified_chrome_surface, true);
+        #[cfg(any(test, forge_legacy_renderer))]
+        let unified_chrome_surface = {
+            let unified_chrome_surface = gtk4::DrawingArea::new();
+            unified_chrome_surface.set_hexpand(true);
+            unified_chrome_surface.set_vexpand(true);
+            unified_chrome_surface.set_halign(gtk4::Align::Fill);
+            unified_chrome_surface.set_valign(gtk4::Align::Fill);
+            unified_chrome_surface.set_can_target(false);
+            unified_chrome_surface.set_focusable(false);
+            unified_chrome_surface.set_visible(false);
+            vte_overlay.add_overlay(&unified_chrome_surface);
+            vte_overlay.set_measure_overlay(&unified_chrome_surface, false);
+            vte_overlay.set_clip_overlay(&unified_chrome_surface, true);
+            unified_chrome_surface
+        };
 
-        let adjustment = active_vte.as_ref().and_then(ScrollableExt::vadjustment);
-        #[cfg(forge_shared_terminal)]
-        let adjustment = shared_active
-            .as_ref()
-            .map_or(adjustment, |terminal| Some(terminal.scrollback().clone()));
+        let adjustment = match &surface {
+            #[cfg(forge_shared_terminal)]
+            ActiveSurface::Shared(terminal) => Some(terminal.scrollback().clone()),
+            #[cfg(any(test, forge_legacy_renderer))]
+            ActiveSurface::Legacy(terminal) => terminal.vadjustment(),
+        };
         let live_scrollbar = gtk4::Scrollbar::new(Orientation::Vertical, adjustment.as_ref());
         live_scrollbar.add_css_class("block-output-scrollbar");
         live_scrollbar.set_tooltip_text(Some("Scroll within the running output"));
@@ -5374,7 +5567,8 @@ impl ActiveBlock {
         // Same adjustment-driven visibility as the finished-block scrollbar:
         // the adjustment is the one place that always knows whether the live
         // buffer has scrolled past the viewport.
-        if let (Some(adj), Some(terminal)) = (&adjustment, &active_vte) {
+        #[cfg(any(test, forge_legacy_renderer))]
+        if let (Some(adj), Some(terminal)) = (&adjustment, surface.legacy_terminal()) {
             let scrollbar = live_scrollbar.downgrade();
             let terminal = terminal.downgrade();
             let clip = live_clip.downgrade();
@@ -5394,7 +5588,8 @@ impl ActiveBlock {
         // `realize` is too early: the VTE's IM context does not have a mapped
         // surface yet. Taking logical focus there can suppress the real
         // focus-in fcitx/ibus need. `map` is the first valid point to focus.
-        if let Some(terminal) = &active_vte {
+        #[cfg(any(test, forge_legacy_renderer))]
+        if let Some(terminal) = surface.legacy_terminal() {
             let first_map = Cell::new(true);
             terminal.connect_map(move |terminal| {
                 if !(terminal.has_css_class("chat-live-terminal")
@@ -5408,9 +5603,7 @@ impl ActiveBlock {
 
         ActiveBlock {
             widget,
-            #[cfg(forge_shared_terminal)]
-            shared_active,
-            active_vte,
+            surface,
             developer_header,
             vte_overlay,
             live_spacer,
@@ -5423,7 +5616,9 @@ impl ActiveBlock {
             alt_leave_pending: Rc::new(Cell::new(false)),
             preserve_live_scrollback: Cell::new(config.preserve_live_scrollback),
             live_organism_surface,
+            #[cfg(any(test, forge_legacy_renderer))]
             unified_image_surface,
+            #[cfg(any(test, forge_legacy_renderer))]
             unified_chrome_surface,
             live_scrollbar,
             live_organism_visible: Cell::new(false),
@@ -5459,9 +5654,23 @@ impl ActiveBlock {
         )
     }
 
-    // Used only by paths that have already selected the legacy surface.
+    #[cfg(any(test, forge_legacy_renderer))]
+    pub(super) fn legacy_terminal(&self) -> Option<&Terminal> {
+        self.surface.legacy_terminal()
+    }
+
+    #[cfg(any(test, forge_legacy_renderer))]
     pub(super) fn legacy_surface(&self) -> &Terminal {
-        self.active_vte.as_ref().expect("legacy live terminal")
+        self.legacy_terminal().expect("legacy live terminal")
+    }
+
+    #[cfg(forge_shared_terminal)]
+    pub(super) fn shared_active(&self) -> Option<&Rc<super::shared_active::SharedActiveTerminal>> {
+        match &self.surface {
+            ActiveSurface::Shared(terminal) => Some(terminal),
+            #[cfg(any(test, forge_legacy_renderer))]
+            ActiveSurface::Legacy(_) => None,
+        }
     }
 
     #[cfg(forge_shared_terminal)]
@@ -5533,31 +5742,32 @@ impl ActiveBlock {
     }
 
     pub(super) fn surface_adjustment(&self) -> Option<gtk4::Adjustment> {
-        #[cfg(forge_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            return Some(terminal.scrollback().clone());
+        match &self.surface {
+            #[cfg(forge_shared_terminal)]
+            ActiveSurface::Shared(terminal) => Some(terminal.scrollback().clone()),
+            #[cfg(any(test, forge_legacy_renderer))]
+            ActiveSurface::Legacy(terminal) => terminal.vadjustment(),
         }
-        self.active_vte
-            .as_ref()
-            .and_then(ScrollableExt::vadjustment)
     }
 
     pub(super) fn focus_widget(&self) -> gtk4::Widget {
-        #[cfg(forge_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            return terminal.screen().clone().upcast();
+        match &self.surface {
+            #[cfg(forge_shared_terminal)]
+            ActiveSurface::Shared(terminal) => terminal.screen().clone().upcast(),
+            #[cfg(any(test, forge_legacy_renderer))]
+            ActiveSurface::Legacy(terminal) => terminal.clone().upcast(),
         }
-        self.legacy_surface().clone().upcast()
     }
 
     /// The column count the live terminal is wrapping at — the single source of truth
     /// for pre-wrapping finished blocks so they align with what the user watched.
     pub(crate) fn grid_cols(&self) -> usize {
-        #[cfg(forge_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            return usize::from(terminal.grid_size().0).max(20);
+        match &self.surface {
+            #[cfg(forge_shared_terminal)]
+            ActiveSurface::Shared(terminal) => usize::from(terminal.grid_size().0).max(20),
+            #[cfg(any(test, forge_legacy_renderer))]
+            ActiveSurface::Legacy(terminal) => terminal.column_count().max(20) as usize,
         }
-        self.legacy_surface().column_count().max(20) as usize
     }
 
     /// Give the live terminal a `grid_rows`-tall grid and show `visible_rows`
@@ -5573,6 +5783,7 @@ impl ActiveBlock {
     /// the pane width by expanding. Before the first allocation there is no
     /// width to hand out and the request is left alone; the next layout pass
     /// (contents, adjustment or resize tick) applies it.
+    #[cfg(any(test, forge_legacy_renderer))]
     pub(crate) fn set_live_geometry(&self, cell_h: i32, grid_rows: i64, visible_rows: i64) -> bool {
         let cell_h = cell_h.max(1);
         let grid_rows = grid_rows.max(1);
@@ -5747,25 +5958,29 @@ impl ActiveBlock {
     }
 
     pub(super) fn live_surface_size(&self) -> (i32, i32) {
-        #[cfg(forge_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            return (
+        match &self.surface {
+            #[cfg(forge_shared_terminal)]
+            ActiveSurface::Shared(terminal) => (
                 terminal.widget.width().max(0),
                 terminal.widget.height().max(0),
-            );
+            ),
+            #[cfg(any(test, forge_legacy_renderer))]
+            ActiveSurface::Legacy(terminal) => (terminal.width().max(0), terminal.height().max(0)),
         }
-        let terminal = self.legacy_surface();
-        (terminal.width().max(0), terminal.height().max(0))
     }
 
     pub(super) fn live_cell_size(&self) -> (i32, i32) {
-        #[cfg(forge_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            let (_, _, width, height) = terminal.cell_metrics();
-            return (width, height);
+        match &self.surface {
+            #[cfg(forge_shared_terminal)]
+            ActiveSurface::Shared(terminal) => {
+                let (_, _, width, height) = terminal.cell_metrics();
+                (width, height)
+            }
+            #[cfg(any(test, forge_legacy_renderer))]
+            ActiveSurface::Legacy(terminal) => {
+                (terminal.char_width() as i32, terminal.char_height() as i32)
+            }
         }
-        let terminal = self.legacy_surface();
-        (terminal.char_width() as i32, terminal.char_height() as i32)
     }
 
     #[cfg(forge_shared_terminal)]
@@ -5809,17 +6024,20 @@ impl ActiveBlock {
         self.live_cursor_origin.set(None);
         self.live_cursor_high.set(0);
         self.alt_leave_pending.set(false);
-        #[cfg(forge_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            terminal.output().reset_prompt(preserve_scrollback);
-            return;
-        }
-        let terminal = self.legacy_surface();
-        if preserve_scrollback {
-            terminal.feed(b"\x1b[0m");
-        } else {
-            terminal.reset(true, true);
-            terminal.feed(b"\x1b[H\x1b[2J\x1b[3J");
+        match &self.surface {
+            #[cfg(forge_shared_terminal)]
+            ActiveSurface::Shared(terminal) => {
+                terminal.output().reset_prompt(preserve_scrollback);
+            }
+            #[cfg(any(test, forge_legacy_renderer))]
+            ActiveSurface::Legacy(terminal) => {
+                if preserve_scrollback {
+                    terminal.feed(b"\x1b[0m");
+                } else {
+                    terminal.reset(true, true);
+                    terminal.feed(b"\x1b[H\x1b[2J\x1b[3J");
+                }
+            }
         }
     }
 
@@ -5933,6 +6151,222 @@ mod tests {
     #[cfg(forge_shared_terminal)]
     #[test]
     #[ignore = "requires an isolated native GTK display"]
+    fn completed_headings_keep_bounded_source_without_a_vte_fallback() {
+        use gtk4::prelude::*;
+
+        gtk4::init().expect("GTK display");
+        let commands = [
+            "  printf 'spacing'  ".to_owned(),
+            "printf '中文\n🙂'".to_owned(),
+            "printf '\u{202e}\u{1b}'".to_owned(),
+            "x".repeat(17 * 1024),
+        ];
+        for mode in [
+            crate::config::TerminalMode::Block,
+            crate::config::TerminalMode::Chat,
+            crate::config::TerminalMode::Unified,
+        ] {
+            let mut config = crate::config::Config::safe_defaults();
+            config.terminal_mode = mode;
+            for command in &commands {
+                let mut precomputed = super::FinishedBlockPrecomputed::documents(&config);
+                precomputed.document_command = true;
+                let card = super::FinishedBlock::new_with_pool(
+                    1,
+                    "$ ",
+                    command,
+                    None,
+                    "",
+                    Some(0),
+                    &config,
+                    None,
+                    None,
+                    None,
+                    80,
+                    &[],
+                    0,
+                    None,
+                    precomputed,
+                );
+                assert!(card.command_vte.is_none());
+                let heading = card.command_document.as_ref().expect("native heading");
+                let buffer = heading.widget().buffer();
+                assert_eq!(
+                    buffer
+                        .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                        .as_str(),
+                    jterm_core::review_input::safe_multiline_display(
+                        command,
+                        jterm_core::review_input::MAX_REVIEW_INPUT_BYTES,
+                    ),
+                );
+                assert_eq!(card.cmd_text, *command);
+            }
+        }
+    }
+
+    #[cfg(forge_shared_terminal)]
+    #[test]
+    #[ignore = "requires an isolated native GTK display"]
+    fn completed_output_documents_preserve_text_and_raw_capture() {
+        use gtk4::prelude::*;
+
+        gtk4::init().expect("GTK display");
+        let assert_notice = |card: &super::FinishedBlock, notice: &str| {
+            card.set_output_notice(None);
+            let mut widgets = vec![card
+                .output_document
+                .as_ref()
+                .unwrap()
+                .widget()
+                .clone()
+                .upcast::<gtk4::Widget>()];
+            let mut found_notice = false;
+            while let Some(widget) = widgets.pop() {
+                if let Some(label) = widget.downcast_ref::<gtk4::Label>() {
+                    found_notice |= label.text() == notice && label.is_visible();
+                }
+                widgets.extend(std::iter::successors(widget.first_child(), |child| {
+                    child.next_sibling()
+                }));
+            }
+            assert!(
+                found_notice,
+                "projection notice stays visible after host updates"
+            );
+        };
+        for mode in [
+            crate::config::TerminalMode::Block,
+            crate::config::TerminalMode::Chat,
+            crate::config::TerminalMode::Unified,
+        ] {
+            let mut config = crate::config::Config::safe_defaults();
+            config.terminal_mode = mode;
+            for (capture, expected) in [
+                ("\x1b[5mblinking text\x1b[0m\r\n", "blinking text"),
+                ("\x1b[31m\x1b[0m", ""),
+                ("progress\r\x1b[2Kcomplete\r\n", "complete"),
+                ("\x1b[38;2;33;77;121m中文\x1b[0m\r\nnext", "中文\nnext"),
+            ] {
+                let mut precomputed = super::FinishedBlockPrecomputed::documents(&config);
+                precomputed.document_command = true;
+                precomputed.document_output = true;
+                let card = super::FinishedBlock::new_with_pool(
+                    1,
+                    "$ ",
+                    "run",
+                    None,
+                    capture,
+                    Some(0),
+                    &config,
+                    None,
+                    None,
+                    None,
+                    80,
+                    &[],
+                    capture.len(),
+                    None,
+                    precomputed,
+                );
+                assert!(card.output_vte.is_none());
+                assert_eq!(
+                    card.output_surface().document_text().as_deref(),
+                    Some(expected)
+                );
+                assert_eq!(card.full_output.borrow().as_str(), capture);
+                card.with_stripped_output(|text| assert_eq!(text, expected));
+                assert_eq!(card.copy_output_btn.get_visible(), !expected.is_empty());
+                assert_eq!(card.copy_output_btn.get_sensitive(), !expected.is_empty());
+                let filter = std::iter::successors(card.action_box.first_child(), |child| {
+                    child.next_sibling()
+                })
+                .filter_map(|widget| widget.downcast::<gtk4::Button>().ok())
+                .find(|button| button.icon_name().as_deref() == Some("edit-find-symbolic"))
+                .expect("output filter button");
+                assert_eq!(filter.get_visible(), !expected.is_empty());
+                assert_eq!(filter.get_sensitive(), !expected.is_empty());
+            }
+        }
+
+        let capture = "\x1b[?9999hretained output";
+        let projection = super::FinishedDocument::project_for_display(capture, (80, 0));
+        assert!(!projection.clipped);
+        let notice = projection
+            .document
+            .projection_notice()
+            .expect("reduced presentation notice");
+        let mut config = crate::config::Config::safe_defaults();
+        config.terminal_mode = crate::config::TerminalMode::Block;
+        let mut precomputed = super::FinishedBlockPrecomputed::documents(&config);
+        precomputed.document_command = true;
+        precomputed.document_output = true;
+        precomputed.finished_document = Some(std::sync::Arc::new(projection.document));
+        let card = super::FinishedBlock::new_with_pool(
+            1,
+            "$ ",
+            "run",
+            None,
+            capture,
+            Some(0),
+            &config,
+            None,
+            None,
+            None,
+            80,
+            &[],
+            capture.len(),
+            None,
+            precomputed,
+        );
+        assert_notice(&card, notice);
+
+        let capture = format!("{}full-source-tail", "output row\n".repeat(6000));
+        let mut config = crate::config::Config::safe_defaults();
+        config.terminal_mode = crate::config::TerminalMode::Block;
+        let mut precomputed = super::FinishedBlockPrecomputed::documents(&config);
+        precomputed.document_command = true;
+        precomputed.document_output = true;
+        let card = super::FinishedBlock::new_with_pool(
+            1,
+            "$ ",
+            "run",
+            None,
+            &capture,
+            Some(0),
+            &config,
+            None,
+            None,
+            None,
+            80,
+            &[],
+            capture.len(),
+            None,
+            precomputed,
+        );
+        assert!(card.output_vte.is_none());
+        let visible = card
+            .output_surface()
+            .document_text()
+            .expect("bounded document");
+        assert!(
+            visible.lines().count() < capture.lines().count(),
+            "the preview bounds the rendered row count"
+        );
+        assert_eq!(card.full_output.borrow().as_str(), capture);
+        card.with_stripped_output(|text| assert_eq!(text, capture));
+        let projection = super::FinishedDocument::project_for_display(&capture, (80, 0));
+        assert!(projection.clipped, "the document layout budget is enforced");
+        let notice = projection.notice().expect("clipped output notice");
+        assert!(
+            !visible.contains(notice),
+            "the notice is outside copied text"
+        );
+        assert_notice(&card, notice);
+    }
+
+    #[cfg(forge_shared_terminal)]
+    #[test]
+    #[ignore = "requires an isolated native GTK display"]
     fn completed_image_cards_share_the_caption_and_keep_the_picture() {
         use gtk4::prelude::*;
         use gtk4::{gdk, glib};
@@ -5952,7 +6386,10 @@ mod tests {
         for (caption, expected) in [
             ("caption for plot\r\n", Some("caption for plot")),
             ("", Some("")),
-            ("\x1b[5mblinking caption\x1b[0m\r\n", None),
+            (
+                "\x1b[5mblinking caption\x1b[0m\r\n",
+                Some("blinking caption"),
+            ),
         ] {
             let card = super::FinishedBlock::new_with_pool(
                 1,

@@ -22,3 +22,16 @@ and do not report those results as exact production-pin validation.
 Nix's full source-tree NAR hash is separate from an archive SHA-256. Repinning
 requires updating the `jterm_core-0.2.0` output hash as well as the manifest,
 lockfile, dependency policy and generated Flatpak sources.
+
+Production packages use only `shared-terminal`. The Flatpak runtime and Nix
+package do not provision VTE. Explicit legacy oracle builds require separately
+installed VTE development libraries. The offline Cargo source manifest may still
+vendor optional legacy crates present in Cargo.lock; vendoring does not enable
+their Cargo feature.
+
+The source manifest and Nix Git output hash match exact core
+`06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e`. Its private candidate tree was
+verified locally using command-scoped Git URL redirection. Public availability
+has not been asserted; public package fetches require that exact revision to be
+available from their configured Git source. The production receipt records the
+independently verified NAR hash without claiming publication.

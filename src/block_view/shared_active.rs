@@ -271,7 +271,7 @@ impl SharedActiveTerminal {
         self.terminal.scrollback_adjustment()
     }
 
-    pub(super) fn embedded(&self) -> &EmbeddedTerminal<Transport> {
+    pub(super) fn embedded(&self) -> &Rc<EmbeddedTerminal<Transport>> {
         &self.terminal
     }
 

@@ -12,17 +12,19 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(any(test, forge_legacy_renderer))]
 use vte4::Terminal;
+#[cfg(any(test, forge_legacy_renderer))]
 use vte4::TerminalExt;
 
 use crate::persistence::{self, PersistenceKey};
 use crate::process::deserialize_restorable_argv_bounded;
 use jterm_core::snapshot_file;
 
-use crate::terminal::{
-    find_first_terminal, terminal_child_lifecycle, terminal_child_pid, terminal_working_directory,
-    TERMINAL_ESCALATION,
-};
+#[cfg(any(test, forge_legacy_renderer))]
+use crate::terminal::{find_first_terminal, terminal_working_directory};
+#[cfg(any(test, forge_legacy_renderer))]
+use crate::terminal::{terminal_child_lifecycle, terminal_child_pid, TERMINAL_ESCALATION};
 use crate::ui::{PaneLeaf, PaneNode};
 
 const MAX_READY_WINDOW_STATES: usize = 32;
@@ -998,14 +1000,18 @@ fn serialize_pane_layout_with_tab_state(
         }
     } else {
         let pane_leaf = PaneLeaf::from_widget(widget);
+        // Legacy/oracle builds retain widget-tree compatibility metadata.
+        #[cfg(any(test, forge_legacy_renderer))]
         let terminal = find_first_terminal(widget);
         let dir = pane_leaf
             .as_ref()
             .and_then(PaneLeaf::block_view)
             .map(|view| view.cwd())
             .filter(|cwd| !cwd.is_empty())
-            .or_else(|| pane_leaf.as_ref().and_then(PaneLeaf::working_directory))
-            .or_else(|| terminal.as_ref().and_then(terminal_working_directory))
+            .or_else(|| pane_leaf.as_ref().and_then(PaneLeaf::working_directory));
+        #[cfg(any(test, forge_legacy_renderer))]
+        let dir = dir.or_else(|| terminal.as_ref().and_then(terminal_working_directory));
+        let dir = dir
             .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/".to_string()));
 
         // Prefer the identity attached to this exact leaf. The tab-number map
@@ -1034,11 +1040,10 @@ fn serialize_pane_layout_with_tab_state(
         let cmds = remote_name
             .is_none()
             .then(|| {
-                pane_leaf
-                    .as_ref()
-                    .and_then(PaneLeaf::restorable_command)
-                    .or_else(|| terminal.as_ref().and_then(get_restorable_commands))
-                    .and_then(|argv| crate::process::match_restorable_command_bounded(&argv))
+                let argv = pane_leaf.as_ref().and_then(PaneLeaf::restorable_command);
+                #[cfg(any(test, forge_legacy_renderer))]
+                let argv = argv.or_else(|| terminal.as_ref().and_then(get_restorable_commands));
+                argv.and_then(|argv| crate::process::match_restorable_command_bounded(&argv))
             })
             .flatten();
         let cwd_external = pane_leaf.as_ref().is_some_and(PaneLeaf::is_remote)
@@ -1837,6 +1842,7 @@ pub(crate) fn kill_widget_child_processes(widget: &gtk4::Widget) -> bool {
 /// glib child watch for a conventional pane, this process for a Block pane —
 /// so this path never has to guess from the widget type. Calling it a second
 /// time (an explicit close followed by the drop of the same pane) is a no-op.
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn kill_terminal_child(terminal: &Terminal) {
     let cleanup = crate::gtk_process::vte_cleanup(terminal)
         .or_else(|| terminal_child_lifecycle(terminal).map(Into::into));
@@ -1848,6 +1854,7 @@ pub(crate) fn kill_terminal_child(terminal: &Terminal) {
     ) {
         crate::gtk_process::retain_children(&window, vec![cleanup]);
     }
+    #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
     crate::terminal::close_terminal_launch(terminal);
     if let Some(lifecycle) = terminal_child_lifecycle(terminal) {
         lifecycle.terminate(TERMINAL_ESCALATION);
@@ -1942,6 +1949,7 @@ pub(crate) fn detach_all_pane_leaves(notebook: &Notebook) {
 
 /// Conventional-VTE compatibility wrapper. Block panes must use their
 /// `PaneLeaf` probe because their custom PTY is intentionally not VTE-owned.
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn get_restorable_commands(terminal: &Terminal) -> Option<Vec<String>> {
     let shell_pid = terminal_child_pid(terminal)?;
     let pty_fd = terminal.pty()?.fd().as_raw_fd();
@@ -1950,6 +1958,7 @@ pub(crate) fn get_restorable_commands(terminal: &Terminal) -> Option<Vec<String>
 }
 
 /// Conventional-VTE compatibility wrapper for tooltip callers.
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn get_foreground_process_name(terminal: &Terminal) -> Option<String> {
     let shell_pid = terminal_child_pid(terminal)?;
     let pty_fd = terminal.pty()?.fd().as_raw_fd();
@@ -2210,6 +2219,83 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
 mod tests {
     use super::*;
 
+    #[test]
+    fn shared_pane_persistence_keeps_raw_widget_search_in_legacy_oracles_only() {
+        let source = include_str!("state.rs")
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
+        let leaf = source
+            .split_once("fn serialize_pane_layout_with_tab_state(")
+            .unwrap()
+            .1
+            .split_once("pub fn escape_tab_state(")
+            .unwrap()
+            .0;
+        assert!(leaf.contains("#[cfg(any(test, forge_legacy_renderer))]\n        let terminal = find_first_terminal(widget);"));
+        assert!(leaf.contains("#[cfg(any(test, forge_legacy_renderer))]\n        let dir = dir.or_else(|| terminal.as_ref().and_then(terminal_working_directory));"));
+        assert!(leaf.contains("#[cfg(any(test, forge_legacy_renderer))]\n                let argv = argv.or_else(|| terminal.as_ref().and_then(get_restorable_commands));"));
+        assert_eq!(leaf.matches("find_first_terminal(widget)").count(), 1);
+        for metadata in [
+            "PaneLeaf::working_directory",
+            "PaneLeaf::managed_remote_session_id",
+            "PaneLeaf::session_id",
+            "PaneLeaf::managed_remote_name",
+            "PaneLeaf::restorable_command",
+        ] {
+            assert!(leaf.contains(metadata), "{metadata}");
+        }
+    }
+
+    #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+    #[test]
+    #[ignore = "requires an isolated GTK display"]
+    fn typed_shared_pane_persistence_retains_identity_and_tab_metadata() {
+        gtk4::init().expect("GTK display");
+        let pane = crate::ui::shared_terminal::SharedPane::failed(
+            &crate::config::Config::safe_defaults(),
+            &["synthetic-shell".into()],
+            "synthetic launch failure",
+        );
+        let leaf = PaneLeaf::Shared(pane);
+        let widget = leaf.root_widget();
+        widget.set_widget_name("tab-7");
+        leaf.set_session_id("123-456");
+        leaf.set_managed_remote_session_id("456-789");
+        leaf.set_managed_remote_name("fixture-host");
+        leaf.set_remote(true);
+        leaf.attach_to(&widget);
+        unsafe {
+            widget.set_data("pinned", true);
+        }
+        let sessions = [(7, "999-000".to_owned())].into_iter().collect();
+        let layout =
+            serialize_pane_layout_with_tab_state(&widget, &sessions, Some(true), Some(false));
+        let PaneLayout::Leaf {
+            dir,
+            sid,
+            cwd_external,
+            remote_name,
+            custom_title,
+            private_title,
+            cmds,
+            pinned,
+        } = layout
+        else {
+            panic!("typed leaf")
+        };
+        assert_eq!(
+            dir,
+            std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
+        );
+        assert_eq!(sid, "456-789");
+        assert!(cwd_external);
+        assert_eq!(remote_name.as_deref(), Some("fixture-host"));
+        assert_eq!(custom_title, Some(true));
+        assert_eq!(private_title, Some(false));
+        assert!(cmds.is_none());
+        assert_eq!(pinned, Some(true));
+    }
     #[test]
     fn unavailable_window_root_remains_unavailable_without_filesystem_work() {
         let slot = OnceLock::new();

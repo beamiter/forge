@@ -10,10 +10,12 @@ use jterm_core::vim9::{
 };
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
+#[cfg(any(test, forge_legacy_renderer))]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
+#[cfg(any(test, forge_legacy_renderer))]
 use vte4::prelude::*;
 
 #[path = "vim9_ide_buffer.rs"]
@@ -617,6 +619,7 @@ fn shell_source(
             return Some((root.clone().downcast().ok()?, session.focus_widget()));
         }
     }
+    #[cfg(any(test, forge_legacy_renderer))]
     if let Some(terminal) = root.downcast_ref::<vte4::Terminal>() {
         if terminal
             .pty()

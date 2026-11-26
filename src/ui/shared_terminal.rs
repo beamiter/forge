@@ -12,6 +12,7 @@ const PAGE_DATA: &str = "forge-shared-terminal";
 
 pub(crate) struct SharedTerminal {
     pane: Rc<TerminalPane<OwnedPty>>,
+    find: Rc<jterm_gtk_view::TerminalFind<OwnedPty>>,
     #[cfg(target_os = "linux")]
     runtime_guard: Option<std::sync::Arc<crate::gtk_process::Guard>>,
 }
@@ -50,9 +51,12 @@ impl SharedTerminal {
             }),
         };
         let links = Self::links();
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", any(not(forge_shared_terminal), test)))]
         let mut runtime_guard = None;
+        #[cfg(all(target_os = "linux", forge_shared_terminal, not(test)))]
+        let runtime_guard;
         let status = jterm_core::review_input::safe_inline_display;
+        #[cfg(any(not(all(forge_shared_terminal, target_os = "linux")), test))]
         let legacy = |theme, links, close| {
             let argv: Vec<_> = argv.iter().map(String::as_str).collect();
             let pty = OwnedPty::spawn(&argv, cwd, &jterm_gtk_view::CHILD_ENV)
@@ -62,6 +66,34 @@ impl SharedTerminal {
         let (widget, pane) = {
             #[cfg(target_os = "linux")]
             {
+                #[cfg(all(forge_shared_terminal, not(test)))]
+                let runtime = if crate::host::is_flatpak() {
+                    let launch = crate::host::wrap_argv(argv, cwd, &jterm_gtk_view::CHILD_ENV);
+                    Self::runtime_environment(
+                        argv,
+                        config.vim9.auto_gui,
+                        &jterm_gtk_view::CHILD_ENV,
+                    )
+                    .and_then(|environment| {
+                        RuntimeShell::spawn_pane_command(&launch, Some("/"), None, environment)
+                    })
+                } else {
+                    RuntimeShell::spawn_configured_shell(
+                        argv,
+                        cwd,
+                        None,
+                        crate::host::working_directory_available,
+                        || {
+                            Self::runtime_environment(
+                                argv,
+                                config.vim9.auto_gui,
+                                &jterm_gtk_view::CHILD_ENV,
+                            )
+                        },
+                    )
+                }
+                .map(Some)?;
+                #[cfg(any(not(forge_shared_terminal), test))]
                 let runtime = RuntimeShell::spawn_candidate(
                     argv,
                     cwd,
@@ -85,7 +117,14 @@ impl SharedTerminal {
                     ));
                     TerminalPane::with_runtime(runtime, theme, status, links, close)?
                 } else {
-                    legacy(theme, links, close)?
+                    #[cfg(any(not(forge_shared_terminal), test))]
+                    {
+                        legacy(theme, links, close)?
+                    }
+                    #[cfg(all(forge_shared_terminal, not(test)))]
+                    {
+                        return Err("shared terminal launch supplied no session".into());
+                    }
                 }
             }
             #[cfg(not(target_os = "linux"))]
@@ -93,10 +132,12 @@ impl SharedTerminal {
         };
         pane.set_history_row_limit(config.terminal_scrollback_lines as usize);
         let session = Self {
+            find: pane.find_controller(),
             pane,
             #[cfg(target_os = "linux")]
             runtime_guard,
         };
+        crate::eva_companion::tag_pane(&widget);
         unsafe { widget.set_data(PAGE_DATA, Rc::new(session)) };
         Ok(widget)
     }
@@ -211,6 +252,8 @@ impl SharedTerminal {
             Action::Copy => self.pane.copy(),
             Action::Paste => self.pane.paste(),
             Action::ToggleSearch => self.pane.toggle_history_search(),
+            Action::ScrollUp => self.pane.scroll(-3),
+            Action::ScrollDown => self.pane.scroll(3),
             _ => {}
         }
     }
@@ -224,6 +267,8 @@ pub(crate) struct SharedPane {
     live: Option<SharedTerminal>,
     failure: Option<String>,
     hosted_directory: Option<String>,
+    detached_focus: Option<gtk4::Button>,
+    detached_style: Option<gtk4::CssProvider>,
 }
 
 #[cfg(target_os = "linux")]
@@ -237,9 +282,31 @@ impl SharedPane {
         let home = std::env::var("HOME").ok();
         let cwd = cwd.or(home.as_deref());
         if crate::host::is_flatpak() {
-            let argv = RuntimeShell::configured_shell_argv(argv, session_id)?;
-            return Self::open_host_command(config, &argv, cwd);
+            let Some(launch) = RuntimeShell::configured_shell_argv(argv, session_id) else {
+                return Some(Self::failed(
+                    config,
+                    argv,
+                    "configured shell session identity differs from the restored pane",
+                ));
+            };
+            return Self::open_host_command(config, &launch, cwd);
         }
+        #[cfg(all(forge_shared_terminal, not(test)))]
+        let runtime = RuntimeShell::spawn_configured_shell(
+            argv,
+            cwd,
+            Some(session_id),
+            crate::host::working_directory_available,
+            || {
+                SharedTerminal::runtime_environment(
+                    argv,
+                    config.vim9.auto_gui,
+                    &jterm_gtk_view::INTERACTIVE_CHILD_ENV,
+                )
+            },
+        )
+        .map(Some);
+        #[cfg(any(not(forge_shared_terminal), test))]
         let runtime = RuntimeShell::spawn_session_candidate(
             argv,
             cwd,
@@ -264,6 +331,15 @@ impl SharedPane {
     ) -> Option<Rc<Self>> {
         let (launch, local_directory) =
             crate::host::hosted_attachment_pty(argv, cwd, &jterm_gtk_view::INTERACTIVE_CHILD_ENV);
+        #[cfg(all(forge_shared_terminal, not(test)))]
+        let runtime = SharedTerminal::runtime_environment(
+            argv,
+            config.vim9.auto_gui,
+            &jterm_gtk_view::INTERACTIVE_CHILD_ENV,
+        )
+        .and_then(|environment| RuntimeShell::spawn_program(&launch, local_directory, environment))
+        .map(Some);
+        #[cfg(any(not(forge_shared_terminal), test))]
         let runtime = RuntimeShell::spawn_hosted_attachment(&launch, local_directory, || {
             SharedTerminal::runtime_environment(
                 argv,
@@ -285,6 +361,15 @@ impl SharedPane {
         if crate::host::is_flatpak() {
             return Self::open_host_command(config, &launch, cwd);
         }
+        #[cfg(all(forge_shared_terminal, not(test)))]
+        let runtime = SharedTerminal::runtime_environment(
+            argv,
+            config.vim9.auto_gui,
+            &jterm_gtk_view::INTERACTIVE_CHILD_ENV,
+        )
+        .and_then(|environment| RuntimeShell::spawn_pane_command(&launch, cwd, None, environment))
+        .map(Some);
+        #[cfg(any(not(forge_shared_terminal), test))]
         let runtime =
             RuntimeShell::spawn_explicit_command(&launch, cwd, crate::host::is_flatpak(), || {
                 SharedTerminal::runtime_environment(
@@ -348,10 +433,22 @@ impl SharedPane {
     fn open_host_command(config: &Config, argv: &[String], cwd: Option<&str>) -> Option<Rc<Self>> {
         let environment = &jterm_gtk_view::INTERACTIVE_CHILD_ENV;
         let launch = crate::host::wrap_argv(argv, cwd, environment);
+        #[cfg(all(forge_shared_terminal, not(test)))]
+        let runtime = SharedTerminal::runtime_environment(argv, config.vim9.auto_gui, environment)
+            .and_then(|environment| {
+                RuntimeShell::spawn_pane_command(&launch, Some("/"), None, environment)
+            })
+            .map(Some);
+        #[cfg(any(not(forge_shared_terminal), test))]
         let runtime = RuntimeShell::spawn_explicit_command(&launch, Some("/"), false, || {
             SharedTerminal::runtime_environment(argv, config.vim9.auto_gui, environment)
         });
         Self::from_runtime(config, &launch, runtime, None, false)
+    }
+
+    pub(crate) fn failed(config: &Config, argv: &[String], error: &str) -> Rc<Self> {
+        Self::from_runtime(config, argv, Err(error.to_owned()), None, false)
+            .expect("a failed launch always supplies a diagnostic pane")
     }
 
     fn from_runtime(
@@ -384,6 +481,7 @@ impl SharedPane {
             Ok::<_, String>((
                 widget,
                 SharedTerminal {
+                    find: pane.find_controller(),
                     pane,
                     runtime_guard: Some(guard),
                 },
@@ -407,13 +505,119 @@ impl SharedPane {
         root.set_hexpand(true);
         root.set_vexpand(true);
         root.append(header.widget());
-        root.append(&view);
+        let mut detached_style = None;
+        let detached_focus = if let Some(live) = &live {
+            let stack = gtk4::Stack::new();
+            stack.set_hexpand(true);
+            stack.set_vexpand(true);
+            stack.add_named(&view, Some("attached"));
+            let placeholder = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+            placeholder.set_hexpand(true);
+            placeholder.set_vexpand(true);
+            let content = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+            content.set_halign(gtk4::Align::Center);
+            content.set_valign(gtk4::Align::Center);
+            content.set_vexpand(true);
+            content.append(&gtk4::Label::new(Some("Terminal view detached")));
+            let resume = gtk4::Button::with_label("Reattach terminal view");
+            content.append(&resume);
+            placeholder.append(&content);
+            stack.add_named(&placeholder, Some("detached"));
+            stack.set_visible_child_name("attached");
+            let detach = gtk4::Button::with_label("Detach terminal view");
+            detach.set_halign(gtk4::Align::End);
+            let style = gtk4::CssProvider::new();
+            Self::style_detached_view(&style, config);
+            for widget in [
+                placeholder.clone().upcast::<gtk4::Widget>(),
+                resume.clone().upcast(),
+                detach.clone().upcast(),
+            ] {
+                #[allow(deprecated)]
+                widget
+                    .style_context()
+                    .add_provider(&style, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
+            }
+            detached_style = Some(style);
+            detach.set_tooltip_text(Some("Release this view while its terminal keeps running. Closing the pane still stops its process."));
+            if let Ok(ticket) = live.pane.view_attachment() {
+                detach.update_property(&[gtk4::accessible::Property::Description(&format!(
+                    "session={} epoch={} generation={}",
+                    ticket.session, ticket.epoch, ticket.generation
+                ))]);
+            } else {
+                detach.set_sensitive(false);
+            }
+            let pane = Rc::downgrade(&live.pane);
+            let weak_stack = stack.downgrade();
+            let resume_weak = resume.downgrade();
+            detach.connect_clicked(move |button| {
+                let (Some(pane), Some(stack), Some(resume)) =
+                    (pane.upgrade(), weak_stack.upgrade(), resume_weak.upgrade())
+                else {
+                    return;
+                };
+                let result = pane
+                    .view_attachment()
+                    .and_then(|ticket| pane.switch_view_attachment(&ticket, false));
+                match result {
+                    Ok(ticket) => {
+                        resume.update_property(&[gtk4::accessible::Property::Description(
+                            &format!(
+                                "session={} epoch={} generation={}",
+                                ticket.session, ticket.epoch, ticket.generation
+                            ),
+                        )]);
+                        button.set_sensitive(false);
+                        stack.set_visible_child_name("detached");
+                        resume.grab_focus();
+                    }
+                    Err(error) => button.set_tooltip_text(Some(&error)),
+                }
+            });
+            let pane = Rc::downgrade(&live.pane);
+            let weak_stack = stack.downgrade();
+            let detach_weak = detach.downgrade();
+            resume.connect_clicked(move |button| {
+                let (Some(pane), Some(stack), Some(detach)) =
+                    (pane.upgrade(), weak_stack.upgrade(), detach_weak.upgrade())
+                else {
+                    return;
+                };
+                let result = pane
+                    .view_attachment()
+                    .and_then(|ticket| pane.switch_view_attachment(&ticket, true));
+                match result {
+                    Ok(ticket) => {
+                        detach.update_property(&[gtk4::accessible::Property::Description(
+                            &format!(
+                                "session={} epoch={} generation={}",
+                                ticket.session, ticket.epoch, ticket.generation
+                            ),
+                        )]);
+                        stack.set_visible_child_name("attached");
+                        detach.set_sensitive(true);
+                        pane.focus();
+                    }
+                    Err(error) => button.set_tooltip_text(Some(&error)),
+                }
+            });
+            root.append(&detach);
+            root.append(&stack);
+            Some(resume)
+        } else {
+            root.append(&view);
+            None
+        };
+        crate::eva_companion::tag_pane(&root);
         Some(Rc::new(Self {
             root: root.upcast(),
             header,
             live,
             failure,
             hosted_directory: hosted_directory.map(str::to_owned),
+            detached_focus,
+            detached_style,
         }))
     }
 
@@ -443,7 +647,17 @@ impl SharedPane {
         }
     }
 
+    fn style_detached_view(style: &gtk4::CssProvider, config: &Config) {
+        style.load_from_string(&format!(
+            "* {{ background-color: {}; background-image: none; color: {}; }}",
+            config.background, config.foreground
+        ));
+    }
+
     pub(crate) fn update_theme(&self, config: &Config, scale: f64) {
+        if let Some(style) = &self.detached_style {
+            Self::style_detached_view(style, config);
+        }
         if let Some(live) = &self.live {
             live.pane.set_theme(Self::theme(config, scale));
         }
@@ -458,6 +672,15 @@ impl SharedPane {
     }
 
     pub(crate) fn focus_widget(&self) -> gtk4::Widget {
+        if self
+            .live
+            .as_ref()
+            .is_some_and(|live| !live.pane.view_is_attached())
+        {
+            if let Some(button) = &self.detached_focus {
+                return button.clone().upcast();
+            }
+        }
         self.live.as_ref().map_or_else(
             || self.root.last_child().unwrap_or_else(|| self.root.clone()),
             |live| live.pane.screen().clone().upcast(),
@@ -488,6 +711,10 @@ impl SharedPane {
         self.live
             .as_ref()
             .is_some_and(|live| live.matches_vim_source(invocation))
+    }
+
+    pub(crate) fn find_controller(&self) -> Option<&Rc<jterm_gtk_view::TerminalFind<OwnedPty>>> {
+        self.live.as_ref().map(|live| &live.find)
     }
 
     pub(crate) fn launch_error(&self) -> Option<&str> {

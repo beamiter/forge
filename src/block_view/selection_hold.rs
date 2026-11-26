@@ -18,6 +18,7 @@ use std::rc::Rc;
 #[cfg(forge_shared_terminal)]
 use gtk4::prelude::{TextBufferExt, TextViewExt};
 use jterm_core::terminal_report::classify_terminal_report;
+#[cfg(any(test, forge_legacy_renderer))]
 use vte4::TerminalExt;
 
 use super::{BlockState, MouseReporting};
@@ -142,6 +143,7 @@ impl SelectionFeedHold {
     /// `cpr_outstanding` is the pane's count of cursor position queries left
     /// to the VTE, which is what tells its CPR answer from Shift+F3; see
     /// [`commit_releases_hold`].
+    #[cfg(any(test, forge_legacy_renderer))]
     pub(crate) fn install_vte_hooks(
         self: &Rc<Self>,
         vte: &vte4::Terminal,

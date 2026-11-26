@@ -5,13 +5,16 @@ use super::local_preview_file::{
     PreviewContent,
 };
 use super::preview_navigation::{match_background, ImageZoom, Occurrence, SourceMatches};
-use super::{local_preview_file, local_reference, PaneLeaf, UiState};
+#[cfg(any(test, forge_legacy_renderer))]
+use super::PaneLeaf;
+use super::{local_preview_file, local_reference, UiState};
 use gtk4::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+#[cfg(any(test, forge_legacy_renderer))]
 use vte4::{prelude::TerminalExtManual, TerminalExt};
 
 static READER_BUSY: AtomicBool = AtomicBool::new(false);
@@ -45,6 +48,7 @@ fn candidate(raw: &str) -> Option<PathBuf> {
     .then_some(path)
 }
 
+#[cfg(any(test, forge_legacy_renderer))]
 fn host_owns_click(terminal: &vte4::Terminal) -> bool {
     // Finished output VTEs cannot report this click to a PTY application.
     if !terminal.is_input_enabled() {
@@ -69,7 +73,7 @@ fn host_owns_click(terminal: &vte4::Terminal) -> bool {
 
 fn hit(window: &gtk4::Widget, x: f64, y: f64) -> Option<(usize, PathBuf)> {
     let mut picked = window.pick(x, y, gtk4::PickFlags::DEFAULT)?;
-    let terminal = loop {
+    loop {
         #[cfg(forge_shared_terminal)]
         if let Some(document) = picked.downcast_ref::<gtk4::TextView>() {
             let point =
@@ -79,22 +83,32 @@ fn hit(window: &gtk4::Widget, x: f64, y: f64) -> Option<(usize, PathBuf)> {
             let reference = jterm_core::link::document_local_reference_at(&text, byte)?;
             return candidate(&reference).map(|path| (document.as_ptr() as usize, path));
         }
-        if let Ok(terminal) = picked.clone().downcast::<vte4::Terminal>() {
-            break terminal;
+        #[cfg(any(test, forge_legacy_renderer))]
+        if let Some(terminal) = picked.downcast_ref::<vte4::Terminal>() {
+            return legacy_hit(window, terminal, x, y);
         }
         picked = picked.parent()?;
-    };
-    if !host_owns_click(&terminal) {
+    }
+}
+
+#[cfg(any(test, forge_legacy_renderer))]
+fn legacy_hit(
+    window: &gtk4::Widget,
+    terminal: &vte4::Terminal,
+    x: f64,
+    y: f64,
+) -> Option<(usize, PathBuf)> {
+    if !host_owns_click(terminal) {
         return None;
     }
-    let point = window.compute_point(&terminal, &gtk4::graphene::Point::new(x as f32, y as f32))?;
+    let point = window.compute_point(terminal, &gtk4::graphene::Point::new(x as f32, y as f32))?;
     // Explicit hyperlinks and the existing URL matcher take priority; never
     // reinterpret a refused remote OSC8 label as a local path.
     let raw = terminal
         .check_hyperlink_at(point.x().into(), point.y().into())
         .map(|s| s.to_string())
         .or_else(|| {
-            crate::vte_reference::hit(&terminal, point.x().into(), point.y().into()).map(
+            crate::vte_reference::hit(terminal, point.x().into(), point.y().into()).map(
                 |reference| {
                     if reference.blocked {
                         String::new()
@@ -134,6 +148,12 @@ struct ReadTarget {
     source_reference: bool,
 }
 
+struct RemotePreviewSource {
+    host: crate::config::RemoteHost,
+    label: String,
+    is_current: Box<dyn Fn() -> bool>,
+}
+
 struct PreviewPanel {
     root: gtk4::Box,
     path: gtk4::Label,
@@ -169,6 +189,7 @@ struct PreviewPanel {
     picture: gtk4::Picture,
     image_scroll: gtk4::ScrolledWindow,
     target: RefCell<Option<ReadTarget>>,
+    remote: Option<RemotePreviewSource>,
     active: Cell<bool>,
     loaded: Cell<bool>,
     loading: Cell<bool>,
@@ -212,6 +233,7 @@ impl PreviewPanel {
     fn new(
         path: PathBuf,
         from_terminal: bool,
+        remote: Option<RemotePreviewSource>,
         close_preview: impl Fn(&Rc<Self>) + 'static,
     ) -> Rc<Self> {
         let root = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
@@ -221,7 +243,11 @@ impl PreviewPanel {
         root.set_margin_end(8);
 
         let heading = gtk4::Label::builder()
-            .label("Local file preview")
+            .label(if remote.is_some() {
+                "Remote file preview"
+            } else {
+                "Local file preview"
+            })
             .xalign(0.0)
             .hexpand(true)
             .ellipsize(gtk4::pango::EllipsizeMode::End)
@@ -231,6 +257,7 @@ impl PreviewPanel {
         let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
         header.append(&heading);
         header.append(&close);
+        let remote_label = remote.as_ref().map(|source| wrapped_label(&source.label));
         let path_label = gtk4::Label::builder()
             .xalign(0.0)
             .ellipsize(gtk4::pango::EllipsizeMode::Middle)
@@ -375,6 +402,9 @@ impl PreviewPanel {
         body.add_named(&image_scroll, Some("image"));
 
         root.append(&header);
+        if let Some(label) = remote_label {
+            root.append(&label);
+        }
         root.append(&path_label);
         root.append(&status);
         root.append(&read_status);
@@ -423,6 +453,7 @@ impl PreviewPanel {
                 path: path.clone(),
                 source_reference: from_terminal,
             })),
+            remote,
             active: Cell::new(true),
             loaded: Cell::new(false),
             loading: Cell::new(false),
@@ -712,8 +743,14 @@ impl PreviewPanel {
         }
     }
 
+    fn source_is_current(&self) -> bool {
+        self.remote
+            .as_ref()
+            .is_none_or(|source| (source.is_current)())
+    }
+
     fn read(self: &Rc<Self>) {
-        if !self.active.get() || self.loading.get() {
+        if !self.active.get() || self.loading.get() || !self.source_is_current() {
             return;
         }
         let Some(target) = self.target.borrow().clone() else {
@@ -730,15 +767,17 @@ impl PreviewPanel {
         self.approval.set_visible(false);
         self.tools.set_visible(true);
         self.reload.set_sensitive(false);
-        self.show_read_status(if self.loaded.get() {
-            "Reloading local file…"
-        } else {
-            "Reading local file…"
+        let remote_host = self.remote.as_ref().map(|source| source.host.clone());
+        self.show_read_status(match (self.loaded.get(), remote_host.is_some()) {
+            (true, true) => "Reloading remote file…",
+            (false, true) => "Reading remote file…",
+            (true, false) => "Reloading local file…",
+            (false, false) => "Reading local file…",
         });
 
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         if std::thread::Builder::new()
-            .name("local-file-preview".into())
+            .name("file-preview".into())
             .spawn(move || {
                 struct ReleaseReader;
                 impl Drop for ReleaseReader {
@@ -750,7 +789,11 @@ impl PreviewPanel {
                 let result = if target.source_reference {
                     reader::read_reference(&target.path)
                 } else {
-                    read_exact(&target.path).map(|content| LoadedPreview {
+                    let content = match remote_host {
+                        Some(host) => reader::read_remote(&host, &target.path),
+                        None => read_exact(&target.path),
+                    };
+                    content.map(|content| LoadedPreview {
                         path: target.path,
                         content,
                         location: None,
@@ -769,7 +812,10 @@ impl PreviewPanel {
 
         let weak = Rc::downgrade(self);
         gtk4::glib::timeout_add_local(Duration::from_millis(40), move || {
-            let Some(panel) = weak.upgrade().filter(|panel| panel.active.get()) else {
+            let Some(panel) = weak
+                .upgrade()
+                .filter(|panel| panel.active.get() && panel.source_is_current())
+            else {
                 return gtk4::glib::ControlFlow::Break;
             };
             let result = match rx.try_recv() {
@@ -793,8 +839,10 @@ impl PreviewPanel {
             Ok(preview) => preview,
             Err(error) => {
                 let description = match error.kind() {
-                    std::io::ErrorKind::NotFound => "Local file not found".into(),
-                    std::io::ErrorKind::PermissionDenied => {
+                    std::io::ErrorKind::NotFound if self.remote.is_none() => {
+                        "Local file not found".into()
+                    }
+                    std::io::ErrorKind::PermissionDenied if self.remote.is_none() => {
                         "Permission denied reading the local file".into()
                     }
                     _ => error.to_string(),
@@ -1057,7 +1105,13 @@ impl PreviewState {
 }
 
 impl PreviewState {
-    fn present(self: &Rc<Self>, stack: &gtk4::Stack, path: PathBuf, from_terminal: bool) {
+    fn present(
+        self: &Rc<Self>,
+        stack: &gtk4::Stack,
+        path: PathBuf,
+        from_terminal: bool,
+        remote: Option<RemotePreviewSource>,
+    ) {
         if stack.visible_child_name().as_deref() != Some(PAGE) {
             *self.previous.borrow_mut() = stack
                 .visible_child_name()
@@ -1072,7 +1126,7 @@ impl PreviewState {
         }
         let weak_state = Rc::downgrade(self);
         let weak_stack = stack.downgrade();
-        let panel = PreviewPanel::new(path, from_terminal, move |panel| {
+        let panel = PreviewPanel::new(path, from_terminal, remote, move |panel| {
             if let (Some(state), Some(stack)) = (weak_state.upgrade(), weak_stack.upgrade()) {
                 let still_current = state
                     .current
@@ -1089,6 +1143,15 @@ impl PreviewState {
         stack.set_visible_child_name(PAGE);
         if !from_terminal {
             panel.read();
+        }
+    }
+
+    pub(super) fn retire_remote(&self, stack: &gtk4::Stack, force: bool) {
+        let retire = self.current.borrow().as_ref().is_some_and(|panel| {
+            panel.remote.is_some() && (force || !panel.source_is_current())
+        });
+        if retire {
+            self.close(stack);
         }
     }
 
@@ -1109,7 +1172,7 @@ impl PreviewState {
 impl UiState {
     fn show_local_file_preview(&self, path: PathBuf, from_terminal: bool) {
         self.local_preview
-            .present(&self.side_stack, path, from_terminal);
+            .present(&self.side_stack, path, from_terminal, None);
         super::reference_shell::sync_inspector(self, true);
     }
 
@@ -1117,11 +1180,28 @@ impl UiState {
         self.show_local_file_preview(path, false);
     }
 
+    pub(super) fn preview_remote_file_tree_path(
+        &self,
+        path: PathBuf,
+        host: crate::config::RemoteHost,
+        label: String,
+        is_current: impl Fn() -> bool + 'static,
+    ) {
+        let remote = RemotePreviewSource {
+            host,
+            label,
+            is_current: Box::new(is_current),
+        };
+        self.local_preview
+            .present(&self.side_stack, path, false, Some(remote));
+        super::reference_shell::sync_inspector(self, true);
+    }
+
     pub(crate) fn install_local_source_preview(self: &Rc<Self>) {
         self.local_preview.observe_stack(&self.side_stack);
         let weak_ui = Rc::downgrade(self);
         let weak_owner = weak_ui.clone();
-        crate::vte_reference::click(
+        crate::link_gesture::install(
             &self.window,
             move |x, y| hit(weak_ui.upgrade()?.window.upcast_ref(), x, y),
             move |(_, path)| {

@@ -1,8 +1,8 @@
 {
   "adapter_source_core_base": "10120c3aa690ff5e1a66ae15f2418b753e2053f1",
   "bundle": "pty-process-v1",
-  "core_pin_verification": "The locked Cargo graph uses the published core revision in public_core_base. The content checksums identify the bundled adapter files.",
-  "files_sha256": {
+  "core_pin_verification": "The locked Cargo graph uses the exact core revision in public_core_base. This candidate was verified locally using command-scoped Git redirection; publication is not claimed. Adapter exporter provenance remains separately recorded.",
+  "exporter_baseline_files_sha256": {
     "src/gtk_process.rs": "f566d1094be37c094a08044f11831ccc4adf600583bfbe783f1bd19dedfcfaa3",
     "src/gtk_spawn.rs": "6614651ce110c538fdd8659fd00ee042c402befd7ac4caf6a7f361967dc87ecc",
     "tools/check-process-bundle.py": "72e4641349af09b2ac91ad92a80aedc0c4599c9cce11082f9f4d9aa823ccff19",
@@ -12,7 +12,29 @@
     "vendor/companion-process/src/pty_session.rs": "34ef861a92c1afe27059f491664802f932b996306f09d5a04e91db94b8661a2f",
     "vendor/companion-process/src/shell_identity.rs": "cff15f40ec159f8c099a74335d51bc236d524e4166088f9d1bf785ebff28435f"
   },
-  "public_core_base": "c4bcdb73b27e21deaf4d7d4a608384e20e8963d7",
+  "files_sha256": {
+    "src/gtk_process.rs": "2c45c7ac3e31139775d8813b2c1cfd0600db1360a6278bc0bb34601c8124de90",
+    "src/gtk_spawn.rs": "6614651ce110c538fdd8659fd00ee042c402befd7ac4caf6a7f361967dc87ecc",
+    "tools/check-process-bundle.py": "72e4641349af09b2ac91ad92a80aedc0c4599c9cce11082f9f4d9aa823ccff19",
+    "vendor/companion-process/Cargo.toml": "46cfd243bd73a0b8d0c94e10a4c456e719123d153008b02f043ad122ee7c66e2",
+    "vendor/companion-process/LICENSE": "df864a86870c22b4a37004850372cd147b82495362f64676fecbe28f27f58d42",
+    "vendor/companion-process/src/lib.rs": "f1ef41de8ba3f4646e43c5ddd4dad41b098bcd49ff46322e96f6c0fcb61854a5",
+    "vendor/companion-process/src/pty_session.rs": "8b2e4c259e38fad84cdede5c74b0a63b5760469d061a9f4788d7c1939c176d66",
+    "vendor/companion-process/src/shell_identity.rs": "cff15f40ec159f8c099a74335d51bc236d524e4166088f9d1bf785ebff28435f"
+  },
+  "frontend_adaptations": {
+    "src/gtk_process.rs": {
+      "exporter_sha256": "f566d1094be37c094a08044f11831ccc4adf600583bfbe783f1bd19dedfcfaa3",
+      "frontend_sha256": "2c45c7ac3e31139775d8813b2c1cfd0600db1360a6278bc0bb34601c8124de90",
+      "reason": "Featureless GTK shared-runtime adapter removes VTE launch/process dependencies while retaining child drain ownership. Exporter baseline identity remains unchanged."
+    },
+    "vendor/companion-process/src/pty_session.rs": {
+      "exporter_sha256": "34ef861a92c1afe27059f491664802f932b996306f09d5a04e91db94b8661a2f",
+      "frontend_sha256": "8b2e4c259e38fad84cdede5c74b0a63b5760469d061a9f4788d7c1939c176d66",
+      "reason": "Preserves completed empty process scans across bounded exit-drain retries for the same unreaped child."
+    }
+  },
+  "public_core_base": "06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e",
   "schema": 1,
   "scope": "Versioned process observer and GTK launch ownership. The GTK adapter also tracks child drain in the opt-in shared runtime. The file hashes identify these exact adapter sources.",
   "version": "0.1.0"

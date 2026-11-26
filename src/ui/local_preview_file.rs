@@ -109,16 +109,27 @@ fn read_reference_with(
     }
 }
 
-pub fn read_preview(path: &Path) -> io::Result<PreviewContent> {
-    let image = path
-        .extension()
+fn is_image(path: &Path) -> bool {
+    path.extension()
         .and_then(|x| x.to_str())
-        .is_some_and(|x| matches!(x.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg"));
-    if image {
+        .is_some_and(|x| matches!(x.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg"))
+}
+
+pub fn read_preview(path: &Path) -> io::Result<PreviewContent> {
+    if is_image(path) {
         let bytes = read_bounded(path, super::local_preview_image::MAX_IMAGE_BYTES)?;
         return super::local_preview_image::decode(&bytes).map(PreviewContent::Image);
     }
     read_source(path).map(PreviewContent::Text)
+}
+
+pub(super) fn read_remote(host: &crate::config::RemoteHost, path: &Path) -> io::Result<PreviewContent> {
+    if is_image(path) {
+        let bytes =
+            super::remote_fs::preview_bytes(host, path, super::local_preview_image::MAX_IMAGE_BYTES)?;
+        return super::local_preview_image::decode(&bytes).map(PreviewContent::Image);
+    }
+    source_text(super::remote_fs::preview_bytes(host, path, MAX_BYTES)?).map(PreviewContent::Text)
 }
 
 fn read_bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {

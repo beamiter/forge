@@ -1,24 +1,39 @@
 use adw::prelude::*;
 use gtk4::gdk::RGBA;
 use gtk4::gio;
+#[cfg(any(test, forge_legacy_renderer))]
 use gtk4::pango::FontDescription;
-use gtk4::{glib, Entry, Label, Orientation, Paned};
+#[cfg(any(test, forge_legacy_renderer))]
+use gtk4::Orientation;
+use gtk4::{glib, Entry, Label, Paned};
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
+#[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
+#[cfg(any(test, forge_legacy_renderer))]
 use std::sync::Arc;
-use vte4::{CursorBlinkMode, CursorShape, Terminal};
-use vte4::{TerminalExt, TerminalExtManual};
+#[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
+use vte4::{CursorBlinkMode, CursorShape};
+#[cfg(any(test, forge_legacy_renderer))]
+use vte4::{Terminal, TerminalExt, TerminalExtManual};
 
+#[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
 mod launch_owner;
+#[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
 mod launch_recovery;
+#[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
 mod launch_state;
+#[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
 mod launch_success;
+#[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
 pub(crate) use launch_recovery::close_terminal_launch;
 
+#[cfg(any(test, forge_legacy_renderer))]
 use crate::config::Config;
-use crate::process::{ChildLifecycle, EscalationPolicy};
+#[cfg(any(test, forge_legacy_renderer))]
+use crate::process::ChildLifecycle;
+use crate::process::EscalationPolicy;
 
 /// Shutdown ladder for a terminal pane's shell.
 ///
@@ -36,9 +51,11 @@ pub(crate) const TERMINAL_ESCALATION: EscalationPolicy = EscalationPolicy::SESSI
 /// process for a Block pane), so widget-tree teardown paths never have to
 /// infer ownership from the widget type — and can never signal a pid that has
 /// already been reaped and recycled.
+#[cfg(any(test, forge_legacy_renderer))]
 const CHILD_LIFECYCLE_DATA_KEY: &str = "child-lifecycle";
 
 /// Attach a pane's child lifecycle to the live VTE that displays it.
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn set_terminal_child_lifecycle(terminal: &Terminal, lifecycle: Arc<ChildLifecycle>) {
     unsafe {
         terminal.set_data::<Arc<ChildLifecycle>>(CHILD_LIFECYCLE_DATA_KEY, lifecycle);
@@ -46,6 +63,7 @@ pub(crate) fn set_terminal_child_lifecycle(terminal: &Terminal, lifecycle: Arc<C
 }
 
 /// The child lifecycle of the shell shown by `terminal`, if one was attached.
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn terminal_child_lifecycle(terminal: &Terminal) -> Option<Arc<ChildLifecycle>> {
     unsafe {
         terminal
@@ -55,6 +73,7 @@ pub(crate) fn terminal_child_lifecycle(terminal: &Terminal) -> Option<Arc<ChildL
 }
 
 /// The shell pid behind `terminal`, for `/proc` probes and logging only.
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn terminal_child_pid(terminal: &Terminal) -> Option<i32> {
     terminal_child_lifecycle(terminal).map(|lifecycle| lifecycle.pid())
 }
@@ -146,6 +165,7 @@ pub(crate) fn focus_terminal(terminal: &impl IsA<gtk4::Widget>) {
 /// surface and for both read-only VTEs of every finished card. The value
 /// changes only when the config does, so a one-entry cache is enough — keyed
 /// on the icon fallback too, since that is the other half of what gets built.
+#[cfg(any(test, forge_legacy_renderer))]
 fn with_font_description<R>(config: &Config, f: impl FnOnce(&FontDescription) -> R) -> R {
     thread_local! {
         static CACHED: std::cell::RefCell<Option<(String, Option<String>, FontDescription)>> =
@@ -169,6 +189,7 @@ fn with_font_description<R>(config: &Config, f: impl FnOnce(&FontDescription) ->
     })
 }
 
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn apply_terminal_theme(terminal: &Terminal, config: &Config) {
     let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
     terminal.set_colors(
@@ -207,6 +228,7 @@ pub(crate) fn chat_terminal_colors() -> (RGBA, RGBA, RGBA) {
     )
 }
 
+#[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
 pub(crate) fn create_terminal(config: &Config) -> Terminal {
     let font_scale = config.default_font_scale;
     let terminal = Terminal::builder()
@@ -252,6 +274,7 @@ type IntCallbacks = Rc<RefCell<Vec<Box<dyn Fn(i32)>>>>;
 type VoidCallbacks = Rc<RefCell<Vec<Box<dyn Fn()>>>>;
 
 #[allow(dead_code)]
+#[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
 pub struct VteTerminalView {
     root: gtk4::Box,
     launch_recovery: Rc<launch_recovery::LaunchRecovery>,
@@ -269,6 +292,7 @@ pub struct VteTerminalView {
 }
 
 #[allow(dead_code)]
+#[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
 impl VteTerminalView {
     pub fn new(
         config: Rc<RefCell<Config>>,
@@ -572,6 +596,7 @@ impl VteTerminalView {
 }
 
 /// Wrap a terminal in an hbox with a scrollbar on the right side.
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn wrap_with_scrollbar(terminal: &Terminal) -> gtk4::Box {
     let hbox = gtk4::Box::new(Orientation::Horizontal, 0);
     hbox.set_hexpand(true);
@@ -594,6 +619,7 @@ pub(crate) fn scrollbar_wrapper_of(term_widget: &gtk4::Widget) -> Option<gtk4::B
     }
 }
 
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn terminal_working_directory(terminal: &Terminal) -> Option<String> {
     // This value starts local shells and navigates the local Files tree.
     // GFile::path() discards a file URI's remote authority, so it cannot be
@@ -694,6 +720,7 @@ impl InitialCommands {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
 fn spawn_shell(
     terminal: &Terminal,
     argv_owned: &[String],
@@ -844,6 +871,7 @@ fn spawn_shell(
     );
 }
 
+#[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
 fn launch_error_with_program(program: &str, error: std::io::Error) -> std::io::Error {
     let program = jterm_core::review_input::safe_inline_display(program, 512);
     let detail = jterm_core::review_input::safe_inline_display(&error.to_string(), 1024);
@@ -856,6 +884,7 @@ fn launch_error_with_program(program: &str, error: std::io::Error) -> std::io::E
 }
 
 /// Real owned launch outcome. No callback can reopen or signal a retired PID.
+#[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
 fn resolve_spawn(
     terminal: &Terminal,
     owner: Rc<launch_owner::LaunchOwner>,
@@ -1132,6 +1161,7 @@ pub(crate) fn openable_link(
 /// ("Security guide"). VTE underlines it and shows the hand cursor, but
 /// `check_match_at` only knows the URL regex, so those links could never be
 /// opened; `check_hyperlink_at` is the OSC 8 half.
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn openable_link_at(terminal: &Terminal, x: f64, y: f64) -> Option<String> {
     openable_link(
         terminal.check_hyperlink_at(x, y).map(|uri| uri.to_string()),
@@ -1143,6 +1173,7 @@ pub(crate) fn openable_link_at(terminal: &Terminal, x: f64, y: f64) -> Option<St
 /// pointer is over it: its label can say anything, including another URL.
 /// Only targets the opener would accept are shown, so Unified's zone markers
 /// and refused schemes stay silent.
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn install_hyperlink_hover_tooltip(terminal: &Terminal) {
     terminal.connect_hyperlink_hover_uri_notify(|terminal| {
         let target = terminal
@@ -1159,11 +1190,12 @@ pub(crate) fn install_hyperlink_hover_tooltip(terminal: &Terminal) {
     });
 }
 
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn setup_terminal_click_handler(terminal: &Terminal) {
     install_hyperlink_hover_tooltip(terminal);
     crate::vte_reference::install_hover(terminal);
     let weak = terminal.downgrade();
-    crate::vte_reference::click(
+    crate::link_gesture::install(
         terminal,
         move |x, y| openable_link_at(&weak.upgrade()?, x, y),
         |uri| open_uri(&uri),
@@ -1173,6 +1205,7 @@ pub(crate) fn setup_terminal_click_handler(terminal: &Terminal) {
 /// Find the first Terminal in a widget tree (depth-first). Traverses children
 /// generically so the live VTE buried under ScrolledWindow → Viewport →
 /// block_list → active_holder is reachable.
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn find_first_terminal(widget: &gtk4::Widget) -> Option<Terminal> {
     if let Ok(term) = widget.clone().downcast::<Terminal>() {
         return Some(term);
@@ -1188,6 +1221,7 @@ pub(crate) fn find_first_terminal(widget: &gtk4::Widget) -> Option<Terminal> {
 }
 
 /// Find the focused Terminal in a widget tree.
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn find_focused_terminal(widget: &gtk4::Widget) -> Option<Terminal> {
     if let Ok(term) = widget.clone().downcast::<Terminal>() {
         if term.has_focus() {
@@ -1205,6 +1239,7 @@ pub(crate) fn find_focused_terminal(widget: &gtk4::Widget) -> Option<Terminal> {
 }
 
 /// Collect all terminals in a widget tree.
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn collect_terminals(widget: &gtk4::Widget, out: &mut Vec<Terminal>) {
     if let Ok(term) = widget.clone().downcast::<Terminal>() {
         out.push(term);

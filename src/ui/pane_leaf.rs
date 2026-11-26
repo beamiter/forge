@@ -11,9 +11,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use gtk4::glib::prelude::ObjectExt;
 use gtk4::prelude::*;
+#[cfg(any(test, forge_legacy_renderer))]
 use vte4::Terminal;
 
 use crate::block_view::TermView;
+#[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
 use crate::terminal::{focus_terminal, VteTerminalView};
 
 const PANE_LEAF_DATA_KEY: &str = "terminal-view-type";
@@ -29,6 +31,7 @@ static NEXT_PANE_FOCUS_SERIAL: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone)]
 pub(crate) enum PaneLeaf {
     Block(Rc<TermView>),
+    #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
     Vte(Rc<VteTerminalView>),
     #[cfg(all(forge_shared_terminal, target_os = "linux"))]
     Shared(Rc<super::shared_terminal::SharedPane>),
@@ -39,6 +42,7 @@ impl PaneLeaf {
     pub(crate) fn root_widget(&self) -> gtk4::Widget {
         match self {
             Self::Block(view) => view.widget(),
+            #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
             Self::Vte(view) => view.widget(),
             #[cfg(all(forge_shared_terminal, target_os = "linux"))]
             Self::Shared(view) => view.root().clone(),
@@ -49,9 +53,12 @@ impl PaneLeaf {
     ///
     /// Finished Block snapshots contain additional read-only VTE widgets, so
     /// generic widget-tree traversal cannot reliably identify this terminal.
+    #[cfg(any(test, forge_legacy_renderer))]
     pub(crate) fn terminal(&self) -> Option<&Terminal> {
         match self {
+            #[cfg(any(test, forge_legacy_renderer))]
             Self::Block(view) => view.legacy_terminal(),
+            #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
             Self::Vte(view) => Some(view.vte()),
             #[cfg(all(forge_shared_terminal, target_os = "linux"))]
             Self::Shared(_) => None,
@@ -61,6 +68,7 @@ impl PaneLeaf {
     pub(crate) fn focus_widget(&self) -> gtk4::Widget {
         match self {
             Self::Block(view) => view.focus_widget(),
+            #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
             Self::Vte(view) => view.vte().clone().upcast(),
             #[cfg(all(forge_shared_terminal, target_os = "linux"))]
             Self::Shared(view) => view.focus_widget(),
@@ -68,43 +76,72 @@ impl PaneLeaf {
     }
 
     pub(crate) fn working_directory(&self) -> Option<String> {
-        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
-        if let Self::Shared(view) = self {
-            return view.working_directory();
+        match self {
+            Self::Block(view) => {
+                #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
+                if let Some(terminal) = view.legacy_terminal() {
+                    return crate::terminal::terminal_working_directory(terminal);
+                }
+                // A remote OSC 7 path may be useful to the block's display,
+                // but starting a local shell requires the local child's cwd.
+                crate::process::process_cwd(view.pid_i32())
+            }
+            #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
+            Self::Vte(view) => crate::terminal::terminal_working_directory(view.vte()),
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+            Self::Shared(view) => view.working_directory(),
         }
-        self.terminal()
-            .and_then(crate::terminal::terminal_working_directory)
+    }
+
+    pub(crate) fn reported_directory_uri(&self) -> Option<String> {
+        match self {
+            Self::Block(view) => view.reported_directory_uri(),
+            #[cfg(any(test, forge_legacy_renderer))]
+            Self::Vte(view) => {
+                use vte4::TerminalExt;
+                view.vte()
+                    .current_directory_uri()
+                    .map(|uri| uri.to_string())
+            }
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+            Self::Shared(view) => view.terminal_pane()?.reported_directory_uri(),
+        }
     }
 
     pub(crate) fn window_title(&self) -> Option<String> {
-        use vte4::TerminalExt;
-        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
-        if let Self::Shared(view) = self {
-            return view.terminal_pane()?.window_title();
+        match self {
+            Self::Block(view) => view.window_title(),
+            #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
+            Self::Vte(view) => {
+                use vte4::TerminalExt;
+                view.vte().window_title().map(|title| title.to_string())
+            }
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+            Self::Shared(view) => view.terminal_pane()?.window_title(),
         }
-        self.terminal()?
-            .window_title()
-            .map(|title| title.to_string())
     }
 
     pub(crate) fn grid_size(&self) -> (u16, u16) {
-        use vte4::TerminalExt;
-        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
-        if let Self::Shared(view) = self {
-            return view.terminal_pane().map_or((0, 0), |pane| pane.grid_size());
+        match self {
+            Self::Block(view) => view.child_grid_size(),
+            #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
+            Self::Vte(view) => {
+                use vte4::TerminalExt;
+                let dimension = |count: i64| count.clamp(0, i64::from(u16::MAX)) as u16;
+                (
+                    dimension(view.vte().column_count()),
+                    dimension(view.vte().row_count()),
+                )
+            }
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+            Self::Shared(view) => view.terminal_pane().map_or((0, 0), |pane| pane.grid_size()),
         }
-        self.terminal().map_or((0, 0), |terminal| {
-            let dimension = |count: i64| count.clamp(0, i64::from(u16::MAX)) as u16;
-            (
-                dimension(terminal.column_count()),
-                dimension(terminal.row_count()),
-            )
-        })
     }
 
     pub(crate) fn input_generation(&self) -> Option<(u64, u64)> {
         match self {
             Self::Block(view) => Some(view.path_drop_generation()),
+            #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
             Self::Vte(_) => None,
             #[cfg(all(forge_shared_terminal, target_os = "linux"))]
             Self::Shared(view) => view.terminal_pane().map(|pane| (pane.input_revision(), 0)),
@@ -115,6 +152,7 @@ impl PaneLeaf {
     pub(crate) fn pane_header(&self) -> &super::PaneHeader {
         match self {
             Self::Block(view) => view.pane_header(),
+            #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
             Self::Vte(view) => view.pane_header(),
             #[cfg(all(forge_shared_terminal, target_os = "linux"))]
             Self::Shared(view) => view.header(),
@@ -154,6 +192,7 @@ impl PaneLeaf {
         self.mark_active();
         match self {
             Self::Block(view) => view.grab_focus(),
+            #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
             Self::Vte(view) => focus_terminal(view.vte()),
             #[cfg(all(forge_shared_terminal, target_os = "linux"))]
             Self::Shared(view) => {
@@ -198,6 +237,7 @@ impl PaneLeaf {
     pub(crate) fn write_input(&self, data: &[u8]) -> Result<(), crate::pty::PtyWriteError> {
         match self {
             Self::Block(view) => view.write_input(data),
+            #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
             Self::Vte(view) => {
                 view.write_input(data);
                 Ok(())
@@ -238,6 +278,7 @@ impl PaneLeaf {
     pub(crate) fn process_probe(&self) -> (i32, i32) {
         match self {
             Self::Block(view) => (view.pty_fd_i32(), view.pid_i32()),
+            #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
             Self::Vte(view) => (view.pty_fd_i32(), view.pid_i32()),
             #[cfg(all(forge_shared_terminal, target_os = "linux"))]
             Self::Shared(view) => (
@@ -289,8 +330,17 @@ impl PaneLeaf {
             self.root_widget()
                 .set_data::<bool>(PANE_REMOTE_DATA_KEY, remote);
         }
+        #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
         if let Self::Vte(view) = self {
             view.set_organism_local(!remote);
+        }
+        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+        if let Self::Shared(view) = self {
+            if remote {
+                view.root().add_css_class("eva-remote-surface");
+            } else {
+                view.root().remove_css_class("eva-remote-surface");
+            }
         }
     }
 
@@ -403,6 +453,7 @@ impl PaneLeaf {
     pub(crate) fn child_cleanup(&self) -> Option<crate::gtk_process::ChildDrain> {
         match self {
             Self::Block(view) => Some(view.child_lifecycle().into()),
+            #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
             Self::Vte(view) => view.child_cleanup(),
             #[cfg(all(forge_shared_terminal, target_os = "linux"))]
             Self::Shared(view) => view.child_cleanup(),
@@ -414,6 +465,7 @@ impl PaneLeaf {
             Self::Block(view) => self
                 .foreground_process_name()
                 .or_else(|| view.close_blocker()),
+            #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
             Self::Vte(view) => view.close_blocker(self.foreground_process_name()),
             #[cfg(all(forge_shared_terminal, target_os = "linux"))]
             Self::Shared(view) => view.close_blocker(),
@@ -423,6 +475,7 @@ impl PaneLeaf {
     pub(crate) fn withdrawal_work_probe(&self) -> Box<dyn Fn() -> bool> {
         match self {
             Self::Block(view) => view.withdrawal_work_probe(),
+            #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
             Self::Vte(view) => crate::gtk_process::vte_withdrawal_work_probe(view.vte()),
             #[cfg(all(forge_shared_terminal, target_os = "linux"))]
             Self::Shared(view) => view.withdrawal_work_probe(),
@@ -450,6 +503,7 @@ impl PaneLeaf {
             // through TermView so the channel and cloned master fd close before
             // the escalation ladder starts.
             Self::Block(view) => view.kill(),
+            #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
             Self::Vte(view) => view.kill(),
             #[cfg(all(forge_shared_terminal, target_os = "linux"))]
             Self::Shared(view) => view.stop(),

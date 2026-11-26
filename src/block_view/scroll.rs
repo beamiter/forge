@@ -61,6 +61,18 @@ enum CanvasDrive {
     Coast,
 }
 
+#[derive(Clone)]
+struct ReaderAnchor {
+    lookup: Rc<dyn Fn() -> Option<gtk::Widget>>,
+    viewport_y: f64,
+}
+
+#[derive(Clone)]
+enum ReaderSnapshot {
+    Reading(ReaderAnchor),
+    Follow,
+}
+
 /// One controller belongs to one pane's persistent scroller. PTY output only
 /// retargets this controller; it never writes an abrupt adjustment value.
 /// Native pointer/scrollbar moves interrupt it, precision input is direct, and
@@ -77,6 +89,10 @@ pub(crate) struct ScrollDebouncer {
     coast_velocity: Rc<Cell<f64>>,
     precision_forwarded: Rc<Cell<bool>>,
     immediate_follow: Rc<Cell<bool>>,
+    reader_anchor: Rc<RefCell<Option<ReaderSnapshot>>>,
+    reader_restoring: Rc<Cell<bool>>,
+    reader_generation: Rc<Cell<u64>>,
+    reader_tick: Rc<RefCell<Option<gtk::TickCallbackId>>>,
 }
 
 impl ScrollDebouncer {
@@ -102,7 +118,150 @@ impl ScrollDebouncer {
             coast_velocity: Rc::new(Cell::new(0.0)),
             precision_forwarded: Rc::new(Cell::new(false)),
             immediate_follow: Rc::new(Cell::new(false)),
+            reader_anchor: Rc::default(),
+            reader_restoring: Rc::new(Cell::new(false)),
+            reader_generation: Rc::new(Cell::new(0)),
+            reader_tick: Rc::default(),
         }
+    }
+
+    /// Layout clamps while retained cards are hidden are not user navigation.
+    pub(crate) fn preserving_reader(&self) -> bool {
+        self.reader_anchor.borrow().is_some()
+    }
+
+    pub(crate) fn suspend_reader(
+        &self,
+        scroll: &ScrolledWindow,
+        lookup: Rc<dyn Fn() -> Option<gtk::Widget>>,
+    ) {
+        self.stop_motion();
+        self.reader_restoring.set(false);
+        self.stop_reader_tick();
+        if self.preserving_reader() {
+            return;
+        }
+        if !self.user_scrolled_up.get() {
+            self.reader_anchor.replace(Some(ReaderSnapshot::Follow));
+            return;
+        }
+        if let Some(widget) = lookup() {
+            if let Some(bounds) = widget.compute_bounds(scroll) {
+                self.reader_anchor
+                    .replace(Some(ReaderSnapshot::Reading(ReaderAnchor {
+                        lookup,
+                        viewport_y: f64::from(bounds.y()),
+                    })));
+            }
+        }
+    }
+
+    pub(crate) fn restore_reader(&self, scroll: &ScrolledWindow) {
+        if !self.preserving_reader() {
+            return;
+        }
+        self.user_scrolled_up.set(matches!(
+            *self.reader_anchor.borrow(),
+            Some(ReaderSnapshot::Reading(_))
+        ));
+        self.reader_restoring.set(true);
+        self.start_reader_tick(scroll);
+    }
+
+    fn stop_reader_tick(&self) {
+        self.reader_generation
+            .set(self.reader_generation.get().wrapping_add(1));
+        let tick = self.reader_tick.borrow_mut().take();
+        if let Some(tick) = tick {
+            tick.remove();
+        }
+    }
+
+    fn cancel_reader(&self) {
+        self.reader_anchor.borrow_mut().take();
+        self.reader_restoring.set(false);
+        self.stop_reader_tick();
+    }
+
+    fn cancel_active_reader_restore(&self) {
+        if self.reader_restoring.get() {
+            self.cancel_reader();
+        }
+    }
+
+    fn start_reader_tick(&self, scroll: &ScrolledWindow) {
+        if !scroll.is_mapped() || self.reader_tick.borrow().is_some() {
+            return;
+        }
+        let this = self.clone();
+        let generation = self.reader_generation.get();
+        let started = std::time::Instant::now();
+        let previous = Cell::new(None::<(f64, f64, f64)>);
+        let stable = Cell::new(0u8);
+        let id = scroll.add_tick_callback(move |scroll, _| {
+            let finish = || {
+                this.reader_tick.borrow_mut().take();
+                this.reader_anchor.borrow_mut().take();
+                this.reader_restoring.set(false);
+                glib::ControlFlow::Break
+            };
+            if this.reader_generation.get() != generation || !this.reader_restoring.get() {
+                return glib::ControlFlow::Break;
+            }
+            let saved = this.reader_anchor.borrow().clone();
+            let Some(snapshot) = saved else {
+                return finish();
+            };
+            let adjustment = scroll.vadjustment();
+            let desired = match snapshot {
+                ReaderSnapshot::Follow => Some(bottom_value(&adjustment)),
+                ReaderSnapshot::Reading(anchor) => {
+                    // A recycled widget or evicted id cannot inherit a restore.
+                    let Some(widget) = (anchor.lookup)()
+                        .filter(|widget| widget.is_visible() && widget.is_ancestor(scroll))
+                    else {
+                        return finish();
+                    };
+                    widget
+                        .compute_bounds(scroll)
+                        .filter(|_| widget.height() > 1)
+                        .map(|bounds| {
+                            adjustment.value() + f64::from(bounds.y()) - anchor.viewport_y
+                        })
+                }
+            };
+            if let Some(desired) = desired {
+                let adj = adjustment;
+                let target = desired.clamp(adj.lower(), bottom_value(&adj));
+                let geometry = (adj.upper(), adj.page_size(), target);
+                let same = previous.get().is_some_and(|old| {
+                    (old.0 - geometry.0).abs() < 0.5
+                        && (old.1 - geometry.1).abs() < 0.5
+                        && (old.2 - geometry.2).abs() < 0.5
+                });
+                stable.set(if same {
+                    stable.get().saturating_add(1)
+                } else {
+                    0
+                });
+                previous.set(Some(geometry));
+                let was = this.programmatic_scroll.replace(true);
+                adj.set_value(target);
+                this.programmatic_scroll.set(was);
+                let mut motion = this.motion.borrow_mut();
+                motion.set_bounds(adj.lower(), bottom_value(&adj));
+                motion.jump_to(adj.value());
+                if stable.get() >= BOTTOM_STABLE_FRAMES && started.elapsed().as_millis() >= 150 {
+                    return finish();
+                }
+            }
+            if started.elapsed().as_secs_f64() > 1.5 {
+                finish()
+            } else {
+                glib::ControlFlow::Continue
+            }
+        });
+        self.reader_tick.replace(Some(id));
     }
 
     pub(crate) fn install(&self, scroll: &ScrolledWindow, content: &gtk::Box) {
@@ -111,9 +270,15 @@ impl ScrollDebouncer {
         // A hidden tab must not retain a clock callback, a strong widget, or a
         // fling that resumes unexpectedly when the tab becomes visible again.
         let this = self.clone();
-        scroll.connect_unmap(move |_| this.stop_motion());
+        scroll.connect_unmap(move |_| {
+            this.stop_motion();
+            this.stop_reader_tick();
+        });
         let this = self.clone();
         scroll.connect_map(move |scroll| {
+            if this.reader_restoring.get() {
+                this.start_reader_tick(scroll);
+            }
             if !this.user_scrolled_up.get() {
                 // A tab returning after background output starts at its current
                 // live edge; do not animate through unseen restored history.
@@ -121,6 +286,11 @@ impl ScrollDebouncer {
                 this.pin_to_bottom_deferred(scroll);
             }
         });
+        let drag = gtk::GestureClick::new();
+        drag.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let this = self.clone();
+        drag.connect_pressed(move |_, _, _, _| this.cancel_active_reader_restore());
+        scroll.vscrollbar().add_controller(drag);
         // Descendant VTE controllers claim their own scrollback first. At the
         // content's bubble phase the remaining header/gap events share the same
         // outer canvas as events forwarded at a terminal's boundary.
@@ -152,7 +322,10 @@ impl ScrollDebouncer {
     ) {
         controller.set_flags(controller.flags() | gtk::EventControllerScrollFlags::KINETIC);
         let this = self.clone();
-        controller.connect_scroll_begin(move |_| this.stop_motion());
+        controller.connect_scroll_begin(move |_| {
+            this.cancel_active_reader_restore();
+            this.stop_motion();
+        });
         let forwarded = self.precision_forwarded.clone();
         controller.connect_scroll(move |_, _, _| {
             forwarded.set(false);
@@ -188,7 +361,7 @@ impl ScrollDebouncer {
     }
 
     pub(crate) fn pin_to_bottom_deferred(&self, scroll: &ScrolledWindow) {
-        if self.user_scrolled_up.get() || !scroll.is_mapped() {
+        if self.preserving_reader() || self.user_scrolled_up.get() || !scroll.is_mapped() {
             return;
         }
         let starting =
@@ -221,6 +394,7 @@ impl ScrollDebouncer {
         if !delta.is_finite() || delta == 0.0 {
             return;
         }
+        self.cancel_active_reader_restore();
         let adjustment = scroll.vadjustment();
         let (position, target) = {
             let mut motion = self.motion.borrow_mut();
@@ -378,6 +552,7 @@ impl ScrollDebouncer {
     }
 
     pub(crate) fn reset_scroll_lock(&self) {
+        self.cancel_reader();
         self.user_scrolled_up.set(false);
     }
 }
@@ -474,6 +649,111 @@ mod canvas_native_tests {
             }
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display and frame clock; run with test-gtk-display.sh"]
+    fn fullscreen_reader_restores_retained_anchor_and_yields_to_new_navigation() {
+        gtk::init().expect("GTK display");
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let cards: Vec<_> = (0..3)
+            .map(|i| {
+                let card = gtk::Label::new(Some(&format!("retained {i}")));
+                card.set_height_request(400);
+                content.append(&card);
+                card
+            })
+            .collect();
+        let scroll = gtk::ScrolledWindow::builder().child(&content).build();
+        if let Some(viewport) = scroll.child().and_downcast::<gtk::Viewport>() {
+            viewport.set_scroll_to_focus(false);
+        }
+        let window = gtk::Window::builder()
+            .default_width(500)
+            .default_height(300)
+            .child(&scroll)
+            .build();
+        let reading = Rc::new(Cell::new(true));
+        let controller =
+            ScrollDebouncer::with_scroll_lock(reading.clone(), Rc::new(Cell::new(false)));
+        controller.install(&scroll, &content);
+        window.present();
+        spin_for(150);
+        let adjustment = scroll.vadjustment();
+        adjustment.set_value(450.0);
+        spin_for(80);
+        let expected = cards[1].compute_bounds(&scroll).unwrap().y();
+        let retained = Rc::new(RefCell::new(Some(cards[1].clone().upcast::<gtk::Widget>())));
+        let lookup: Rc<dyn Fn() -> Option<gtk::Widget>> = {
+            let retained = retained.clone();
+            Rc::new(move || retained.borrow().clone())
+        };
+        controller.suspend_reader(&scroll, lookup.clone());
+        for card in &cards {
+            card.set_visible(false);
+        }
+        spin_for(80);
+        assert!(
+            adjustment.value() < 1.0,
+            "hidden cards must actually clamp the adjustment"
+        );
+        for card in &cards {
+            card.set_visible(true);
+        }
+        controller.restore_reader(&scroll);
+        spin_for(450);
+        assert!((cards[1].compute_bounds(&scroll).unwrap().y() - expected).abs() < 0.5);
+        assert!(reading.get());
+        assert!(!controller.preserving_reader());
+        // A new native navigation owns the canvas before a delayed restore.
+        controller.suspend_reader(&scroll, lookup.clone());
+        for card in &cards {
+            card.set_visible(false);
+        }
+        spin_for(50);
+        for card in &cards {
+            card.set_visible(true);
+        }
+        controller.restore_reader(&scroll);
+        controller.scroll_pixels(&scroll, -40.0);
+        spin_for(350);
+        assert!(!controller.preserving_reader());
+        assert!(adjustment.value() < 1.0);
+        // An evicted/recycled record must not be revived by an old callback.
+        adjustment.set_value(450.0);
+        reading.set(true);
+        controller.suspend_reader(&scroll, lookup.clone());
+        for card in &cards {
+            card.set_visible(false);
+        }
+        spin_for(50);
+        for card in &cards {
+            card.set_visible(true);
+        }
+        controller.restore_reader(&scroll);
+        retained.borrow_mut().take();
+        spin_for(100);
+        assert!(!controller.preserving_reader());
+        let position = adjustment.value();
+        retained.replace(Some(cards[2].clone().upcast()));
+        spin_for(200);
+        assert_eq!(adjustment.value(), position);
+        // A tail follower must return to the current tail, not a saved offset.
+        reading.set(false);
+        controller.suspend_reader(&scroll, lookup);
+        for card in &cards {
+            card.set_visible(false);
+        }
+        spin_for(50);
+        for card in &cards {
+            card.set_visible(true);
+        }
+        controller.restore_reader(&scroll);
+        spin_for(450);
+        assert!(!reading.get());
+        assert!((adjustment.value() - bottom_value(&adjustment)).abs() < 0.5);
+        window.close();
+        spin_for(50);
     }
 
     #[test]

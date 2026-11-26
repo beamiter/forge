@@ -1,15 +1,17 @@
 //! config_apply — UiState methods extracted from ui (mechanical split, no logic changes)
 use adw::prelude::*;
-use gtk4::gdk::RGBA;
 use gtk4::glib;
 use libadwaita as adw;
+#[cfg(any(test, forge_legacy_renderer))]
 use vte4::Terminal;
+#[cfg(any(test, forge_legacy_renderer))]
 use vte4::{TerminalExt, TerminalExtManual};
 
 use super::*;
 use crate::config::{
     choose_shell_argv, config_file_path, load_config, validate_config_contents, Theme,
 };
+#[cfg(any(test, forge_legacy_renderer))]
 use crate::terminal::collect_terminals;
 
 /// Configuration broadcasts include temporarily detached pane trees, unlike
@@ -442,7 +444,10 @@ impl UiState {
                 // Updates the live surface, every finished renderer,
                 // and the TermView config used by future blocks.
                 view.set_font_scale(new_scale);
-            } else if let Some(terminal) = leaf.terminal() {
+                continue;
+            }
+            #[cfg(any(test, forge_legacy_renderer))]
+            if let Some(terminal) = leaf.terminal() {
                 terminal.set_font_scale(new_scale);
             }
             #[cfg(all(forge_shared_terminal, target_os = "linux"))]
@@ -455,6 +460,7 @@ impl UiState {
         self.apply_dynamic_css();
     }
 
+    #[cfg(any(test, forge_legacy_renderer))]
     pub(crate) fn for_each_terminal(&self, f: impl Fn(&Terminal)) {
         let mut terminals = Vec::new();
         for leaf in self.configuration_leaves() {
@@ -469,7 +475,9 @@ impl UiState {
 
     pub(crate) fn apply_colors_all(&self) {
         let config = self.config.borrow().clone();
-        let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
+        #[cfg(any(test, forge_legacy_renderer))]
+        let palette_refs = config.palette.each_ref();
+        #[cfg(any(test, forge_legacy_renderer))]
         self.for_each_terminal(|term| {
             term.set_colors(
                 Some(&config.foreground),
@@ -486,6 +494,10 @@ impl UiState {
             if let Some(view) = leaf.block_view() {
                 view.reload_config(&config);
                 view.apply_theme();
+            }
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+            if let PaneLeaf::Shared(view) = &leaf {
+                view.update_theme(&config, self.font_scale.get());
             }
         }
         self.apply_dynamic_css();
@@ -806,12 +818,16 @@ impl UiState {
     pub(crate) fn apply_font_all(&self) {
         let config = self.config.borrow();
         let desc = config.font_desc.clone();
+        #[cfg(any(test, forge_legacy_renderer))]
         let font_desc = crate::font::terminal_font_description(&desc, &config);
         drop(config);
         for leaf in self.configuration_leaves() {
             if let Some(view) = leaf.block_view() {
                 view.set_font(&desc);
-            } else if let Some(terminal) = leaf.terminal() {
+                continue;
+            }
+            #[cfg(any(test, forge_legacy_renderer))]
+            if let Some(terminal) = leaf.terminal() {
                 terminal.set_font(Some(&font_desc));
             }
             #[cfg(all(forge_shared_terminal, target_os = "linux"))]
@@ -825,6 +841,7 @@ impl UiState {
 
     pub(crate) fn apply_scrollback_all(&self) {
         let lines = self.config.borrow().terminal_scrollback_lines;
+        #[cfg(any(test, forge_legacy_renderer))]
         self.for_each_terminal(|term| {
             term.set_scrollback_lines(lines as i64);
         });
@@ -856,12 +873,6 @@ impl UiState {
         // a later command/font change can bring the old palette back.
         self.sync_block_configs();
         self.apply_colors_all();
-        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
-        for leaf in self.configuration_leaves() {
-            if let PaneLeaf::Shared(view) = leaf {
-                view.update_theme(&self.config.borrow(), self.font_scale.get());
-            }
-        }
         // Finish with Block-specific treatment, including transparent
         // snapshot cursors that the generic VTE pass would otherwise reset.
         for leaf in self.configuration_leaves() {

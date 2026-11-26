@@ -37,6 +37,7 @@ mod local_preview_tokens;
 mod local_reference;
 mod notebooks;
 mod organism;
+#[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
 mod organism_vte;
 mod pane_dnd;
 mod pane_header;
@@ -107,6 +108,7 @@ pub(crate) use file_tree::{
 pub(crate) use organism::{
     pane_token, OrganismActivity, OrganismAgentSignal, OrganismCorrectionSignal, OrganismPresence,
 };
+#[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
 pub(crate) use organism_vte::VteOrganismSurface;
 pub(crate) use pane_header::{PaneHeader, PANE_HEADER_CSS};
 pub(crate) use pane_leaf::PaneLeaf;

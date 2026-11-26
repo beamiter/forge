@@ -21,6 +21,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk::prelude::*;
+#[cfg(any(test, forge_legacy_renderer))]
 use vte4::TerminalExt;
 
 use super::selection_hold::{feed_hold_eligible, SelectionFeedHold};
@@ -114,6 +115,7 @@ impl std::io::Write for SelectionWriter {
     }
 }
 
+#[cfg(any(test, forge_legacy_renderer))]
 fn capture_surface_text(
     vte: &vte4::Terminal,
     max_bytes: usize,
@@ -533,6 +535,7 @@ impl CrossSelection {
                 }
             };
             match surface {
+                #[cfg(any(test, forge_legacy_renderer))]
                 TerminalTextSurface::Native(terminal) => {
                     let weak = Rc::downgrade(self);
                     let contents = terminal.connect_contents_changed(move |_| {
@@ -710,6 +713,7 @@ impl CrossSelection {
             return writer.into_text(result.is_ok());
         }
         match surface {
+            #[cfg(any(test, forge_legacy_renderer))]
             TerminalTextSurface::Native(terminal) => {
                 capture_surface_text(terminal, max_bytes, deadline)
             }
@@ -853,8 +857,8 @@ mod tests {
             let terminal = view
                 .active
                 .borrow()
-                .shared_active
-                .clone()
+                .shared_active()
+                .cloned()
                 .expect("shared active renderer");
             let screen = terminal.screen();
             let buffer = screen.buffer();
@@ -874,8 +878,7 @@ mod tests {
                     && view
                         .active
                         .borrow()
-                        .shared_active
-                        .as_ref()
+                        .shared_active()
                         .is_some_and(|current| Rc::ptr_eq(current, &terminal))
                     && view.pid_i32() == pid
                     && view.pty_fd_i32() == fd
@@ -1092,10 +1095,13 @@ mod tests {
                 multiline.text(&multiline.start_iter(), &multiline.end_iter(), false),
                 "echo https://example.test\n./src/file.rs"
             );
-            assert!(
-                finished[2].output_vte.is_some(),
-                "unsupported blinking output stays on VTE"
-            );
+            assert_eq!(finished[2].output_vte.is_none(), document_output);
+            if document_output {
+                assert_eq!(
+                    finished[2].output_surface().document_text().as_deref(),
+                    Some("blinking text"),
+                );
+            }
             assert_eq!(finished[1].output_vte.is_none(), document_output);
             let first = &finished[0];
             if document_output {
@@ -1432,7 +1438,22 @@ mod tests {
 
         retained.cmd = "printf\x07invalid-control".into();
         let fallback = super::super::FinishedBlock::from_retained(&retained, &config, 80);
-        assert!(fallback.command_vte.is_some());
+        assert!(fallback.command_vte.is_none());
+        assert_eq!(
+            fallback
+                .command_surface()
+                .unwrap()
+                .document_text()
+                .as_deref(),
+            Some(
+                jterm_core::review_input::safe_multiline_display(
+                    &retained.cmd,
+                    jterm_core::review_input::MAX_REVIEW_INPUT_BYTES,
+                )
+                .as_str()
+            ),
+        );
+        assert_eq!(fallback.cmd_text, retained.cmd);
         assert_eq!(fallback.output_vte.is_none(), document_output);
         if document_output {
             let (mut retained, record_ids) = {

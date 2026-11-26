@@ -13,7 +13,10 @@ use super::*;
 use crate::block_view::TermView;
 use crate::keybindings::Direction;
 use crate::state::generate_session_id;
-use crate::terminal::{setup_terminal_click_handler, VteTerminalView};
+#[cfg(any(test, forge_legacy_renderer))]
+use crate::terminal::setup_terminal_click_handler;
+#[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
+use crate::terminal::VteTerminalView;
 
 fn command_history_exit_code(reported: Option<i32>) -> Option<i32> {
     // The JSONL wire schema has a plain i32. Skipping an unknown status is the
@@ -180,6 +183,7 @@ impl UiState {
     /// Runtime splits and restored split layouts share this constructor so every
     /// leaf root stores a `PaneLeaf` controller. This keeps process callbacks and
     /// GTK object ownership attached to the same widget that enters the pane tree.
+    #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
     pub(crate) fn create_vte_leaf(
         &self,
         working_directory: Option<&str>,
@@ -280,6 +284,7 @@ impl UiState {
         view.start_history_load();
         view.arm_completed_history_checkpoint();
 
+        #[cfg(any(test, forge_legacy_renderer))]
         if let Some(terminal) = view.legacy_terminal() {
             setup_terminal_click_handler(terminal);
             self.setup_context_menu(terminal);
@@ -409,7 +414,7 @@ impl UiState {
             ),
             crate::config::TerminalMode::Vte => {
                 #[cfg(all(forge_shared_terminal, target_os = "linux"))]
-                if std::env::var_os("FORGE_SAFE_MODE").is_none() {
+                {
                     let sid = session_id
                         .filter(|sid| jterm_core::execution_journal::is_valid_jsh_session_id(sid))
                         .map(str::to_owned)
@@ -440,12 +445,19 @@ impl UiState {
                         return Ok(leaf);
                     }
                 }
-                Ok(self.create_vte_leaf(
-                    working_directory,
-                    session_id,
-                    initial_commands,
-                    tab_widget_name,
-                ))
+                #[cfg(any(not(all(forge_shared_terminal, target_os = "linux")), test))]
+                {
+                    Ok(self.create_vte_leaf(
+                        working_directory,
+                        session_id,
+                        initial_commands,
+                        tab_widget_name,
+                    ))
+                }
+                #[cfg(all(forge_shared_terminal, target_os = "linux", not(test)))]
+                {
+                    Err(io::Error::other("shared terminal launch supplied no pane"))
+                }
             }
         }
     }

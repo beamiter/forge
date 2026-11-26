@@ -33,12 +33,10 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
-use vte4::TerminalExt;
 
 use super::remote_fs::{self, FsClipboard, FsEntry, FsExecutionOverlay, FsLocation};
 use super::*;
 use crate::config::RemoteHost;
-use crate::terminal::terminal_working_directory;
 use jterm_core::jsh_remote::RemoteHostConfig;
 
 const SCAN_POLL_INTERVAL: Duration = Duration::from_millis(16);
@@ -3250,7 +3248,7 @@ impl UiState {
         let ui = self.clone();
         toast.connect_button_clicked(move |_| {
             ui.set_sidebar_visible(true, false);
-            ui.apply_sidebar_view(crate::config::SidebarView::Files, false);
+            ui.reveal_file_tree(false);
             ui.file_tree_location_selector.grab_focus();
         });
         self.toast_overlay.add_toast(toast);
@@ -3608,9 +3606,7 @@ impl UiState {
     /// Set up the initial file tree root (current tab cwd, else $HOME).
     pub(crate) fn init_file_tree(&self) {
         let start = self
-            .current_terminal()
-            .as_ref()
-            .and_then(terminal_working_directory)
+            .current_local_pane_directory()
             .map(PathBuf::from)
             .filter(|path| path.is_dir())
             .or_else(home_dir)
@@ -3970,6 +3966,7 @@ impl UiState {
             self.refresh_file_tree_location_selector();
             return;
         }
+        self.local_preview.retire_remote(&self.side_stack, true);
         // Selector/navigation changes choose stable authority explicitly; an
         // accelerator observed for a previous SSH process must not follow the
         // user onto that new endpoint.
@@ -4263,6 +4260,7 @@ impl UiState {
     /// selections, so the notify handler is explicitly suppressed until both
     /// the model and selected index are coherent.
     pub(crate) fn refresh_file_tree_location_selector(&self) {
+        self.local_preview.retire_remote(&self.side_stack, false);
         let config = self.config.borrow();
         let hosts = &config.remote_hosts;
         let active_count = hosts.len().min(crate::config::MAX_REMOTE_HOSTS);
@@ -4377,9 +4375,8 @@ impl UiState {
             // Only the OSC 7 report is trusted here: the /proc fallback in
             // `terminal_working_directory` would resolve the ssh client's
             // LOCAL cwd, which is not a path on the remote host.
-            let reported = self
-                .current_terminal()
-                .and_then(|terminal| terminal.current_directory_uri())
+            let reported = active_leaf
+                .reported_directory_uri()
                 .and_then(|uri| gio::File::for_uri(uri.as_str()).path())
                 .filter(|path| path.is_absolute());
             if let Some(cwd) = reported {
@@ -4399,10 +4396,8 @@ impl UiState {
             }
             return;
         }
-        let cwd = self
-            .current_terminal()
-            .as_ref()
-            .and_then(terminal_working_directory)
+        let cwd = active_leaf
+            .working_directory()
             .map(PathBuf::from)
             .filter(|path| path.is_dir());
         match cwd {
@@ -4961,7 +4956,7 @@ impl UiState {
         };
 
         if let [entry] = entries.as_slice() {
-            if !entry.is_dir && !location.is_remote() {
+            if !entry.is_dir {
                 let item = make_item("Preview file");
                 let popover = popover.clone();
                 let ui = self.clone();
@@ -4969,13 +4964,38 @@ impl UiState {
                 let entry = entry.clone();
                 item.connect_clicked(move |_| {
                     popover.popdown();
-                    if ui.require_current_file_tree_entries(
+                    if !ui.require_current_file_tree_entries(
                         context_generation,
                         &expected_location,
                         std::slice::from_ref(&entry),
                     ) {
-                        ui.preview_file_tree_path(entry.path.clone());
+                        return;
                     }
+                    if !expected_location.is_remote() {
+                        ui.preview_file_tree_path(entry.path.clone());
+                        return;
+                    }
+                    let config = ui.config.borrow();
+                    let overlay = ui.file_tree_execution_overlay.borrow();
+                    let Ok(Some(host)) = remote_fs::remote_host_with_overlay(
+                        &expected_location,
+                        &config.remote_hosts,
+                        &overlay,
+                    ) else {
+                        ui.toast_overlay
+                            .add_toast(adw::Toast::new("The remote preview source is unavailable"));
+                        return;
+                    };
+                    let label = expected_location.label(&config.remote_hosts);
+                    drop(overlay);
+                    drop(config);
+                    let authority = expected_location.clone();
+                    let weak = ui.unified_navigation_owner.borrow().clone();
+                    ui.preview_remote_file_tree_path(entry.path.clone(), host, label, move || {
+                        weak.upgrade().is_some_and(|ui| {
+                            ui.file_tree_context_is_current(context_generation, &authority)
+                        })
+                    });
                 });
                 vbox.append(&item);
             }

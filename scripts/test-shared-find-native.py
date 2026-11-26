@@ -29,7 +29,7 @@ def wait_to_enter_alternate_screen():
     while not (root / 'enter-alternate').exists() and time.monotonic() < deadline:
         time.sleep(0.02)
 
-if root.name == 'unified':
+if root.name in ('unified', 'vte'):
     emit(b'shared-find-probe archived\r\n')
     for row in range(90):
         emit(f'{row}\r\n'.encode())
@@ -43,7 +43,15 @@ else:
     emit(b'\x1b[?1049hfull-screen-find-probe\r\n')
     (root / 'alternate-input').write_bytes(os.read(0, 1))
     emit(b'\x1b[?1049l\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07')
-sys.stdin.read(1)
+if root.name == 'vte':
+    deadline = time.monotonic() + 45
+    while not (root / 'extra-output').exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    emit(b'shared-find-probe updated\r\n')
+    (root / 'ordinary-input').write_bytes(os.read(0, 1))
+    time.sleep(30)
+else:
+    sys.stdin.read(1)
 """
 
 
@@ -73,7 +81,7 @@ def run(binary, root, mode):
 
         def screen_text():
             screen = next((node for node in application_nodes(pid)
-                           if node.get_description() == 'Shared active terminal'
+                           if node.get_description() == ('Shared runtime session' if mode == 'vte' else 'Shared active terminal')
                            and node.get_state_set().contains(Atspi.StateType.SHOWING)), None)
             return accessible_text(screen)
 
@@ -97,8 +105,9 @@ def run(binary, root, mode):
         tty_fd = Path(f'/proc/{leader}/fd/0')
         terminal = tty_fd.readlink()
         assert str(terminal).startswith('/dev/pts/')
-        if mode == 'unified':
+        if mode in ('unified', 'vte'):
             assert 'shared-find-probe archived' not in screen_text()
+        if mode == 'unified':
             button = wait_for('Unified Find toolbar button', lambda: first_named(pid, 'Find in this terminal'))
             assert Atspi.Action.do_action(button.get_action_iface(), 0)
         else:
@@ -116,13 +125,16 @@ def run(binary, root, mode):
             raise
         xdotool('key', '--clearmodifiers', 'Return')
         wait_for('second match on the mounted terminal', lambda: status('2 of 2') and (
-            ('shared-find-probe archived' if mode == 'unified' else 'shared-find-probe live') in screen_text()
+            ('shared-find-probe archived' if mode in ('unified', 'vte') else 'shared-find-probe live') in screen_text()
         ))
         xdotool('key', '--clearmodifiers', 'shift+Return')
         wait_for('previous match', lambda: status('1 of 2') and (
-            mode != 'unified' or 'shared-find-probe live' in screen_text()
+            mode not in ('unified', 'vte') or 'shared-find-probe live' in screen_text()
         ))
-        if mode != 'unified':
+        if mode == 'vte':
+            (root / 'extra-output').touch()
+            wait_for('inline Find refreshes after live output', lambda: status('1 of 3'))
+        if mode in ('block', 'chat'):
             (root / 'enter-alternate').touch()
             wait_for('the alternate screen', lambda: 'full-screen-find-probe' in screen_text())
             xdotool('key', '--clearmodifiers', 'Return')
@@ -137,7 +149,7 @@ def run(binary, root, mode):
             wait_for('application Find from the workspace shortcut', entry)
         else:
             xdotool('key', '--clearmodifiers', 'x')
-            input_file = root / 'alternate-input'
+            input_file = root / ('ordinary-input' if mode == 'vte' else 'alternate-input')
             wait_for('the same PTY receives input after Find closes',
                      lambda: input_file.exists() and input_file.read_bytes() == b'x')
         assert tty_fd.readlink() == terminal
@@ -147,9 +159,9 @@ def run(binary, root, mode):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('binary', type=Path)
-    parser.add_argument('--mode', choices=('unified', 'block', 'chat'), action='append')
+    parser.add_argument('--mode', choices=('unified', 'block', 'chat', 'vte'), action='append')
     args = parser.parse_args()
     start_accessibility()
     with tempfile.TemporaryDirectory(prefix='forge-shared-find-') as directory:
-        for mode in args.mode or ('unified', 'block', 'chat'):
+        for mode in args.mode or ('unified', 'block', 'chat', 'vte'):
             run(args.binary.resolve(strict=True), Path(directory) / mode, mode)

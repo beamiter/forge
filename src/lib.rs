@@ -1,13 +1,21 @@
 #![allow(dead_code)]
+// Inline widget comparisons run from the independent test manifest.
+#![cfg(any(not(test), forge_vte_oracle))]
+
+#[cfg(all(not(target_os = "linux"), not(forge_vte_oracle)))]
+compile_error!("Forge's shared GTK terminal requires the Linux PTY runtime");
 
 mod agent_cli;
 mod composer_geometry;
+mod pane_restore;
 #[cfg(test)]
 mod delimited_reference;
 mod gtk_presentation;
 mod gtk_process;
+#[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
 mod gtk_spawn;
 mod immersive_command;
+mod link_gesture;
 
 pub mod agent;
 pub(crate) mod agent_task;
@@ -29,6 +37,7 @@ pub(crate) mod history_gc;
 mod vim9_buffer_labels;
 pub(crate) mod vim9_ide;
 mod vim9_zoom;
+#[cfg(any(test, forge_legacy_renderer))]
 mod vte_reference;
 /// The OSC/CSI stream parser lives in [`jterm_core::parser`], shared with the
 /// other terminals; re-exported here so `crate::parser::…` paths keep working.

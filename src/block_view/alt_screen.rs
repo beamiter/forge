@@ -5,12 +5,18 @@
 //! that exact DEC mode and renders full-viewport. The matching leave sequence
 //! discards the alt-screen frame; the block keeps only command metadata.
 //! No frame-merge / pager-snapshot path runs, matching Warp.
+#[cfg(any(test, forge_legacy_renderer))]
 use crate::config::Config;
+#[cfg(any(test, forge_legacy_renderer))]
 use crate::terminal::apply_terminal_theme;
+#[cfg(any(test, forge_legacy_renderer))]
 use gtk4::glib;
+#[cfg(any(test, forge_legacy_renderer))]
 use gtk4::prelude::*;
 use jterm_core::parser::{MouseEncoding, MouseMode};
+#[cfg(any(test, forge_legacy_renderer))]
 use vte4::TerminalExt;
+#[cfg(any(test, forge_legacy_renderer))]
 use vte4::{CursorBlinkMode, CursorShape, Format, Terminal};
 
 /// Give dense block output the same breathing room as anvil. Patched
@@ -345,6 +351,7 @@ pub(crate) fn set_find_render_trace(enabled: bool) {
 }
 
 #[cfg(test)]
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn trace_find_render(event: &str, terminal: &Terminal) {
     if !FIND_RENDER_TRACE.with(std::cell::Cell::get) {
         return;
@@ -366,6 +373,7 @@ pub(crate) fn trace_find_render(event: &str, terminal: &Terminal) {
 /// combining/wide glyphs, CR redraws, and automatic wrapping. The resize is
 /// intentionally bidirectional: estimates are only capture capacity, never a
 /// minimum visible height.
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn fit_finished_terminal_to_content(terminal: &Terminal) {
     #[cfg(test)]
     trace_find_render("fit-before", terminal);
@@ -450,6 +458,7 @@ fn snapshot_settle_tail_replay(display_text: &str) -> Option<String> {
 
 /// Whether the terminal's rendered text already ends with the snapshot's
 /// expected final line. Trailing blank rows are ignored on both sides.
+#[cfg(any(test, forge_legacy_renderer))]
 fn feed_tail_applied(terminal: &Terminal, expected_tail: Option<&str>) -> bool {
     let Some(tail) = expected_tail else {
         return true;
@@ -460,6 +469,7 @@ fn feed_tail_applied(terminal: &Terminal, expected_tail: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(any(test, forge_legacy_renderer))]
 fn anchor_terminal_top(terminal: &Terminal) {
     // Native find has already scrolled its confirmed match into view. A
     // later render-settle pin must not hide that selection again.
@@ -480,6 +490,7 @@ fn anchor_terminal_top(terminal: &Terminal) {
 /// that fits. Wait for proof the feed is fully applied (the snapshot's final
 /// line is rendered), then fold the retained rows into the card and pin the
 /// first row.
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn settle_finished_terminal_after_feed(
     terminal: &Terminal,
     expected_tail: Option<&str>,
@@ -544,6 +555,7 @@ pub(crate) fn settle_finished_terminal_after_feed(
 /// the buffer has overflowed (an anchored view detaches from the follow and
 /// later bytes can no longer move it) or the whole snapshot proved shorter
 /// than the grid (its final line is visible).
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn settle_finished_terminal_at_top(terminal: &Terminal, expected_tail: Option<&str>) {
     let weak = terminal.downgrade();
     let tail = expected_tail.map(str::to_owned);
@@ -573,6 +585,7 @@ pub(crate) fn settle_finished_terminal_at_top(terminal: &Terminal, expected_tail
 /// so the VTE translates keypresses into terminal byte sequences and emits them
 /// via its `commit` signal (which we forward to our PTY). It also owns IME
 /// natively, so there is no separate IMMulticontext to fight for fcitx/ibus focus.
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn create_active_terminal(config: &Config) -> Terminal {
     let terminal = Terminal::builder()
         .hexpand(true)
@@ -617,6 +630,7 @@ pub(crate) fn create_active_terminal(config: &Config) -> Terminal {
 /// so a session with 200 blocks paid ~400 identical compiles.
 /// `match_add_regex` takes its own reference, so one handle can be shared by
 /// every terminal.
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn add_url_match_regex(terminal: &Terminal) {
     thread_local! {
         static URL_REGEX: Option<vte4::Regex> = vte4::Regex::for_match(
@@ -635,6 +649,7 @@ pub(crate) fn add_url_match_regex(terminal: &Terminal) {
 /// Apply the common terminal theme to a snapshot VTE, then restore its hidden
 /// cursor. Keeping this separate avoids theme changes turning a finished block's
 /// inert caret visible again.
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn apply_snapshot_theme_to_vte(terminal: &Terminal, config: &Config) {
     apply_terminal_theme(terminal, config);
     let mut transparent = config.background;
@@ -652,6 +667,7 @@ pub(crate) fn apply_snapshot_theme_to_vte(terminal: &Terminal, config: &Config) 
 /// a live prompt). Most completed outputs expand to their full retained buffer
 /// and participate in the outer block history. Only exceptionally large outputs
 /// stay capped at `viewport_cap` and keep private scrollback as a safety valve.
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn create_finished_terminal(
     config: &Config,
     cols: i64,

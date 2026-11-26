@@ -22,7 +22,7 @@ case "$command" in
     packages=(build-essential pkg-config ca-certificates)
     case "$lane" in
       anvil|forge|runtime)
-        packages+=(libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev libpcre2-dev) ;;
+        packages+=(libgtk-4-dev libadwaita-1-dev libpcre2-dev) ;;
     esac
     case "$lane" in
       ember|frost|runtime)

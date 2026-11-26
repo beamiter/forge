@@ -293,7 +293,7 @@ impl UiState {
     /// Capture only the selected pane's retained completed records. The pane
     /// is held weakly after capture: another pane can never replace its owner.
     pub(crate) fn show_exact_search_preview(&self) {
-        let Some(owner) = self.search_targets().1 else {
+        let Some(owner) = self.search_view() else {
             self.toast_overlay.add_toast(adw::Toast::new(
                 "Search preview requires retained completed records.",
             ));

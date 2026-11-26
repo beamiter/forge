@@ -19,7 +19,6 @@ finish-args:
   - --env=FORGE_WORKFLOW_DIR=/app/share/forge/workflows
 
 cleanup:
-  - /bin/vte-2.91-gtk4
   - /include
   - /lib/cmake
   - /lib/pkgconfig
@@ -33,53 +32,6 @@ cleanup:
   - '*.la'
 
 modules:
-  - name: fast_float
-    buildsystem: cmake-ninja
-    config-opts:
-      - -DCMAKE_INSTALL_LIBDIR=lib
-    sources:
-      - type: git
-        url: https://github.com/fastfloat/fast_float.git
-        tag: v8.2.5
-        commit: 05087a303dad9c98768b33c829d398223a649bc6
-        x-checker-data:
-          type: anitya
-          project-id: 214353
-          tag-template: v$version
-
-  - name: simdutf
-    buildsystem: cmake-ninja
-    config-opts:
-      - -DCMAKE_INSTALL_LIBDIR=lib
-    sources:
-      - type: git
-        url: https://github.com/simdutf/simdutf.git
-        tag: v9.0.0
-        commit: ca7acbcea967b5dcbab490066e99e3a6e6925539
-        x-checker-data:
-          type: anitya
-          project-id: 378662
-          tag-template: v$version
-
-  - name: vte
-    buildsystem: meson
-    config-opts:
-      - --buildtype=release
-      - --libdir=lib
-      - -Dgtk3=false
-      - -Dgtk4=true
-      - -Dglade=false
-      - -Dgir=false
-      - -Dvapi=false
-    sources:
-      - type: archive
-        url: https://download.gnome.org/sources/vte/0.84/vte-0.84.0.tar.xz
-        sha256: 0414e31583836aeb7878da25f67c515f7e8879917ecc37c92e26b83e8d8fc3e3
-        x-checker-data:
-          type: gnome
-          version-scheme: odd-minor-is-unstable
-          name: vte
-
   # Local task worktrees use a private Git binary. Interactive Git still
   # runs in the user's host shell.
   - name: task-git
@@ -102,7 +54,7 @@ modules:
         CARGO_NET_OFFLINE: 'true'
     build-commands:
       - cargo --offline fetch --manifest-path Cargo.toml --verbose
-      - cargo build --offline --release --all-features --locked
+      - cargo build --offline --release --no-default-features --features shared-terminal --locked
       - install -Dm0755 target/release/forge ${FLATPAK_DEST}/bin/forge
       - install -Dm0755 scripts/support-bundle.sh ${FLATPAK_DEST}/bin/forge-support-bundle
       - install -Dm0644 LICENSE-MIT ${FLATPAK_DEST}/share/licenses/io.github.beamiter.forge/LICENSE-MIT

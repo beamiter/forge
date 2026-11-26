@@ -1185,6 +1185,7 @@ impl UiState {
         };
         match leaf {
             super::pane_leaf::PaneLeaf::Block(view) => view.connect_activity(on_activity),
+            #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
             super::pane_leaf::PaneLeaf::Vte(view) => view.connect_activity(on_activity),
             #[cfg(all(forge_shared_terminal, target_os = "linux"))]
             super::pane_leaf::PaneLeaf::Shared(_) => {}

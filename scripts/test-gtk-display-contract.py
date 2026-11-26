@@ -93,7 +93,7 @@ def main():
         policy.parent.mkdir(parents=True)
         policy.write_text("fake policy: never starts a daemon\n")
         # Closed PATH: no real Cargo/display/debugger can be used accidentally.
-        for command in ("dirname", "mktemp", "mkdir", "chmod", "rm", "grep", "tee", "cat"):
+        for command in ("dirname", "mktemp", "mkdir", "chmod", "rm", "grep", "tee", "cat", "env"):
             (bindir / command).symlink_to(shutil.which(command))
         (bindir / "python3").symlink_to(sys.executable)
         fake_commands = ("cargo", "dbus-run-session", "dbus-daemon", "xvfb-run", "xdotool",

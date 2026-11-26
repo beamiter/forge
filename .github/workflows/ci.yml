@@ -41,7 +41,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
       - name: Build the shared GTK backend from the production lock
-        run: cargo build --locked --release --features shared-terminal --bin forge
+        run: cargo build --locked --release --bin forge
       - name: Verify ordinary tabs, shell exit, caret, input and scrollback under X11
         run: |
           core=$(python3 scripts/shared-core-path.py)
@@ -55,6 +55,12 @@ jobs:
           dbus-run-session -- xvfb-run -a --server-args='-screen 0 1440x1100x24 -nolisten tcp' \
             /usr/bin/python3 -B "$core/crates/jterm_gtk_view/tests/native.py" \
             forge target/release/forge --shared-runtime --underline-colors --osc8-links
+      - name: Verify safe-mode ordinary tabs and splits share the runtime
+        run: |
+          core=$(python3 scripts/shared-core-path.py)
+          FORGE_SAFE_MODE=1 dbus-run-session -- xvfb-run -a --server-args='-screen 0 1440x1100x24 -nolisten tcp' \
+            /usr/bin/python3 -B "$core/crates/jterm_gtk_view/tests/native.py" \
+            forge target/release/forge --ordinary-panes
       - name: Verify native and compatibility Vim9 editing and the embedded shell return
         run: |
           core=$(python3 scripts/shared-core-path.py)
@@ -108,7 +114,7 @@ jobs:
           log="$RUNNER_TEMP/shared-terminal-wayland/cards/completed-image-cards.log"
           dbus-run-session -- xvfb-run -a env -u JTERM_SHARED_FINISHED_COMMANDS \
             -u JTERM_SHARED_FINISHED_OUTPUT GSK_RENDERER=cairo \
-            cargo test --locked --release --features shared-terminal --lib \
+            python3 tools/vte-oracle/run.py test --locked --release --features shared-terminal --lib \
             block_view::blocks::tests::completed_image_cards_share_the_caption_and_keep_the_picture \
             -- --exact --ignored --test-threads=1 | tee "$log"
           grep -F 'test result: ok. 1 passed; 0 failed;' "$log"
@@ -140,14 +146,14 @@ jobs:
           dbus-run-session -- xvfb-run -a --server-args='-screen 0 1440x1100x24 -nolisten tcp' \
             env PYTHONPATH="$core/crates/jterm_gtk_view/tests" \
             /usr/bin/python3 -B scripts/test-shared-font-native.py target/release/forge
-      - name: Verify default and rollback PTY ownership, replies and cleanup
+      - name: Verify shared PTY ownership, replies and cleanup with old override variables
         if: ${{ !cancelled() }}
         run: |
           core=$(python3 scripts/shared-core-path.py)
           dbus-run-session -- xvfb-run -a --server-args='-screen 0 1440x1100x24 -nolisten tcp' \
             /usr/bin/python3 -B "$core/crates/jterm_gtk_view/tests/native_prepared_pty.py" \
             forge target/release/forge
-      - name: Verify a default ordinary jsh session and explicit VTE rollback
+      - name: Verify ordinary jsh session restore and shared ownership with the old override
         if: ${{ !cancelled() }}
         run: |
           core=$(python3 scripts/shared-core-path.py)
@@ -459,7 +465,7 @@ jobs:
           vim_bin="$(command -v "${JTERM_VIM9_BIN:-${VIM9_TEST_VIM:-vim}}")"
           export JTERM_VIM9_BIN="$vim_bin" VIM9_TEST_VIM="$vim_bin"
           "$vim_bin" --version
-          cargo_test=(cargo test --lib --all-features --locked)
+          cargo_test=(python3 tools/vte-oracle/run.py test --lib --all-features --locked)
           listed_tests="$("${cargo_test[@]}" vim9_ide -- --include-ignored --list)"
           mapfile -t tests < <(printf '%s\n' "$listed_tests" | sed -n 's/: test$//p')
           if ((${#tests[@]} == 0)); then
@@ -499,7 +505,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           test_name=block_view::blocks::command_reuse_labels_tests::recall_header_describes_insert_only_action
-          listed_tests="$(cargo test --lib --all-features --locked -- --ignored --list)"
+          listed_tests="$(python3 tools/vte-oracle/run.py test --lib --all-features --locked -- --ignored --list)"
           grep -Fqx -- "${test_name}: test" <<<"${listed_tests}"
           test_xdg_root="$(mktemp -d)"
           trap 'rm -rf -- "$test_xdg_root"' EXIT
@@ -514,7 +520,7 @@ jobs:
           export LIBGL_ALWAYS_SOFTWARE=1 NO_AT_BRIDGE=1 GTK_A11Y=none
           dbus-run-session -- \
             xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
-            cargo test --lib --all-features --locked "$test_name" -- \
+            python3 tools/vte-oracle/run.py test --lib --all-features --locked "$test_name" -- \
             --ignored --exact --nocapture
 
       - name: Check independent native font groups
@@ -525,7 +531,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           test_name=block_view::font_sync_tests::font_groups_stay_independent_across_native_panes_and_late_rows
-          listed_tests="$(cargo test --lib --all-features --locked -- --ignored --list)"
+          listed_tests="$(python3 tools/vte-oracle/run.py test --lib --all-features --locked -- --ignored --list)"
           grep -Fqx -- "${test_name}: test" <<<"${listed_tests}"
           test_xdg_root="$(mktemp -d)"
           trap 'rm -rf -- "$test_xdg_root"' EXIT
@@ -540,7 +546,7 @@ jobs:
           export LIBGL_ALWAYS_SOFTWARE=1 NO_AT_BRIDGE=1 GTK_A11Y=none
           dbus-run-session -- \
             xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
-            cargo test --lib --all-features --locked "$test_name" -- \
+            python3 tools/vte-oracle/run.py test --lib --all-features --locked "$test_name" -- \
             --ignored --exact --nocapture
 
       - name: Check production top-tab geometry extremes
@@ -550,7 +556,7 @@ jobs:
           python3 scripts/check-tab-geometry-shape.py
           mkdir -p gtk-paint-diagnostics
           test_name=ui::tab_geometry_tests::production_top_tabs_bound_viewport_minimum_across_font_extremes
-          listed_tests="$(cargo test --lib --all-features --locked -- --ignored --list)"
+          listed_tests="$(python3 tools/vte-oracle/run.py test --lib --all-features --locked -- --ignored --list)"
           grep -Fqx -- "${test_name}: test" <<<"${listed_tests}"
           test_xdg_root="$(mktemp -d)"
           trap 'rm -rf -- "$test_xdg_root"' EXIT
@@ -565,7 +571,7 @@ jobs:
           export LIBGL_ALWAYS_SOFTWARE=1 NO_AT_BRIDGE=1 GTK_A11Y=none
           dbus-run-session -- \
             xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
-            cargo test --lib --all-features --locked "$test_name" -- \
+            python3 tools/vte-oracle/run.py test --lib --all-features --locked "$test_name" -- \
             --ignored --exact --nocapture 2>&1 | tee gtk-paint-diagnostics/top-tab-geometry.log
 
       - name: Check exact retained-text search preview
@@ -574,12 +580,12 @@ jobs:
           set -Eeuo pipefail
           python3 scripts/check-search-preview-shape.py
           mkdir -p gtk-paint-diagnostics
-          model_tests="$(cargo test --lib --all-features --locked -- --list)"
+          model_tests="$(python3 tools/vte-oracle/run.py test --lib --all-features --locked -- --list)"
           grep -Fqx -- 'block_view::search_preview::tests::failed_snapshot_construction_cannot_publish_a_partial_total: test' <<<"$model_tests"
-          cargo test --lib --all-features --locked block_view::search_preview::tests:: -- \
+          python3 tools/vte-oracle/run.py test --lib --all-features --locked block_view::search_preview::tests:: -- \
             --nocapture 2>&1 | tee gtk-paint-diagnostics/exact-search-preview-model.log
           test_name=ui::search_preview::tests::exact_preview_tags_follow_unicode_ranges_without_native_selection
-          listed_tests="$(cargo test --lib --all-features --locked -- --ignored --list)"
+          listed_tests="$(python3 tools/vte-oracle/run.py test --lib --all-features --locked -- --ignored --list)"
           grep -Fqx -- "${test_name}: test" <<<"${listed_tests}"
           test_xdg_root="$(mktemp -d)"
           trap 'rm -rf -- "$test_xdg_root"' EXIT
@@ -594,14 +600,14 @@ jobs:
           export LIBGL_ALWAYS_SOFTWARE=1 NO_AT_BRIDGE=1 GTK_A11Y=none
           dbus-run-session -- \
             xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
-            cargo test --lib --all-features --locked "$test_name" -- \
+            python3 tools/vte-oracle/run.py test --lib --all-features --locked "$test_name" -- \
             --ignored --exact --nocapture 2>&1 | tee gtk-paint-diagnostics/exact-search-preview.log
 
           test_name=ui::search_preview::dialog_tests::production_dialog_is_frozen_stale_safe_and_primary_neutral
           grep -Fqx -- "${test_name}: test" <<<"${listed_tests}"
           dbus-run-session -- \
             xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
-            cargo test --lib --all-features --locked "$test_name" -- \
+            python3 tools/vte-oracle/run.py test --lib --all-features --locked "$test_name" -- \
             --ignored --exact --nocapture 2>&1 | tee gtk-paint-diagnostics/exact-search-preview-dialog.log
 
       - name: Run display-backed GTK/VTE regressions
@@ -755,7 +761,9 @@ jobs:
           shared-key: tests
 
       - name: Run tests
-        run: cargo test --all-targets --all-features --locked --no-fail-fast
+        run: |
+          cargo test --tests --all-features --locked --no-fail-fast
+          python3 tools/vte-oracle/run.py test --lib --all-features --locked --no-fail-fast
 
   ascii-organism:
     name: ASCII organism prototype
@@ -819,7 +827,6 @@ jobs:
             pkg-config \
             libgtk-4-dev \
             libadwaita-1-dev \
-            libvte-2.91-gtk4-dev \
             libpcre2-dev
 
       - name: Install Rust toolchain
@@ -831,7 +838,9 @@ jobs:
           shared-key: release
 
       - name: Build release binary
-        run: cargo build --release --all-features --locked
+        run: |
+          cargo build --release --all-features --locked
+          bash scripts/check-gtk-production-linkage.sh target/release/forge
 
       - name: Build and verify relocatable release bundle
         run: |

@@ -4200,6 +4200,7 @@ fn percent(value: f32) -> u8 {
 #[derive(Clone)]
 pub(crate) enum OrganismGreetingTarget {
     Block(std::rc::Weak<TermView>),
+    #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
     Vte(gtk4::glib::WeakRef<gtk4::Widget>),
     Unavailable,
 }
@@ -4208,6 +4209,7 @@ impl UiState {
     pub(super) fn organism_greeting_target(&self) -> OrganismGreetingTarget {
         match self.current_pane_leaf() {
             Some(PaneLeaf::Block(view)) => OrganismGreetingTarget::Block(Rc::downgrade(&view)),
+            #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
             Some(PaneLeaf::Vte(view)) => OrganismGreetingTarget::Vte(view.widget().downgrade()),
             _ => OrganismGreetingTarget::Unavailable,
         }
@@ -4216,6 +4218,7 @@ impl UiState {
     pub(crate) fn greet_ascii_organism_for(&self, target: &OrganismGreetingTarget) {
         let view = match target {
             OrganismGreetingTarget::Block(view) => view.upgrade(),
+            #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
             OrganismGreetingTarget::Vte(root)
                 if root
                     .upgrade()
@@ -4268,6 +4271,7 @@ impl UiState {
                     && view.widget().is_ancestor(&self.window)
                     && !PaneLeaf::Block(view.clone()).is_remote()
             }),
+            #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
             OrganismGreetingTarget::Vte(root)
                 if root.upgrade().is_some_and(|root| {
                     self.current_pane_leaf()
@@ -4397,6 +4401,7 @@ impl UiState {
                 OrganismRuntime::apply_settings(&runtime, &view, enabled, motion);
             }
         }
+        #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
         for leaf in self.configuration_leaves() {
             if let PaneLeaf::Vte(view) = leaf {
                 view.sync_organism(enabled, motion);
@@ -4411,6 +4416,9 @@ impl UiState {
             view.widget().add_css_class("eva-remote-surface");
         } else {
             view.widget().remove_css_class("eva-remote-surface");
+        }
+        if !remote && crate::eva_companion::shared_mode_requested() {
+            crate::eva_companion::observe_shell_view(view);
         }
         if remote || crate::eva_companion::shared_mode_requested() {
             return;

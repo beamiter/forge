@@ -8,7 +8,6 @@ use gtk4::prelude::*;
 use gtk4::{glib, Orientation};
 use jterm_core::developer_workspace as token;
 use std::rc::Rc;
-use vte4::TerminalExt;
 #[path = "navigation_drawer.rs"]
 mod navigation_drawer;
 
@@ -758,7 +757,7 @@ fn guard_tools_focus(tools: &gtk4::MenuButton, popup: &gtk4::Popover) {
     // action or outside click that has already focused another control wins.
     // Run once before the history guard restores native focus reveal, so
     // merely closing Tools does not scroll the reader back to the editor.
-    let owner: Rc<std::cell::RefCell<Option<glib::WeakRef<vte4::Terminal>>>> =
+    let owner: Rc<std::cell::RefCell<Option<glib::WeakRef<gtk4::Widget>>>> =
         Rc::new(std::cell::RefCell::new(None));
     let generation = Rc::new(std::cell::Cell::new(0u64));
     let weak = tools.downgrade();
@@ -769,7 +768,7 @@ fn guard_tools_focus(tools: &gtk4::MenuButton, popup: &gtk4::Popover) {
         *saved_owner.borrow_mut() = weak
             .upgrade()
             .and_then(|tools| ui_for_widget(tools.upcast_ref()))
-            .and_then(|ui| ui.current_terminal())
+            .and_then(|ui| ui.current_pane_leaf().map(|leaf| leaf.focus_widget()))
             .filter(|terminal| terminal.is_mapped())
             .map(|terminal| terminal.downgrade());
     });
@@ -794,7 +793,9 @@ fn guard_tools_focus(tools: &gtk4::MenuButton, popup: &gtk4::Popover) {
                 return glib::ControlFlow::Break;
             };
             if !terminal.is_mapped()
-                || ui.current_terminal().as_ref() != Some(&terminal)
+                || ui
+                    .current_pane_leaf()
+                    .is_none_or(|leaf| leaf.focus_widget() != terminal)
                 || !gtk4::prelude::RootExt::focus(&ui.window)
                     .is_some_and(|focused| focused.is_ancestor(tools))
             {
@@ -1289,12 +1290,12 @@ fn workspace_menu_snapshot(ui: &UiState) -> Vec<(String, Option<String>)> {
 /// A remote pane may only contribute its reported remote directory. Looking
 /// up the local SSH client's process directory would describe another host.
 fn session_directory(ui: &UiState) -> Option<String> {
-    let terminal = ui.current_terminal()?;
+    let leaf = ui.current_pane_leaf()?;
     context_directory(
         private_session(ui),
-        ui.current_pane_leaf().is_some_and(|leaf| leaf.is_remote()),
-        terminal.current_directory_uri().as_deref(),
-        || crate::terminal::terminal_working_directory(&terminal).filter(|path| !path.is_empty()),
+        leaf.is_remote(),
+        leaf.reported_directory_uri().as_deref(),
+        || leaf.working_directory().filter(|path| !path.is_empty()),
     )
 }
 
@@ -1352,7 +1353,7 @@ fn context_action(title: &str, key: &'static str) -> gtk4::Button {
             }
             "browse" => {
                 ui.file_tree_goto_current_cwd();
-                ui.apply_sidebar_view(SidebarView::Files, false);
+                ui.reveal_file_tree(false);
             }
             _ => {}
         }
@@ -2190,12 +2191,8 @@ pub(crate) fn install(
             if let Some(ui) = ui.upgrade() {
                 match index {
                     0 => ui.apply_sidebar_view(SidebarView::Tabs, false),
-                    1 => ui.apply_sidebar_view(SidebarView::Files, false),
-                    2 => {
-                        if let Some(terminal) = ui.current_terminal() {
-                            terminal.grab_focus();
-                        }
-                    }
+                    1 => ui.reveal_file_tree(false),
+                    2 => ui.focus_current_terminal(),
                     3 => ui.execute_action(crate::keybindings::Action::ToggleTasksPanel),
                     _ => ui.execute_action(crate::keybindings::Action::ToggleSettings),
                 }
@@ -2363,12 +2360,8 @@ pub(crate) fn install(
             button.connect_clicked(move |_| {
                 if let Some(ui) = ui.upgrade() {
                     match index {
-                        1 => ui.apply_sidebar_view(SidebarView::Files, false),
-                        2 => {
-                            if let Some(terminal) = ui.current_terminal() {
-                                terminal.grab_focus();
-                            }
-                        }
+                        1 => ui.reveal_file_tree(false),
+                        2 => ui.focus_current_terminal(),
                         3 => ui.execute_action(crate::keybindings::Action::ToggleTasksPanel),
                         _ => palette.emit_clicked(),
                     }
@@ -2712,7 +2705,7 @@ pub(crate) fn install(
                 "native_surface":native_surface_geometry(&ui),
                 "dpr":ui.window.scale_factor(),
                 "window_active":ui.window.is_active(),
-                "terminal_has_focus":ui.current_terminal().map(|terminal| terminal.has_focus()),
+                "terminal_has_focus":ui.current_pane_leaf().map(|leaf| leaf.focus_widget().has_focus()),
                 "prompt_status":ui.current_term_view().map(|view| format!("{:?}", view.command_prompt_status())),
                 "presentation":active_mode(&ui).map(|mode| mode.presentation_label()),
                 "titlebar":bounds(top_for_geometry.upcast_ref()),
@@ -2827,7 +2820,7 @@ pub(crate) fn install(
             button.set_sensitive(ui.config.borrow().agent_tasks_enabled);
         }
         refresh_task_overview(&ui);
-        if let Some(terminal) = ui.current_terminal() {
+        if let Some(leaf) = ui.current_pane_leaf() {
             let private = private_session(&ui);
             let remote = ui.current_pane_leaf().is_some_and(|leaf| leaf.is_remote());
             let directory = session_directory(&ui);
@@ -2919,14 +2912,11 @@ pub(crate) fn install(
                         .unwrap_or("Native terminal input")
                 },
             );
+            let (columns, rows) = leaf.grid_size();
             set_context_value(
                 &ui.side_stack,
                 "size",
-                &format!(
-                    "{} columns × {} rows",
-                    terminal.column_count(),
-                    terminal.row_count()
-                ),
+                &format!("{columns} columns × {rows} rows"),
             );
             let config = ui.config.borrow();
             set_context_value(
@@ -3011,7 +3001,7 @@ pub(crate) fn install(
             if let Some(ui) = weak.upgrade() {
                 use std::io::Write;
                 if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&trace) {
-                    let event = serde_json::json!({"key":key.to_unicode().map(|c| c.to_string()), "window_active":ui.window.is_active(), "terminal_has_focus":ui.current_terminal().map(|terminal| terminal.has_focus()), "prompt_status":ui.current_term_view().map(|view| format!("{:?}", view.command_prompt_status()))});
+                    let event = serde_json::json!({"key":key.to_unicode().map(|c| c.to_string()), "window_active":ui.window.is_active(), "terminal_has_focus":ui.current_pane_leaf().map(|leaf| leaf.focus_widget().has_focus()), "prompt_status":ui.current_term_view().map(|view| format!("{:?}", view.command_prompt_status()))});
                     let _ = writeln!(file, "{event}");
                 }
             }

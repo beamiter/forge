@@ -1,4 +1,4 @@
-//! Click-to-place-cursor for the live VTE prompt.
+//! Click-to-place-cursor for the live shell prompt.
 //!
 //! A click cannot move the shell's caret directly; it has to become the arrow
 //! keys the user would otherwise hold down. The decisions — whether a click may
@@ -15,13 +15,19 @@
 //! is not a gesture, so it is not cancelled — it is used here purely to observe
 //! that the button came back up.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
+#[cfg(any(test, forge_legacy_renderer))]
+use std::cell::RefCell;
 use std::rc::Rc;
 
+#[cfg(any(test, forge_legacy_renderer))]
 use gtk4::gdk::ffi::GDK_BUTTON_PRIMARY;
+#[cfg(any(test, forge_legacy_renderer))]
 use gtk4::gdk::{EventType, ModifierType};
+#[cfg(any(test, forge_legacy_renderer))]
 use gtk4::prelude::*;
 use jterm_core::click_cursor as core_click;
+#[cfg(any(test, forge_legacy_renderer))]
 use vte4::{Terminal, TerminalExt};
 
 use super::{BlockState, MouseReporting};
@@ -38,9 +44,11 @@ pub(crate) struct ClickCursorCtx {
     /// Cursor-motion bytes make the append-only command shadow inexact. This
     /// callback runs only after the PTY queue accepts the synthesized arrows.
     pub(crate) cursor_move_accepted: Rc<dyn Fn()>,
-    /// VTE cursor position captured at OSC 133 `B`, i.e. where the user's
+    /// Cursor position captured at OSC 133 `B`, i.e. where the user's
     /// command starts. It bounds how far left a click may walk.
     pub(crate) prompt_end_pos: Rc<Cell<(i64, i64)>>,
+    #[cfg(forge_shared_terminal)]
+    pub(crate) prompt_anchor_ready: Rc<Cell<bool>>,
     pub(crate) bstate: Rc<Cell<BlockState>>,
     pub(crate) mouse_mode: Rc<Cell<MouseReporting>>,
     pub(crate) fullscreen: Rc<Cell<bool>>,
@@ -93,8 +101,150 @@ impl ClickCursorCtx {
     }
 }
 
+#[cfg(forge_shared_terminal)]
+pub(crate) fn install_shared(
+    terminal: &Rc<super::shared_active::SharedActiveTerminal>,
+    ctx: ClickCursorCtx,
+) {
+    use jterm_gtk_view::{Color, HistoryAnchor};
+
+    let owner = Rc::downgrade(terminal);
+    terminal
+        .embedded()
+        .connect_primary_cell_click(move |frame, column, row| {
+            if !core_click::click_may_move_cursor(&ctx.guards()) {
+                return;
+            }
+            let Some(shell) = ctx.pty.shell_foreground_token() else {
+                return;
+            };
+            let Some(owner) = owner.upgrade() else {
+                return;
+            };
+            let bytes = owner.embedded().inspect(|terminal| {
+                let cursor = terminal.primary_cursor_anchor()?;
+                let screen_cursor = frame.cursor();
+                let top = cursor.row.checked_sub(screen_cursor.row as u64)?;
+                let column =
+                    column + usize::from(frame.rows()[row].cells[column].flags.wide_continuation());
+                let click = HistoryAnchor {
+                    row: top.checked_add(row as u64)?,
+                    column: column as u16,
+                };
+                let known_prompt = ctx.bstate.get() == BlockState::AwaitingCommand;
+                let start = if known_prompt {
+                    if !ctx.prompt_anchor_ready.get() {
+                        return None;
+                    }
+                    let (column, row) = ctx.prompt_end_pos.get();
+                    HistoryAnchor {
+                        row: row.try_into().ok()?,
+                        column: column.try_into().ok()?,
+                    }
+                } else {
+                    if click.row != cursor.row {
+                        return None;
+                    }
+                    HistoryAnchor {
+                        row: cursor.row,
+                        column: 0,
+                    }
+                };
+                let position = |anchor: HistoryAnchor| (anchor.row, anchor.column);
+                if click.row < start.row || position(start) > position(cursor) {
+                    return None;
+                }
+
+                let steps_between = |start, end| {
+                    terminal
+                        .primary_text_range(start, end)
+                        .ok()
+                        .map(|text| text.chars().count() as i64)
+                };
+                let steps = if position(click) < position(cursor) {
+                    let from = if position(click) < position(start) {
+                        start
+                    } else {
+                        click
+                    };
+                    -steps_between(from, cursor)?
+                } else {
+                    let colors = terminal.paint_colors().map(|(_, colors)| colors);
+                    let suggestion = colors.as_ref().map_or(ctx.suggestion_rgb, |colors| {
+                        let (r, g, b) = colors.palette_color(8);
+                        [r, g, b]
+                    });
+                    let mut suffix = Vec::new();
+                    let mut last_row = screen_cursor.row;
+                    for (index, line) in frame.rows().iter().enumerate().skip(screen_cursor.row) {
+                        last_row = index;
+                        let from = if index == screen_cursor.row {
+                            usize::from(cursor.column)
+                        } else {
+                            0
+                        };
+                        for (column, cell) in line.cells.iter().enumerate().skip(from) {
+                            if cell.flags.wide_continuation() {
+                                continue;
+                            }
+                            let color = match cell.foreground {
+                                Color::BrightBlack | Color::Indexed(8) => Some(suggestion),
+                                Color::Rgb(r, g, b) => Some([r, g, b]),
+                                _ => None,
+                            };
+                            if let Some(cluster) = frame.cluster_text(index, column) {
+                                suffix.extend(cluster.chars().map(|ch| PaintedChar { ch, color }));
+                            } else {
+                                suffix.push(PaintedChar {
+                                    ch: cell.character,
+                                    color,
+                                });
+                            }
+                            if suffix.len() > core_click::MAX_STEPS as usize {
+                                return None;
+                            }
+                        }
+                        if !line.wrapped {
+                            break;
+                        }
+                    }
+                    if row > last_row {
+                        return None;
+                    }
+                    let max_right = absorbable_chars(
+                        &suffix,
+                        suggestion,
+                        frame.cols() as i64,
+                        i64::from(cursor.column),
+                    );
+                    steps_between(cursor, click)?.min(max_right)
+                };
+                if steps == 0 || steps.abs() > core_click::MAX_STEPS {
+                    return None;
+                }
+                let arrow = if steps > 0 { "ArrowRight" } else { "ArrowLeft" };
+                Some(
+                    terminal
+                        .encode_key(arrow, false, false, false)
+                        .ok()?
+                        .repeat(steps.unsigned_abs() as usize),
+                )
+            });
+            if let Some(bytes) = bytes {
+                if (ctx.cursor_move_allowed)() && ctx.pty.shell_foreground_token() == Some(shell) {
+                    if let Err(error) = ctx.pty.write_bytes(&bytes) {
+                        log::warn!("click-to-place-cursor could not reach the shell: {error}");
+                    } else {
+                        (ctx.cursor_move_accepted)();
+                    }
+                }
+            }
+        });
+}
+
 /// Pointer pixels to an absolute ring cell (the space `cursor_position` and
 /// `text_range_format` both use).
+#[cfg(any(test, forge_legacy_renderer))]
 fn cell_at(vte: &Terminal, x: f64, y: f64) -> core_click::Cell {
     let char_width = (vte.char_width() as f64).max(1.0);
     let char_height = (vte.char_height() as f64).max(1.0);
@@ -109,6 +259,7 @@ fn cell_at(vte: &Terminal, x: f64, y: f64) -> core_click::Cell {
 
 /// The text VTE holds between two ring positions, or empty when the range is
 /// empty or unreadable.
+#[cfg(any(test, forge_legacy_renderer))]
 fn text_between(vte: &Terminal, from: core_click::Cell, to: core_click::Cell) -> String {
     if (from.row, from.col) >= (to.row, to.col) {
         return String::new();
@@ -121,6 +272,7 @@ fn text_between(vte: &Terminal, from: core_click::Cell, to: core_click::Cell) ->
 
 /// Characters between two ring positions. Soft-wrapped rows are joined by VTE
 /// without a newline, so an interior newline really is one editable position.
+#[cfg(any(test, forge_legacy_renderer))]
 fn chars_between(vte: &Terminal, from: core_click::Cell, to: core_click::Cell) -> i64 {
     text_between(vte, from, to).chars().count() as i64
 }
@@ -143,6 +295,7 @@ struct PaintedChar {
 /// `g_markup` entities — so a small hand parser beats dragging in an HTML
 /// crate. Unknown tags are ignored; unknown entities are kept verbatim so a
 /// parsing surprise degrades to miscounting, not to a panic.
+#[cfg(any(test, forge_legacy_renderer))]
 fn painted_chars(html: &str) -> Vec<PaintedChar> {
     let mut painted = Vec::new();
     let mut fonts: Vec<Option<[u8; 3]>> = Vec::new();
@@ -204,6 +357,7 @@ fn painted_chars(html: &str) -> Vec<PaintedChar> {
 
 /// The HTML VTE holds between two ring positions, or `None` when the range is
 /// empty or unreadable (the caller then falls back to colour-blind counting).
+#[cfg(any(test, forge_legacy_renderer))]
 fn html_between(vte: &Terminal, from: core_click::Cell, to: core_click::Cell) -> Option<String> {
     if (from.row, from.col) >= (to.row, to.col) {
         return None;
@@ -290,6 +444,7 @@ fn absorbable_chars(
 /// the difference is zero (never negative — a shell that parks its cursor
 /// mid-screen must not shift clicks upward, where extra arrows do damage;
 /// biased low they at worst do less than asked).
+#[cfg(any(test, forge_legacy_renderer))]
 fn adjustment_rebase_offset(vte: &Terminal, cursor: core_click::Cell) -> i64 {
     let upper = vte
         .vadjustment()
@@ -303,6 +458,7 @@ fn adjustment_rebase_offset(vte: &Terminal, cursor: core_click::Cell) -> i64 {
 /// prompt furniture, and rows below the input. Agent prompt verification uses
 /// the same conservative model as click-to-place so the two safety gates cannot
 /// disagree about whether a suffix is real input.
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn editable_suffix_chars_checked(vte: &Terminal, suggestion: [u8; 3]) -> Option<i64> {
     let (cursor_col, cursor_row) = vte.cursor_position();
     let cursor = core_click::Cell::new(cursor_row, cursor_col);
@@ -326,6 +482,7 @@ pub(crate) fn editable_suffix_chars_checked(vte: &Terminal, suggestion: [u8; 3])
     .map(|text| text.trim_end().chars().count() as i64)
 }
 
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn editable_suffix_chars(vte: &Terminal, suggestion: [u8; 3]) -> i64 {
     // Click-to-place errs toward fewer arrows when VTE cannot export its live
     // range. Security-sensitive callers use the checked variant and fail
@@ -336,6 +493,7 @@ pub(crate) fn editable_suffix_chars(vte: &Terminal, suggestion: [u8; 3]) -> i64 
 /// Strict reviewed-execution check for everything to the right of the cursor.
 /// Unlike click placement, visual colour/geometry cannot make a suffix trusted:
 /// real editable text can imitate a ghost suggestion or right prompt exactly.
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn verified_suffix_is_empty(vte: &Terminal, _suggestion: [u8; 3]) -> Option<bool> {
     let (cursor_col, cursor_row) = vte.cursor_position();
     let cursor = core_click::Cell::new(cursor_row, cursor_col);
@@ -371,6 +529,7 @@ fn click_may_target_live_input(click: core_click::Cell, input_start_row: i64) ->
 
 /// Bytes that walk the line editor from the cursor to `click`, or nothing when
 /// the click must not move it.
+#[cfg(any(test, forge_legacy_renderer))]
 fn move_for_click(vte: &Terminal, ctx: &ClickCursorCtx, click: core_click::Cell) -> Vec<u8> {
     if !core_click::click_may_move_cursor(&ctx.guards()) {
         return Vec::new();
@@ -417,6 +576,7 @@ fn move_for_click(vte: &Terminal, ctx: &ClickCursorCtx, click: core_click::Cell)
 }
 
 /// Attach the press/motion/release trio to a live VTE.
+#[cfg(any(test, forge_legacy_renderer))]
 pub(crate) fn install(vte: &Terminal, ctx: ClickCursorCtx) {
     let tracker = Rc::new(RefCell::new(core_click::ClickTracker::default()));
     let ctx = Rc::new(ctx);

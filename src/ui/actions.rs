@@ -5,13 +5,14 @@ use gtk4::glib;
 use gtk4::Orientation;
 use libadwaita as adw;
 use std::rc::Rc;
+#[cfg(any(test, forge_legacy_renderer))]
 use vte4::Terminal;
+#[cfg(any(test, forge_legacy_renderer))]
 use vte4::TerminalExt;
 
 use super::*;
 use crate::block_view::{RecordNavigationResult, SessionExportFormat, TermView, UndoClearResult};
 use crate::keybindings::{Action, Direction};
-use crate::terminal::terminal_working_directory;
 
 const MIN_AI_PANEL_WIDTH: i32 = 240;
 const MAX_AI_PANEL_WIDTH: i32 = 1200;
@@ -174,10 +175,17 @@ impl UiState {
 
     pub(crate) fn execute_action(&self, action: Action) {
         #[cfg(forge_shared_terminal)]
-        if matches!(action, Action::Copy | Action::Paste | Action::ToggleSearch) {
+        if matches!(
+            action,
+            Action::Copy | Action::Paste | Action::ToggleSearch | Action::ScrollUp | Action::ScrollDown
+        ) {
             #[cfg(target_os = "linux")]
             if let Some(PaneLeaf::Shared(view)) = self.current_pane_leaf() {
-                view.terminal_action(action);
+                if action == Action::ToggleSearch {
+                    self.toggle_search();
+                } else {
+                    view.terminal_action(action);
+                }
                 return;
             }
             let session = self
@@ -192,6 +200,7 @@ impl UiState {
         }
         let font_step = 0.025;
         let opacity_step = 0.025;
+        #[cfg(any(test, forge_legacy_renderer))]
         let current_terminal = self.current_terminal();
 
         match action {
@@ -227,11 +236,11 @@ impl UiState {
                 if let Some(term_view) = self.current_term_view() {
                     log::debug!(">>> UI Copy: calling term_view.copy_to_clipboard");
                     term_view.copy_to_clipboard();
-                } else {
-                    log::debug!(">>> UI Copy: no current term_view, falling back to VTE");
-                    if let Some(ref term) = current_terminal {
-                        crate::vte_reference::copy_selection(term);
-                    }
+                    return;
+                }
+                #[cfg(any(test, forge_legacy_renderer))]
+                if let Some(ref term) = current_terminal {
+                    crate::vte_reference::copy_selection(term);
                 }
             }
             Action::Paste => {
@@ -239,11 +248,11 @@ impl UiState {
                 if let Some(term_view) = self.current_term_view() {
                     log::debug!(">>> UI Paste: calling term_view.paste_from_clipboard");
                     term_view.paste_from_clipboard();
-                } else {
-                    log::debug!(">>> UI Paste: no current term_view, falling back to VTE");
-                    if let Some(ref term) = current_terminal {
-                        term.paste_clipboard();
-                    }
+                    return;
+                }
+                #[cfg(any(test, forge_legacy_renderer))]
+                if let Some(ref term) = current_terminal {
+                    term.paste_clipboard();
                 }
             }
             Action::FontIncrease => {
@@ -308,9 +317,7 @@ impl UiState {
                     ));
                     return;
                 }
-                let root = current_terminal
-                    .as_ref()
-                    .and_then(terminal_working_directory)
+                let root = self.current_local_pane_directory()
                     .map(std::path::PathBuf::from)
                     .filter(|path| path.is_dir())
                     .or_else(|| std::env::current_dir().ok())
@@ -369,7 +376,10 @@ impl UiState {
             Action::ScrollUp => {
                 if let Some(term_view) = self.current_term_view() {
                     term_view.scroll_lines(-3);
-                } else if let Some(ref term) = current_terminal {
+                    return;
+                }
+                #[cfg(any(test, forge_legacy_renderer))]
+                if let Some(ref term) = current_terminal {
                     if let Some(adj) = term.vadjustment() {
                         let new_val = (adj.value() - adj.step_increment() * 3.0).max(adj.lower());
                         adj.set_value(new_val);
@@ -379,7 +389,10 @@ impl UiState {
             Action::ScrollDown => {
                 if let Some(term_view) = self.current_term_view() {
                     term_view.scroll_lines(3);
-                } else if let Some(ref term) = current_terminal {
+                    return;
+                }
+                #[cfg(any(test, forge_legacy_renderer))]
+                if let Some(ref term) = current_terminal {
                     if let Some(adj) = term.vadjustment() {
                         let max_val = adj.upper() - adj.page_size();
                         let new_val = (adj.value() + adj.step_increment() * 3.0).min(max_val);
@@ -993,10 +1006,12 @@ impl UiState {
     /// Block pages contain read-only VTE snapshots in addition to the active
     /// input VTE, so callers must use the typed pane controller rather than
     /// walking the GTK widget tree.
+    #[cfg(any(test, forge_legacy_renderer))]
     pub(crate) fn terminal_in_page(&self, widget: &gtk4::Widget) -> Option<Terminal> {
         PaneNode::from_widget(widget).and_then(|node| node.active_terminal())
     }
 
+    #[cfg(any(test, forge_legacy_renderer))]
     pub(crate) fn current_terminal(&self) -> Option<Terminal> {
         self.notebook
             .current_page()
@@ -1010,6 +1025,12 @@ impl UiState {
             .and_then(|page_num| self.notebook.nth_page(Some(page_num)))
             .and_then(|widget| PaneNode::from_widget(&widget))
             .and_then(|node| node.active_leaf())
+    }
+
+    pub(crate) fn current_local_pane_directory(&self) -> Option<String> {
+        self.current_pane_leaf()
+            .filter(|leaf| !leaf.is_remote())
+            .and_then(|leaf| leaf.working_directory())
     }
 
     /// Receive the emitting pane directly; no operation depends on a delayed

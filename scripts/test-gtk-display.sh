@@ -52,6 +52,11 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    ui::tabs::tests::closed_terminal_callbacks_cannot_retarget_a_promoted_sibling_or_new_tab
+    ui::search_native_tests::ordinary_shared_find_keeps_history_regex_and_pane_ownership
+    eva_companion::tests::shared_terminal_selection_is_explicit_bounded_and_scoped
+    block_view::blocks::tests::completed_output_documents_preserve_text_and_raw_capture
+    block_view::blocks::tests::completed_headings_keep_bounded_source_without_a_vte_fallback
     ui::local_preview::tests::mapped_preview_jumps_reloads_and_retires_the_page
     vte_reference::tests::mapped_vte_never_reconstructs_a_url_authority
     vte_reference::tests::mapped_vte_blocks_ambiguous_paths_and_preserves_native_selection
@@ -71,6 +76,7 @@ tests=(
     ui::sidebar_tabs::layout_tests::sidebar_resize_and_vertical_scroll_keep_the_leading_edge_visible
     ui::sidebar_resize::tests::native_sidebar_drags_preserve_requests_and_input_focus
     block_view::tests::chat_completion_never_expands_between_shell_markers
+    block_view::scroll::canvas_native_tests::fullscreen_reader_restores_retained_anchor_and_yields_to_new_navigation
     block_view::scroll::canvas_native_tests::capped_output_hands_remaining_pixels_to_retained_canvas
     block_view::scroll::canvas_native_tests::retained_canvas_scrolls_through_frames_and_yields_to_reading
     ui::organism::inspector::tests::snapshot_dialog_is_scrollable_and_closes_without_an_animation_source
@@ -247,7 +253,7 @@ export LIBGL_ALWAYS_SOFTWARE=1
 export NO_AT_BRIDGE=1
 export GTK_A11Y=none
 
-listed_tests="$(cargo test --lib --all-features --locked -- --ignored --list)"
+listed_tests="$(python3 tools/vte-oracle/run.py test --lib --all-features --locked -- --ignored --list)"
 for test_name in "${tests[@]}"; do
     if ! grep -Fqx -- "${test_name}: test" <<<"${listed_tests}"; then
         printf 'Error: GTK display regression is not registered: %s\n' "${test_name}" >&2
@@ -266,7 +272,7 @@ capture_vte_crash() {
     command -v timeout >/dev/null || return
     # Resolve the exact current lib-test executable from Cargo's structured
     # artifact output; never guess a hash or select a stale directory entry.
-    cargo test --lib --all-features --locked --no-run --message-format=json \
+    python3 tools/vte-oracle/run.py test --lib --all-features --locked --no-run --message-format=json \
         > "$diagnostic_dir/cargo-artifacts.jsonl" || return
     test_binary="$(python3 - "$diagnostic_dir/cargo-artifacts.jsonl" <<'PY_BINARY'
 import json, sys
@@ -339,7 +345,7 @@ for test_name in "${tests[@]}"; do
         timeout --signal=TERM --kill-after=10s 120s \
         dbus-run-session "${dbus_run_args[@]}" -- \
         xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
-        env "${card_backend[@]}" cargo test --lib --all-features --locked "${test_name}" -- \
+        env "${card_backend[@]}" python3 tools/vte-oracle/run.py test --lib --all-features --locked "${test_name}" -- \
         --ignored --exact --nocapture; then
         passed_count=$((passed_count + 1))
     else

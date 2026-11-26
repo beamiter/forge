@@ -5,6 +5,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gtk4::prelude::*;
+#[cfg(any(test, forge_legacy_renderer))]
 use vte4::TerminalExt;
 
 use super::PaneLeaf;
@@ -32,6 +33,7 @@ impl DropIntent {
         let cancel = intent.clone();
         focus.connect_leave(move |_| cancel.invalidate());
         leaf.root_widget().add_controller(focus);
+        #[cfg(any(test, forge_legacy_renderer))]
         if let Some(terminal) = leaf.terminal() {
             let cancel = intent.clone();
             terminal.connect_commit(move |_, _, _| cancel.invalidate());

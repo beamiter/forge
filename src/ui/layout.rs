@@ -83,6 +83,12 @@ impl UiState {
         }
     }
 
+    /// Open Files from a user action, including when the inspector is hidden.
+    pub(crate) fn reveal_file_tree(&self, persist: bool) {
+        self.apply_sidebar_view(SidebarView::Files, persist);
+        super::reference_shell::sync_inspector(self, true);
+    }
+
     /// Size a single strip button for the active placement: fill width in the
     /// sidebar, use the persisted draggable width in the top bar.
     pub(crate) fn apply_strip_btn_placement(&self, btn: &ToggleButton) {

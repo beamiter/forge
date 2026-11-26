@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Development convenience script. All native build commands run inside the
-# pinned flake so `make verify` uses the same GTK/VTE toolchain as CI.
+# pinned flake so `make verify` uses the same GTK toolchain as CI.
 
 set -Eeuo pipefail
 
@@ -40,12 +40,12 @@ if [[ "${CMD}" != package ]] && ! command -v nix >/dev/null 2>&1; then
     exit 1
 fi
 if [[ "${CMD}" == package ]] && ! command -v cargo >/dev/null 2>&1; then
-    echo "Error: Cargo and the system GTK/VTE development libraries are required for portable packaging." >&2
+    echo "Error: Cargo and the system GTK development libraries are required for portable packaging." >&2
     exit 1
 fi
 if [[ "${CMD}" == package && -n "${IN_NIX_SHELL:-}" ]]; then
     echo "Error: portable packaging must run outside a Nix development shell." >&2
-    echo "Exit the shell and run 'make package' with the system GTK/VTE toolchain." >&2
+    echo "Exit the shell and run 'make package' with the system GTK toolchain." >&2
     exit 1
 fi
 
@@ -68,12 +68,13 @@ case "${CMD}" in
 
     test)
         echo "Running tests..."
-        run_in_nix cargo test --all-targets --all-features --locked --no-fail-fast
+        run_in_nix cargo test --tests --all-features --locked --no-fail-fast
+        nix develop .#vte-oracle --command python3 tools/vte-oracle/run.py test --lib --all-features --no-fail-fast
         ;;
 
     test-display)
         echo "Running display-backed GTK/VTE regressions..."
-        run_in_nix bash scripts/test-gtk-display.sh
+        nix develop .#vte-oracle --command bash scripts/test-gtk-display.sh
         ;;
 
     check)
@@ -100,7 +101,7 @@ case "${CMD}" in
         echo "Running the complete quality gate..."
         # Expansion belongs to the inner Nix shell.
         # shellcheck disable=SC2016
-        run_in_nix bash -c '
+        nix develop .#vte-oracle --command bash -c '
             set -Eeuo pipefail
             bash scripts/privacy-check.sh
             python3 tools/check-process-bundle.py
@@ -108,7 +109,8 @@ case "${CMD}" in
             python3 scripts/test-shared-core-pin.py
             cargo fmt --all -- --check
             cargo check --all-targets --all-features --locked
-            cargo test --all-targets --all-features --locked --no-fail-fast
+            cargo test --tests --all-features --locked --no-fail-fast
+            python3 tools/vte-oracle/run.py test --lib --all-features --no-fail-fast
             bash scripts/test-gtk-display.sh
             cargo clippy --all-targets --all-features --locked -- -D warnings
             RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked

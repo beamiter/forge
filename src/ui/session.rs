@@ -293,6 +293,7 @@ impl UiState {
             }
         };
         debug_assert!(first_leaf.is_none());
+        let restored_dividers = crate::pane_restore::RestoredPaneDividers::capture(&restored);
 
         let Some(parent) = placeholder
             .parent()
@@ -338,6 +339,7 @@ impl UiState {
         self.apply_restored_pin(&restored, first.pinned == Some(true));
         self.sync_tab_strip_active(Some(inserted));
         self.sync_tab_bar_visibility();
+        restored_dividers.schedule(&restored);
         RestoreOutcome::Complete
     }
 

@@ -1,6 +1,7 @@
 //! Developer Block presentation: native record cards over one existing PTY.
 //! The gutter never enters the terminal byte stream or its native selection.
 use super::*;
+#[cfg(any(test, forge_legacy_renderer))]
 use std::cell::RefCell;
 
 pub(super) const HEADER_HEIGHT: i32 = 40;
@@ -73,6 +74,7 @@ fn logical_starts(text: &str, cols: i64) -> (Vec<(i64, usize)>, i64) {
     (starts, visual)
 }
 
+#[cfg(any(test, forge_legacy_renderer))]
 pub(super) fn line_gutter(
     terminal: &Terminal,
     original: Rc<RefCell<String>>,
@@ -183,6 +185,7 @@ pub(super) fn terminal_background() -> gtk4::gdk::RGBA {
     gtk4::gdk::RGBA::new(14.0 / 255.0, 22.0 / 255.0, 33.0 / 255.0, 1.0)
 }
 
+#[cfg(any(test, forge_legacy_renderer))]
 pub(super) fn terminal_colors(terminal: &Terminal) {
     terminal.set_color_foreground(&terminal_foreground());
     terminal.set_color_background(&terminal_background());

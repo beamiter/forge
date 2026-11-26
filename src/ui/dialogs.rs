@@ -4,17 +4,21 @@ use gtk4::gdk::Key;
 use gtk4::gdk::ModifierType;
 use gtk4::glib;
 use gtk4::pango::FontDescription;
+#[cfg(any(test, forge_legacy_renderer))]
+use gtk4::GestureClick;
 use gtk4::{Adjustment, Label, ListBox, Orientation, Scale, ScrolledWindow};
-use gtk4::{EventControllerKey, GestureClick, SearchEntry};
+use gtk4::{EventControllerKey, SearchEntry};
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
+#[cfg(any(test, forge_legacy_renderer))]
 use vte4::Terminal;
 
 use super::*;
 use crate::block_view::RecordNavigationResult;
 use crate::keybindings::Action;
+#[cfg(any(test, forge_legacy_renderer))]
 use crate::terminal::open_uri;
 
 /// Weak controls for the currently open settings dialog. External reloads
@@ -5939,6 +5943,7 @@ impl UiState {
     }
 
     /// Set up right-click context menu for a terminal.
+    #[cfg(any(test, forge_legacy_renderer))]
     pub(crate) fn setup_context_menu(&self, terminal: &Terminal) {
         let right_click = GestureClick::new();
         right_click.set_button(3); // Right mouse button
@@ -6505,9 +6510,10 @@ impl UiState {
             else {
                 return;
             };
-            let Some(pane_for_run) = ui_for_run.palette_input_target(&pane_for_run) else {
+            let Some((pane_for_run, page_for_run)) = ui_for_run.workflow_input_target(&pane_for_run)
+            else {
                 ui_for_run.toast_overlay.add_toast(adw::Toast::new(
-                    "Nothing was inserted: the workflow's original pane is no longer active.",
+                    "Nothing was inserted: the workflow's original pane is no longer available.",
                 ));
                 return;
             };
@@ -6528,6 +6534,9 @@ impl UiState {
                         || {
                             closed_for_run.set(true);
                             dialog_for_run.force_close();
+                            if let Some(page) = ui_for_run.notebook.page_num(&page_for_run) {
+                                ui_for_run.notebook.set_current_page(Some(page));
+                            }
                             pane_for_run.grab_focus();
                         },
                     );
@@ -6551,6 +6560,7 @@ impl UiState {
         let dialog_for_key = dialog.downgrade();
         let closed_for_key = closed;
         let run_btn_for_key = run_btn.downgrade();
+        let ui_for_key = self.clone();
         key_controller.connect_key_pressed(move |_, keyval, _, state| {
             let Some(dialog_for_key) = workflow_dialog_if_open(&dialog_for_key, &closed_for_key)
             else {
@@ -6569,11 +6579,34 @@ impl UiState {
                 }
                 return true.into();
             }
+            if state.intersects(
+                ModifierType::CONTROL_MASK | ModifierType::ALT_MASK | ModifierType::SUPER_MASK,
+            ) {
+                let action = crate::app::chord_from_gdk(keyval, state)
+                    .and_then(|chord| ui_for_key.keybinding_map.borrow().lookup(&chord));
+                if let Some(action @ (Action::PrevTab | Action::NextTab)) = action {
+                    ui_for_key.execute_action(action);
+                    return true.into();
+                }
+            }
             false.into()
         });
         dialog.add_controller(key_controller);
 
         dialog.present(Some(&self.window));
+    }
+
+    fn workflow_input_target(
+        &self,
+        original: &Option<glib::WeakRef<gtk4::Widget>>,
+    ) -> Option<(crate::ui::PaneLeaf, gtk4::Widget)> {
+        let root = original.as_ref()?.upgrade()?;
+        // A hidden tab remains a valid owner. Removed or replaced widgets
+        // must never redirect the draft to the currently selected pane.
+        let page = (0..self.notebook.n_pages())
+            .filter_map(|index| self.notebook.nth_page(Some(index)))
+            .find(|page| root == *page || root.is_ancestor(page))?;
+        Some((crate::ui::PaneLeaf::from_widget(&root)?, page))
     }
 
     /// Read-only view of a completed record's bounded output snapshot:
@@ -6976,7 +7009,7 @@ mod tests {
             assert!(form.contains(weak), "missing weak callback owner: {weak}");
         }
         assert!(!form.contains("let pane_for_run = pane.clone()"));
-        assert!(form.contains("ui_for_run.palette_input_target(&pane_for_run)"));
+        assert!(form.contains("ui_for_run.workflow_input_target(&pane_for_run)"));
         let submit = form
             .split("run_btn.connect_clicked(move |_|")
             .nth(1)
@@ -6984,7 +7017,7 @@ mod tests {
         assert!(
             submit.find("workflow_dialog_if_open").unwrap() < submit.find(".render()").unwrap()
         );
-        assert!(submit.find("palette_input_target").unwrap() < submit.find(".render()").unwrap());
+        assert!(submit.find("workflow_input_target").unwrap() < submit.find(".render()").unwrap());
     }
 
     #[test]

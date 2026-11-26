@@ -879,6 +879,7 @@ impl UiState {
             .current_pane_leaf()
             .map(|pane| pane.root_widget().downgrade());
         let greeting_target = self.organism_greeting_target();
+        #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
         let vte_presentation_target = self.vte_companion_target();
         let output_review_target = self.current_term_view().map(|view| Rc::downgrade(&view));
         let library = self.workflow_library.snapshot().value;
@@ -994,10 +995,13 @@ impl UiState {
                     | crate::keybindings::Action::CollapseVteCompanion),
                 ) = &entry.accept
                 {
+                    #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
                     ui.set_vte_companion_for(
                         &vte_presentation_target,
                         *action == crate::keybindings::Action::ExpandVteCompanion,
                     );
+                    #[cfg(all(forge_shared_terminal, target_os = "linux", not(test)))]
+                    let _ = action;
                 } else {
                     ui.accept_palette_entry(entry, &snapshot.borrow().workflows, &input_target);
                 }

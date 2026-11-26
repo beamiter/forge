@@ -9,6 +9,7 @@ use gtk4::{glib, Orientation};
 use jterm_core::chat_mode::{resolve_surface, ChatSessionState, ChatSurface};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+#[cfg(any(test, forge_legacy_renderer))]
 use vte4::{Terminal, TerminalExt};
 
 // The allocation probe is not painted content. Even NON_TARGETABLE picking
@@ -124,6 +125,7 @@ fn screen_caret_row(cursor_row: i64, displayed_origin: i64, native_rows: i64) ->
 /// Cursor positions use absolute ring rows; VTE's adjustment can be rebased.
 /// Reuse the existing displayed-text/ring calibration, and decline to invent
 /// coordinates while history is being read or no screen origin is provable.
+#[cfg(any(test, forge_legacy_renderer))]
 pub(super) fn editor_caret_point(terminal: &Terminal) -> Option<(i64, gtk4::graphene::Point)> {
     let (origin, row) = editor_screen_caret(terminal)?;
     let cursor = terminal.cursor_position();
@@ -141,6 +143,7 @@ pub(super) fn editor_caret_point(terminal: &Terminal) -> Option<(i64, gtk4::grap
     ))
 }
 
+#[cfg(any(test, forge_legacy_renderer))]
 fn editor_screen_caret(terminal: &Terminal) -> Option<(i64, i64)> {
     let origin = super::displayed_live_origin(terminal)?;
     let row = screen_caret_row(terminal.cursor_position().1, origin, terminal.row_count())?;
@@ -149,6 +152,7 @@ fn editor_screen_caret(terminal: &Terminal) -> Option<(i64, i64)> {
 
 /// Include a blank trailing caret row as well as the prompt's drawn text.
 /// The extent is admitted only in the independently calibrated screen domain.
+#[cfg(any(test, forge_legacy_renderer))]
 pub(super) fn editor_caret_rows(terminal: &Terminal) -> Option<i64> {
     editor_screen_caret(terminal).map(|(_, row)| row.saturating_add(1))
 }
@@ -156,6 +160,7 @@ pub(super) fn editor_caret_rows(terminal: &Terminal) -> Option<i64> {
 /// Reveal the native caret inside the bounded editor without moving history
 /// or scrolling the terminal's own ring. Coordinates come from the actual VTE
 /// allocation and its adjustment, including the terminal's computed CSS box.
+#[cfg(any(test, forge_legacy_renderer))]
 fn reveal_editor_caret(terminal: &Terminal, viewport: &gtk4::ScrolledWindow) {
     if !viewport.is_mapped() || viewport.height() <= 0 {
         return;
@@ -506,6 +511,7 @@ pub(super) struct ChatPresentation {
     block_input_hint: Option<glib::WeakRef<gtk4::Label>>,
     command_generation: Cell<u64>,
     displayed_stop_target: Cell<Option<StopTarget>>,
+    #[cfg(any(test, forge_legacy_renderer))]
     reveal_editor: Rc<dyn Fn()>,
 }
 
@@ -554,41 +560,45 @@ impl ChatPresentation {
         if let Some(viewport) = composer_viewport.child().and_downcast::<gtk4::Viewport>() {
             viewport.set_scroll_to_focus(false);
         }
-        // GtkViewport emits adjustment::changed while thawing notifications at
-        // the end of size_allocate, after allocating its child. Setting value
-        // there queues an allocation inside the allocation being completed:
-        // the numeric value can change while the child's transform stays old.
-        // Coalesce one idle after that stack returns; there is no polling tick.
-        let reveal_pending = Rc::new(Cell::new(false));
-        let terminal = active.active_vte.as_ref().map(vte4::Terminal::downgrade);
-        let editor = composer_viewport.downgrade();
-        let reveal_editor: Rc<dyn Fn()> = Rc::new(move || {
-            if reveal_pending.replace(true) {
-                return;
-            }
-            let pending = reveal_pending.clone();
-            let terminal = terminal.clone();
-            let editor = editor.clone();
-            glib::idle_add_local_once(move || {
-                pending.set(false);
-                if let (Some(terminal), Some(editor)) = (
-                    terminal.as_ref().and_then(glib::WeakRef::upgrade),
-                    editor.upgrade(),
-                ) {
-                    if terminal.is_mapped() && terminal.is_ancestor(&editor) {
-                        reveal_editor_caret(&terminal, &editor);
-                    }
+        #[cfg(any(test, forge_legacy_renderer))]
+        let reveal_editor = {
+            // GtkViewport emits adjustment::changed while thawing notifications at
+            // the end of size_allocate, after allocating its child. Setting value
+            // there queues an allocation inside the allocation being completed:
+            // the numeric value can change while the child's transform stays old.
+            // Coalesce one idle after that stack returns; there is no polling tick.
+            let reveal_pending = Rc::new(Cell::new(false));
+            let terminal = active.legacy_terminal().map(vte4::Terminal::downgrade);
+            let editor = composer_viewport.downgrade();
+            let reveal_editor: Rc<dyn Fn()> = Rc::new(move || {
+                if reveal_pending.replace(true) {
+                    return;
                 }
+                let pending = reveal_pending.clone();
+                let terminal = terminal.clone();
+                let editor = editor.clone();
+                glib::idle_add_local_once(move || {
+                    pending.set(false);
+                    if let (Some(terminal), Some(editor)) = (
+                        terminal.as_ref().and_then(glib::WeakRef::upgrade),
+                        editor.upgrade(),
+                    ) {
+                        if terminal.is_mapped() && terminal.is_ancestor(&editor) {
+                            reveal_editor_caret(&terminal, &editor);
+                        }
+                    }
+                });
             });
-        });
-        let reveal = reveal_editor.clone();
-        composer_viewport
-            .vadjustment()
-            .connect_changed(move |_| reveal());
-        if let Some(terminal) = &active.active_vte {
             let reveal = reveal_editor.clone();
-            terminal.connect_cursor_moved(move |_| reveal());
-        }
+            composer_viewport
+                .vadjustment()
+                .connect_changed(move |_| reveal());
+            if let Some(terminal) = active.legacy_terminal() {
+                let reveal = reveal_editor.clone();
+                terminal.connect_cursor_moved(move |_| reveal());
+            }
+            reveal_editor
+        };
         dock.append(&composer_viewport);
         let block_input_hint = if root.has_css_class("developer-block-canvas") {
             let hint = gtk4::Label::new(Some("Input belongs to the running command"));
@@ -685,6 +695,7 @@ impl ChatPresentation {
             reparenting: Cell::new(false),
             command_generation: Cell::new(0),
             displayed_stop_target: Cell::new(None),
+            #[cfg(any(test, forge_legacy_renderer))]
             reveal_editor,
         }
     }
@@ -751,6 +762,8 @@ impl ChatPresentation {
         }
     }
 
+    #[cfg(any(test, forge_legacy_renderer))]
+    #[cfg(any(test, forge_legacy_renderer))]
     pub(super) fn size_editor(&self, _terminal: &Terminal, budget: EditorHeightBudget) {
         let Some(viewport) = self.composer_viewport.upgrade() else {
             return;

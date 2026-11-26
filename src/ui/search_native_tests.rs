@@ -25,10 +25,24 @@ struct UiState {
     search_generation: Rc<Cell<u64>>,
     search_owner: Rc<RefCell<Option<controller::SearchOwner>>>,
     terminal: vte4::Terminal,
+    #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+    shared: Rc<RefCell<Option<Rc<crate::ui::shared_terminal::SharedPane>>>>,
 }
 
 impl UiState {
+    #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+    fn current_pane_leaf(&self) -> Option<crate::ui::PaneLeaf> {
+        self.shared
+            .borrow()
+            .as_ref()
+            .cloned()
+            .map(crate::ui::PaneLeaf::Shared)
+    }
     fn current_terminal(&self) -> Option<vte4::Terminal> {
+        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+        if self.shared.borrow().is_some() {
+            return None;
+        }
         Some(self.terminal.clone())
     }
     fn current_term_view(&self) -> Option<Rc<TermView>> {
@@ -78,6 +92,8 @@ fn native_entry_navigation_and_close_reopen_retire_stale_queries() {
         search_generation: Default::default(),
         search_owner: Default::default(),
         terminal: vte4::Terminal::new(),
+        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+        shared: Default::default(),
     });
     // Make the old delayed signal's race deterministic, independent of how
     // quickly the CI machine processes input. Production uses its default.
@@ -188,4 +204,125 @@ fn native_entry_navigation_and_close_reopen_retire_stale_queries() {
     ui.toggle_search();
     ui.search_entry.disconnect(connection);
     window.close();
+}
+
+#[cfg(all(forge_shared_terminal, target_os = "linux"))]
+#[test]
+#[ignore = "requires native GTK display and real PTYs"]
+fn ordinary_shared_find_keeps_history_regex_and_pane_ownership() {
+    use crate::ui::{shared_terminal::SharedPane, PaneLeaf};
+    use gtk4::prelude::*;
+    use jterm_gtk_view::TerminalFindStatus;
+
+    jterm_core::child_env::capture_inherited_environment().expect("child environment");
+    libadwaita::init().expect("GTK display");
+    let mut config = crate::config::Config::safe_defaults();
+    config.terminal_scrollback_lines = 1000;
+    let argv = ["/bin/sh", "-c", r#"i=0; while [ $i -lt 150 ]; do printf 'history-needle-%03d\n' $i; i=$((i+1)); done; printf 'live needle\n'; while IFS= read -r line; do printf 'received:%s\n' "$line"; done"#].map(str::to_owned);
+    let first = SharedPane::open_explicit(&config, &argv, Some("/tmp")).expect("shared pane");
+    assert!(first.launch_error().is_none());
+    let argv = [
+        "/bin/sh",
+        "-c",
+        r#"printf 'other needle\n'; while IFS= read -r line; do printf '%s\n' "$line"; done"#,
+    ]
+    .map(str::to_owned);
+    let second = SharedPane::open_explicit(&config, &argv, Some("/tmp")).expect("second pane");
+    for pane in [&first, &second] {
+        PaneLeaf::Shared(pane.clone()).attach_to(pane.root());
+    }
+    let ui = Rc::new(UiState {
+        search_bar: gtk4::SearchBar::new(),
+        search_entry: gtk4::SearchEntry::new(),
+        search_status: gtk4::Label::new(None),
+        search_debounce_source: Default::default(),
+        search_generation: Default::default(),
+        search_owner: Default::default(),
+        terminal: vte4::Terminal::new(),
+        shared: Rc::new(RefCell::new(Some(first.clone()))),
+    });
+    ui.search_bar.set_child(Some(&ui.search_entry));
+    ui.search_bar.connect_entry(&ui.search_entry);
+    let column = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    column.append(&ui.search_bar);
+    column.append(first.root());
+    column.append(second.root());
+    let window = gtk4::Window::builder()
+        .default_width(800)
+        .default_height(600)
+        .child(&column)
+        .build();
+    window.present();
+    pump(Duration::from_millis(600));
+    ui.connect_search_entry_changes();
+    first.focus_widget().grab_focus();
+    ui.toggle_search();
+    ui.search_entry.set_text("history-needle-000");
+    ui.search_apply();
+    pump(Duration::from_millis(100));
+    assert_eq!(
+        ui.search_status.text(),
+        "1 of 1",
+        "retained history is searchable"
+    );
+    ui.search_entry.set_text("/history-needle-00[01]/");
+    ui.search_apply();
+    assert_eq!(ui.search_status.text(), "1 of 2");
+    *ui.shared.borrow_mut() = Some(second.clone());
+    ui.search_next();
+    assert_eq!(ui.search_status.text(), "2 of 2");
+    ui.search_prev();
+    assert_eq!(ui.search_status.text(), "1 of 2");
+    assert_eq!(
+        second.find_controller().unwrap().status(),
+        TerminalFindStatus::Idle
+    );
+    ui.search_entry.set_text("/[/");
+    ui.search_apply();
+    assert_eq!(ui.search_status.text(), "Invalid regex");
+    ui.search_next();
+    assert_eq!(ui.search_status.text(), "Invalid regex");
+    ui.search_entry.set_text(&"x".repeat(8193));
+    ui.search_apply();
+    assert!(ui.search_status.text().starts_with("Query too long"));
+    ui.search_next();
+    assert!(ui.search_status.text().starts_with("Query too long"));
+    ui.search_entry.set_text("NEEDLE");
+    ui.search_apply();
+    assert_eq!(ui.search_status.text(), "1 of 151");
+    ui.search_entry.grab_focus();
+    ui.toggle_search();
+    assert_eq!(
+        first.find_controller().unwrap().status(),
+        TerminalFindStatus::Idle
+    );
+    assert!(first.focus_widget().has_focus());
+    ui.toggle_search();
+    ui.search_entry.set_text("other");
+    ui.search_apply();
+    assert_eq!(ui.search_status.text(), "1 of 1");
+    assert_eq!(
+        first.find_controller().unwrap().status(),
+        TerminalFindStatus::Idle
+    );
+    column.remove(second.root());
+    *ui.shared.borrow_mut() = Some(first.clone());
+    ui.search_next();
+    assert_eq!(
+        ui.search_status.text(),
+        "The search pane is no longer available"
+    );
+    assert_eq!(
+        first.find_controller().unwrap().status(),
+        TerminalFindStatus::Idle
+    );
+    ui.toggle_search();
+    for pane in [&first, &second] {
+        if let Some(terminal) = pane.terminal_pane() {
+            terminal.stop();
+        }
+        PaneLeaf::detach_from(pane.root());
+    }
+    window.destroy();
+    pump(Duration::from_millis(100));
 }

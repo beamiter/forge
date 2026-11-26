@@ -6,6 +6,7 @@
 //! marker-eviction increment can retire an id without deleting history search
 //! or export metadata, and a stale URI can never resurrect it.
 
+use super::blocks::lifecycle_badge;
 use gtk4::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -132,17 +133,6 @@ impl ZoneChromeRecord {
                 super::blocks::format_block_duration(duration)
             )
         })
-    }
-}
-
-/// One word for a record whose lifecycle is not fully trusted, or `None` when
-/// it is. Block's card chip and Unified's status line share this vocabulary.
-pub(super) fn lifecycle_badge(health: super::BlockLifecycleHealth) -> Option<&'static str> {
-    match health {
-        super::BlockLifecycleHealth::Healthy => None,
-        super::BlockLifecycleHealth::Recovered => Some("recovered"),
-        super::BlockLifecycleHealth::Degraded => Some("inferred"),
-        super::BlockLifecycleHealth::Incomplete => Some("incomplete"),
     }
 }
 

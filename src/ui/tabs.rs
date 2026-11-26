@@ -9,40 +9,52 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::os::fd::BorrowedFd;
 use std::rc::Rc;
+#[cfg(any(test, forge_legacy_renderer))]
 use vte4::TerminalExt;
 
 use super::*;
 use crate::block_view::TermView;
 use crate::keybindings::Action;
-use crate::state::{generate_session_id, kill_terminal_child, kill_widget_child_processes};
-use crate::terminal::{
-    collect_terminals, default_tab_title, find_first_terminal, setup_terminal_click_handler,
-    show_rename_dialog, show_rename_dialog_with_strip, terminal_working_directory, VteTerminalView,
-};
+#[cfg(any(test, forge_legacy_renderer))]
+use crate::state::kill_terminal_child;
+use crate::state::{generate_session_id, kill_widget_child_processes};
+#[cfg(any(not(all(forge_shared_terminal, target_os = "linux")), test))]
+use crate::terminal::VteTerminalView;
+#[cfg(any(test, forge_legacy_renderer))]
+use crate::terminal::{collect_terminals, setup_terminal_click_handler};
+use crate::terminal::{default_tab_title, show_rename_dialog, show_rename_dialog_with_strip};
 
-/// A launch diagnostic is rendered through VTE too. Only the first output of
-/// an attempt which has not failed may turn its remote badge green.
+/// Only output from an admitted child may turn its connection badge green.
 fn connect_remote_launch_status(leaf: &PaneLeaf, on_status: impl Fn(ConnStatus) + 'static) {
-    if let PaneLeaf::Block(view) = leaf {
-        view.connect_first_pty_output(move || on_status(ConnStatus::Connected));
-        return;
+    match leaf {
+        PaneLeaf::Block(view) => {
+            view.connect_first_pty_output(move || on_status(ConnStatus::Connected));
+        }
+        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+        PaneLeaf::Shared(view) => {
+            if view.launch_error().is_some() {
+                on_status(ConnStatus::Disconnected);
+            }
+        }
+        #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
+        PaneLeaf::Vte(view) => {
+            let settled = Rc::new(Cell::new(false));
+            let on_status = Rc::new(on_status);
+            view.connect_launch_failed({
+                let settled = settled.clone();
+                let on_status = on_status.clone();
+                move |_| {
+                    settled.set(true);
+                    on_status(ConnStatus::Disconnected);
+                }
+            });
+            view.vte().connect_contents_changed(move |_| {
+                if !settled.replace(true) {
+                    on_status(ConnStatus::Connected);
+                }
+            });
+        }
     }
-    let PaneLeaf::Vte(view) = leaf else { return };
-    let settled = Rc::new(Cell::new(false));
-    let on_status = Rc::new(on_status);
-    view.connect_launch_failed({
-        let settled = settled.clone();
-        let on_status = on_status.clone();
-        move |_| {
-            settled.set(true);
-            on_status(ConnStatus::Disconnected);
-        }
-    });
-    view.vte().connect_contents_changed(move |_| {
-        if !settled.replace(true) {
-            on_status(ConnStatus::Connected);
-        }
-    });
 }
 
 struct TabLaunch<'a> {
@@ -130,11 +142,27 @@ fn pane_leaf_root_of(widget: &gtk4::Widget) -> Option<gtk4::Widget> {
     None
 }
 
+/// Process callbacks must still name a real member of this UI's tree. A
+/// detached leaf can retain the same tab caption as its promoted sibling;
+/// that caption is never authority for a late exit callback.
+fn terminal_target_is_attached(
+    notebook: &gtk4::Notebook,
+    retained_zoom: Option<(&gtk4::Widget, &gtk4::Widget)>,
+    target: &gtk4::Widget,
+) -> bool {
+    (0..notebook.n_pages()).any(|index| {
+        notebook.nth_page(Some(index)).is_some_and(|page| widget_is_within(target, &page))
+    }) || retained_zoom.is_some_and(|(original, zoomed)| {
+        widget_is_within(target, original) || widget_is_within(target, zoomed)
+    })
+}
+
 /// What an OSC 0/2 title does to a tab label: `None` leaves it alone (the
 /// user renamed the tab), an empty title restores `default` (the program is
 /// handing the title back), anything else becomes the label.
 /// A VTE pane's current directory for its default tab title: the OSC 7 value
 /// or the shell's `/proc` cwd, not the directory the tab was opened in.
+#[cfg(any(test, forge_legacy_renderer))]
 fn vte_live_cwd(terminal: &glib::WeakRef<vte4::Terminal>) -> Option<String> {
     let terminal = terminal.upgrade()?;
     crate::terminal::terminal_working_directory(&terminal)
@@ -313,8 +341,8 @@ impl UiState {
             return;
         };
         let cwd = PaneNode::from_widget(&page)
-            .and_then(|node| node.active_terminal())
-            .and_then(|terminal| terminal_working_directory(&terminal));
+            .and_then(|node| node.active_leaf())
+            .and_then(|leaf| leaf.working_directory());
         let title = default_tab_title(tab_num + 1, cwd.as_deref());
         self.set_tab_strip_label(tab_num, &title);
         if let Some(tab_label) = self.notebook.tab_label(&page) {
@@ -393,19 +421,26 @@ impl UiState {
 
         // Compatibility fallback for a page created before typed PaneLeaf
         // attachment was introduced. New pages always take the branch above.
-        let mut terminals = Vec::new();
-        collect_terminals(widget, &mut terminals);
-        terminals
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, terminal)| {
-                crate::gtk_process::vte_blocker(
-                    &terminal,
-                    crate::state::get_foreground_process_name(&terminal),
-                )
-                .map(|process| format!("Pane {}: {process}", index + 1))
-            })
-            .collect()
+        #[cfg(any(test, forge_legacy_renderer))]
+        {
+            let mut terminals = Vec::new();
+            collect_terminals(widget, &mut terminals);
+            terminals
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, terminal)| {
+                    crate::gtk_process::vte_blocker(
+                        &terminal,
+                        crate::state::get_foreground_process_name(&terminal),
+                    )
+                    .map(|process| format!("Pane {}: {process}", index + 1))
+                })
+                .collect()
+        }
+        #[cfg(not(any(test, forge_legacy_renderer)))]
+        {
+            Vec::new()
+        }
     }
 
     fn running_process_summary_in_widget(widget: &gtk4::Widget) -> Option<String> {
@@ -484,6 +519,9 @@ impl UiState {
             return;
         }
         let leaf_root = pane_leaf_root_of(term_widget).unwrap_or_else(|| term_widget.clone());
+        if !self.owns_terminal_close_target(&leaf_root) {
+            return;
+        }
         self.forget_agent_session_tab(&leaf_root);
         if let Some(leaf) = PaneLeaf::from_widget(&leaf_root) {
             if leaf.task_role().is_some() {
@@ -565,6 +603,9 @@ impl UiState {
             }
         }
         // Kill shell processes and remove the strip button for the current page
+        #[cfg(not(any(test, forge_legacy_renderer)))]
+        kill_widget_child_processes(&widget);
+        #[cfg(any(test, forge_legacy_renderer))]
         if !kill_widget_child_processes(&widget) {
             let mut terms = Vec::new();
             collect_terminals(&widget, &mut terms);
@@ -603,6 +644,26 @@ impl UiState {
             if !restore_surviving_focus(root, focus.as_ref()) && target_was_active {
                 self.focus_current_terminal();
             }
+        }
+    }
+
+    fn owns_terminal_close_target(&self, target: &gtk4::Widget) -> bool {
+        let zoom = self.zoom_state.borrow();
+        let retained = zoom.as_ref().map(|state| (&state.swap.original_page, &state.swap.zoomed_page));
+        terminal_target_is_attached(&self.notebook, retained, target)
+    }
+
+    fn commit_explicit_pane_close(&self, leaf: &PaneLeaf) {
+        let target = leaf.root_widget();
+        if !self.owns_terminal_close_target(&target) {
+            return;
+        }
+        leaf.kill();
+        // Prepared PTY stop cancels its reader rather than manufacturing an
+        // exit status. User-confirmed close therefore commits the existing
+        // structural close path itself, independently of a later callback.
+        if self.owns_terminal_close_target(&target) {
+            self.handle_terminal_exited(&target);
         }
     }
 
@@ -661,13 +722,11 @@ impl UiState {
                             // The process may have exited and collapsed this
                             // leaf while the confirmation was open. Never use
                             // its now-stale PID after it left the pane tree.
-                            if leaf.root_widget().parent().is_some() {
-                                leaf.kill();
-                            }
+                            ui_state.commit_explicit_pane_close(&leaf);
                         }
                     });
                 } else {
-                    leaf.kill();
+                    self.commit_explicit_pane_close(&leaf);
                 }
                 return;
             }
@@ -678,9 +737,9 @@ impl UiState {
     pub(crate) fn duplicate_current_tab(&self) {
         if let Some(page) = self.notebook.current_page() {
             if let Some(widget) = self.notebook.nth_page(Some(page)) {
-                let working_directory = find_first_terminal(&widget)
-                    .as_ref()
-                    .and_then(terminal_working_directory);
+                let working_directory = PaneNode::from_widget(&widget)
+                    .and_then(|node| node.active_leaf())
+                    .and_then(|leaf| leaf.working_directory());
                 let title = custom_tab_title(&self.notebook, &widget);
                 let private = tab_private_title_cell(&widget).is_some_and(|flag| flag.get());
                 self.add_new_tab(
@@ -943,6 +1002,7 @@ impl UiState {
                     }
                 });
             }
+            #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
             PaneLeaf::Vte(view) => {
                 let identity = page_widget.downgrade();
                 let expected_name = tab_widget_name.clone();
@@ -1299,10 +1359,7 @@ impl UiState {
     pub(crate) fn add_shared_terminal_tab(&self) {
         use super::shared_terminal::SharedTerminal;
 
-        let cwd = self
-            .current_terminal()
-            .as_ref()
-            .and_then(terminal_working_directory);
+        let cwd = self.current_local_pane_directory();
         let state = self.clone();
         let page = match SharedTerminal::open(
             &self.config.borrow(),
@@ -1433,6 +1490,7 @@ impl UiState {
             .insert(key, root.downgrade());
         self.sync_agent_session_tab_bindings();
         self.apply_tab_filter(self.tab_search_entry.text().as_str());
+        #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
         if let PaneLeaf::Vte(view) = &leaf {
             crate::block_view::install_inline_cli_reading(view.vte());
             let completion = request.completion.clone();
@@ -1453,9 +1511,9 @@ impl UiState {
                     }
                 }
             });
-        } else {
-            let _ = request.completion.send(Ok(()));
+            return;
         }
+        let _ = request.completion.send(Ok(()));
     }
 
     fn forget_agent_session_tab(&self, root: &gtk4::Widget) {
@@ -1518,6 +1576,7 @@ impl UiState {
         working_directory: Option<String>,
         spawn: TaskSpawnExtras<'_>,
     ) -> PaneLeaf {
+        #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
         let role = spawn.role;
         let leaf = self.add_tab_with_argv(TabLaunch {
             working_directory,
@@ -1529,6 +1588,7 @@ impl UiState {
             terminal_mode: crate::config::TerminalMode::Vte,
             task: Some(spawn),
         });
+        #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
         if let PaneLeaf::Vte(view) = &leaf {
             if role == crate::agent_task::TaskTerminalRole::Agent {
                 crate::block_view::install_inline_cli_reading(view.vte());
@@ -1968,7 +2028,15 @@ impl UiState {
             let _ = hosted_attachment;
             None
         };
-        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+        #[cfg(all(forge_shared_terminal, target_os = "linux", not(test)))]
+        if let Some(PaneLeaf::Shared(view)) = &shared {
+            if view.launch_error().is_none() {
+                if let Some(on_launched) = task.and_then(|extras| extras.on_launched) {
+                    glib::idle_add_local_once(on_launched);
+                }
+            }
+        }
+        #[cfg(all(forge_shared_terminal, target_os = "linux", test))]
         let task = if let Some(PaneLeaf::Shared(view)) = &shared {
             if view.launch_error().is_none() {
                 if let Some(on_launched) = task.and_then(|extras| extras.on_launched) {
@@ -2016,41 +2084,81 @@ impl UiState {
                             PaneLeaf::Block(term_view)
                         }
                         Err(error) => {
-                            self.report_block_spawn_error(
-                                "creating a tab",
-                                &error,
-                                "Opened a conventional terminal instead.",
-                            );
-                            let (env_extra, on_launched) = task
-                                .map(|extras| (extras.env_extra, extras.on_launched))
-                                .unwrap_or_default();
-                            let vte_view = Rc::new(VteTerminalView::new(
-                                self.config.clone(),
-                                shell_argv,
-                                working_directory.as_deref(),
-                                Some(&sid),
-                                initial_commands.as_slice(),
-                                env_extra,
-                                on_launched,
-                            ));
-                            PaneLeaf::Vte(vte_view)
+                            #[cfg(all(forge_shared_terminal, target_os = "linux", not(test)))]
+                            {
+                                self.report_block_spawn_error(
+                                    "creating a tab",
+                                    &error,
+                                    "Opened a shared terminal recovery pane.",
+                                );
+                                let config = self.config.borrow();
+                                let view = super::shared_terminal::SharedPane::open(
+                                    &config,
+                                    shell_argv,
+                                    working_directory.as_deref(),
+                                    &sid,
+                                )
+                                .unwrap_or_else(|| {
+                                    super::shared_terminal::SharedPane::failed(
+                                        &config,
+                                        shell_argv,
+                                        &error.to_string(),
+                                    )
+                                });
+                                if let Some(pane) = view.terminal_pane() {
+                                    pane.schedule_initial_commands(initial_commands.as_slice());
+                                }
+                                PaneLeaf::Shared(view)
+                            }
+                            #[cfg(any(not(all(forge_shared_terminal, target_os = "linux")), test))]
+                            {
+                                self.report_block_spawn_error(
+                                    "creating a tab",
+                                    &error,
+                                    "Opened a conventional terminal instead.",
+                                );
+                                let (env_extra, on_launched) = task
+                                    .map(|extras| (extras.env_extra, extras.on_launched))
+                                    .unwrap_or_default();
+                                let vte_view = Rc::new(VteTerminalView::new(
+                                    self.config.clone(),
+                                    shell_argv,
+                                    working_directory.as_deref(),
+                                    Some(&sid),
+                                    initial_commands.as_slice(),
+                                    env_extra,
+                                    on_launched,
+                                ));
+                                PaneLeaf::Vte(vte_view)
+                            }
                         }
                     }
                 }
                 crate::config::TerminalMode::Vte => {
-                    let (env_extra, on_launched) = task
-                        .map(|extras| (extras.env_extra, extras.on_launched))
-                        .unwrap_or_default();
-                    let vte_view = Rc::new(VteTerminalView::new(
-                        self.config.clone(),
-                        shell_argv,
-                        working_directory.as_deref(),
-                        Some(&sid),
-                        initial_commands.as_slice(),
-                        env_extra,
-                        on_launched,
-                    ));
-                    PaneLeaf::Vte(vte_view)
+                    #[cfg(all(forge_shared_terminal, target_os = "linux", not(test)))]
+                    {
+                        PaneLeaf::Shared(super::shared_terminal::SharedPane::failed(
+                            &self.config.borrow(),
+                            shell_argv,
+                            "the requested launch is unavailable through the shared terminal",
+                        ))
+                    }
+                    #[cfg(any(not(all(forge_shared_terminal, target_os = "linux")), test))]
+                    {
+                        let (env_extra, on_launched) = task
+                            .map(|extras| (extras.env_extra, extras.on_launched))
+                            .unwrap_or_default();
+                        let vte_view = Rc::new(VteTerminalView::new(
+                            self.config.clone(),
+                            shell_argv,
+                            working_directory.as_deref(),
+                            Some(&sid),
+                            initial_commands.as_slice(),
+                            env_extra,
+                            on_launched,
+                        ));
+                        PaneLeaf::Vte(vte_view)
+                    }
                 }
             }
         });
@@ -2058,6 +2166,7 @@ impl UiState {
         if let Some(role) = task_role {
             view_type.set_task_role(role);
         }
+        #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
         if allow_local_recovery {
             if let PaneLeaf::Vte(view) = &view_type {
                 view.enable_local_launch_recovery();
@@ -2085,6 +2194,7 @@ impl UiState {
         }
 
         // Setup click handler for hyperlinks and context menu (uses VTE inside both views)
+        #[cfg(any(test, forge_legacy_renderer))]
         if let Some(terminal) = view_type.terminal() {
             setup_terminal_click_handler(terminal);
             self.setup_context_menu(terminal);
@@ -2160,6 +2270,7 @@ impl UiState {
                 self.connect_bottom_bar_block_status(term_view);
                 self.attach_ascii_organism_to_view(term_view, is_remote);
             }
+            #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
             PaneLeaf::Vte(vte_view) => {
                 let ui_for_failure = UiState::clone(self);
                 let root_for_failure = vte_view.widget().downgrade();
@@ -2317,6 +2428,7 @@ impl UiState {
                     }
                 });
             }
+            #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
             PaneLeaf::Vte(vte_view) => {
                 let identity_for_pwd = view_type.root_widget().downgrade();
                 let expected_name_for_pwd = format!("tab-{tab_num}");
@@ -2412,6 +2524,7 @@ impl UiState {
                     }),
                 );
             }
+            #[cfg(any(test, not(all(forge_shared_terminal, target_os = "linux"))))]
             PaneLeaf::Vte(vte_view) => {
                 let terminal = vte_view.vte().downgrade();
                 let dir = working_directory.clone();
@@ -2641,16 +2754,30 @@ impl UiState {
 
         // Bell signal: badge the tab (the current one too while the window is
         // inactive) and toast an inactive window.
-        if let Some(terminal) = view_type.terminal() {
-            let ui_for_bell = self.clone();
-            let root_for_bell = view_type.root_widget().downgrade();
-            let last_bell_toast = Cell::new(None);
-            terminal.connect_bell(move |_| {
-                log::debug!("Bell signal received");
-                if let Some(root) = root_for_bell.upgrade() {
-                    ui_for_bell.ring_tab_bell(&root, &last_bell_toast);
+        let ui_for_bell = self.clone();
+        let root_for_bell = view_type.root_widget().downgrade();
+        let last_bell_toast = Cell::new(None);
+        let notify_bell = move || {
+            if let Some(root) = root_for_bell.upgrade() {
+                ui_for_bell.ring_tab_bell(&root, &last_bell_toast);
+            }
+        };
+        match &view_type {
+            PaneLeaf::Block(view) => view.connect_bell(notify_bell),
+            #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+            PaneLeaf::Shared(view) => {
+                if let Some(pane) = view.terminal_pane() {
+                    pane.set_event_handler(move |event| {
+                        if matches!(event, jterm_gtk_view::PaneEvent::Bell) {
+                            notify_bell();
+                        }
+                    });
                 }
-            });
+            }
+            #[cfg(any(test, forge_legacy_renderer))]
+            PaneLeaf::Vte(view) => {
+                view.vte().connect_bell(move |_| notify_bell());
+            }
         }
 
         // Activity indicator: mark the tab when its pane *outputs*. Not VTE's
@@ -2780,8 +2907,8 @@ impl UiState {
                     let working_directory = page
                         .as_ref()
                         .and_then(PaneNode::from_widget)
-                        .and_then(|node| node.active_terminal())
-                        .and_then(|terminal| terminal_working_directory(&terminal))
+                        .and_then(|node| node.active_leaf())
+                        .and_then(|leaf| leaf.working_directory())
                         .or_else(|| std::env::var("HOME").ok());
                     let title = page
                         .as_ref()
@@ -3155,6 +3282,41 @@ mod tests {
 
     #[test]
     #[ignore = "requires a GTK display"]
+    fn closed_terminal_callbacks_cannot_retarget_a_promoted_sibling_or_new_tab() {
+        gtk4::init().expect("GTK display");
+        let notebook = gtk4::Notebook::new();
+        let a = gtk4::Box::new(gtk4::Orientation::Vertical, 0).upcast::<gtk4::Widget>();
+        let b = gtk4::Box::new(gtk4::Orientation::Vertical, 0).upcast::<gtk4::Widget>();
+        a.set_widget_name("tab-1");
+        b.set_widget_name("tab-1");
+        let split = gtk4::Paned::new(gtk4::Orientation::Horizontal);
+        split.set_start_child(Some(&a));
+        split.set_end_child(Some(&b));
+        notebook.append_page(&split, None::<&gtk4::Widget>);
+        assert!(terminal_target_is_attached(&notebook, None, &a));
+        assert!(terminal_target_is_attached(&notebook, None, &b));
+        split.set_start_child(None::<&gtk4::Widget>);
+        split.set_end_child(None::<&gtk4::Widget>);
+        notebook.remove_page(Some(0));
+        notebook.append_page(&b, None::<&gtk4::Widget>);
+        assert!(!terminal_target_is_attached(&notebook, None, &a));
+        assert!(terminal_target_is_attached(&notebook, None, &b));
+        notebook.remove_page(Some(0));
+        let replacement = gtk4::Box::new(gtk4::Orientation::Vertical, 0).upcast::<gtk4::Widget>();
+        replacement.set_widget_name("tab-1");
+        notebook.append_page(&replacement, None::<&gtk4::Widget>);
+        assert!(!terminal_target_is_attached(&notebook, None, &b));
+        assert!(terminal_target_is_attached(&notebook, None, &replacement));
+        let original = gtk4::Box::new(gtk4::Orientation::Vertical, 0).upcast::<gtk4::Widget>();
+        original.downcast_ref::<gtk4::Box>().unwrap().append(&a);
+        let zoomed = gtk4::Box::new(gtk4::Orientation::Vertical, 0).upcast::<gtk4::Widget>();
+        assert!(terminal_target_is_attached(&notebook, Some((&original, &zoomed)), &a));
+        assert!(terminal_target_is_attached(&notebook, Some((&original, &zoomed)), &zoomed));
+        assert!(!terminal_target_is_attached(&notebook, None, &a));
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display"]
     fn failed_remote_launch_diagnostics_never_mark_the_attempt_connected() {
         gtk4::init().expect("GTK display");
         let context = glib::MainContext::default();
@@ -3206,6 +3368,21 @@ mod tests {
                     "actual child output still marks the attempt connected"
                 );
             }
+        }
+
+        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+        {
+            let failed = super::super::shared_terminal::SharedPane::failed(
+                &crate::config::Config::safe_defaults(),
+                &["/forge-test/nonexistent-ssh".to_string()],
+                "remote transport could not start",
+            );
+            let statuses = Rc::new(RefCell::new(Vec::new()));
+            let observed = statuses.clone();
+            connect_remote_launch_status(&PaneLeaf::Shared(failed), move |status| {
+                observed.borrow_mut().push(status);
+            });
+            assert!(matches!(statuses.borrow().as_slice(), [ConnStatus::Disconnected]));
         }
     }
 

@@ -1852,7 +1852,7 @@ pub fn run() -> glib::ExitCode {
         });
         let ui_for_files_view = ui.clone();
         sidebar_files_btn.connect_clicked(move |_| {
-            ui_for_files_view.apply_sidebar_view(crate::config::SidebarView::Files, true);
+            ui_for_files_view.reveal_file_tree(true);
         });
 
         // Initialize the file tree and apply the persisted tab placement

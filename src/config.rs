@@ -45,7 +45,12 @@ impl TerminalMode {
     }
 
     pub(crate) fn public_presentation_for_shell(&self, shell: &[String]) -> Self {
-        #[cfg(all(forge_shared_terminal, target_os = "linux"))]
+        #[cfg(all(forge_shared_terminal, target_os = "linux", not(test)))]
+        if matches!(self, Self::Vte) {
+            let _ = shell;
+            return Self::Vte;
+        }
+        #[cfg(all(forge_shared_terminal, target_os = "linux", test))]
         if matches!(self, Self::Vte)
             && crate::host::bridge_available()
             && jterm_gtk_view::RuntimeShell::supports_local_shell(shell, false)

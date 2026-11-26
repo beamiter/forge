@@ -11,9 +11,7 @@ impl UiState {
             return;
         }
         let cwd = self
-            .current_terminal()
-            .as_ref()
-            .and_then(crate::terminal::terminal_working_directory)
+            .current_local_pane_directory()
             .map(std::path::PathBuf::from);
         let shell = self.shell_argv.borrow().clone();
         if let Err(error) =

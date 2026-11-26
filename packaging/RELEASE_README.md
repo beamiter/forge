@@ -16,7 +16,7 @@ canonical license texts under `share/doc/forge/`.
 ## Runtime requirements
 
 This is not a statically linked or self-contained portable application. A
-compatible graphical Linux system with GTK 4, libadwaita, GTK4 VTE, and PCRE2
+compatible graphical Linux system with GTK 4, libadwaita, and PCRE2
 runtime libraries is required. Optional integrations include `notify-send`,
 OpenSSH, Git, and a configured AI provider.
 

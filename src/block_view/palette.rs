@@ -10,7 +10,6 @@ use gtk4::prelude::*;
 use gtk4::{glib, Orientation, ScrolledWindow};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use vte4::Terminal;
 
 use super::write_recalled_command;
 use crate::pty::OwnedPty;
@@ -86,7 +85,7 @@ pub(crate) fn show_command_palette(
     typed_cmd: Rc<RefCell<String>>,
     pty_synced: Rc<Cell<bool>>,
     bracketed_paste: Rc<Cell<bool>>,
-    live_vte: Terminal,
+    live_vte: gtk4::Widget,
 ) {
     let popover = gtk4::Popover::new();
     popover.add_css_class("forge-popup");

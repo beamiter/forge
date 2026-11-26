@@ -363,6 +363,48 @@ case "$op" in
     cp -a -- "$s" "$stage/payload" || exit 4
     publish_noreplace "$stage/payload" "$n" || exit $?
     ;;
+  preview)
+    p=${2:-}; limit=${3:-}
+    case "$p" in /*) ;; *) exit 2 ;; esac
+    case "$limit" in ''|0|*[!0-9]*) exit 2 ;; esac
+    python3 -I -c '
+import os
+import stat
+import sys
+
+path, limit = sys.argv[1], int(sys.argv[2])
+parts = path.split("/")[1:]
+if not parts or any(part in ("", ".", "..") for part in parts):
+    sys.exit(2)
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+directory = os.open("/", flags)
+try:
+    for part in parts[:-1]:
+        child = os.open(part, flags, dir_fd=directory)
+        os.close(directory)
+        directory = child
+    handle = os.open(parts[-1], os.O_PATH | os.O_NOFOLLOW, dir_fd=directory)
+    try:
+        info = os.fstat(handle)
+        if not stat.S_ISREG(info.st_mode):
+            print("Preview requires a regular file", file=sys.stderr)
+            sys.exit(4)
+        if info.st_size > limit:
+            print("File exceeds the preview byte limit", file=sys.stderr)
+            sys.exit(4)
+        reader = os.open("/proc/self/fd/" + str(handle), os.O_RDONLY | os.O_NONBLOCK)
+    finally:
+        os.close(handle)
+    with os.fdopen(reader, "rb") as source:
+        data = source.read(limit + 1)
+        if len(data) > limit:
+            print("File exceeds the preview byte limit", file=sys.stderr)
+            sys.exit(4)
+        sys.stdout.buffer.write(data)
+finally:
+    os.close(directory)
+' "$p" "$limit" || exit $?
+    ;;
   cat)
     p=${2:-}
     case "$p" in /*) ;; *) exit 2 ;; esac
@@ -999,6 +1041,29 @@ fn run_probe(
     max_out: u64,
 ) -> io::Result<Capture> {
     run_probe_or_cancel(host, op, args, timeout, max_out, None)
+}
+
+pub(super) fn preview_bytes(host: &RemoteHost, path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    let path = path
+        .to_str()
+        .filter(|path| path.starts_with('/'))
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Choose an absolute remote path")
+        })?;
+    let max_output = limit
+        .checked_add(1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid preview byte limit"))?;
+    let capture = run_probe(
+        host,
+        "preview",
+        &[path, &limit.to_string()],
+        PROBE_LIST_TIMEOUT,
+        max_output,
+    )?;
+    if capture.stdout.len() as u64 > limit {
+        return Err(io::Error::other("File exceeds the preview byte limit"));
+    }
+    Ok(capture.stdout)
 }
 
 fn run_probe_or_cancel(
@@ -2372,7 +2437,7 @@ pub(crate) fn observed_target_and_overlay(
 /// the owned execution snapshot. The final Forge execution gate is repeated
 /// after the overlay so neither a stale socket path nor argument-budget growth
 /// can bypass validation.
-fn remote_host_with_overlay(
+pub(super) fn remote_host_with_overlay(
     loc: &FsLocation,
     hosts: &[RemoteHost],
     overlay: &FsExecutionOverlay,
@@ -3891,6 +3956,47 @@ mod tests {
 
     fn probe_locally(op: &str, args: &[&str]) -> Capture {
         probe_locally_with_stdin(op, args, &[])
+    }
+
+    #[test]
+    fn preview_probe_requires_a_bounded_regular_file_without_symlinks() {
+        let root = unique_temp_dir("probe-preview");
+        let directory = root.join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        let file = directory.join("a file's name.bin");
+        let bytes = [0u8, 255, 1, 2];
+        std::fs::write(&file, bytes).unwrap();
+        let file_link = root.join("file-link");
+        let directory_link = root.join("directory-link");
+        std::os::unix::fs::symlink(&file, &file_link).unwrap();
+        std::os::unix::fs::symlink(&directory, &directory_link).unwrap();
+        let fifo = root.join("fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let good = probe_locally("preview", &[file.to_str().unwrap(), "4"]);
+        assert_eq!(good.status, 0);
+        assert_eq!(good.stdout, bytes);
+        let too_large = probe_locally("preview", &[file.to_str().unwrap(), "3"]);
+        assert_eq!(too_large.status, 4);
+        assert!(too_large.stdout.is_empty());
+
+        for path in [
+            directory,
+            file_link,
+            directory_link.join(file.file_name().unwrap()),
+            fifo,
+        ] {
+            let result = probe_locally("preview", &[path.to_str().unwrap(), "4"]);
+            assert_ne!(result.status, 0, "accepted {path:?}");
+            assert!(result.stdout.is_empty());
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

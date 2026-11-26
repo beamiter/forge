@@ -2,7 +2,7 @@
 
 新版 Shared Eva 默认启用，由 JWM 随图形会话启动共享协调器。四端只连接同一协调器；设置 `eva_companion_enabled = false` 并重启窗口可关闭。旧本地 Organism 仅在显式关闭 Shared Eva 后使用。
 
-forge 是一个面向开发工作流的原生 GTK4 终端。它默认使用 Block 后端，把命令、输出、退出状态和工作目录组织成可搜索的结构化块；需要传统终端语义时也可切换到 VTE 后端。
+forge 是一个面向开发工作流的原生 GTK4 终端。它默认使用 Block 后端，把命令、输出、退出状态和工作目录组织成可搜索的结构化块；也可切换到普通 Shell 视图。
 
 ## Agent Workspace
 
@@ -11,7 +11,7 @@ forge 是一个面向开发工作流的原生 GTK4 终端。它默认使用 Bloc
 ## 能力概览
 
 - 原生 [Vim9 GUI buffer](docs/VIM9_IDE.md)：默认只保留编辑区，IDE 控件/面板可在 `[vim9]` 中逐项开启；真实 Vim 9 编辑语义 + GTK/Pango 原生 buffer 渲染（读取 GUI RGB 高亮、编辑器字体/行距、连字、原生输入法预编辑；复杂视图明确回退兼容显示），GTK 项目/缓冲区导航、全项目模糊快速打开、行列跳转、Vim 双向分屏、受保护的缓冲区关闭、保存全部后构建、项目搜索、诊断定位、异步构建与输出，以及按 Vim 实际能力启用的语言服务按钮。在本地交互命令行运行 `vim` 自动打开原生 GUI（保留参数、目录和退出码）；也可用 `forge --ide ~/project` 或 `Ctrl+Alt+I`。滚动保留触摸板小数位移，按分屏投递并跟随显示器帧时钟。
-- 默认 Block、连续滚屏 Unified、传统 VTE 的三终端后端
+- Block、Chat、连续滚屏 Unified 和普通 Shell 四种终端视图
 - Unified 专用命令导航条：实时/阅读历史状态、未读完成计数、前后命令、复制当前命令、Find、Browse 和返回实时
 - 标签页、混合后端分屏、方向导航、缩放、前台进程关闭确认与多窗口独立会话恢复
 - 拖动普通单-pane 标签到目标 pane 四边即可无损并入分屏；拖动分屏标题栏回标签栏即可恢复为普通标签。短暂悬停会预览目标页，取消或中心释放不会重启、复制 PTY
@@ -30,7 +30,7 @@ forge 是一个面向开发工作流的原生 GTK4 终端。它默认使用 Bloc
 - 配置热重载、可覆盖的应用动作快捷键、8 套内置主题
 - CJK 输入法和 Unicode 安全的搜索/通知显示
 
-分屏会继承当前 pane 的后端：Block 创建 Block sibling，VTE 创建 VTE sibling，并可继续嵌套。每个可见 pane 都独立拥有并清理其进程，关闭 pane、标签或窗口前会统一检查前台任务。
+分屏继承当前窗格的终端视图，并可继续嵌套。每个可见 pane 都独立拥有并清理其进程，关闭 pane、标签或窗口前会统一检查前台任务。
 
 打开命令面板（`Ctrl+Shift+P`），搜索 `>Remote desktop` 并输入 JWM 主机地址。Forge
 使用 PATH 中的 `jwm-remote` 和默认 JWM 密钥，也可填写密钥文件路径。连接默认只读。
@@ -48,7 +48,7 @@ Ctrl+滚轮按鼠标位置独立缩放：顶部栏与侧栏共用一组字号，
 
 ## Unified：连续终端中的命令导航
 
-Unified 在一个持续运行的原生 VTE 中保留命令、输出和 shell 提示符。终端上方的紧凑导航条
+Unified 在一个持续运行的共享终端中保留命令、输出和 shell 提示符。终端上方的紧凑导航条
 占用独立布局空间，显示 `Live` 或 `Reading history`；阅读旧输出期间完成的新命令会累积
 未读计数。`Return to live` 回到原生滚屏底部、清除未读并把输入焦点交回同一 pane。
 普通滚轮、原生文本拖选、shell 编辑键和现有 `Ctrl+Up` / `Ctrl+Down` 滚动语义保持不变。
@@ -101,7 +101,7 @@ Unified 在一个持续运行的原生 VTE 中保留命令、输出和 shell 提
 | Export selected command records as JSON | `export_selected_json` |
 
 源 pane 与记录身份在打开时绑定。记录被淘汰后会保留一个明确的不可用选择项，取消它才能继续；
-导出与比较都不会把邻近的新记录当作原选择。传统 VTE 后端不保留此类结构化记录，因此没有该能力。
+导出与比较都不会把邻近的新记录当作原选择。普通 Shell 视图不保留此类结构化记录，因此没有该能力。
 
 ## 构建与运行
 
@@ -112,11 +112,10 @@ nix develop
 cargo run
 ```
 
-也可以在安装 GTK4、libadwaita、VTE GTK4、PCRE2 与 `pkg-config` 开发包后直接使用 Cargo。
+Linux 上也可以在安装 GTK4、libadwaita、PCRE2 与 `pkg-config` 开发包后直接使用 Cargo。
 
-GTK4 栈必须足够新（glib >= 2.80、pango >= 1.52、gtk4 >= 4.14、libadwaita >= 1.5，
-以及 GTK4 版 VTE `vte-2.91-gtk4` >= 0.76）。Ubuntu 22.04 等稳定发行版自带的这些库过旧，
-或根本没有 `vte-2.91-gtk4`，会导致 `cargo install --path .` 在 `*-sys` 构建脚本处失败。
+GTK4 栈要求 glib >= 2.80、pango >= 1.52、gtk4 >= 4.14、libadwaita >= 1.5。
+发行版提供的开发库版本低于要求时，可以用 Nix 工具链构建。
 运行 `./scripts/bootstrap_deps.sh` 一键准备依赖：
 
 ```bash
@@ -141,11 +140,12 @@ release 构建、shell 语法和已跟踪文本隐私
 检查；`make security` 通过与 CI 共用的入口对主程序和 ASCII organism 原型的已提交
 `Cargo.lock` 运行 warnings-denied RustSec、依赖策略/许可证/来源门禁、重复依赖审计与
 ShellCheck，不会在检查过程中解析出另一份依赖图。
-两者现在都自动进入锁定的 Nix 开发环境，不会意外使用系统中过旧的 GTK/VTE；
-`make test-display` 会在独立 Xvfb 会话中逐项运行真实 GTK/VTE 回归。只需运行轻量隐私
-检查时可使用 `make privacy`。
+生产构建和独立集成测试使用主 Cargo 清单。`make test` 和 `make test-display` 同时提供
+仓库内的控件对照测试，使用 `vte-oracle` Nix 环境和独立 Cargo 清单。
+`make test-display` 在独立 Xvfb 会话中逐项运行显示回归。只需运行轻量隐私检查时
+可使用 `make privacy`。
 
-`make package` 刻意使用宿主 Cargo 与系统 GTK/VTE 开发库：发行归档按兼容系统的动态库
+`make package` 使用宿主 Cargo 与系统 GTK 开发库。发行归档按兼容系统的动态库
 ABI 分发，不能把 Nix store 解释器/RPATH 烘进裸二进制。日常构建和验收仍使用上面的 Nix 门禁。
 
 安装脚本默认优先使用 Nix；没有 Nix 时自动退回 Cargo。已有配置仅在字段结构变化时备份并替换；仅默认值、注释或顺序变化时保留原配置。使用 `--no-config` 可始终保留自定义配置：
@@ -231,8 +231,7 @@ make package
 (cd target/dist && sha256sum --check *.sha256)
 ```
 
-该归档可换目录后安装，但仍动态依赖兼容的 GTK4、libadwaita、VTE GTK4
-和 PCRE2 系统运行库，并非静态或自包含的 portable 应用。
+该归档支持换目录安装，运行时依赖兼容的 GTK4、libadwaita 和 PCRE2 系统库。
 
 
 ## Flatpak 与桌面集成
@@ -256,12 +255,9 @@ flatpak build-bundle flatpak-repo io.github.beamiter.forge.flatpak \
 
 ## 启动与配置
 
-带 `shared-terminal` 的 Linux 原生发行包默认为 Block、Chat 和 Unified
-新窗格使用共享终端。PTY、渲染与输入法随窗格创建时选定的实现运行到退出。
-需要回退时，退出 Forge 后，启动时设 `JTERM_SHARED_ACTIVE_TERMINAL=0`
-以让 Block 和 Chat 使用 VTE，或设 `JTERM_SHARED_TRANSCRIPT=0` 以让
-Unified 使用 VTE。普通终端中的已支持本地 Shell 可用
-`JTERM_SHARED_RUNTIME=0` 回退。Flatpak 的宿主 Shell 继续使用兼容路径。
+Linux 发行包的普通 Shell、Block、Chat 和 Unified 窗格使用共享终端。
+每个窗格保留自己的 PTY、视图和输入法状态。Flatpak 的宿主 Shell 通过共享的宿主接入路径启动。
+旧控件用于独立差分测试。
 
 左右侧栏的分隔条均可拖动调整宽度，松手后自动保存。窗口变窄、侧栏隐藏或
 右侧栏转为抽屉时保留原宽度，恢复空间后还原。右侧抽屉的左缘也可拖动；
@@ -295,7 +291,7 @@ forge -d /tmp --execute bash -lc 'printf "hello\\n"'
 forge --safe-mode
 ```
 
-`--safe-mode` 不读取指定或默认配置，也不采用 `FORGE_*` 外观/行为覆盖；它使用内置 VTE 主题与默认快捷键，并禁用配置重载、恢复、持久化、远程主机、历史、仓库探测、AI/Agent 与 Notebook 执行，适合排查损坏配置或启动环境。
+`--safe-mode` 不读取指定或默认配置，也不采用 `FORGE_*` 外观/行为覆盖；它使用内置终端主题与默认快捷键，并禁用配置重载、恢复、持久化、远程主机、历史、仓库探测、AI/Agent 与 Notebook 执行，适合排查损坏配置或启动环境。
 
 诊断命令均可在没有图形显示的 SSH/CI 环境运行：
 
@@ -586,7 +582,7 @@ Block 模式与 anvil 保持相同的选择语义：`Ctrl+Up` 从最新块进入
 （右键菜单的 **Re-run Command** 等价）：仅限本 pane 里用户自己已经执行过的单行命令，
 并且必须同时证明提示符锚点已稳定、光标仍在锚点、可见后缀为空、没有用户/Agent/外部提交，
 且 PTY 前台所有权已回到 shell；右键项的启用状态与键盘执行共用这套门禁。
-通过门禁后也不会立即提交：Forge 先插入命令，等待 VTE 稳定显示字节一致的完整文本，再单独发送
+通过门禁后也不会立即提交：Forge 先插入命令，等待共享终端稳定显示字节一致的完整文本，再单独发送
 CR，从而覆盖“同步检查为空、异步回显却已有输入”的竞态。
 多选、后台块和会被截断为首行的多行命令一律拒绝执行，仍可按普通 `Enter` 回填审阅。
 多选回填需要 shell 的 bracketed-paste 支持；否则整次拒绝并响铃，不会静默丢掉首行之后的命令。
@@ -595,7 +591,7 @@ CR，从而覆盖“同步检查为空、异步回显却已有输入”的竞态
 为降低误删，紧凑提示不宣传 `Delete`，但删除能力与单级撤销保持不变。
 选区中的拒绝会消费普通 `Enter` 或 `Ctrl+Enter`，短暂显示 busy、dirty、多选或命令不安全等可见
 原因并响铃，然后恢复动作提示；连续拒绝会刷新提示时长，旧状态不会提前覆盖新状态；同一个 Enter
-不会继续交给实时 VTE。淡出的卡片快捷操作区也不参与 pointer hit-test，因此触摸 header 不会命中
+不会继续交给实时终端。淡出的卡片快捷操作区也不参与 pointer hit-test，因此触摸 header 不会命中
 看不见的按钮。
 含控制符、嵌入 paste marker 或任何经 sanitizer 改写的历史命令也保持只回填审阅。
 AI / Agent / 命令面板的建议仍然只 **Insert for review**，永不自行提交。
@@ -817,3 +813,12 @@ Codex 的兼容入口仅加入子进程 PATH；用户自己的 alias/function �
 用 `JTERM_AGENT_SCROLLBACK=0` 启动终端可关闭上述兼容默认值。
 
 Click the **Agent Workspace** heading in the sidebar to show or hide its conversations, filters, and tasks. The setting is saved as `agent_workspace_enabled` (default `true`); terminal navigation, active sessions, drafts, and background work stay in place.
+
+Ordinary shared terminal panes offer **Detach terminal view** and **Reattach
+terminal view**. Detaching releases the writable view while the same in-process
+terminal actor continues draining its PTY and answering terminal queries. The
+placeholder retains the pane and its shell; reattaching restores its current
+screen. Closing a detached pane or window still uses normal process confirmation
+and termination. This is view detachment within the running application, not a
+persistent session across application exit. Read-only observers remain separate
+from writable view authority.

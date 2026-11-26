@@ -9,7 +9,7 @@ nix develop
 cargo run
 ```
 
-A native Cargo build also works after installing GTK4, libadwaita, VTE GTK4, PCRE2, and `pkg-config` development packages. The repository toolchain file installs stable Rust with rustfmt and Clippy.
+A native Cargo build also works after installing GTK4, libadwaita, PCRE2, and `pkg-config` development packages. The repository toolchain file installs stable Rust with rustfmt and Clippy.
 
 `jagent` and `jterm_core` are pinned Git dependencies with an explicit crate `version` plus an exact `rev`. Keep those in sync with `Cargo.lock`, `deny.toml`, and the matching `cargoLock.outputHashes` entry in `flake.nix`; otherwise `cargo deny check`, `nix develop`, and `nix build` will fail. When repinning either revision, temporarily set the corresponding output hash to `pkgs.lib.fakeHash`, run `nix build .#default`, and copy the `got:` hash from the mismatch error.
 
@@ -33,7 +33,7 @@ addresses remain valid examples.
 
 For packaging changes, also run `desktop-file-validate`, `appstreamcli validate --no-net`, regenerate `packaging/flatpak/cargo-sources.json`, build the Flatpak manifest, execute `scripts/smoke-flatpak.sh` inside a D-Bus session, and verify the archive produced by `make package` with its SHA-256 file.
 
-For UI changes, smoke-test both Wayland and X11 when practical, VTE and Block modes, CJK input, tab closing, process cleanup, and session restoration. Changes to Block rendering should also follow `docs/BLOCK_MODE_ACCEPTANCE.md`.
+For UI changes, smoke-test both Wayland and X11 when practical, Shell and Block modes, CJK input, tab closing, process cleanup, and session restoration. Changes to Block rendering should also follow `docs/BLOCK_MODE_ACCEPTANCE.md`.
 
 ## Design expectations
 

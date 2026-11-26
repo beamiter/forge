@@ -36,11 +36,12 @@
                 "jagent-0.7.0" = "sha256-2PO6UiTrhwa2JUBznPTXFV42KxJ3H8qctBTg7WNxZfA=";
                 # git+https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa569540091524d637a7115b64c587b9177a55b
                 "companion-core-0.1.0" = "sha256-yQQw/Viz2gzouHRdutU6TtVL3yqDI7koYbN/leWsf7I=";
-                # git+https://github.com/beamiter/jterm_core.git?rev=7a32027258dfe5f05ec6eaa01b76b5d44396cbf6#7a32027258dfe5f05ec6eaa01b76b5d44396cbf6
-                "jterm_core-0.2.0" = "sha256-b5pCPcqUNEfyBN+1wP1uWmAvgZlDKP4nUtRbK5HMMYw=";
+                # git+https://github.com/beamiter/jterm_core.git?rev=06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e#06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e
+                "jterm_core-0.2.0" = "sha256-wl9nuwe8rHngycQsFVBOV3vkMeuLf5we2xx0Pj4WQBg=";
               };
             };
             strictDeps = true;
+            buildNoDefaultFeatures = true;
             buildFeatures = [ "shared-terminal" ];
 
             preBuild = "python3 tools/check-process-bundle.py && python3 tools/check-host-bundle.py";
@@ -54,7 +55,6 @@
             buildInputs = with pkgs; [
               gtk4
               libadwaita
-              vte-gtk4
               pcre2
               fcitx5-gtk
             ];
@@ -137,8 +137,6 @@
               glib
               pkg-config
               libadwaita
-              vte
-              vte-gtk4
               pcre2
               fcitx5-gtk
 
@@ -164,6 +162,13 @@
               export FCITX5_GTK_PATH="${pkgs.fcitx5-gtk}/lib/gtk-4.0"
               echo "forge development environment ready. Run 'make verify'."
             '';
+          };
+
+          # Independent legacy renderer fixtures opt into VTE explicitly.
+          # Neither the production package nor the default shell inherits it.
+          devShells.vte-oracle = pkgs.mkShell {
+            inputsFrom = [ self.devShells.${system}.default ];
+            packages = [ pkgs.vte-gtk4 ];
           };
         }
       );
