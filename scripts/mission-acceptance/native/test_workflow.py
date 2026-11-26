@@ -203,7 +203,7 @@ class LayoutDependencyAcquisitionTests(GtkDependencyAcquisitionTests):
         self.assertNotIn('continue-on-error:', workflow)
         self.assertNotIn('        if:', workflow)
         self.assertIn('      - name: Compile application tests\n'
-                      '        run: cargo test --locked --lib --all-features --no-run\n', workflow)
+                      '        run: python3 tools/vte-oracle/run.py test --locked --lib --all-features --no-run\n', workflow)
         required = workflow.split('          tests=(\n', 1)[1].split('          )\n', 1)[0]
         self.assertEqual(required.split(), [
             'pty::tests::live_display_fixture_reaps_its_idle_child_on_drop',
@@ -217,7 +217,7 @@ class LayoutDependencyAcquisitionTests(GtkDependencyAcquisitionTests):
             'block_view::tests::multiline_native_caret_fits_editor_and_footer',
             'block_view::tests::chat_docking_keeps_pty_rows_and_native_hit_geometry_stable'])
         tail = workflow.split('          )\n', 1)[1]
-        self.assertEqual(tail, '''          listed_tests="$(cargo test --locked --lib --all-features -- --list --include-ignored)"
+        self.assertEqual(tail, '''          listed_tests="$(python3 tools/vte-oracle/run.py test --locked --lib --all-features -- --list --include-ignored)"
           failed=0
           for test_name in "${tests[@]}"; do
             if ! grep -Fxq "${test_name}: test" <<< "$listed_tests"; then
@@ -226,7 +226,7 @@ class LayoutDependencyAcquisitionTests(GtkDependencyAcquisitionTests):
               continue
             fi
             if ! dbus-run-session -- xvfb-run --auto-servernum \\
-              cargo test --locked --lib --all-features "$test_name" \\
+              python3 tools/vte-oracle/run.py test --locked --lib --all-features "$test_name" \\
               -- --exact --include-ignored --test-threads=1; then
               failed=1
             fi

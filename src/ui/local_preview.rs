@@ -1294,7 +1294,7 @@ mod tests {
         };
 
         let reference = fixture.join("source.rs:1400:3");
-        state.present(&stack, reference.clone(), true);
+        state.present(&stack, reference.clone(), true, None);
         let panel = state.current.borrow().as_ref().unwrap().clone();
         assert!(panel.approval.is_visible() && !panel.loading.get());
         panel.confirm.emit_clicked();
@@ -1372,7 +1372,7 @@ mod tests {
         assert_eq!(panel.target.borrow().as_ref().unwrap().path, path);
         assert_eq!(panel.text.buffer().line_count(), 1602);
 
-        state.present(&stack, reference, false);
+        state.present(&stack, reference, false, None);
         let exact = state.current.borrow().as_ref().unwrap().clone();
         wait("exact filename read", &|| exact.loaded.get());
         assert_eq!(exact.text.buffer().line_count(), 1);
@@ -1383,7 +1383,7 @@ mod tests {
         image::RgbaImage::from_pixel(640, 480, image::Rgba([24, 80, 130, 255]))
             .save(&image_path)
             .unwrap();
-        state.present(&stack, image_path, false);
+        state.present(&stack, image_path, false, None);
         let image = state.current.borrow().as_ref().unwrap().clone();
         wait("image read", &|| image.loaded.get());
         assert_eq!(image.status.text(), "640 × 480 pixels");
