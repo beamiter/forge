@@ -453,6 +453,9 @@ jobs:
       - name: Check font sizing against native Pango
         run: python3 scripts/test-font-sync.py
 
+      - name: Check VTE oracle wrapper arguments
+        run: python3 scripts/test-vte-oracle-wrapper.py
+
       - name: Check native Vim9 editing and navigation
         timeout-minutes: 10
         env:

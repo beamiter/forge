@@ -33,11 +33,12 @@ cleanup:
 
 modules:
   # Local task worktrees use a private Git binary. Interactive Git still
-  # runs in the user's host shell.
+  # runs in the user's host shell. Use upstream Git's C implementation so
+  # this isolated module does not depend on Cargo or a second vendor graph.
   - name: task-git
     buildsystem: simple
     build-commands:
-      - make -j${FLATPAK_BUILDER_N_JOBS} prefix=/app gitexecdir=/app/libexec/jterm NO_GETTEXT=1 NO_CURL=1 NO_EXPAT=1 NO_OPENSSL=1 git
+      - make -j${FLATPAK_BUILDER_N_JOBS} prefix=/app gitexecdir=/app/libexec/jterm NO_GETTEXT=1 NO_CURL=1 NO_EXPAT=1 NO_OPENSSL=1 NO_RUST=1 git
       - install -Dm0755 git ${FLATPAK_DEST}/libexec/jterm/git
       - install -Dm0644 COPYING ${FLATPAK_DEST}/share/licenses/task-git/COPYING
     sources:

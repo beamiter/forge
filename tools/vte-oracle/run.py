@@ -52,6 +52,13 @@ def main():
     arguments = sys.argv[1:] or ["test", "--lib"]
     if arguments[0] not in ("test", "check", "clippy"):
         raise SystemExit("usage: run.py {test|check|clippy} [cargo arguments]")
+    # The oracle always requires its synthesized lockfile. Older callers
+    # already pass --locked, so consume their redundant Cargo-side flag.
+    # Preserve everything after -- for libtest or rustc/clippy.
+    tail = arguments[1:]
+    delimiter = tail.index("--") if "--" in tail else len(tail)
+    cargo_args = [arg for arg in tail[:delimiter] if arg != "--locked"]
+    passthrough = tail[delimiter:]
     cache = ROOT / "target" / "vte-oracle"
     overlay = cache / "source"
     overlay.mkdir(parents=True, exist_ok=True)
@@ -76,7 +83,7 @@ def main():
         environment.setdefault("CARGO_TARGET_DIR", str(ROOT / "target"))
         return subprocess.run(
             ["cargo", arguments[0], "--manifest-path", str(overlay / "Cargo.toml"),
-             "--locked", "--features", "vte-oracle", *arguments[1:]],
+             "--locked", "--features", "vte-oracle", *cargo_args, *passthrough],
             cwd=ROOT,
             env=environment,
         ).returncode
