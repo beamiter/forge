@@ -36,8 +36,8 @@
                 "jagent-0.7.0" = "sha256-2PO6UiTrhwa2JUBznPTXFV42KxJ3H8qctBTg7WNxZfA=";
                 # git+https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa569540091524d637a7115b64c587b9177a55b
                 "companion-core-0.1.0" = "sha256-yQQw/Viz2gzouHRdutU6TtVL3yqDI7koYbN/leWsf7I=";
-                # git+https://github.com/beamiter/jterm_core.git?rev=9226427ee88d11183fa941e9803fab14325aa6ee#9226427ee88d11183fa941e9803fab14325aa6ee
-                "jterm_core-0.2.0" = "sha256-njCZeahlObKtLf6iPVFjr81dhDgs45u/3f1vYYiIStk=";
+                # git+https://github.com/beamiter/jterm_core.git?rev=82eea8a9e6726611ac7278d7f2ea83810cff4f5c#82eea8a9e6726611ac7278d7f2ea83810cff4f5c
+                "jterm_core-0.2.0" = "sha256-chpLDFbG4Vam17P5Y+2TpkgJVTctMruVFynHNF/4/Rc=";
               };
             };
             strictDeps = true;
