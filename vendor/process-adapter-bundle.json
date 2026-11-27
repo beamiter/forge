@@ -34,7 +34,7 @@
       "reason": "Preserves completed empty process scans across bounded exit-drain retries for the same unreaped child."
     }
   },
-  "public_core_base": "f7ca9bff418463861f641c3b6bd21df3f6e44e50",
+  "public_core_base": "eae08e36f20f8a6eb127b55e23353849882ad4f5",
   "schema": 1,
   "scope": "Versioned process observer and GTK launch ownership. The GTK adapter also tracks child drain in the opt-in shared runtime. The file hashes identify these exact adapter sources.",
   "version": "0.1.0"
