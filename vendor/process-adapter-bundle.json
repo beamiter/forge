@@ -1,7 +1,7 @@
 {
   "adapter_source_core_base": "10120c3aa690ff5e1a66ae15f2418b753e2053f1",
   "bundle": "pty-process-v1",
-  "core_pin_verification": "The locked Cargo graph uses the exact core revision in public_core_base. This candidate was verified locally using command-scoped Git redirection; publication is not claimed. Adapter exporter provenance remains separately recorded.",
+  "core_pin_verification": "The application lock resolves the exact published jterm_core revision named by the legacy public_core_base field. Bundled source origins remain separately recorded.",
   "exporter_baseline_files_sha256": {
     "src/gtk_process.rs": "f566d1094be37c094a08044f11831ccc4adf600583bfbe783f1bd19dedfcfaa3",
     "src/gtk_spawn.rs": "6614651ce110c538fdd8659fd00ee042c402befd7ac4caf6a7f361967dc87ecc",
@@ -34,7 +34,7 @@
       "reason": "Preserves completed empty process scans across bounded exit-drain retries for the same unreaped child."
     }
   },
-  "public_core_base": "4473c65b39244e67d4edd8a00a22728f8ef6c8dc",
+  "public_core_base": "aabcd4a9e33353e2d83224ecd519785e37662908",
   "schema": 1,
   "scope": "Versioned process observer and GTK launch ownership. The GTK adapter also tracks child drain in the opt-in shared runtime. The file hashes identify these exact adapter sources.",
   "version": "0.1.0"
