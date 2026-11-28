@@ -12,7 +12,7 @@ import sys
 import urllib.request
 
 NAMES = ("jterm_core", "anvil", "forge", "ember", "frost")
-CORE = "1ebfe4573d43c1b6de0332476cfea75f42899a96"
+CORE = "463ba771a982ccdf20cbd1d87816c785923b5bb0"
 WORKFLOWS = {
     "jterm_core": ("ci.yml", "vim9-pixel-input.yml", "security.yml"),
     "anvil": ("ci.yml", "security.yml", "link-recovery.yml", "vim9-pixel-viewport.yml", "ui-layout.yml"),

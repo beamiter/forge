@@ -27,7 +27,7 @@ from x11_geometry import client_geometry
 
 APPS = ('anvil', 'forge', 'ember', 'frost')
 REPOS = ('jterm_core', *APPS)
-CORE = '1ebfe4573d43c1b6de0332476cfea75f42899a96'
+CORE = '463ba771a982ccdf20cbd1d87816c785923b5bb0'
 REFRESH = {'anvil': 'Refresh saved Missions', 'forge': 'Refresh saved Missions and expire old evidence',
            'ember': 'Refresh saved Missions', 'frost': 'Refresh'}
 INSPECT = {'anvil': 'Inspect saved candidates', 'forge': 'Inspect saved repository candidates',
