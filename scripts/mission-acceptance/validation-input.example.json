@@ -1,14 +1,14 @@
 {
   "schema": 1,
   "frozen": false,
-  "core": "463ba771a982ccdf20cbd1d87816c785923b5bb0",
+  "core": "b60a61fb948ea62361cc41d10e871f2b53060515",
   "state_dir": "",
   "mission_id": "",
   "mission_revision": 0,
   "repositories": [
     {
       "full_name": "beamiter/jterm_core",
-      "revision": "463ba771a982ccdf20cbd1d87816c785923b5bb0",
+      "revision": "b60a61fb948ea62361cc41d10e871f2b53060515",
       "baseline": "",
       "path": ""
     },
