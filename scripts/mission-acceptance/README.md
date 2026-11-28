@@ -137,4 +137,4 @@ native review navigation and the final complete delivery remain separate work.
 
 ## SQLite security core update
 
-The compiled harness and collector now require core `b60a61fb948ea62361cc41d10e871f2b53060515`. The old, unfrozen `frozen-candidates.json` example is historical and is not an accepted current source set. Prepare a new complete five-repository candidate set and validate its exact digest before any acceptance run. This dependency update does not establish native acceptance or rewrite historical evidence.
+The compiled harness and collector now require core `5b39c534da4e472c57a5ea8e5fdfe55868d00b5b`. The old, unfrozen `frozen-candidates.json` example is historical and is not an accepted current source set. Prepare a new complete five-repository candidate set and validate its exact digest before any acceptance run. This dependency update does not establish native acceptance or rewrite historical evidence.
