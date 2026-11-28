@@ -1127,10 +1127,15 @@ impl RowWidgets {
             None if matches!(row.action, Action::Mission(_)) => "Delivery plan: inspection is read only; task execution and integration require explicit existing controls.",
             None => "Local conversation; waiting for shared-session registration.",
         };
-        self.widget.set_tooltip_text(Some(&format!(
+        let tooltip = format!(
             "{}\n{}\n{}\n{lifecycle}",
             row.title, row.detail, row.searchable
-        )));
+        );
+        // GTK re-queries the pointer when a tooltip is set, even if the text
+        // is unchanged. The workspace poll updates every retained row.
+        if self.widget.tooltip_text().as_deref() != Some(tooltip.as_str()) {
+            self.widget.set_tooltip_text(Some(&tooltip));
+        }
         if row.active {
             self.widget.add_css_class("active-conversation");
         } else {
@@ -1138,10 +1143,12 @@ impl RowWidgets {
         }
         if let Some(delete) = &self.delete {
             delete.set_sensitive(!row.busy && row.source.is_some());
-            delete.set_tooltip_text(
-                row.busy
-                    .then_some("Stop the running CLI session before deleting it"),
-            );
+            let tooltip = row
+                .busy
+                .then_some("Stop the running CLI session before deleting it");
+            if delete.tooltip_text().as_deref() != tooltip {
+                delete.set_tooltip_text(tooltip);
+            }
         }
         // A visible menu is a concrete action snapshot. A remote change must
         // not reverse Pin/Unpin between the user's press and release.
@@ -1581,15 +1588,39 @@ mod tests {
         cli.source = Some(cli.search_row());
         cli.busy = true;
         navigation.sync(vec![cli.clone()], &Filter::default());
-        let delete = navigation.widgets.borrow()[0]
-            .delete
-            .as_ref()
-            .unwrap()
-            .clone();
+        let (cli_widget, delete) = {
+            let widgets = navigation.widgets.borrow();
+            (
+                widgets[0].widget.clone(),
+                widgets[0].delete.clone().unwrap(),
+            )
+        };
         assert!(!delete.is_sensitive());
+        assert!(delete.tooltip_text().is_some());
+        let row_updates = Rc::new(Cell::new(0));
+        let delete_updates = Rc::new(Cell::new(0));
+        cli_widget.connect_tooltip_text_notify({
+            let updates = row_updates.clone();
+            move |_| updates.set(updates.get() + 1)
+        });
+        delete.connect_tooltip_text_notify({
+            let updates = delete_updates.clone();
+            move |_| updates.set(updates.get() + 1)
+        });
+        navigation.sync(vec![cli.clone()], &Filter::default());
+        assert_eq!((row_updates.get(), delete_updates.get()), (0, 0));
+        cli.searchable = "Updated CLI preview".into();
         cli.busy = false;
         navigation.sync(vec![cli.clone()], &Filter::default());
+        assert_eq!((row_updates.get(), delete_updates.get()), (1, 1));
+        assert!(cli_widget
+            .tooltip_text()
+            .unwrap()
+            .contains(cli.searchable.as_str()));
+        assert!(delete.tooltip_text().is_none());
         assert!(delete.is_sensitive());
+        navigation.sync(vec![cli.clone()], &Filter::default());
+        assert_eq!((row_updates.get(), delete_updates.get()), (1, 1));
         delete.emit_clicked();
         assert_eq!(
             actions.borrow().last(),
